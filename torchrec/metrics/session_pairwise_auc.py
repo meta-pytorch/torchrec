@@ -23,6 +23,9 @@ from torchrec.metrics.rec_metric import (
 
 CORRECT_PAIR_WEIGHT = "correct_pair_weight"
 TOTAL_PAIR_WEIGHT = "total_pair_weight"
+VALID_PAIR_COUNT = "valid_pair_count"
+EFFECTIVE_EXAMPLE_COUNT = "effective_example_count"
+BATCH_COUNT = "batch_count"
 REQUIRED_INPUTS = "required_inputs"
 DEFAULT_SESSION_KEY = "session_id"
 DEFAULT_PAIR_CHUNK_SIZE = 256
@@ -56,6 +59,7 @@ def _get_session_pairwise_auc_states(
     remove_zero_weight_from_pair: bool = True,
     weight_pairs: bool = True,
     pair_chunk_size: int = DEFAULT_PAIR_CHUNK_SIZE,
+    report_batch_coverage: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Compute batch-local pairwise concordance in bounded-memory chunks.
 
@@ -69,6 +73,17 @@ def _get_session_pairwise_auc_states(
     reduces that block. It is exact and does not require padding sessions or
     reading a data-dependent CUDA scalar on the host. Runtime is O(tasks * B^2)
     and temporary memory is O(tasks * pair_chunk_size * B).
+
+    When ``report_batch_coverage`` is enabled, ``valid_pair_count`` is the raw,
+    unweighted number of eligible unordered pairs in this batch::
+
+        sum(1[same_session(i, j)] * 1[i < j] *
+            1[abs(label_i - label_j) >= 1e-6] *
+            1[weight_i * weight_j > 0])
+
+    The prediction values and the magnitude of the pair weight do not affect
+    this count. Coverage states are not computed or returned when the option is
+    disabled.
     """
     if predictions.shape != labels.shape or predictions.shape != example_weights.shape:
         raise RecMetricException(
@@ -87,6 +102,15 @@ def _get_session_pairwise_auc_states(
         n_tasks, dtype=torch.double, device=predictions.device
     )
     total_pair_weight = torch.zeros_like(correct_pair_weight)
+    coverage_states: Dict[str, torch.Tensor] = {}
+    effective_example_mask: Optional[torch.Tensor] = None
+    if report_batch_coverage:
+        coverage_states = {
+            VALID_PAIR_COUNT: torch.zeros_like(correct_pair_weight),
+            EFFECTIVE_EXAMPLE_COUNT: torch.zeros_like(correct_pair_weight),
+        }
+        effective_example_mask = torch.zeros_like(example_weights, dtype=torch.bool)
+
     right_indices = torch.arange(batch_size, device=predictions.device)
     right_sessions = session_ids.unsqueeze(0)
     right_labels = labels.unsqueeze(1)
@@ -112,6 +136,14 @@ def _get_session_pairwise_auc_states(
         if remove_zero_weight_from_pair:
             valid_pair = valid_pair & ((left_weight * right_weights) > 0)
 
+        if report_batch_coverage:
+            assert effective_example_mask is not None
+            coverage_states[VALID_PAIR_COUNT] += torch.sum(
+                valid_pair, dim=(1, 2), dtype=torch.double
+            )
+            effective_example_mask[:, left_start:left_stop] |= valid_pair.any(dim=-1)
+            effective_example_mask |= valid_pair.any(dim=-2)
+
         pair_weight = (
             left_weight + right_weights if weight_pairs else torch.ones_like(label_diff)
         )
@@ -130,9 +162,16 @@ def _get_session_pairwise_auc_states(
             dtype=torch.double,
         )
 
+    if report_batch_coverage:
+        assert effective_example_mask is not None
+        coverage_states[EFFECTIVE_EXAMPLE_COUNT] += torch.sum(
+            effective_example_mask, dim=1, dtype=torch.double
+        )
+
     return {
         CORRECT_PAIR_WEIGHT: correct_pair_weight,
         TOTAL_PAIR_WEIGHT: total_pair_weight,
+        **coverage_states,
     }
 
 
@@ -146,6 +185,16 @@ def _compute_pairwise_auc(
     )
 
 
+def _compute_average_per_batch(
+    *, value_sum: torch.Tensor, batch_count: torch.Tensor
+) -> torch.Tensor:
+    return torch.where(
+        batch_count > 0,
+        value_sum / batch_count,
+        torch.zeros_like(value_sum),
+    )
+
+
 class SessionPairwiseAUCMetricComputation(RecMetricComputation):
     def __init__(
         self,
@@ -156,6 +205,7 @@ class SessionPairwiseAUCMetricComputation(RecMetricComputation):
         rank_order_label: bool = False,
         remove_zero_weight_from_pair: bool = True,
         weight_pairs: bool = True,
+        report_batch_coverage: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -165,7 +215,11 @@ class SessionPairwiseAUCMetricComputation(RecMetricComputation):
         self._rank_order_label = rank_order_label
         self._remove_zero_weight_from_pair = remove_zero_weight_from_pair
         self._weight_pairs = weight_pairs
-        for state_name in (CORRECT_PAIR_WEIGHT, TOTAL_PAIR_WEIGHT):
+        self._report_batch_coverage = report_batch_coverage
+        state_names = [CORRECT_PAIR_WEIGHT, TOTAL_PAIR_WEIGHT]
+        if self._report_batch_coverage:
+            state_names.extend([VALID_PAIR_COUNT, EFFECTIVE_EXAMPLE_COUNT, BATCH_COUNT])
+        for state_name in state_names:
             self._add_state(
                 state_name,
                 torch.zeros(self._n_tasks, dtype=torch.double),
@@ -232,14 +286,19 @@ class SessionPairwiseAUCMetricComputation(RecMetricComputation):
             rank_order_label=self._rank_order_label,
             remove_zero_weight_from_pair=self._remove_zero_weight_from_pair,
             weight_pairs=self._weight_pairs,
+            report_batch_coverage=self._report_batch_coverage,
         )
+        if self._report_batch_coverage:
+            states[BATCH_COUNT] = torch.ones(
+                self._n_tasks, dtype=torch.double, device=labels.device
+            )
         for state_name, state_value in states.items():
             state = getattr(self, state_name).to(labels.device)
             state += state_value
             self._aggregate_window_state(state_name, state_value, batch_size)
 
     def _compute(self) -> List[MetricComputationReport]:
-        return [
+        reports = [
             MetricComputationReport(
                 name=MetricName.SESSION_PAIRWISE_AUC,
                 metric_prefix=MetricPrefix.LIFETIME,
@@ -261,11 +320,56 @@ class SessionPairwiseAUCMetricComputation(RecMetricComputation):
                 ),
             ),
         ]
+        if not self._report_batch_coverage:
+            return reports
+
+        reports.extend(
+            [
+                # These are averages per metric update (and therefore per
+                # rank-local batch after distributed state reduction), not a
+                # count summed across the global training step.
+                MetricComputationReport(
+                    name=MetricName.VALID_PAIRS_PER_BATCH,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_average_per_batch(
+                        value_sum=cast(torch.Tensor, getattr(self, VALID_PAIR_COUNT)),
+                        batch_count=cast(torch.Tensor, getattr(self, BATCH_COUNT)),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.VALID_PAIRS_PER_BATCH,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_average_per_batch(
+                        value_sum=self.get_window_state(VALID_PAIR_COUNT),
+                        batch_count=self.get_window_state(BATCH_COUNT),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.EFFECTIVE_TRAINING_EXAMPLES_PER_BATCH,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_average_per_batch(
+                        value_sum=cast(
+                            torch.Tensor, getattr(self, EFFECTIVE_EXAMPLE_COUNT)
+                        ),
+                        batch_count=cast(torch.Tensor, getattr(self, BATCH_COUNT)),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.EFFECTIVE_TRAINING_EXAMPLES_PER_BATCH,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_average_per_batch(
+                        value_sum=self.get_window_state(EFFECTIVE_EXAMPLE_COUNT),
+                        batch_count=self.get_window_state(BATCH_COUNT),
+                    ),
+                ),
+            ]
+        )
+        return reports
 
 
 class SessionPairwiseAUCMetric(RecMetric):
-    # Pair construction depends on logical batch boundaries. ZORM currently
-    # merges those boundaries before metric update.
+    # Pair construction and per-batch coverage depend on logical batch
+    # boundaries. ZORM currently merges those boundaries before metric update.
     supports_cpu_offloaded_metric_module: bool = False
 
     # pyre-ignore[15]: The base metric namespace is intentionally specialized.
