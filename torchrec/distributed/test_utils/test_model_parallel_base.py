@@ -68,6 +68,7 @@ from torchrec.modules.embedding_configs import (
 )
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.modules.fused_embedding_modules import FusedEmbeddingBagCollection
+from torchrec.optim.ftrl import FTRL
 from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port, seed_and_log
@@ -1267,6 +1268,10 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    @unittest.skipIf(
+        not hasattr(EmbOptimType, "FTRL"),
+        "fbgemm_gpu build does not provide EmbOptimType.FTRL",
+    )
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1285,6 +1290,136 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         ),
     )
     @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
+    def test_ftrl_numerical_equivalence(
+        self,
+        sharder_type: str,
+        sharding_type: str,
+        kernel_type: str,
+    ) -> None:
+        learning_rate = 0.1
+        # l1_reg is left at 0 here on purpose. FTRL pins |linear| <= l1_reg to
+        # exactly 0, and the fused and dense paths can land on opposite sides of
+        # that threshold for float reasons, which would make this comparison
+        # flaky. Exact-zero thresholding is covered deterministically in
+        # FBGEMM's FtrlTest and in torchrec/optim/tests/test_ftrl.py.
+        fused_params = {
+            # pyre-ignore[16]: guarded by the skipIf above
+            "optimizer": EmbOptimType.FTRL,
+            "learning_rate": learning_rate,
+            "ftrl_l2_reg": 0.01,
+        }
+
+        fused_sharders = [
+            cast(
+                ModuleSharder[nn.Module],
+                create_test_sharder(
+                    sharder_type,
+                    sharding_type,
+                    EmbeddingComputeKernel.FUSED.value,
+                    fused_params=fused_params,
+                ),
+            ),
+        ]
+        dense_sharders = [
+            cast(
+                ModuleSharder[nn.Module],
+                create_test_sharder(
+                    sharder_type,
+                    ShardingType.DATA_PARALLEL.value,
+                    EmbeddingComputeKernel.DENSE.value,
+                    fused_params=fused_params,
+                ),
+            ),
+        ]
+        (fused_model, _), _ = self._generate_dmps_and_batch(fused_sharders)
+        (dense_model, _), batch = self._generate_dmps_and_batch(dense_sharders)
+
+        dense_opt = FTRL(
+            # pyrefly: ignore[missing-attribute]
+            dense_model.module.sparse.parameters(),
+            lr=learning_rate,
+            ftrl_l2_reg=0.01,
+        )
+
+        # FTRL recomputes each weight from (accum, linear) rather than
+        # incrementing it, so the dense optimizer drives *every* row to
+        # f(0, 0) == 0 on its first step, while the fused kernel only visits
+        # rows present in the batch. Starting from all-zero weights makes the
+        # two paths agree on untouched rows as well.
+        #
+        # Zero the *fused* side: copy_state_dict(loc, glob) copies glob -> loc,
+        # so fused_model is the source and dense_model the destination.
+        with torch.no_grad():
+            for key, val in fused_model.state_dict().items():
+                if not key.endswith(".weight") or "embedding_bags" not in key:
+                    continue
+                (
+                    val.local_shards()[0].tensor
+                    if isinstance(val, ShardedTensor)
+                    else val
+                ).zero_()
+
+        # load the baseline model's state_dict onto the new model.
+        # Use copy_state_dict (not load_state_dict) because the two models have
+        # different topologies: fused_model produces ShardedTensor entries in its
+        # state_dict (table-wise + fused), while dense_model's params are
+        # TableBatchedEmbeddingSlice (data-parallel + dense). PyTorch's default
+        # load_state_dict cannot copy ShardedTensor into TableBatchedEmbeddingSlice.
+        copy_state_dict(
+            dense_model.state_dict(),
+            cast("OrderedDict[str, torch.Tensor]", fused_model.state_dict()),
+        )
+
+        for _ in range(4):
+            dense_opt.zero_grad()
+            loss1, pred1 = fused_model(batch)
+            loss2, pred2 = dense_model(batch)
+            loss1.backward()
+            loss2.backward()
+            dense_opt.step()
+
+        self._eval_models(fused_model, dense_model, batch, is_deterministic=False)
+        fused_sd = fused_model.state_dict()
+        dense_sd = dense_model.state_dict()
+        for key, dense_val in dense_sd.items():
+            if not key.endswith(".weight") or "embedding_bags" not in key:
+                continue
+            fused_val = fused_sd[key]
+            fused_tensor = (
+                fused_val.local_shards()[0].tensor
+                if isinstance(fused_val, ShardedTensor)
+                else fused_val
+            )
+            dense_tensor = (
+                dense_val.local_shards()[0].tensor
+                if isinstance(dense_val, ShardedTensor)
+                else dense_val
+            )
+            rtol, atol = _get_default_rtol_and_atol(fused_tensor, dense_tensor)
+            torch.testing.assert_close(fused_tensor, dense_tensor, rtol=rtol, atol=atol)
+
+    @given(
+        sharder_type=st.sampled_from(
+            [
+                SharderType.EMBEDDING_BAG_COLLECTION.value,
+            ]
+        ),
+        sharding_type=st.sampled_from(
+            [
+                ShardingType.TABLE_WISE.value,
+            ]
+        ),
+        kernel_type=st.sampled_from(
+            [
+                EmbeddingComputeKernel.FUSED.value,
+            ]
+        ),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     def test_rowwise_adagrad_numerical_equivalence(
         self,
         sharder_type: str,
