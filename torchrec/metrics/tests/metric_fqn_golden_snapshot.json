@@ -298,6 +298,14 @@
       "throughput_metric.warmup_examples"
     ]
   },
+  "cross_net": {
+    "state_dict_keys": [
+      "bias.0",
+      "bias.1",
+      "kernels.0",
+      "kernels.1"
+    ]
+  },
   "embedding_bag_collection": {
     "state_dict_keys": [
       "embedding_bags.table1.weight"
@@ -366,6 +374,28 @@
       "weights"
     ]
   },
+  "low_rank_cross_net": {
+    "state_dict_keys": [
+      "V_kernels.0",
+      "V_kernels.1",
+      "W_kernels.0",
+      "W_kernels.1",
+      "bias.0",
+      "bias.1"
+    ]
+  },
+  "low_rank_mixture_cross_net": {
+    "state_dict_keys": [
+      "C_kernels.0",
+      "C_kernels.1",
+      "U_kernels.0",
+      "U_kernels.1",
+      "V_kernels.0",
+      "V_kernels.1",
+      "bias.0",
+      "bias.1"
+    ]
+  },
   "mch_managed_collision_module": {
     "state_dict_keys": [
       "_current_iter_tensor",
@@ -394,8 +424,22 @@
       "_output_segments_tensor"
     ]
   },
+  "mlp": {
+    "state_dict_keys": [
+      "_mlp.0._linear.bias",
+      "_mlp.0._linear.weight",
+      "_mlp.1._linear.bias",
+      "_mlp.1._linear.weight"
+    ]
+  },
   "noop_metric_module": {
     "state_dict_keys": []
+  },
+  "perceptron": {
+    "state_dict_keys": [
+      "_linear.bias",
+      "_linear.weight"
+    ]
   },
   "rec_metric_module": {
     "state_dict_keys": [
@@ -416,6 +460,12 @@
       "throughput_metric.warmup_examples"
     ]
   },
+  "swish_layer_norm": {
+    "state_dict_keys": [
+      "norm.0.bias",
+      "norm.0.weight"
+    ]
+  },
   "tensor_pool": {
     "state_dict_keys": [
       "_pool"
@@ -434,6 +484,14 @@
       "time_lapse_after_warmup",
       "total_examples",
       "warmup_examples"
+    ]
+  },
+  "vector_cross_net": {
+    "state_dict_keys": [
+      "bias.0",
+      "bias.1",
+      "kernels.0",
+      "kernels.1"
     ]
   }
 }
