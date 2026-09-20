@@ -22,10 +22,14 @@ def _ftrl_reference_step(
     grad: torch.Tensor,
     lr: float,
     learning_rate_power: float,
+    beta: float,
     l1_reg: float,
     l2_reg: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Independent transcription of x-deeplearning's FtrlUpdater inner loop.
+    """Independent transcription of McMahan et al. 2013 Algorithm 1.
+
+    Matches NVIDIA DynamicEmb's own reference (`ftrl_step` in recsys-examples
+    `test/unit_tests/optimizer/test_ftrl_optimizer.py`).
 
     Deliberately written as a scalar loop rather than reusing the optimizer's
     own vectorized code, so the test checks the algorithm and not just that the
@@ -48,7 +52,7 @@ def _ftrl_reference_step(
         sigma_new = n_new**exponent
         sigma_old = n_old**exponent
         z = float(flat_z[i]) + g - (sigma_new - sigma_old) / lr * float(flat_w[i])
-        quadratic = sigma_new / lr + 2.0 * l2_reg
+        quadratic = (beta + sigma_new) / lr + l2_reg
         if abs(z) > l1_reg:
             sgn = 1.0 if z > 0 else (-1.0 if z < 0 else 0.0)
             flat_w[i] = (l1_reg * sgn - z) / quadratic
@@ -75,7 +79,7 @@ class FTRLTest(unittest.TestCase):
 
     def test_matches_reference(self) -> None:
         """Multi-step agreement with a scalar transcription of the XDL kernel."""
-        lr, power, l1, l2 = 0.5, -0.5, 1e-3, 1e-2
+        lr, power, beta, l1, l2 = 0.5, -0.5, 0.5, 1e-3, 1e-2
         torch.manual_seed(0)
         embedding_bag = torch.nn.EmbeddingBag(
             num_embeddings=4, embedding_dim=4, mode="sum"
@@ -85,6 +89,7 @@ class FTRLTest(unittest.TestCase):
             embedding_bag.parameters(),
             lr=lr,
             ftrl_learning_rate_power=power,
+            ftrl_beta=beta,
             ftrl_l1_reg=l1,
             ftrl_l2_reg=l2,
         )
@@ -101,7 +106,7 @@ class FTRLTest(unittest.TestCase):
             opt.step()
 
             weight, accum, linear = _ftrl_reference_step(
-                weight, accum, linear, grad, lr, power, l1, l2
+                weight, accum, linear, grad, lr, power, beta, l1, l2
             )
             torch.testing.assert_close(
                 embedding_bag.weight.detach(),
@@ -181,7 +186,29 @@ class FTRLTest(unittest.TestCase):
 
         # First step from accum == 0 gives sigma_new == |g| == 0.8.
         sigma_new = 0.8
-        ratio = (sigma_new / lr) / (sigma_new / lr + 2.0 * l2)
+        ratio = (sigma_new / lr) / (sigma_new / lr + l2)
+        torch.testing.assert_close(bags[1][0], bags[0][0] * ratio, atol=1e-6, rtol=1e-6)
+
+    def test_beta_enters_denominator(self) -> None:
+        """ftrl_beta is the paper's beta: it bounds the per-coordinate learning
+        rate by adding to sigma inside the denominator."""
+        lr, beta = 0.5, 1.5
+        state_dict = {"weight": torch.zeros(4, 4)}
+
+        bags = []
+        for ftrl_beta in (0.0, beta):
+            bag = torch.nn.EmbeddingBag(num_embeddings=4, embedding_dim=4, mode="sum")
+            bag.load_state_dict(state_dict)
+            # pyrefly: ignore[implicit-import]
+            opt = torchrec.optim.FTRL(bag.parameters(), lr=lr, ftrl_beta=ftrl_beta)
+            index, offsets = torch.tensor([0]), torch.tensor([0, 1])
+            opt.zero_grad()
+            (bag(index, offsets).sum() * 0.8).backward()
+            opt.step()
+            bags.append(bag.weight.detach().clone())
+
+        sigma_new = 0.8
+        ratio = (sigma_new / lr) / ((beta + sigma_new) / lr)
         torch.testing.assert_close(bags[1][0], bags[0][0] * ratio, atol=1e-6, rtol=1e-6)
 
     def test_invalid_args(self) -> None:
@@ -189,6 +216,9 @@ class FTRLTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             # pyrefly: ignore[implicit-import]
             torchrec.optim.FTRL(params(), lr=0.0)
+        with self.assertRaises(ValueError):
+            # pyrefly: ignore[implicit-import]
+            torchrec.optim.FTRL(params(), lr=0.1, ftrl_learning_rate_power=0.5)
         with self.assertRaises(ValueError):
             # pyrefly: ignore[implicit-import]
             torchrec.optim.FTRL(params(), lr=0.1, ftrl_l1_reg=-1.0)

@@ -20,10 +20,11 @@ class FTRL(Optimizer):
     r"""Implements the FTRL-Proximal algorithm (Follow The Regularized Leader).
 
     This is the dense counterpart of ``EmbOptimType.FTRL``, the fused FBGEMM TBE
-    optimizer. It implements the same update, which matches TensorFlow's
-    ``ApplyFtrlV2`` (with ``l2_shrinkage = 0``) and Alibaba x-deeplearning's
-    ``FtrlUpdater``. Per coordinate, with state ``accum`` (the running sum of
-    squared gradients) and ``linear``:
+    optimizer. It implements the same update: Algorithm 1 of McMahan et al.
+    2013, with the paper's fixed square root generalized to an arbitrary
+    exponent the way TensorFlow's ``FtrlOptimizer`` does. This matches NVIDIA
+    DynamicEmb's FTRL element for element. Per coordinate, with state ``accum``
+    (the running sum of squared gradients) and ``linear``:
 
     .. code-block:: text
 
@@ -31,7 +32,7 @@ class FTRL(Optimizer):
         sigma_new = new_accum ^ (-learning_rate_power)
         sigma_old = accum     ^ (-learning_rate_power)
         linear   += g - (sigma_new - sigma_old) / lr * w
-        quadratic = sigma_new / lr + 2 * l2_reg
+        quadratic = (beta + sigma_new) / lr + l2_reg
         w         = |linear| > l1_reg ? (l1_reg * sgn(linear) - linear) / quadratic : 0
         accum     = new_accum
 
@@ -55,11 +56,18 @@ class FTRL(Optimizer):
         lr (float, optional): learning rate, FTRL's ``alpha`` (default: 1e-2).
             Must be strictly positive -- the update divides by it.
         ftrl_learning_rate_power (float, optional): exponent applied to
-            ``accum``; -0.5 gives the classic 1/sqrt schedule (default: -0.5)
-        ftrl_l1_reg (float, optional): L1 regularization strength (default: 0.0)
-        ftrl_l2_reg (float, optional): proximal L2 regularization strength.
-            Enters as ``2 * l2`` in the denominator, not as a gradient-space
-            weight decay (default: 0.0)
+            ``accum``; -0.5 gives the classic 1/sqrt schedule. Must be <= 0 --
+            a positive value would make the learning rate grow without bound
+            (default: -0.5)
+        ftrl_beta (float, optional): the paper's beta; keeps the per-coordinate
+            learning rate finite while ``accum`` is still small (default: 0.0)
+        ftrl_l1_reg (float, optional): L1 regularization strength, the paper's
+            lambda1 (default: 0.0)
+        ftrl_l2_reg (float, optional): proximal L2 regularization strength,
+            the paper's lambda2. Note TensorFlow and x-deeplearning scale their
+            l2 knob differently (``2 * l2``, no beta), so a config ported from
+            either must halve its value. Enters the denominator, not as a
+            gradient-space weight decay (default: 0.0)
     """
 
     def __init__(
@@ -67,6 +75,7 @@ class FTRL(Optimizer):
         params: Iterable[torch.nn.Parameter],
         lr: float = 1e-2,
         ftrl_learning_rate_power: float = -0.5,
+        ftrl_beta: float = 0.0,
         ftrl_l1_reg: float = 0.0,
         ftrl_l2_reg: float = 0.0,
         **unused: Any,
@@ -75,6 +84,16 @@ class FTRL(Optimizer):
             raise ValueError(
                 "Invalid learning rate: {} (FTRL divides by it)".format(lr)
             )
+        if ftrl_learning_rate_power > 0.0:
+            raise ValueError(
+                "ftrl_learning_rate_power must be <= 0 (it is the exponent on "
+                "the accumulator in the learning rate, so a positive value "
+                "would make the rate grow without bound); got {}".format(
+                    ftrl_learning_rate_power
+                )
+            )
+        if not 0.0 <= ftrl_beta:
+            raise ValueError("Invalid ftrl_beta value: {}".format(ftrl_beta))
         if not 0.0 <= ftrl_l1_reg:
             raise ValueError("Invalid ftrl_l1_reg value: {}".format(ftrl_l1_reg))
         if not 0.0 <= ftrl_l2_reg:
@@ -83,6 +102,7 @@ class FTRL(Optimizer):
         defaults = dict(
             lr=lr,
             ftrl_learning_rate_power=ftrl_learning_rate_power,
+            ftrl_beta=ftrl_beta,
             ftrl_l1_reg=ftrl_l1_reg,
             ftrl_l2_reg=ftrl_l2_reg,
         )
@@ -156,6 +176,7 @@ class FTRL(Optimizer):
                 state_steps,
                 lr=group["lr"],
                 learning_rate_power=group["ftrl_learning_rate_power"],
+                beta=group["ftrl_beta"],
                 l1_reg=group["ftrl_l1_reg"],
                 l2_reg=group["ftrl_l2_reg"],
             )
@@ -175,6 +196,7 @@ def ftrl(
     *,
     lr: float,
     learning_rate_power: float,
+    beta: float,
     l1_reg: float,
     l2_reg: float,
 ) -> None:
@@ -195,6 +217,7 @@ def ftrl(
         state_steps,
         lr=lr,
         learning_rate_power=learning_rate_power,
+        beta=beta,
         l1_reg=l1_reg,
         l2_reg=l2_reg,
     )
@@ -209,6 +232,7 @@ def _single_tensor_ftrl(
     *,
     lr: float,
     learning_rate_power: float,
+    beta: float,
     l1_reg: float,
     l2_reg: float,
 ) -> None:
@@ -228,7 +252,7 @@ def _single_tensor_ftrl(
         # NOTE: reads `param` before it is overwritten below.
         linear.add_(grad - (sigma_new - sigma_old) / lr * param)
 
-        quadratic = sigma_new / lr + 2.0 * l2_reg
+        quadratic = (beta + sigma_new) / lr + l2_reg
         param.copy_(
             torch.where(
                 linear.abs() > l1_reg,
