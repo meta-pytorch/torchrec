@@ -143,7 +143,7 @@ class TritonBatchIndexSelectTest(unittest.TestCase):
                 torch.arange(batch_size, device="cuda") % input_rows[1],
             ]
         )
-        reference_inputs = inputs.detach().clone().requires_grad_()
+        reference_inputs = inputs.detach().clone().float().requires_grad_()
 
         with mock.patch.object(
             triton_batch_index_select_module,
@@ -163,10 +163,12 @@ class TritonBatchIndexSelectTest(unittest.TestCase):
             input_rows,
             input_columns,
         )
-        expected_grad = torch.autograd.grad(expected, reference_inputs, grad_output)[0]
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        expected_grad = torch.autograd.grad(
+            expected, reference_inputs, grad_output.float()
+        )[0]
+        torch.testing.assert_close(output, expected.to(output.dtype), rtol=0, atol=0)
         torch.testing.assert_close(
-            actual_grad,
+            actual_grad.float(),
             expected_grad,
             rtol=0,
             atol=batch_size * torch.finfo(inputs.dtype).eps,
