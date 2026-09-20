@@ -170,8 +170,8 @@ class TritonQuantizedCommTest(unittest.TestCase):
         )
         quantized = quantize(input)
         actual = dequantize(quantized)
-        expected = torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(
-            torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
+        expected = triton_fused8bitrowwise_quantized_to_float(
+            triton_float_to_fused8bitrowwise_quantized(input)
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
 
