@@ -3083,6 +3083,10 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 permuted_length_per_key_sum,
             )
 
+        # Native FBGEMM can return an undefined tensor for absent weights.
+        if self.weights_or_none() is None:
+            permuted_weights = None
+
         kjt = KeyedJaggedTensor(
             keys=permuted_keys,
             values=permuted_values,
