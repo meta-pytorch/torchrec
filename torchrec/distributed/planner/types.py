@@ -2258,6 +2258,15 @@ class PlannerConfig:
     # in request_hash. Consumed only by the SKU_AWARE reservation. (Appended last to
     # preserve positional construction of the pre-existing fields.)
     reserve_module_terms: bool = True
+    # 2D sparse-parallelism world count; None or 1 means 2D is off. This is a
+    # property of the topology, not of any one solver: it divides each host's
+    # ranks across parallel worlds when the topology is built, so every planner
+    # variant needs it, not just the LP one. Deliberately absent from the
+    # request_hash() field list -- the fb request_hash_extension() folds it in
+    # instead, so requests that leave it unset keep their existing digest.
+    # (Appended last to preserve positional construction of the pre-existing
+    # fields.)
+    num_parallel_worlds: Optional[int] = None
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
