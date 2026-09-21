@@ -4849,6 +4849,85 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             ),
         )
 
+    def _run_forward(
+        self,
+        indices: torch.Tensor,
+        offsets: torch.Tensor,
+        per_sample_weights: Optional[torch.Tensor],
+        batch_size_per_feature_per_rank: Optional[List[List[int]]],
+        vbe_metadata: Optional[Any],
+        row_output_offsets: Optional[torch.Tensor],
+        b_t_map: Optional[torch.Tensor],
+        info_B_num_bits: int,
+        info_B_mask: int,
+        total_B: int,
+        max_B: int,
+        use_fused_bounds_check: bool,
+        *,
+        weight_ptrs: Tuple[torch.Tensor, ...],
+        weight_chunk_starts: Tuple[int, ...],
+        split_weight_row_starts: Tuple[int, ...],
+        feature_weight_chunk_ids: Tuple[int, ...],
+        feature_chunk_relative_table_offsets: Tuple[int, ...],
+    ) -> torch.Tensor:
+        return TritonTBE.apply(
+            indices,
+            offsets,
+            self.weight,
+            self.table_offsets,
+            self.embedding_dims,
+            self.embedding_offsets,
+            self.feature_table_map_tensor,
+            self.total_embedding_dim,
+            self.T,
+            self.hash_size_cumsum,
+            self.total_hash_size_bits,
+            self.learning_rate,
+            self.block_size,
+            self.eps,
+            self.optimizer,
+            self.momentum,
+            self.rows_cumsum,
+            per_sample_weights,
+            self.record_forward_event,
+            self.output_dtype,
+            self.stochastic_rounding,
+            batch_size_per_feature_per_rank,
+            self._feature_dims_cpu,
+            self._D_offsets,
+            self._max_D,
+            vbe_metadata,
+            row_output_offsets,
+            b_t_map,
+            info_B_num_bits,
+            info_B_mask,
+            total_B,
+            max_B,
+            self.hoist_transpose_to_forward,
+            self._histogram_feature,
+            self._histogram_num_rows,
+            self._histogram_row_bins,
+            self._histogram_block_size,
+            self._saved_histogram_plans,
+            self.bounds_check_warning,
+            use_fused_bounds_check,
+            self._bwd_bucket_block_sizes,
+            self._bwd_feature_bucket_id,
+            self._bwd_bucket_rows,
+            self._bwd_bucket_rows_tensor,
+            weight_ptrs,
+            weight_chunk_starts,
+            split_weight_row_starts,
+            feature_weight_chunk_ids,
+            feature_chunk_relative_table_offsets,
+            self._weight_chunk_starts_tensor,
+            self._feature_weight_chunk_ids_tensor,
+            self._feature_chunk_relative_table_offsets_tensor,
+            self.enable_triton_tbe_optimizations,
+            self.forward_block_limit,
+            self.vbe_forward_block_limit,
+        )
+
     def _forward(
         self,
         indices: torch.Tensor,
@@ -4948,32 +5027,11 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
                         num_warps=1,
                     )
 
-        return TritonTBE.apply(
+        return self._run_forward(
             indices,
             offsets,
-            self.weight,
-            self.table_offsets,
-            self.embedding_dims,
-            self.embedding_offsets,
-            self.feature_table_map_tensor,
-            self.total_embedding_dim,
-            self.T,
-            self.hash_size_cumsum,
-            self.total_hash_size_bits,
-            self.learning_rate,
-            self.block_size,
-            self.eps,
-            self.optimizer,
-            self.momentum,
-            self.rows_cumsum,
             per_sample_weights,
-            self.record_forward_event,
-            self.output_dtype,
-            self.stochastic_rounding,
             batch_size_per_feature_per_rank,
-            self._feature_dims_cpu,
-            self._D_offsets,
-            self._max_D,
             vbe_metadata,
             row_output_offsets,
             b_t_map,
@@ -4981,29 +5039,12 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             info_B_mask,
             total_B,
             max_B,
-            self.hoist_transpose_to_forward,
-            self._histogram_feature,
-            self._histogram_num_rows,
-            self._histogram_row_bins,
-            self._histogram_block_size,
-            self._saved_histogram_plans,
-            self.bounds_check_warning,
             use_fused_bounds_check,
-            self._bwd_bucket_block_sizes,
-            self._bwd_feature_bucket_id,
-            self._bwd_bucket_rows,
-            self._bwd_bucket_rows_tensor,
-            weight_ptrs,
-            weight_chunk_starts,
-            split_weight_row_starts,
-            feature_weight_chunk_ids,
-            feature_chunk_relative_table_offsets,
-            self._weight_chunk_starts_tensor,
-            self._feature_weight_chunk_ids_tensor,
-            self._feature_chunk_relative_table_offsets_tensor,
-            self.enable_triton_tbe_optimizations,
-            self.forward_block_limit,
-            self.vbe_forward_block_limit,
+            weight_ptrs=weight_ptrs,
+            weight_chunk_starts=weight_chunk_starts,
+            split_weight_row_starts=split_weight_row_starts,
+            feature_weight_chunk_ids=feature_weight_chunk_ids,
+            feature_chunk_relative_table_offsets=(feature_chunk_relative_table_offsets),
         )
 
     def split_embedding_weights(self) -> List[torch.Tensor]:
@@ -5106,60 +5147,6 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
                 stream if stream is not None else torch.cuda.current_stream()
             )
             target_stream.wait_event(self._forward_event)
-
-
-class TritonUVMTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
-    """Forward-only Triton TBE with weights allocated in CUDA managed memory."""
-
-    def _allocate_weight(
-        self,
-        total_weight_size: int,
-        weights_precision: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if device.type != "cuda":
-            raise ValueError("Triton UVM TBE requires a CUDA device")
-        reference = torch.empty(0, dtype=weights_precision, device=device)
-        return torch.ops.fbgemm.new_managed_tensor(
-            reference,
-            [total_weight_size],
-        )
-
-    def forward(
-        self,
-        indices: torch.Tensor,
-        offsets: torch.Tensor,
-        per_sample_weights: Optional[torch.Tensor] = None,
-        batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            return super().forward(
-                indices,
-                offsets,
-                per_sample_weights,
-                batch_size_per_feature_per_rank,
-            )
-
-
-class TritonUVMCappedTableBatchedEmbeddingBags(TritonUVMTableBatchedEmbeddingBags):
-    """Forward-only Triton UVM TBE with bounded forward launches."""
-
-    def __init__(
-        self,
-        *args: Any,
-        forward_block_limit: int = 0,
-        vbe_forward_block_limit: int = 0,
-        **kwargs: Any,
-    ) -> None:
-        if forward_block_limit < 0:
-            raise ValueError("forward_block_limit must be non-negative")
-        if vbe_forward_block_limit < 0:
-            raise ValueError("vbe_forward_block_limit must be non-negative")
-        if forward_block_limit == 0 and vbe_forward_block_limit == 0:
-            raise ValueError("capped UVM TBE requires a positive forward block limit")
-        super().__init__(*args, **kwargs)
-        self.forward_block_limit = forward_block_limit
-        self.vbe_forward_block_limit = vbe_forward_block_limit
 
 
 class ChunkedTritonTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
