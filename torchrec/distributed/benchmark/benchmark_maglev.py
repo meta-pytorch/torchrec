@@ -120,8 +120,8 @@ def _shard_embeddings_in_hsd(
     The tables are sharded over ``stage_pg``, so the lookup all-to-all stays local
     to the HSD with no global cross-HSD exchange, and the embedding optimizer is
     fused into the TBE backward. Dense params are replicated in DDP over the same
-    group and reduced once per pass, the schedule having suppressed DDP's sync on
-    every backward but the last.
+    group. The schedule accumulates every microbatch locally, then flushes DDP
+    once after the final backward.
     """
     sharders: List[ModuleSharder[nn.Module]] = [
         cast(ModuleSharder[nn.Module], EmbeddingBagCollectionSharder())
@@ -161,13 +161,13 @@ def _shard_embeddings_in_hsd(
         device=device,
         plan=plan,
         sharders=sharders,
-        # Dense params go into DDP over the stage pg; the schedule suppresses its
-        # sync around every forward but the pass's last, so one all-reduce lands
-        # per pass. static_graph is off: it requires the reducer to be armed on
-        # the first backward, which cannot hold when the first microbatch's
-        # forward is deliberately inside no_sync.
+        # Dense params go into DDP over the stage pg. The 1F1B schedule defers its
+        # one all-reduce until every microbatch backward has accumulated, which
+        # requires dynamic unused-parameter tracking rather than static graph.
         init_data_parallel=True,
-        data_parallel_wrapper=DefaultDataParallelWrapper(static_graph=False),
+        data_parallel_wrapper=DefaultDataParallelWrapper(
+            static_graph=False, find_unused_parameters=True
+        ),
         init_parameters=True,
     )
 

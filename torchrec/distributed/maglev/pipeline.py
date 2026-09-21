@@ -76,10 +76,9 @@ class MaglevPipelineBase:
     by the correctness test.
 
     Subclasses override :meth:`progress` with their own ordering; what they
-    inherit is the stage and optimizer, the boundary-contract check, and
-    :meth:`_forward_context`, which every schedule uses to arm DDP's single
-    gradient sync for a pass. FSDP2 synchronization is configured directly before
-    each backward.
+    inherit is the stage and optimizer, the boundary-contract check, and the
+    data-parallel synchronization controls. FSDP2 is armed before the pass's final
+    backward; DDP is flushed immediately after it.
 
     Args:
         stage: this rank's :class:`StageWrapper`. Everything about where this
@@ -89,11 +88,11 @@ class MaglevPipelineBase:
         optimizer: the stage's optimizer. Gradients accumulate across a pass and
             are applied with a single step.
         no_sync: returns a context that suppresses the DP wrapper's gradient
-            sync, entered around every forward but the pass's last. Defaults to
-            suppressing whatever wrappers :func:`_no_sync_modules` finds on
-            ``stage.module``, so an unwrapped stage needs nothing and a DDP/DMP
-            one works unconfigured. Pass your own only if that derivation is
-            wrong for your setup. FSDP2 modules are discovered independently.
+            sync. Defaults to suppressing whatever wrappers
+            :func:`_no_sync_modules` finds on ``stage.module``, so an unwrapped
+            stage needs nothing and a DDP/DMP one works unconfigured. Pass your
+            own only if that derivation is wrong for your setup. DDP and FSDP2
+            modules are discovered independently for final-backward handling.
 
     Raises:
         ValueError: if a boundary stage declares an activation it cannot have (an
@@ -114,6 +113,9 @@ class MaglevPipelineBase:
         self._no_sync: Callable[[], ContextManager[None]] = no_sync or (
             lambda: _no_sync(modules)
         )
+        self._ddp_modules: List[DistributedDataParallel] = [
+            module for module in modules if isinstance(module, DistributedDataParallel)
+        ]
         self._fsdp_modules: List[FSDPModule] = [
             module
             for module in stage.module.modules()
@@ -176,27 +178,37 @@ class MaglevPipelineBase:
         return loss if self.stage.is_last else None
 
     def _forward_context(self, fwd_idx: int, num_forwards: int) -> ContextManager[None]:
-        """Suppress gradient sync for every microbatch but the pass's last.
+        """Suppress DDP sync for every microbatch forward.
 
-        Wraps the **forward**, not the backward. ``DistributedDataParallel``
-        reads ``require_backward_grad_sync`` in ``_pre_forward`` /
-        ``_post_forward`` -- that is where the reducer is armed for the coming
-        backward -- so a ``no_sync`` placed around ``backward()`` alone has no
-        effect and every microbatch all-reduces. PyTorch documents the same:
-        "The forward pass should be included inside the context manager, or else
-        gradients will still be synchronized."
+        A 1F1B stage can have several forwards outstanding and backpropagates them
+        in FIFO order. Arming DDP on the final *forward* therefore makes the reducer
+        consume an earlier graph's hooks. Keep every DDP forward unsynchronized and
+        flush its accumulated gradient buckets after the final backward.
 
-        The last microbatch forwards outside the context, so its backward carries
-        the one reduction for the whole pass, over gradients every earlier
-        microbatch accumulated locally.
+        Non-DDP wrappers retain the ordinary last-forward synchronization behavior.
 
         Args:
             fwd_idx: index of this forward within the pass.
             num_forwards: forwards this pass will run.
         """
         if fwd_idx == num_forwards - 1:
-            return contextlib.nullcontext()
+            return _no_sync(self._ddp_modules)
         return self._no_sync()
+
+    def _finalize_ddp_backward(
+        self,
+        backward_idx: int,
+        num_backwards: int,
+    ) -> None:
+        """Reduce DDP gradients once, after every microbatch has accumulated."""
+        if backward_idx != num_backwards - 1:
+            return
+        for module in self._ddp_modules:
+            # All forwards ran under no_sync, so no graph-specific reducer state is
+            # live. Flush the accumulated parameter grads through DDP's configured
+            # buckets and communication hook in one reduction.
+            module.reducer.prepare_for_backward([])
+            module.reducer._delay_all_reduce()
 
     def _configure_fsdp_backward(
         self,
@@ -247,6 +259,16 @@ class Maglev1F1B(MaglevPipelineBase):
         no_sync: Optional[Callable[[], ContextManager[None]]] = None,
     ) -> None:
         super().__init__(stage, optimizer, no_sync)
+        if any(module.static_graph for module in self._ddp_modules):
+            raise ValueError(
+                "1F1B requires DDP static_graph=False because every forward runs under "
+                "no_sync and the reducer is flushed after the final backward"
+            )
+        if any(not module.find_unused_parameters for module in self._ddp_modules):
+            raise ValueError(
+                "1F1B requires DDP find_unused_parameters=True so its deferred reducer "
+                "can distinguish accumulated gradients from unused parameters"
+            )
         if num_microbatches < stage.num_stages:
             raise ValueError(
                 f"1F1B needs at least one microbatch per stage: got "
@@ -316,6 +338,7 @@ class Maglev1F1B(MaglevPipelineBase):
             self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
             stage.start_recv_grad()
             stage.backward_micro()
+            self._finalize_ddp_backward(bwd_idx, self.num_microbatches)
             bwd_idx += 1
 
         for _ in range(self.num_warmup):
@@ -353,6 +376,7 @@ class Maglev1F1B(MaglevPipelineBase):
             nonlocal bwd_idx
             self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
             result = stage.compute_backward_micro(grads)
+            self._finalize_ddp_backward(bwd_idx, self.num_microbatches)
             bwd_idx += 1
             return result
 
@@ -441,6 +465,7 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
             nonlocal bwd_idx
             self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
             stage.backward_micro()
+            self._finalize_ddp_backward(bwd_idx, self.num_microbatches)
             bwd_idx += 1
 
         for i in range(self.num_steady):
