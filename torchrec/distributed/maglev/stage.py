@@ -318,6 +318,15 @@ class _LayerChain(nn.Module):
     ``nn.ModuleList`` has no ``forward``. :class:`StageWrapper` builds one from
     the layer list it is given and exposes it as :attr:`StageWrapper.module`.
 
+    Layers are registered in an ``nn.ModuleDict`` whose keys are their global
+    model indices. This preserves checkpoint FQNs after non-local layers are
+    discarded: for example, a stage beginning at layer 10 owns parameters under
+    ``layers.10`` rather than renumbering them under ``layers.0``. Execution does
+    not derive its order by sorting those string keys (which would place ``10``
+    before ``2``). ``nn.ModuleDict`` preserves insertion order, the constructor
+    inserts the supplied sequence in execution order, and :meth:`forward`
+    iterates :meth:`nn.ModuleDict.values` in that same order.
+
     The stage holding the model's *final* layer is also given the model's
     :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.postproc`, and
     applies it to the last activation. By default its complete result is
@@ -337,7 +346,8 @@ class _LayerChain(nn.Module):
             layer; ``None`` on every other stage, which must hand a plain
             activation tuple to the next HSD. Called as
             ``postproc(activations, layer_inputs[-1])``.
-        first_layer_index: global index of this stage's first layer, for tracing.
+        first_layer_index: global index of this stage's first layer, used for
+            parameter FQNs and tracing.
         loss_only_output: whether to expose only the loss from ``postproc``.
 
     Example::
@@ -354,7 +364,12 @@ class _LayerChain(nn.Module):
         loss_only_output: bool = False,
     ) -> None:
         super().__init__()
-        self.layers: nn.ModuleList = nn.ModuleList(layers)
+        self.layers: nn.ModuleDict = nn.ModuleDict(
+            {
+                str(first_layer_index + index): layer
+                for index, layer in enumerate(layers)
+            }
+        )
         self._profile_names: List[str] = [
             f"## torchrec_maglev:layer[{first_layer_index + index}] "
             f"{type(layer).__name__.lstrip('_')} ##"
@@ -390,7 +405,7 @@ class _LayerChain(nn.Module):
             )
         activations = in_activations
         for layer, layer_input, profile_name in zip(
-            self.layers, layer_inputs, self._profile_names
+            self.layers.values(), layer_inputs, self._profile_names
         ):
             maglev_layer = cast(MaglevLayer, layer)
             with record_function(profile_name):
