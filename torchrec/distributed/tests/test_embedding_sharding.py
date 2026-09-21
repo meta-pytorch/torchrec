@@ -219,6 +219,7 @@ class TestGroupTablesPerRank(unittest.TestCase):
         fused_params = {
             "learning_rate": 0.1,
             "forward_block_limit": 48,
+            "uvm_cache_materialize_block_limit": 96,
             "vbe_forward_block_limit": 24,
         }
         tables = [
@@ -251,6 +252,30 @@ class TestGroupTablesPerRank(unittest.TestCase):
         self.assertEqual(fbgemm_params, {"learning_rate": 0.1})
         self.assertEqual(triton_hbm_params, {"learning_rate": 0.1})
         self.assertEqual(triton_uvm_params, fused_params)
+
+    def test_triton_cache_load_factor_is_preserved_across_grouping(self) -> None:
+        table = ShardedEmbeddingTable(
+            name="table_0",
+            feature_names=["feature_0"],
+            embedding_names=["feature_0"],
+            data_type=DataType.FP16,
+            pooling=PoolingType.SUM,
+            fused_params={
+                "cache_sets": 0,
+                "cache_load_factor": 0.25,
+            },
+            compute_kernel=EmbeddingComputeKernel.TRITON_UVM,
+            embedding_dim=64,
+            local_cols=64,
+            num_embeddings=64,
+        )
+
+        groups = group_tables([[table]])[0]
+
+        self.assertEqual(len(groups), 1)
+        fused_params = groups[0].fused_params or {}
+        self.assertEqual(fused_params["cache_sets"], 0)
+        self.assertEqual(fused_params["cache_load_factor"], 0.25)
 
     def test_triton_bag_size_hints_follow_grouped_feature_order(self) -> None:
         tables = [

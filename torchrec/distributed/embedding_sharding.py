@@ -109,6 +109,9 @@ USE_ONE_TBE_PER_TABLE: str = "use_one_tbe_per_table"
 TRITON_UVM_ONLY_FUSED_PARAMS: frozenset[str] = frozenset(
     {
         "forward_block_limit",
+        "uvm_cache_lookup_block_limit",
+        "uvm_cache_materialize_block_limit",
+        "uvm_cache_populate_block_limit",
         "vbe_forward_block_limit",
     }
 )
@@ -458,7 +461,11 @@ def _get_weighted_avg_cache_load_factor(
 
     for table in embedding_tables:
         if (
-            table.compute_kernel == EmbeddingComputeKernel.FUSED_UVM_CACHING
+            table.compute_kernel
+            in {
+                EmbeddingComputeKernel.FUSED_UVM_CACHING,
+                EmbeddingComputeKernel.TRITON_UVM,
+            }
             and table.fused_params
             and CACHE_LOAD_FACTOR_STR in table.fused_params
         ):
@@ -689,7 +696,6 @@ def group_tables(
                 grouped_bag_size_hints = _get_grouped_bag_size_hints(grouped_tables)
                 if grouped_bag_size_hints is not None:
                     per_tbe_fused_params["bag_size_hints"] = grouped_bag_size_hints
-
             grouped_embedding_configs.append(
                 GroupedEmbeddingConfig(
                     # pyrefly: ignore[bad-argument-type]

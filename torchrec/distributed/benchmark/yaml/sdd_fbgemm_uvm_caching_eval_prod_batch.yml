@@ -1,0 +1,51 @@
+RunOptions:
+  world_size: 2
+  batch_size: 1000
+  num_batches: 5
+  num_benchmarks: 3
+  num_profiles: 1
+  num_iters: 5
+  sharding_type: table_wise
+  profile_dir: "."
+  loglevel: "INFO"
+  memory_snapshot: True
+  name: "sdd_fbgemm_uvm_caching_eval_prod_batch"
+PipelineConfig:
+  pipeline: "eval-fused"
+  enable_embedding_lookup_prefetch: True
+  emb_lookup_stream: "new"
+ModelInputConfig:
+  num_float_features: 1000
+  feature_pooling_avg: 125
+  power_law_alpha: 0.9
+  use_variable_batch: False
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 1000
+    submodule_kwargs:
+      dense_arch_out_size: 1024
+      over_arch_out_size: 4096
+      over_arch_hidden_layers: 10
+      dense_arch_hidden_sizes: [128, 128, 128]
+EmbeddingTablesConfig:
+  num_unweighted_features: 400
+  num_weighted_features: 0
+  embedding_feature_dim: 64
+  base_row_size: 800_000
+  table_data_type: FP16
+  additional_tables:
+    - - name: FP16_table
+        embedding_dim: 64
+        num_embeddings: 100_000
+        feature_names: ["additional_0_0"]
+        data_type: FP16
+PlannerConfig:
+  pooling_factors: [125.0]
+  compute_kernel: fused_uvm_caching
+  additional_constraints:
+    FP16_table:
+      sharding_types: [row_wise]
+ShardingConfig:
+  fused_params:
+    cache_load_factor: 0.2

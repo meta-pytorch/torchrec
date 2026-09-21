@@ -27,6 +27,9 @@ Run the managed-memory comparison with ``triton_uvm_tbe_forward`` and
 ``fbgemm_uvm_tbe_forward``.
 
 Run bounded managed-memory launches with ``triton_uvm_capped_tbe_forward``.
+
+Run the managed-memory cache comparison with
+``triton_uvm_caching_tbe_forward`` and ``fbgemm_uvm_caching_tbe_forward``.
 """
 
 import logging
@@ -39,6 +42,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     ComputeDevice,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
+from fbgemm_gpu.tbe.cache.cache_config import CacheAlgorithm
 
 try:
     from fbgemm_gpu.tbe.config.embedding_config import (
@@ -60,6 +64,9 @@ from torchrec.distributed.benchmark.base import (
 )
 from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
     TritonTableBatchedEmbeddingBags,
+)
+from torchrec.distributed.triton_tbe.triton_uvm_caching_table_batched_embeddings import (
+    TritonUVMCachingTableBatchedEmbeddingBags,
 )
 from torchrec.distributed.triton_tbe.triton_uvm_table_batched_embeddings import (
     TritonUVMCappedTableBatchedEmbeddingBags,
@@ -112,8 +119,11 @@ class TraceTBEForwardConfig(BenchFuncConfig):
     shape_index: int = 0
     all_shapes: bool = False
     seed: int = 42
+    uvm_host_mapped: bool = False
+    cache_algorithm: str = "lru"
     forward_block_limit: int = 0
     vbe_forward_block_limit: int = 0
+    uvm_cache_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -121,6 +131,7 @@ class TritonTBEKernelSpec:
     module_class: type[TritonTableBatchedEmbeddingBags]
     uses_managed_memory: bool
     supports_block_limits: bool = False
+    supports_cache: bool = False
 
 
 _TRITON_TBE_KERNELS: dict[str, TritonTBEKernelSpec] = {
@@ -130,6 +141,11 @@ _TRITON_TBE_KERNELS: dict[str, TritonTBEKernelSpec] = {
         TritonUVMCappedTableBatchedEmbeddingBags,
         True,
         supports_block_limits=True,
+    ),
+    "triton_uvm_caching": TritonTBEKernelSpec(
+        TritonUVMCachingTableBatchedEmbeddingBags,
+        True,
+        supports_cache=True,
     ),
 }
 
@@ -330,6 +346,9 @@ def _make_triton_tbe(
     kernel_name: str,
     forward_block_limit: int = 0,
     vbe_forward_block_limit: int = 0,
+    uvm_cache_bytes: int = 0,
+    uvm_host_mapped: bool = False,
+    cache_algorithm: str = "lru",
 ) -> TritonTableBatchedEmbeddingBags:
     if kernel_name not in _TRITON_TBE_KERNELS:
         raise ValueError(
@@ -338,11 +357,31 @@ def _make_triton_tbe(
         )
     kernel = _TRITON_TBE_KERNELS[kernel_name]
     module_kwargs: dict[str, Any] = {}
+    if kernel.uses_managed_memory:
+        module_kwargs["uvm_host_mapped"] = uvm_host_mapped
     if kernel.supports_block_limits:
-        module_kwargs = {
-            "forward_block_limit": forward_block_limit,
-            "vbe_forward_block_limit": vbe_forward_block_limit,
-        }
+        module_kwargs.update(
+            {
+                "forward_block_limit": forward_block_limit,
+                "vbe_forward_block_limit": vbe_forward_block_limit,
+            }
+        )
+    elif kernel.supports_cache:
+        cache_assoc = torch.cuda.get_device_properties(device).warp_size
+        bytes_per_cache_set = (
+            cache_assoc * max(workload.embedding_dims) * torch.float16.itemsize
+        )
+        cache_sets = uvm_cache_bytes // bytes_per_cache_set
+        if cache_sets <= 0:
+            raise ValueError(
+                f"uvm_cache_bytes must hold at least {cache_assoc} cache rows"
+            )
+        module_kwargs.update(
+            {
+                "cache_sets": cache_sets,
+                "cache_algorithm": cache_algorithm,
+            }
+        )
     module = kernel.module_class(
         embedding_specs=list(zip(workload.table_rows, workload.embedding_dims)),
         feature_table_map=list(range(len(workload.table_rows))),
@@ -371,13 +410,41 @@ def _make_fbgemm_tbe(
     device: torch.device,
     *,
     uvm: bool = False,
+    uvm_cache_bytes: int = 0,
+    uvm_host_mapped: bool = False,
+    cache_algorithm: str = "lru",
 ) -> SplitTableBatchedEmbeddingBagsCodegen:
+    use_uvm_cache = uvm_cache_bytes > 0
+    cache_kwargs: dict[str, Any] = {}
+    if use_uvm_cache:
+        try:
+            cache_algorithm_value = CacheAlgorithm[cache_algorithm.upper()]
+        except KeyError as error:
+            raise ValueError("cache_algorithm must be LRU or LFU") from error
+        cache_assoc = 32
+        bytes_per_cache_set = (
+            cache_assoc * max(workload.embedding_dims) * SparseType.FP16.bit_rate()
+        ) // 8
+        cache_sets = uvm_cache_bytes // bytes_per_cache_set
+        if cache_sets <= 0:
+            raise ValueError(
+                f"uvm_cache_bytes must hold at least {cache_assoc} cache rows"
+            )
+        cache_kwargs = {
+            "cache_algorithm": cache_algorithm_value,
+            "cache_precision": SparseType.FP16,
+            "cache_sets": cache_sets,
+        }
     module = SplitTableBatchedEmbeddingBagsCodegen(
         [
             (
                 rows,
                 dim,
-                EmbeddingLocation.MANAGED if uvm else EmbeddingLocation.DEVICE,
+                (
+                    EmbeddingLocation.MANAGED_CACHING
+                    if use_uvm_cache
+                    else EmbeddingLocation.MANAGED if uvm else EmbeddingLocation.DEVICE
+                ),
                 ComputeDevice.CUDA,
             )
             for rows, dim in zip(workload.table_rows, workload.embedding_dims)
@@ -391,6 +458,8 @@ def _make_fbgemm_tbe(
         stochastic_rounding=False,
         pooling_mode=PoolingMode.SUM,
         bounds_check_mode=BoundsCheckMode.V2_WARNING,
+        uvm_host_mapped=uvm_host_mapped,
+        **cache_kwargs,
     ).to(device)
     module.init_embedding_weights_uniform(-0.01, 0.01)
     return module
@@ -426,12 +495,20 @@ def _run_backend(
             kernel_name=kernel_name,
             forward_block_limit=config.forward_block_limit,
             vbe_forward_block_limit=config.vbe_forward_block_limit,
+            uvm_cache_bytes=config.uvm_cache_bytes,
+            uvm_host_mapped=config.uvm_host_mapped,
+            cache_algorithm=config.cache_algorithm,
         )
-    elif kernel_name in {"fbgemm", "fbgemm_uvm"}:
+    elif kernel_name in {"fbgemm", "fbgemm_uvm", "fbgemm_uvm_caching"}:
         module = _make_fbgemm_tbe(
             workload,
             device,
-            uvm=kernel_name == "fbgemm_uvm",
+            uvm=kernel_name != "fbgemm",
+            uvm_cache_bytes=(
+                config.uvm_cache_bytes if kernel_name == "fbgemm_uvm_caching" else 0
+            ),
+            uvm_host_mapped=config.uvm_host_mapped,
+            cache_algorithm=config.cache_algorithm,
         )
     else:
         raise ValueError(f"Unsupported TBE kernel: {kernel_name}")
@@ -479,7 +556,6 @@ def _run_trace_workload(
         range(len(workload.shapes)) if config.all_shapes else (config.shape_index,)
     )
     device = torch.device(torch.cuda.current_device())
-
     for shape_index in shape_indices:
         shape = workload.shapes[shape_index]
         torch.manual_seed(config.seed + shape_index)
@@ -560,6 +636,30 @@ class TritonUVMCappedTBEForwardConfig(TraceTBEForwardConfig):
 @register_benchmark(TritonUVMCappedTBEForwardConfig)
 def triton_uvm_capped_tbe_forward(config: TraceTBEForwardConfig) -> None:
     _run_trace_workload(config, "triton_uvm_capped")
+
+
+@dataclass
+class TritonUVMCachingTBEForwardConfig(TraceTBEForwardConfig):
+    """Benchmark Triton UVM TBE with a native HBM row cache."""
+
+    uvm_cache_bytes: int = 2 * 1024**3
+
+
+@register_benchmark(TritonUVMCachingTBEForwardConfig)
+def triton_uvm_caching_tbe_forward(config: TraceTBEForwardConfig) -> None:
+    _run_trace_workload(config, "triton_uvm_caching")
+
+
+@dataclass
+class FbgemmUVMCachingTBEForwardConfig(TraceTBEForwardConfig):
+    """Benchmark FBGEMM UVM TBE with an equivalently sized HBM cache."""
+
+    uvm_cache_bytes: int = 2 * 1024**3
+
+
+@register_benchmark(FbgemmUVMCachingTBEForwardConfig)
+def fbgemm_uvm_caching_tbe_forward(config: TraceTBEForwardConfig) -> None:
+    _run_trace_workload(config, "fbgemm_uvm_caching")
 
 
 @dataclass
