@@ -150,6 +150,39 @@ def permute_pooled_embs_auto_grad_split(
     ).to("tpu")
 
 
+def segment_sum_csr_tpu(batch_size, csr_seg, values):
+    return torch.ops.fbgemm.segment_sum_csr(
+        batch_size, csr_seg.to("cpu"), values.to("cpu")
+    ).to(csr_seg.device)
+
+
+def asynchronous_complete_cumsum_tpu(array):
+    return torch.cat(
+        [
+            array.new_zeros(1, dtype=torch.int32),
+            array.cumsum(0, dtype=torch.int32),
+        ]
+    )
+
+
+def batch_index_select_dim0_tpu(
+    inputs,
+    indices,
+    input_num_indices,
+    input_rows,
+    input_columns,
+    permute_output_dim_0_1,
+):
+    return torch.ops.fbgemm.batch_index_select_dim0(
+        inputs.to("cpu"),
+        indices.to("cpu"),
+        input_num_indices,
+        input_rows,
+        input_columns,
+        permute_output_dim_0_1,
+    ).to(inputs.device)
+
+
 # Register these functions to dispatcher with key 'TPU'
 lib.impl("permute_2D_sparse_data", permute_2D_sparse_data, "TPU")
 lib.impl("permute_1D_sparse_data", permute_1D_sparse_data, "TPU")
@@ -160,3 +193,6 @@ lib.impl(
     permute_pooled_embs_auto_grad_split,
     "TPU",
 )
+lib.impl("segment_sum_csr", segment_sum_csr_tpu, "TPU")
+lib.impl("asynchronous_complete_cumsum", asynchronous_complete_cumsum_tpu, "TPU")
+lib.impl("batch_index_select_dim0", batch_index_select_dim0_tpu, "TPU")
