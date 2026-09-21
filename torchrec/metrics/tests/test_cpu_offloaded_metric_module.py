@@ -16,7 +16,7 @@ import threading
 import time
 import unittest
 from typing import Any, Callable, cast, Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
@@ -428,6 +428,36 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             )
         mock_new_group.assert_not_called()
         self.assertIsNone(module.cpu_process_group)
+        module.shutdown()
+
+    def test_injected_cpu_process_group_is_used_verbatim(self) -> None:
+        """An injected gloo PG is used as-is; no group is created."""
+        injected = MagicMock(spec=dist.ProcessGroup)
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.dist.new_group"
+        ) as mock_new_group:
+            module = self._make_module(
+                throughput_metric=ThroughputMetric(
+                    world_size=self.world_size,
+                    batch_size=self.batch_size,
+                    window_seconds=1,
+                ),
+                cpu_process_group=injected,
+            )
+        mock_new_group.assert_not_called()
+        self.assertIs(module.cpu_process_group, injected)
+        module.shutdown()
+
+    def test_fallback_stays_world_scoped(self) -> None:
+        fallback = MagicMock(spec=dist.ProcessGroup)
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.dist.new_group",
+            return_value=fallback,
+        ) as mock_new_group:
+            module = self._make_module()
+
+        mock_new_group.assert_called_once_with(backend="gloo")
+        self.assertIs(module.cpu_process_group, fallback)
         module.shutdown()
 
     @unittest.skipIf(
