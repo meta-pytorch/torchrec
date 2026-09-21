@@ -170,8 +170,16 @@ def is_2d_pod_size_enabled() -> bool:
     pre-existing 2D behaviour end to end: no pod_size factor, and no width check to
     reject the mismatch that its absence creates.
 
-    Scoped to 2D on purpose -- the 1D path has applied pod_size since D105663332 and
-    is not gated here, so flipping this knob cannot regress it.
+    Callers outside this module read it too, so that the planner and runtime halves of
+    the pod_size handshake revert together rather than one at a time -- a planner that
+    keeps adjusting pod_size while the runtime stops widening its node group is exactly
+    the disagreement the knob exists to undo.
+
+    Aimed at 2D: the 1D group builder applies pod_size ungated, and it is only under 2D
+    that the node group is carved out of a shard group narrower than the world, so only
+    there can a pod that tiles the world fail to tile the group. A 1D path is not
+    completely untouched by the knob, though, since consumers may gate work on it that
+    feeds values 1D also reads.
     """
     return torch._utils_internal.justknobs_check(_ENABLE_2D_POD_SIZE_JK)
 
