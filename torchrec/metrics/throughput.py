@@ -217,7 +217,9 @@ class ThroughputMetric(nn.Module):
             self._window_time_lapse -= self._window_time_lapse_buffer.popleft()
 
     def update(self) -> None:
-        ts = time.monotonic()
+        self.update_at(time.monotonic())
+
+    def update_at(self, timestamp: float) -> None:
         self._steps += 1
         if self._batch_size_stages is not None:
             self._num_batch += 1
@@ -233,9 +235,9 @@ class ThroughputMetric(nn.Module):
             # pyrefly: ignore [bad-argument-type, unsupported-operation]
             self.attempt_warmup_examples += batch_examples
             if self._steps == self._warmup_steps:
-                self._previous_ts = ts
+                self._previous_ts = timestamp
         else:
-            time_lapse = ts - self._previous_ts
+            time_lapse = timestamp - self._previous_ts
             # pyrefly: ignore [bad-argument-type, unsupported-operation]
             self.time_lapse_after_warmup += time_lapse
             # pyrefly: ignore [bad-argument-type, unsupported-operation]
@@ -262,7 +264,7 @@ class ThroughputMetric(nn.Module):
             self._window_time_lapse += time_lapse
             buf.append(time_lapse)
             self._check_window()
-            self._previous_ts = ts
+            self._previous_ts = timestamp
 
     def compute(self) -> Dict[str, torch.Tensor]:
         ret = {

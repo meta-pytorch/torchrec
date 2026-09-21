@@ -1802,6 +1802,98 @@ def _compare_metric_results_worker(
     dist.destroy_process_group()
 
 
+class CPUOffloadedThroughputEventTimeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tasks = gen_test_tasks(["task1"])
+        mock_metric = MockRecMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=1,
+            tasks=self.tasks,
+            initial_states=create_tensor_states(["cross_entropy_sum"]),
+        )
+        self.module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=1,
+            world_size=1,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+            throughput_metric=ThroughputMetric(
+                batch_size=1,
+                world_size=1,
+                window_seconds=100,
+                warmup_steps=1,
+            ),
+            update_batch_size=10,
+        )
+
+    def tearDown(self) -> None:
+        with patch.object(self.module, "_process_metric_compute_job", return_value={}):
+            self.module.shutdown()
+
+    def test_merged_batch_uses_enqueue_timestamps_after_stall(self) -> None:
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.5]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        producer_timestamps = [
+            0.0,
+            101.0,
+            102.0,
+            103.0,
+            104.0,
+            105.0,
+            106.0,
+            107.0,
+            108.0,
+            109.0,
+        ]
+        worker_timestamps = [200.0 + i / 10_000 for i in range(10)]
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.time.monotonic",
+            side_effect=producer_timestamps + worker_timestamps,
+        ) as event_clock:
+            for _ in producer_timestamps:
+                self.module.update(model_out)
+            result = self.module.compute_throughput().resolve()
+
+        self.assertEqual(event_clock.call_count, len(producer_timestamps))
+        self.assertEqual(result["throughput-throughput|window_throughput"], 1.0)
+
+    def test_mixed_timestamp_availability_falls_back_to_processing_time(
+        self,
+    ) -> None:
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.5]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+        throughput_metric = self.module.throughput_metric
+        self.assertIsNotNone(throughput_metric)
+        self.module.throughput_metric = None
+        for _ in range(5):
+            self.module.update(model_out)
+        self.module.throughput_metric = throughput_metric
+
+        producer_timestamps = [10.0 + i for i in range(5)]
+        worker_timestamps = [100.0 + i for i in range(10)]
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.time.monotonic",
+            side_effect=producer_timestamps + worker_timestamps,
+        ) as event_clock:
+            for _ in producer_timestamps:
+                self.module.update(model_out)
+            result = self.module.compute_throughput().resolve()
+
+        self.assertEqual(
+            event_clock.call_count,
+            len(producer_timestamps) + len(worker_timestamps),
+        )
+        self.assertEqual(result["throughput-throughput|window_throughput"], 1.0)
+
+
 @skip_if_asan_class
 class WorkerSideBatchingTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -2410,6 +2502,28 @@ class MergeUpdateJobsTest(unittest.TestCase):
         ]
         merged = _merge_update_jobs(jobs)
         self.assertEqual(merged.merged_count, 8)
+
+    def test_mixed_timestamp_availability_uses_legacy_fallback(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([1.0])},
+                kwargs={},
+                update_timestamps=(1.0,),
+            ),
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([2.0])},
+                kwargs={},
+            ),
+        ]
+
+        with self.assertLogs(
+            "torchrec.metrics.cpu_offloaded_metric_module", level="WARNING"
+        ) as logs:
+            merged = _merge_update_jobs(jobs)
+
+        self.assertEqual(merged.merged_count, 2)
+        self.assertEqual(merged.update_timestamps, ())
+        self.assertIn("timestamp count 1 does not match merged count 2", logs.output[0])
 
     def test_empty_required_inputs_passes_through(self) -> None:
         jobs = [

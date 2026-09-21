@@ -58,6 +58,24 @@ class ThroughputMetricTest(unittest.TestCase):
         )
 
     @patch(THROUGHPUT_PATH + ".time.monotonic")
+    def test_update_at_uses_explicit_timestamp(self, time_mock: Mock) -> None:
+        throughput_metric = ThroughputMetric(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_seconds=100,
+            warmup_steps=1,
+        )
+
+        throughput_metric.update_at(10.0)
+        throughput_metric.update_at(12.0)
+
+        time_mock.assert_not_called()
+        self.assertEqual(
+            throughput_metric.compute()["throughput-throughput|window_throughput"],
+            self.batch_size * self.world_size / 2,
+        )
+
+    @patch(THROUGHPUT_PATH + ".time.monotonic")
     def _test_throughput(self, time_mock: Mock, warmup_steps: int) -> None:
         update_timestamps = [10, 11, 12, 14, 15, 17, 18, 20, 21, 22, 25, 29, 30]
         update_timestamps.sort()

@@ -22,13 +22,14 @@ class MetricUpdateJob:
     to update each metric's state tensors.
     """
 
-    __slots__ = ["model_out", "kwargs", "merged_count"]
+    __slots__ = ["model_out", "kwargs", "merged_count", "update_timestamps"]
 
     def __init__(
         self,
         model_out: Dict[str, torch.Tensor],
         kwargs: Dict[str, Any],
         merged_count: int = 1,
+        update_timestamps: tuple[float, ...] = (),
     ) -> None:
         """
         Args:
@@ -38,11 +39,18 @@ class MetricUpdateJob:
             merged_count: number of logical update() calls this job
                 represents (>1 when worker-side micro-batching merges
                 K calls into one job).
+            update_timestamps: monotonic timestamps for the logical update()
+                calls represented by this job.
         """
 
         self.model_out: Dict[str, torch.Tensor] = model_out
         self.kwargs: Dict[str, Any] = kwargs
         self.merged_count: int = merged_count
+        self.update_timestamps: tuple[float, ...] = update_timestamps
+        if self.update_timestamps and len(self.update_timestamps) != merged_count:
+            raise ValueError(
+                "update_timestamps must contain one timestamp per logical update"
+            )
 
 
 class MetricComputeJob:
