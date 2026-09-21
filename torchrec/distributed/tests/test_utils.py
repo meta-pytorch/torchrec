@@ -652,18 +652,25 @@ def block_bucketize_ref(
         key for index in range(trainers_size) for key in keyed_jagged_tensor.keys()
     ]
     if device == "cuda":
+        # Citrine C3/C7: construct translated tensors directly on the target device.
         return KeyedJaggedTensor(
             keys=expected_keys,
             lengths=torch.tensor(
-                translated_lengths, dtype=keyed_jagged_tensor.lengths().dtype
-            )
-            .view(-1)
-            .cuda(),
+                translated_lengths,
+                dtype=keyed_jagged_tensor.lengths().dtype,
+                device=device,
+            ).view(-1),
             values=torch.tensor(
-                translated_indices, dtype=keyed_jagged_tensor.values().dtype
-            ).cuda(),
+                translated_indices,
+                dtype=keyed_jagged_tensor.values().dtype,
+                device=device,
+            ),
             weights=(
-                torch.tensor(translated_weights).float().cuda()
+                torch.tensor(
+                    translated_weights,
+                    dtype=torch.float32,
+                    device=device,
+                )
                 if weights_list
                 else None
             ),
@@ -864,16 +871,18 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
         }
         self.assertEqual(fused_params, expected_fused_params)
 
-    def test_fused_bounds_check_is_only_forwarded_to_triton(self) -> None:
+    def test_triton_params_are_only_forwarded_to_triton(self) -> None:
         fused_params = add_params_from_parameter_sharding(
             {
                 "fused_bounds_check": True,
                 "enable_triton_tbe_optimizations": True,
+                "tbe_chunk_size_limit": 1024**3,
             },
             self.parameter_sharding,
         )
         self.assertNotIn("fused_bounds_check", fused_params)
         self.assertNotIn("enable_triton_tbe_optimizations", fused_params)
+        self.assertNotIn("tbe_chunk_size_limit", fused_params)
 
         triton_sharding = ParameterSharding(
             sharding_type=ShardingType.TABLE_WISE.value,
@@ -884,11 +893,13 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
             {
                 "fused_bounds_check": True,
                 "enable_triton_tbe_optimizations": True,
+                "tbe_chunk_size_limit": 1024**3,
             },
             triton_sharding,
         )
         self.assertTrue(fused_params["fused_bounds_check"])
         self.assertTrue(fused_params["enable_triton_tbe_optimizations"])
+        self.assertEqual(fused_params["tbe_chunk_size_limit"], 1024**3)
 
 
 class ConvertFusedParamsTest(unittest.TestCase):
