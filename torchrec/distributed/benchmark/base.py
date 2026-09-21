@@ -1094,6 +1094,7 @@ def _run_cuda_benchmark(
     sample_count: int = 0,
     pg: Optional[dist.ProcessGroup] = None,
     gpu_backlog_cycles: int = 0,
+    prepare_iter_fn: Optional[Callable[[], None]] = None,
 ) -> PerfWrapper:
     """Run benchmark iterations on CUDA, collecting GPU/CPU timing and memory stats.
 
@@ -1101,6 +1102,7 @@ def _run_cuda_benchmark(
     Call ``to_benchmark_result(name, rank, world_size)`` on the result to
     obtain a ``BenchmarkResult``. When ``pg`` is set, ranks barrier before each
     measured iteration so arrival skew stays out of the timing (see ``measure``).
+    ``prepare_iter_fn`` runs before the timing window for each iteration.
     """
     perf = PerfWrapper(
         num_benchmarks, rank, reset_accumulated_memory_stats, sample_count, pg
@@ -1114,6 +1116,9 @@ def _run_cuda_benchmark(
         if i > 0:
             torch.cuda.synchronize(perf.device)
 
+        if prepare_iter_fn is not None:
+            prepare_iter_fn()
+
         perf.measure(run_iter_fn, gpu_backlog_cycles)
     logger.info(f"Cuda benchmark finished on rank {rank}")
 
@@ -1123,13 +1128,19 @@ def _run_cuda_benchmark(
 def _run_cpu_benchmark(
     run_iter_fn: Callable[[], None],
     num_benchmarks: int,
+    prepare_iter_fn: Optional[Callable[[], None]] = None,
 ) -> List[float]:
     """Collect wall-clock timing for CPU-only benchmarks.
 
     Returns raw per-iteration elapsed times in seconds (from ``timeit``).
     The caller is responsible for constructing a ``BenchmarkResult``.
     """
-    return timeit.repeat(run_iter_fn, number=1, repeat=num_benchmarks)
+    times = []
+    for _ in range(num_benchmarks):
+        if prepare_iter_fn is not None:
+            prepare_iter_fn()
+        times.append(timeit.timeit(run_iter_fn, number=1))
+    return times
 
 
 def _run_cuda_profiling(
@@ -1251,6 +1262,7 @@ def _run_benchmark_core(
     test_name: str = "",
     pg: Optional[dist.ProcessGroup] = None,
     gpu_backlog_ms: float = 0.0,
+    prepare_iter_fn: Optional[Callable[[], None]] = None,
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -1282,6 +1294,7 @@ def _run_benchmark_core(
         gpu_backlog_ms: Synthetic GPU delay queued before CUDA timing events. This
             keeps a CPU-bound launch sequence queued behind the device so event timing
             measures GPU execution rather than GPU idle time waiting for the host.
+        prepare_iter_fn: Optional preparation invoked before every timing window.
     """
 
     if gpu_backlog_ms < 0:
@@ -1315,10 +1328,11 @@ def _run_benchmark_core(
             sample_count,
             pg,
             gpu_backlog_cycles,
+            prepare_iter_fn,
         )
         result = perf.to_benchmark_result(name, rank, world_size)
     else:  # CPU benchmarking
-        times = _run_cpu_benchmark(run_iter_fn, num_benchmarks)
+        times = _run_cpu_benchmark(run_iter_fn, num_benchmarks, prepare_iter_fn)
         cpu_elapsed_time = torch.tensor(times) * 1e3  # convert to ms
         # Per-iteration QPS: sample_count / elapsed_seconds
         times_t = torch.tensor(times, dtype=torch.float)
@@ -1513,6 +1527,7 @@ def benchmark_func(
     test_name: str = "",
     pg: Optional[dist.ProcessGroup] = None,
     gpu_backlog_ms: float = 0.0,
+    iteration_setup_func: Optional[Any] = None,
 ) -> BenchmarkResult:
     """
     Args:
@@ -1544,6 +1559,8 @@ def benchmark_func(
             measured iteration so cross-rank arrival skew is absorbed outside the
             timing window -- important for collective (e.g. all-to-all) benchmarks
             where the straggler would otherwise inflate the measured comm time.
+        iteration_setup_func: Optional callable invoked with the same inputs and
+            kwargs before each measured iteration, outside the timing window.
     """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
@@ -1566,9 +1583,22 @@ def benchmark_func(
     run_iter_fn: Callable[[], None] = lambda: func_to_benchmark(
         bench_inputs, **benchmark_func_kwargs
     )
+    prepare_iter_fn: Optional[Callable[[], None]] = (
+        (
+            lambda: iteration_setup_func(
+                bench_inputs,
+                **benchmark_func_kwargs,
+            )
+        )
+        if iteration_setup_func is not None
+        else None
+    )
 
     def _profile_iter_fn(prof: torch.profiler.profile) -> None:
         for i in range(num_profiles):
+            if iteration_setup_func is not None:
+                with record_function("## iteration setup ##"):
+                    iteration_setup_func(prof_inputs, **benchmark_func_kwargs)
             with record_function(f"## profile {i} ##"):
                 func_to_benchmark(prof_inputs, **benchmark_func_kwargs)
                 prof.step()
@@ -1592,4 +1622,5 @@ def benchmark_func(
         test_name=test_name,
         pg=pg,
         gpu_backlog_ms=gpu_backlog_ms,
+        prepare_iter_fn=prepare_iter_fn,
     )
