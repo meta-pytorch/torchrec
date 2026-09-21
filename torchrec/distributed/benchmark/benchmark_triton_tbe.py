@@ -60,6 +60,8 @@ from torchrec.distributed.benchmark.base import (
 )
 from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
     TritonTableBatchedEmbeddingBags,
+)
+from torchrec.distributed.triton_tbe.triton_uvm_table_batched_embeddings import (
     TritonUVMCappedTableBatchedEmbeddingBags,
     TritonUVMTableBatchedEmbeddingBags,
 )
