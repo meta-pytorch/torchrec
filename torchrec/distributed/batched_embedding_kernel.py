@@ -4007,6 +4007,9 @@ class TritonBatchedFusedEmbeddingBag(
         from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
             TritonTableBatchedEmbeddingBags,
         )
+        from torchrec.distributed.triton_tbe.triton_uvm_caching_table_batched_embeddings import (
+            TritonUVMCachingTableBatchedEmbeddingBags,
+        )
         from torchrec.distributed.triton_tbe.triton_uvm_table_batched_embeddings import (
             TritonUVMCappedTableBatchedEmbeddingBags,
             TritonUVMTableBatchedEmbeddingBags,
@@ -4038,13 +4041,48 @@ class TritonBatchedFusedEmbeddingBag(
         )
         forward_block_limit: int = fused_params.get("forward_block_limit", 0)
         vbe_forward_block_limit: int = fused_params.get("vbe_forward_block_limit", 0)
+        cache_load_factor: Optional[float] = fused_params.get("cache_load_factor")
+        cache_sets_configured = "cache_sets" in fused_params
+        cache_sets: int = fused_params.get("cache_sets", 0)
+        cache_reserved_memory: float = fused_params.get("cache_reserved_memory", 0.0)
+        cache_algorithm = fused_params.get("cache_algorithm", "lru")
+        uvm_cache_lookup_block_limit: int = fused_params.get(
+            "uvm_cache_lookup_block_limit", 0
+        )
+        uvm_cache_populate_block_limit: int = fused_params.get(
+            "uvm_cache_populate_block_limit", 0
+        )
+        uvm_cache_materialize_block_limit: int = fused_params.get(
+            "uvm_cache_materialize_block_limit", 0
+        )
         uses_uvm = config.compute_kernel == EmbeddingComputeKernel.TRITON_UVM
         capped_uvm = uses_uvm and (
             forward_block_limit != 0 or vbe_forward_block_limit != 0
         )
-        if capped_uvm:
+        cached_uvm = uses_uvm and cache_sets_configured
+        if capped_uvm and cached_uvm:
+            raise ValueError(
+                "Triton UVM caching and forward block limits cannot be combined"
+            )
+        triton_tbe_kwargs: Dict[str, Any]
+        if cached_uvm:
+            triton_tbe_class = TritonUVMCachingTableBatchedEmbeddingBags
+            triton_tbe_kwargs = {
+                "cache_load_factor": (
+                    cache_load_factor if cache_load_factor is not None else 0.2
+                ),
+                "cache_sets": cache_sets,
+                "cache_reserved_memory": cache_reserved_memory,
+                "cache_algorithm": cache_algorithm,
+                "uvm_cache_lookup_block_limit": uvm_cache_lookup_block_limit,
+                "uvm_cache_populate_block_limit": uvm_cache_populate_block_limit,
+                "uvm_cache_materialize_block_limit": (
+                    uvm_cache_materialize_block_limit
+                ),
+            }
+        elif capped_uvm:
             triton_tbe_class = TritonUVMCappedTableBatchedEmbeddingBags
-            triton_tbe_kwargs: Dict[str, Any] = {
+            triton_tbe_kwargs = {
                 "forward_block_limit": forward_block_limit,
                 "vbe_forward_block_limit": vbe_forward_block_limit,
             }
