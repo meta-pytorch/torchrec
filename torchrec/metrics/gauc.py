@@ -103,10 +103,15 @@ def get_auc_states(
     predictions: torch.Tensor,
     weights: torch.Tensor,
     num_candidates: torch.Tensor,
+    max_num_candidates: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
 
     # predictions, labels: [n_task, n_sample]
-    max_length = int(num_candidates.max().item())
+    max_length = (
+        max_num_candidates
+        if max_num_candidates is not None
+        else int(num_candidates.max().item())
+    )
     predictions_perm = predictions.permute(1, 0)
     labels_perm = labels.permute(1, 0)
     weights_perm = weights.permute(1, 0)
@@ -173,6 +178,7 @@ class GAUCMetricComputation(RecMetricComputation):
         labels: torch.Tensor,
         weights: Optional[torch.Tensor],
         num_candidates: torch.Tensor,
+        max_num_candidates: Optional[int] = None,
         **kwargs: Dict[str, Any],
     ) -> None:
         if predictions is None or weights is None:
@@ -180,7 +186,13 @@ class GAUCMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for GAUCMetricComputation update"
             )
 
-        states = get_auc_states(labels, predictions, weights, num_candidates)
+        states = get_auc_states(
+            labels,
+            predictions,
+            weights,
+            num_candidates,
+            max_num_candidates=max_num_candidates,
+        )
         num_samples = predictions.shape[-1]
 
         for state_name, state_value in states.items():
