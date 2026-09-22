@@ -70,7 +70,7 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.modules.fused_embedding_modules import FusedEmbeddingBagCollection
 from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from torchrec.test_utils import get_free_port, seed_and_log
+from torchrec.test_utils import init_process_group_single_rank, seed_and_log
 
 
 class InferenceModelParallelTestBase(unittest.TestCase):
@@ -209,7 +209,6 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["NCCL_SOCKET_IFNAME"] = "lo"
 
         if torch.cuda.is_available():
@@ -221,7 +220,7 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
         if self.backend == "nccl" and self.device == torch.device("cpu"):
             self.skipTest("NCCL not supported on CPUs.")
 
-        dist.init_process_group(backend=self.backend)
+        init_process_group_single_rank(backend=self.backend)
 
     def tearDown(self) -> None:
         dist.destroy_process_group()
@@ -340,7 +339,6 @@ class ModelParallelSingleRankBase(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["NCCL_SOCKET_IFNAME"] = "lo"
 
         self.backend = backend
@@ -353,7 +351,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
         if self.backend == "nccl" and self.device == torch.device("cpu"):
             self.skipTest("NCCL not supported on CPUs.")
 
-        dist.init_process_group(backend=backend)
+        init_process_group_single_rank(backend=backend)
 
         self.batch_size = 20
         self.num_float_features = 10
