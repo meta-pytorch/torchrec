@@ -236,10 +236,24 @@ def _merge_update_jobs(
         )
         merged_kwargs["required_inputs"] = merged_required
 
+    merged_count = sum(job.merged_count for job in jobs)
+    update_timestamps = tuple(
+        timestamp for job in jobs for timestamp in job.update_timestamps
+    )
+    if len(update_timestamps) != merged_count:
+        logger.warning(
+            "MetricUpdateJob timestamp count %d does not match merged count %d; "
+            "falling back to processing-time throughput",
+            len(update_timestamps),
+            merged_count,
+        )
+        update_timestamps = ()
+
     return MetricUpdateJob(
         model_out=merged_model_out,
         kwargs=merged_kwargs,
-        merged_count=sum(j.merged_count for j in jobs),
+        merged_count=merged_count,
+        update_timestamps=update_timestamps,
     )
 
 
@@ -606,6 +620,11 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 MetricUpdateJob(
                     model_out=snapshot_model_out,
                     kwargs=snapshot_kwargs,
+                    update_timestamps=(
+                        (time.monotonic(),)
+                        if self.throughput_metric is not None
+                        else ()
+                    ),
                 )
             )
             self._total_updates_enqueued += 1
@@ -676,8 +695,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             )
 
             if self.throughput_metric:
-                for _ in range(metric_update_job.merged_count):
-                    self.throughput_metric.update()
+                if metric_update_job.update_timestamps:
+                    for timestamp in metric_update_job.update_timestamps:
+                        self.throughput_metric.update_at(timestamp)
+                else:
+                    for _ in range(metric_update_job.merged_count):
+                        self.throughput_metric.update()
 
             elapsed_ms = (time.time() - start_time) * 1000
             self.update_job_time_logger.add(elapsed_ms)
