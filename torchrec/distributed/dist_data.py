@@ -968,7 +968,9 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
 
         collective_tag: Optional[int] = None
         tag_parts: Optional[Tuple[object, ...]] = None
-        if validate_collectives_enabled():
+        # _collective_tag_from hashes with hashlib.blake2b, which Dynamo
+        # cannot trace, so skip the tag while compiling.
+        if validate_collectives_enabled() and not is_torchdynamo_compiling():
             # Values that all ranks must agree on:
             # - input.keys(): the feature list BEFORE the all-to-all (not
             #   the local `keys` variable, which is the post-all-to-all

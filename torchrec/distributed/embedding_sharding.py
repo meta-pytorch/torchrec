@@ -82,6 +82,7 @@ from torchrec.distributed.types import (
 from torchrec.distributed.utils import maybe_annotate_embedding_event, none_throws
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.modules.embedding_configs import EmbeddingTableConfig
+from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
 
@@ -1014,7 +1015,9 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
 
         collective_tag: Optional[int] = None
         tag_parts: Optional[Tuple[object, ...]] = None
-        if validate_collectives_enabled():
+        # _collective_tag_from hashes with hashlib.blake2b, which Dynamo
+        # cannot trace, so skip the tag while compiling.
+        if validate_collectives_enabled() and not is_torchdynamo_compiling():
             # Walk the fused list. For each real splits request, add
             # its marker + splits + count + keys as parts. For each
             # placeholder, add just its marker. Splits get length_limit=None

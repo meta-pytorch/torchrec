@@ -9,6 +9,7 @@
 
 #!/usr/bin/env python3
 
+import os
 import timeit
 import unittest
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from torch._dynamo import is_dynamo_supported
 from torch._dynamo.testing import reduce_to_scalar_loss
 from torch.distributed import ProcessGroup
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torchrec.distributed.collective_utils import validate_collectives_enabled
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import QCommsConfig
@@ -528,6 +530,36 @@ def _test_compile_rank_fn(
         ##### NUMERIC CHECK END #####
 
 
+def _test_compile_validate_collectives_rank_fn(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    # _resolve_enablement_on_leader reads this env var ahead of the JustKnob.
+    # DMP init latches the value, so set it before the model is built.
+    os.environ["TORCHREC_VALIDATE_COLLECTIVES"] = "1"
+
+    _test_compile_rank_fn(
+        test_model_type=_ModelType.EBC,
+        rank=rank,
+        world_size=world_size,
+        backend=backend,
+        sharding_type=ShardingType.TABLE_WISE.value,
+        kernel_type=EmbeddingComputeKernel.FUSED.value,
+        input_type=_InputType.SINGLE_BATCH,
+        convert_to_vb=True,
+        config=_TestConfig(),
+        torch_compile_backend="inductor",
+        local_size=local_size,
+    )
+
+    # Without this the test passes vacuously if validation never turned on.
+    assert (
+        validate_collectives_enabled()
+    ), "collective validation did not turn on, so the compiled path was never exercised"
+
+
 def _test_compile_fake_pg_fn(
     rank: int,
     world_size: int,
@@ -789,6 +821,22 @@ class TestPt2Train(MultiProcessTestBase):
             convert_to_vb=tovb == _ConvertToVariableBatch.TRUE,
             config=config,
             torch_compile_backend=compile_backend,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_compile_multiprocess_with_collective_validation(self) -> None:
+        """Compiling must work with collective validation on.
+
+        `test_compile_multiprocess` only samples the knob, so it covers
+        this on a fraction of runs.
+        """
+        self._run_multi_process_test(
+            callable=_test_compile_validate_collectives_rank_fn,
+            world_size=2,
+            backend="nccl",
         )
 
     @unittest.skipIf(
