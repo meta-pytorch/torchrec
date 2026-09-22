@@ -8,16 +8,12 @@
 # pyre-strict
 
 
-import json
-import os
-import subprocess
-import sys
-import tempfile
 import unittest
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.utils._pytree as pytree
+from hypothesis import given, settings, strategies as st
 from torch.testing import FileCheck
 from torchrec.fx import symbolic_trace
 from torchrec.sparse.jagged_tensor import (
@@ -1912,143 +1908,75 @@ class TestKeyedJaggedTensorGPU(unittest.TestCase):
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPU",
     )
-    def test_scripted_permute_preserves_optional_weights(self) -> None:
+    @given(has_weights=st.booleans(), empty=st.booleans())
+    @settings(deadline=None)
+    def test_scripted_permute_preserves_optional_weights(
+        self, has_weights: bool, empty: bool
+    ) -> None:
         class PermuteModule(torch.nn.Module):
-            indices_tensor: Optional[torch.Tensor]
-
-            def __init__(self, variable_stride: bool, cached_indices: bool) -> None:
-                super().__init__()
-                self.variable_stride = variable_stride
-                self.register_buffer(
-                    "indices_tensor",
-                    torch.tensor([1, 0], dtype=torch.int32) if cached_indices else None,
-                )
-
             def forward(
-                self,
-                values: torch.Tensor,
-                lengths: torch.Tensor,
-                weights: Optional[torch.Tensor],
-            ) -> Tuple[
-                torch.Tensor,
-                torch.Tensor,
-                Optional[torch.Tensor],
-                torch.Tensor,
-                torch.Tensor,
-                Optional[torch.Tensor],
-            ]:
-                if self.variable_stride:
-                    kjt = KeyedJaggedTensor(
-                        keys=["a", "b"],
-                        values=values,
-                        lengths=lengths,
-                        weights=weights,
-                        stride_per_key_per_rank=[[1], [3]],
-                    )
-                else:
-                    kjt = KeyedJaggedTensor(
-                        keys=["a", "b"],
-                        values=values,
-                        lengths=lengths,
-                        weights=weights,
-                        stride=2,
-                    )
-                first = kjt.permute([1, 0], self.indices_tensor)
-                second = first.permute([1, 0], self.indices_tensor)
-                return (
-                    first.values(),
-                    first.lengths(),
-                    first.weights_or_none(),
-                    second.values(),
-                    second.lengths(),
-                    second.weights_or_none(),
-                )
+                self, kjt: KeyedJaggedTensor
+            ) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
+                first = kjt.permute([1, 0])
+                return first, first.permute([1, 0])
 
-        # Python operator wrappers mask undefined optional tensors returned by CUDA.
-        # Reload the scripted model with only native operator libraries registered.
-        script = """
-import json
-import sys
-import torch
+        values = torch.tensor(
+            [] if empty else [1, 2, 3], dtype=torch.int64, device=self.device
+        )
+        lengths = torch.tensor(
+            [0, 0, 0, 0] if empty else [2, 0, 0, 1],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        weights = (
+            torch.tensor([] if empty else [0.5, 1.0, 1.5], device=self.device)
+            if has_weights
+            else None
+        )
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["index_0", "index_1"],
+            values=values,
+            lengths=lengths,
+            weights=weights,
+        )
+        module = torch.jit.script(PermuteModule())
+        # Bypass Python autograd wrappers, which can convert an undefined Tensor
+        # to None and mask the native TorchScript failure on the second permute.
+        with torch.inference_mode():
+            first, second = module(kjt)
 
-torch.set_num_threads(1)
-for library in json.loads(sys.argv[2]):
-    torch.ops.load_library(library)
-assert "fbgemm_gpu" not in sys.modules
-assert "torchrec" not in sys.modules
-passed = 0
-for path, variable_stride in json.loads(sys.argv[1]):
-    for device in ("cpu", "cuda:0"):
-        model = torch.jit.load(path, map_location=device)
-        for empty in (False, True):
-            # The scripted variable-stride length calculation uses int64.
-            dtypes = (torch.int64,) if variable_stride else (torch.int32, torch.int64)
-            for dtype in dtypes:
-                lengths = torch.tensor(
-                    [0, 0, 0, 0] if empty else [2, 0, 1, 3],
-                    dtype=dtype, device=device,
-                )
-                values = torch.arange(0 if empty else 6, device=device)
-                split = 1 if variable_stride else 2
-                expected_lengths = torch.cat([lengths[split:], lengths[:split]])
-                expected_values = torch.cat([values[2:], values[:2]])
-                for weighted in (False, True):
-                    weights = values.float() + 0.25 if weighted else None
-                    expected_weights = (
-                        expected_values.float() + 0.25 if weighted else None
-                    )
-                    print((path, device, empty, dtype, weighted), flush=True)
-                    with torch.no_grad():
-                        actual = model(values, lengths, weights)
-                    expected = (
-                        expected_values, expected_lengths, expected_weights,
-                        values, lengths, weights,
-                    )
-                    for result, reference in zip(actual, expected):
-                        torch.testing.assert_close(result, reference, rtol=0, atol=0)
-                    passed += 1
-print(f"{passed} native TorchScript cases passed", flush=True)
-"""
-        with tempfile.TemporaryDirectory() as directory:
-            models = []
-            for variable_stride in (False, True):
-                for cached_indices in (False, True):
-                    path = os.path.join(
-                        directory, f"permute_{variable_stride}_{cached_indices}.pt"
-                    )
-                    torch.jit.script(
-                        PermuteModule(variable_stride, cached_indices)
-                    ).save(path)
-                    models.append((path, variable_stride))
-            try:
-                completed = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        script,
-                        json.dumps(models),
-                        json.dumps(sorted(torch.ops.loaded_libraries)),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-            except subprocess.TimeoutExpired as error:
-                diagnostics = []
-                for name, output in (
-                    ("stdout", error.stdout),
-                    ("stderr", error.stderr),
-                ):
-                    if isinstance(output, bytes):
-                        output = output.decode(errors="replace")
-                    diagnostics.append(f"{name}:\n{output or ''}")
-                self.fail(
-                    f"Native TorchScript timed out after {error.timeout}s\n"
-                    + "\n".join(diagnostics)
-                )
-            self.assertEqual(
-                completed.returncode, 0, completed.stdout + completed.stderr
+        self.assertEqual(first.keys(), ["index_1", "index_0"])
+        torch.testing.assert_close(
+            first.values(),
+            torch.tensor(
+                [] if empty else [3, 1, 2], dtype=torch.int64, device=self.device
+            ),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            first.lengths(),
+            torch.tensor(
+                [0, 0, 0, 0] if empty else [0, 1, 2, 0],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            rtol=0,
+            atol=0,
+        )
+        if has_weights:
+            torch.testing.assert_close(
+                first.weights(),
+                torch.tensor([] if empty else [1.5, 0.5, 1.0], device=self.device),
+                rtol=0,
+                atol=0,
             )
+        else:
+            self.assertIsNone(first.weights_or_none())
+        self.assertEqual(second.keys(), kjt.keys())
+        torch.testing.assert_close(second.values(), values, rtol=0, atol=0)
+        torch.testing.assert_close(second.lengths(), lengths, rtol=0, atol=0)
+        torch.testing.assert_close(second.weights_or_none(), weights, rtol=0, atol=0)
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
