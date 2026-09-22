@@ -303,6 +303,43 @@ class MaglevModuleListTest(unittest.TestCase):
         hook_handle.remove()
 
     @patch("torchrec.distributed.maglev.stage.InputDistDriver")
+    def test_stage_parameter_names_keep_global_layer_indices(
+        self,
+        _input_dist_driver: Any,
+    ) -> None:
+        process_group = MagicMock()
+        process_groups = MaglevProcessGroups(
+            stage_ranks=((0,), (1,)),
+            stage_pg=process_group,
+            handoff_pgs=(process_group, process_group),
+            cascade_pg=process_group,
+            cascade_gloo_pg=process_group,
+            handoff_pg_mode=HandoffPGMode.SHARED,
+        )
+        with patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0):
+            first_stage = StageWrapper(
+                self._model(num_layers=2),
+                layers_per_stage=[1, 1],
+                stage_size=1,
+                process_groups=process_groups,
+            )
+        with patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=1):
+            second_stage = StageWrapper(
+                self._model(num_layers=2),
+                layers_per_stage=[1, 1],
+                stage_size=1,
+                process_groups=process_groups,
+            )
+
+        first_names = {name for name, _ in first_stage.module.named_parameters()}
+        second_names = {name for name, _ in second_stage.module.named_parameters()}
+        self.assertTrue(first_names)
+        self.assertTrue(second_names)
+        self.assertTrue(all(name.startswith("layers.0.") for name in first_names))
+        self.assertTrue(all(name.startswith("layers.1.") for name in second_names))
+        self.assertTrue(first_names.isdisjoint(second_names))
+
+    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
     @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
     def test_last_stage_loss_backward_drains_retained_graph(
         self,
