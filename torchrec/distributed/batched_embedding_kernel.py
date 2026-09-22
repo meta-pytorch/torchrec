@@ -1805,11 +1805,21 @@ def _gen_named_parameters_by_table_fused(
     embedding_weights_by_table = emb_module.split_embedding_weights()
     # Cache all_optimizer_states
     all_optimizer_states = emb_module.get_optimizer_state()
-    for t_idx, (rows, dim, location, _) in enumerate(emb_module.embedding_specs):
+    for t_idx, (_, dim, location, _) in enumerate(emb_module.embedding_specs):
         table_name = config.embedding_tables[t_idx].name
         if table_name not in table_name_to_count:
             continue
         table_count = table_name_to_count.pop(table_name)
+        # Same-table shards are contiguous, but the final row shard may be shorter.
+        if torch._utils_internal.justknobs_check(
+            "torchrec/checkpoint:enable_local_shard_row_slicing"
+        ):
+            table_rows = sum(
+                spec[0]
+                for spec in emb_module.embedding_specs[t_idx : t_idx + table_count]
+            )
+        else:
+            table_rows = table_count * emb_module.embedding_specs[t_idx][0]
         if emb_module.weights_precision == SparseType.INT8:
             dim += emb_module.int8_emb_row_dim_offset
         # pyrefly: ignore [bad-index]
@@ -1829,7 +1839,7 @@ def _gen_named_parameters_by_table_fused(
             # pyrefly: ignore [bad-argument-type]
             start_offset=offset,
             # pyrefly: ignore [bad-argument-type]
-            end_offset=offset + table_count * rows * dim,
+            end_offset=offset + table_rows * dim,
             num_embeddings=-1,
             embedding_dim=dim,
         )
@@ -1855,16 +1865,26 @@ def _gen_named_parameters_by_table_dense(
     config: GroupedEmbeddingConfig,
 ) -> Iterator[Tuple[str, TableBatchedEmbeddingSlice]]:
     # TODO: move logic to FBGEMM to avoid accessing fbgemm internals
-    for t_idx, (rows, dim) in enumerate(emb_module.embedding_specs):
+    for t_idx, (_, dim) in enumerate(emb_module.embedding_specs):
         table_name = config.embedding_tables[t_idx].name
         if table_name not in table_name_to_count:
             continue
         table_count = table_name_to_count.pop(table_name)
+        # Same-table shards are contiguous, but the final row shard may be shorter.
+        if torch._utils_internal.justknobs_check(
+            "torchrec/checkpoint:enable_local_shard_row_slicing"
+        ):
+            table_rows = sum(
+                spec[0]
+                for spec in emb_module.embedding_specs[t_idx : t_idx + table_count]
+            )
+        else:
+            table_rows = table_count * emb_module.embedding_specs[t_idx][0]
         offset = emb_module.weights_physical_offsets[t_idx]
         weight = TableBatchedEmbeddingSlice(
             data=emb_module.weights,
             start_offset=offset,
-            end_offset=offset + table_count * rows * dim,
+            end_offset=offset + table_rows * dim,
             num_embeddings=-1,
             embedding_dim=dim,
         )
