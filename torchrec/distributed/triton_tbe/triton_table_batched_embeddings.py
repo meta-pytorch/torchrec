@@ -684,6 +684,8 @@ def table_batched_embedding_bag_forward_weighted_kernel(
     embedding_offsets_ptr,
     feature_table_map_ptr,
     per_sample_weights_ptr,
+    rows_cumsum_ptr,
+    bounds_check_warning_ptr,
     # VBE-specific pointers (only used when vbe=T)
     # pyre-fixme[2]: Parameter must be annotated.
     row_output_offsets_ptr,
@@ -695,10 +697,12 @@ def table_batched_embedding_bag_forward_weighted_kernel(
     vbe: tl.constexpr = False,
     info_B_num_bits=0,
     info_B_mask=0,
+    FUSED_BOUNDS_CHECK: tl.constexpr = False,
     ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
 ):
 
     b_t = tl.program_id(0).to(tl.int64)
+    warning_count = 0
 
     if vbe:
         info = tl.load(b_t_map_ptr + b_t).to(tl.uint32)
@@ -714,6 +718,10 @@ def table_batched_embedding_bag_forward_weighted_kernel(
     # embedding_dim and embedding_offset are indexed by feature
     embedding_dim = tl.load(embedding_dims_ptr + t)
     embedding_offset = tl.load(embedding_offsets_ptr + t)
+    if FUSED_BOUNDS_CHECK:
+        num_rows = tl.load(rows_cumsum_ptr + table_idx + 1) - tl.load(
+            rows_cumsum_ptr + table_idx
+        )
 
     start = tl.load(offsets_ptr + b_t)
     end = tl.load(offsets_ptr + b_t + 1)
@@ -734,10 +742,41 @@ def table_batched_embedding_bag_forward_weighted_kernel(
     endn = start + step * ns
 
     for idx in range(start, endn, step):
-        row_idx_0 = tl.load(indices_ptr + idx + 0)
-        row_idx_1 = tl.load(indices_ptr + idx + 1)
-        row_idx_2 = tl.load(indices_ptr + idx + 2)
-        row_idx_3 = tl.load(indices_ptr + idx + 3)
+        row_idx_0, invalid_0 = _load_checked_index(
+            indices_ptr,
+            idx + 0,
+            num_rows if FUSED_BOUNDS_CHECK else 0,
+            True,
+            FUSED_BOUNDS_CHECK,
+        )
+        row_idx_1, invalid_1 = _load_checked_index(
+            indices_ptr,
+            idx + 1,
+            num_rows if FUSED_BOUNDS_CHECK else 0,
+            True,
+            FUSED_BOUNDS_CHECK,
+        )
+        row_idx_2, invalid_2 = _load_checked_index(
+            indices_ptr,
+            idx + 2,
+            num_rows if FUSED_BOUNDS_CHECK else 0,
+            True,
+            FUSED_BOUNDS_CHECK,
+        )
+        row_idx_3, invalid_3 = _load_checked_index(
+            indices_ptr,
+            idx + 3,
+            num_rows if FUSED_BOUNDS_CHECK else 0,
+            True,
+            FUSED_BOUNDS_CHECK,
+        )
+        if FUSED_BOUNDS_CHECK:
+            warning_count += (
+                invalid_0.to(tl.int32)
+                + invalid_1.to(tl.int32)
+                + invalid_2.to(tl.int32)
+                + invalid_3.to(tl.int32)
+            )
 
         row_0 = _load_weight_row(
             weight_ptrs,
@@ -787,7 +826,15 @@ def table_batched_embedding_bag_forward_weighted_kernel(
         )
 
     for idx in range(endn, end):
-        row_idx = tl.load(indices_ptr + idx)
+        row_idx, invalid = _load_checked_index(
+            indices_ptr,
+            idx,
+            num_rows if FUSED_BOUNDS_CHECK else 0,
+            True,
+            FUSED_BOUNDS_CHECK,
+        )
+        if FUSED_BOUNDS_CHECK:
+            warning_count += invalid.to(tl.int32)
         row = _load_weight_row(
             weight_ptrs,
             weight_chunk_starts,
@@ -810,6 +857,9 @@ def table_batched_embedding_bag_forward_weighted_kernel(
 
     bag_output_original = bag_output.to(tl.float32)
     tl.store(output_row_ptrs, bag_output_original, mask=mask)
+
+    if FUSED_BOUNDS_CHECK and warning_count > 0:
+        tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
 
 
 @triton.jit
@@ -3086,10 +3136,7 @@ class TritonTBE(torch.autograd.Function):
 
         weighted = per_sample_weights is not None and per_sample_weights.numel() > 0
         if fused_bounds_check and (
-            bounds_check_warning is None
-            or hoist_transpose_to_forward
-            or weighted
-            or vbe
+            bounds_check_warning is None or hoist_transpose_to_forward
         ):
             raise ValueError("Invalid fused bounds-check configuration")
         use_small_table_kernel = (
@@ -3334,6 +3381,8 @@ class TritonTBE(torch.autograd.Function):
                     embedding_offsets,
                     feature_table_map,
                     per_sample_weights,
+                    rows_cumsum,
+                    bounds_check_warning_ptr,
                     row_output_offsets_ptr,
                     b_t_map_ptr,
                     total_embedding_dim,
@@ -3342,6 +3391,7 @@ class TritonTBE(torch.autograd.Function):
                     vbe=vbe,
                     info_B_num_bits=info_B_num_bits,
                     info_B_mask=info_B_mask,
+                    FUSED_BOUNDS_CHECK=fused_bounds_check,
                     ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                     num_warps=num_warps,
                 )
@@ -4975,8 +5025,6 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         use_fused_bounds_check = (
             self.fused_bounds_check
             and bounds_check_mode == BoundsCheckMode.WARNING
-            and batch_size_per_feature_per_rank is None
-            and (per_sample_weights is None or per_sample_weights.numel() == 0)
             and not self.hoist_transpose_to_forward
             and not is_amd()
         )
@@ -4984,10 +5032,22 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         if use_fused_bounds_check:
             if indices.dim() != 1 or offsets.dim() != 1:
                 raise RuntimeError("indices and offsets must be one-dimensional")
-            if offsets.numel() == 0 or (offsets.numel() - 1) % self.T != 0:
-                raise RuntimeError("offsets size must equal B * T + 1")
+            if offsets.numel() == 0:
+                raise RuntimeError("offsets must not be empty")
+            if batch_size_per_feature_per_rank is None:
+                if (offsets.numel() - 1) % self.T != 0:
+                    raise RuntimeError("offsets size must equal B * T + 1")
+            elif offsets.numel() != total_B + 1:
+                raise RuntimeError("offsets size must equal total_B + 1")
             if indices.device != offsets.device or indices.device != self.weight.device:
                 raise RuntimeError("TBE inputs must be on the same device")
+            if per_sample_weights is not None and per_sample_weights.numel() > 0:
+                if per_sample_weights.device != indices.device:
+                    raise RuntimeError("per_sample_weights must be on the same device")
+                if per_sample_weights.size(0) != indices.numel():
+                    raise RuntimeError(
+                        "per_sample_weights size must equal indices size"
+                    )
 
         if bounds_check_mode != BoundsCheckMode.NONE and not use_fused_bounds_check:
             torch.ops.fbgemm.bounds_check_indices(
