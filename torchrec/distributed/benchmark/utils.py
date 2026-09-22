@@ -22,6 +22,22 @@ import torch
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def as_bool(value: Any, default: bool) -> bool:
+    """Interpret a forwarded CLI value as a bool.
+
+    The launcher coerces unrecognized args to int/float and otherwise leaves them as
+    strings, so ``--memory_snapshot=false`` arrives as the string ``"false"`` -- truthy
+    to ``bool()``. Flag-style ``--memory_snapshot`` (no value) arrives as ``"true"``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def get_gpu_type() -> str:
     """Return the GPU device name, or 'N/A' if CUDA is unavailable."""
     if torch.cuda.is_available():
