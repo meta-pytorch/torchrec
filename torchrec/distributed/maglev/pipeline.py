@@ -21,8 +21,13 @@ import torch
 import torch.nn as nn
 from torch.autograd.profiler import record_function
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo
 from torch.nn.parallel import DistributedDataParallel
-from torchrec.distributed.maglev.stage import HandoffPGMode, StageWrapper
+from torchrec.distributed.maglev.stage import (
+    HandoffPGMode,
+    MaglevRailPassState,
+    StageWrapper,
+)
 
 
 def _no_sync_modules(module: nn.Module) -> List[nn.Module]:
@@ -108,8 +113,11 @@ class MaglevPipelineBase:
         self.stage = stage
         self.optimizer = optimizer
         # Read once: the module tree is static after wrapping, and the
-        # pipeline is built after it.
-        modules = _no_sync_modules(stage.module)
+        # pipeline is built after it. Kept as an attribute so a subclass that
+        # issues the reduction itself reduces over exactly the wrappers whose
+        # sync was suppressed, rather than re-deriving a list that could differ.
+        self._no_sync_modules: List[nn.Module] = _no_sync_modules(stage.module)
+        modules = self._no_sync_modules
         self._no_sync: Callable[[], ContextManager[None]] = no_sync or (
             lambda: _no_sync(modules)
         )
@@ -149,6 +157,14 @@ class MaglevPipelineBase:
         What a caller measuring throughput has to divide by; schedules differ.
         """
         return self.stage.num_stages
+
+    @property
+    def takes_whole_pass_input(self) -> bool:
+        r"""takes_whole_pass_input -> bool
+
+        Return whether one dataloader batch contains the entire pass.
+        """
+        return False
 
     def _take_inputs(self, dataloader_iter: Iterator[Any], n: int) -> List[List[Any]]:
         """Acquire this stage's inputs; adapters may override the input seam."""
@@ -215,11 +231,18 @@ class MaglevPipelineBase:
         backward_idx: int,
         num_backwards: int,
     ) -> None:
-        """Reduce FSDP2 gradients on the final microbatch backward."""
+        """Reduce FSDP2 gradients on the final microbatch backward.
+
+        All three flags, as upstream's ``backward_maybe_with_nosync`` does.
+        Leaving ``reshard_after_backward`` at its default reshards after every
+        microbatch, so the next microbatch's forward has to all-gather again --
+        measured at 8x the all-gathers for ``m=8`` before this was set.
+        """
         should_sync = backward_idx == num_backwards - 1
         for module in self._fsdp_modules:
             module.set_requires_gradient_sync(should_sync, recurse=False)
             module.set_is_last_backward(should_sync)
+            module.set_reshard_after_backward(should_sync)
 
 
 class Maglev1F1B(MaglevPipelineBase):
@@ -486,3 +509,367 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
         with record_function("## torchrec_maglev:optimizer_step ##"):
             self.optimizer.step()
         return None
+
+
+class MaglevRail(MaglevPipelineBase):
+    r"""MaglevRail(stage, optimizer, num_microbatches, no_sync=None)
+
+    Batch each layer's sparse work over a pass, then run a zero-bubble dense
+    pipeline against it.
+
+    A dataloader batch covers the whole pass. Each local layer runs its sparse
+    half once and its output is cut into detached per-microbatch seams; the dense
+    pipeline consumes those seams with its backward split into an input half
+    (``I``, sent upstream immediately) and a weight half (``W``, deferred); then
+    the seams' gradients resume each whole-pass sparse graph. See
+    :meth:`_dense_zero_bubble` for the schedule.
+
+    This is the only dense schedule Rail runs -- use :class:`Maglev1F1B` for the
+    monolithic one.
+
+    Args:
+        stage (StageWrapper): This rank's pipeline stage, built with
+            ``enable_rail=True``.
+        optimizer (torch.optim.Optimizer): Optimizer stepped once per pass.
+        num_microbatches (int): Number of dense microbatches. Must be at least
+            ``stage.num_stages``, and must divide the whole-pass batch evenly.
+        no_sync (Callable, optional): Gradient synchronization suppression
+            context. Default: ``None``
+
+    How long a stage defers its weight work is not a parameter. It is fixed at
+    the stage's own index -- the ZB1P rule -- because that is the number of
+    stages waiting behind it, i.e. exactly how many peers it would stall by
+    stopping to run ``W``. Stage 0 has nobody waiting and defers nothing; the
+    deepest stage has the furthest for its gradient to travel and defers most.
+    A caller-supplied value would be uniform across ranks, which is the wrong
+    shape for the only adjustment that makes sense (capping the deep stages
+    under memory pressure), and would hand stage 0 a queue it cannot benefit
+    from. See :attr:`w_lag`.
+
+    Requirements this schedule imposes on the model, none of which
+    :class:`Maglev1F1B` does:
+
+    * every layer implements ``split_dense_input()``, including one with no
+      sparse half;
+    * every trainable parameter belongs to a layer's ``sparse`` or ``dense``
+      half -- one on the layer body would never receive a gradient;
+    * ``MaglevModuleList.get_batch_size()`` is overridden, called every pass;
+    * a layer's out-activation is not a view, because the split backward detaches
+      its roots in place.
+
+    Data parallelism is FSDP2: ``fully_shard`` for a sharded dense net,
+    ``replicate`` for a replicated one. Both produce an ``FSDPModule``, so both
+    take the same path. Raw ``DistributedDataParallel`` does not work with a
+    zero-bubble schedule anywhere -- upstream skips the combination, see
+    pytorch/pytorch#144530 -- because DDP's reducer is driven only by autograd
+    hooks and the deferred weight half runs none.
+
+    Raises:
+        ValueError: if the stage is not Rail-enabled, or the microbatch count is
+            invalid.
+    """
+
+    def __init__(
+        self,
+        stage: StageWrapper,
+        optimizer: torch.optim.Optimizer,
+        num_microbatches: int,
+        no_sync: Optional[Callable[[], ContextManager[None]]] = None,
+    ) -> None:
+        if not stage.rail_enabled:
+            raise ValueError("MaglevRail requires StageWrapper(..., enable_rail=True)")
+        super().__init__(stage, optimizer, no_sync)
+        if num_microbatches < stage.num_stages:
+            raise ValueError(
+                "Rail needs at least one microbatch per stage: got "
+                f"{num_microbatches} for {stage.num_stages} stages"
+            )
+        unsupported = sorted(
+            {
+                type(module).__name__
+                for module in self._no_sync_modules
+                if not isinstance(module, FSDPModule)
+            }
+        )
+        if unsupported:
+            # Any wrapper that is not FSDP2, not just DDP. _no_sync_modules
+            # collects anything exposing no_sync -- DDP, FSDP1, a custom
+            # wrapper -- and the pass suppresses all of them on every forward,
+            # but _reduce_gradients only drives FSDP2. Whatever is left would
+            # train on local gradients forever without a word. DDP in
+            # particular cannot be driven by hand at all: its reducer runs off
+            # autograd hooks, and the split backward fires none.
+            raise ValueError(
+                f"MaglevRail cannot reduce gradients for {', '.join(unsupported)}: "
+                "it drives FSDP2's post-backward by hand, and no other wrapper "
+                "exposes an equivalent entry point. Upstream skips "
+                "DistributedDataParallel with a zero-bubble schedule for the "
+                "same reason (pytorch/pytorch#144530). Use replicate() for a "
+                "replicated dense net, or fully_shard() for a sharded one"
+            )
+        self._configure_fsdp_modules()
+        self.num_microbatches: int = num_microbatches
+        self.num_warmup: int = min(
+            stage.num_stages - stage.stage_index - 1,
+            num_microbatches,
+        )
+        self.num_steady: int = num_microbatches - self.num_warmup
+        # The ZB1P rule: W trails I by the stage's own index, so the deepest
+        # stage defers longest and the gradient wave returns fastest. Derived,
+        # not configurable -- see the class docstring.
+        self.w_lag: int = stage.stage_index
+
+    @property
+    def microbatches_per_pass(self) -> int:
+        return self.num_microbatches
+
+    @property
+    def takes_whole_pass_input(self) -> bool:
+        r"""takes_whole_pass_input -> bool
+
+        Return ``True`` because each input batch contains the entire Rail pass.
+        """
+        return True
+
+    def _dense_zero_bubble(self, state: MaglevRailPassState) -> None:
+        """The dense pipeline with the backward split into ``I`` and ``W``.
+
+        ``I`` computes the gradient w.r.t. this stage's inputs and sends it
+        upstream immediately; ``W`` computes the dense weight gradients, which
+        gate nothing until the optimizer step, so they are deferred. Each hop of
+        the returning wave then costs ``I`` rather than ``I + W``.
+
+        For ``p=4, m=8``, with each stage deferring by its own index
+        (``..`` is idle)::
+
+            s0 | F0 F1 F2 F3 .. .. .. I0 W0 F4 I1 W1 F5 I2 W2 F6 I3 W3 F7 I4 ...
+            s1 | .. F0 F1 F2 .. .. I0 F3 I1 W0 F4 I2 W1 F5 I3 W2 F6 I4 W3 F7 I5 ...
+            s2 | .. .. F0 F1 .. I0 F2 I1 F3 I2 W0 F4 I3 W1 F5 I4 W2 F6 I5 W3 F7 ...
+            s3 | .. .. .. F0 I0 F1 I1 F2 I2 F3 I3 W0 F4 I4 W1 F5 I5 W2 F6 I6 W3 ...
+
+        Each steady slot is one ``F`` then one ``I``, then whatever ``W`` the lag
+        permits -- the loop below is ``_forward(); _backward_act()``.
+
+        The deeper the stage, the longer it defers. The gain is not that ``W``
+        fills a stage's own idle time -- ``s0`` defers nothing and still gains --
+        it is that a deep stage running ``I`` alone forwards its gradient sooner.
+
+        The gradient receive is posted immediately before the ``I`` that consumes
+        it, never earlier. Posting it ahead of the weight work looks like free
+        overlap and is not: a posted ``irecv`` is a spinning NCCL kernel holding
+        SMs, so it competes with the ``W`` it was meant to hide behind. This is
+        the same property that makes :class:`Maglev1F1BRecvAhead` slower than
+        :class:`Maglev1F1B`. Do not move it without measuring.
+        """
+        stage = self.stage
+        fwd_idx = 0
+
+        def _forward() -> None:
+            nonlocal fwd_idx
+            stage_input = state.dense_inputs[fwd_idx]
+            stage.start_recv_act(stage_input)
+            with self._no_sync():
+                stage.dense_forward_micro(
+                    stage_input,
+                    fwd_idx,
+                    state.seams_for(fwd_idx),
+                )
+            fwd_idx += 1
+
+        def _drain_weight(keep: int) -> None:
+            while stage.pending_weight_work > keep:
+                stage.dense_backward_weight_micro()
+
+        def _backward_act() -> None:
+            stage.start_recv_grad()
+            stage.dense_backward_act_micro()
+            # I has already sent this stage's gradient upstream, so the wave is
+            # moving before any of the weight work below runs.
+            _drain_weight(self.w_lag)
+
+        for _ in range(self.num_warmup):
+            _forward()
+        for _ in range(self.num_steady):
+            _forward()
+            _backward_act()
+        for _ in range(self.num_warmup):
+            _backward_act()
+        # Every remaining W. Independent across stages, so this costs no pipeline
+        # time; keeping it here rather than before the pass's last I is what holds
+        # the deferred queue off the critical path.
+        _drain_weight(0)
+
+    def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
+        r"""progress(dataloader_iter) -> Optional[torch.Tensor]
+
+        Run one whole-pass sparse phase, dense 1F1B phase, and sparse backward.
+
+        Args:
+            dataloader_iter (Iterator[Any]): Iterator over whole-pass batches.
+
+        Returns:
+            Optional[torch.Tensor]: Always ``None`` to avoid synchronizing on a
+            microbatch loss.
+        """
+        stage = self.stage
+        global_inputs = stage.take_global_inputs(dataloader_iter)
+        with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
+            self.optimizer.zero_grad()
+
+        try:
+            with self._fsdp_accumulate():
+                with self._no_sync():
+                    state = stage.sparse_forward_global(
+                        global_inputs,
+                        self.num_microbatches,
+                    )
+                del global_inputs
+                self._dense_zero_bubble(state)
+
+                stage.sparse_backward_global(state)
+                # Freed before the reduction and the step, which is where the
+                # pass peaks: state still holds every layer's whole-pass pooled
+                # output and all m seam gradients.
+                del state
+                stage.drain_sends()
+        except BaseException:
+            # A half-finished pass leaves the microbatch queues populated, and
+            # the next progress() would pop this pass's entries against the next
+            # pass's gradients.
+            stage.reset_pass_state()
+            raise
+        # Outside the context, so a pass that raised does not reduce a partial
+        # gradient -- and so the flags are already re-armed when we get here.
+        self._reduce_gradients()
+        with record_function("## torchrec_maglev:optimizer_step ##"):
+            self.optimizer.step()
+        return None
+
+    def _configure_fsdp_modules(self) -> None:
+        """Collect the FSDP2 modules and apply the policy they need, once.
+
+        Construction time is sufficient. ``set_reshard_after_forward`` reads
+        ``_fsdp_param_groups``, which exist from ``fully_shard`` onward, and sets
+        ``_auto_reshard_after_forward`` False -- the flag ``_lazy_init`` checks
+        before it would null ``post_forward_mesh_info`` on the first forward. So
+        the policy survives lazy init, and nothing resets it afterwards:
+        :meth:`_fsdp_accumulate` re-arms only ``is_last_backward``,
+        ``reshard_after_backward`` and ``requires_gradient_sync``.
+
+        Snapshotting rather than re-deriving per pass also matches
+        ``_no_sync_modules``, which :class:`MaglevPipelineBase` takes once on the
+        same premise -- the module tree is static after wrapping, and the
+        pipeline is built after it. Re-deriving this one list per pass would
+        cover a stage re-wrapped after construction for the reduction while the
+        constructor's wrapper guard and the ``no_sync`` closure still ran off the
+        snapshot, so that case is out of contract either way.
+
+        ``reshard_after_forward=False`` is required, and it fails silently if
+        skipped. A post-forward reshard repoints the module at its sharded
+        parameter, so the ``dense_parameters()`` that ``I`` hands to
+        ``stage_backward_input`` no longer intersect the graph, which was built
+        on the unsharded ones. ``get_param_groups`` then records *empty* weight
+        groups and ``stage_backward_weight`` writes no gradient -- no exception,
+        just a dense weight that never trains. Verified: with this off, a
+        two-pass run ends with a parameter whose ``.grad`` is ``None``.
+
+        It also saves all-gathers, which is the reason torchtitan cites for any
+        pipeline schedule -- though the 8x measured against ``Maglev1F1B`` came
+        from ``reshard_after_backward``, not this flag. Both are off for the
+        pass, and the two cannot be separated by measurement here because
+        ``reshard_after_forward=True`` does not produce a correct run to compare.
+        """
+        self._fsdp_modules = [
+            module
+            for module in self.stage.module.modules()
+            if isinstance(module, FSDPModule)
+        ]
+        for module in self._fsdp_modules:
+            # recurse=False because _fsdp_modules already lists every FSDP
+            # module in the tree -- and because recursing would descend from a
+            # fully_shard ancestor into a replicate descendant, whose DDPMeshInfo
+            # trips set_reshard_after_forward's FSDPMeshInfo assertion.
+            # Replicated groups have no post-forward mesh to reshard to, so they
+            # are skipped rather than set.
+            state = module._get_fsdp_state()
+            if all(
+                isinstance(group.mesh_info, FSDPMeshInfo)
+                for group in state._fsdp_param_groups
+            ):
+                module.set_reshard_after_forward(False, recurse=False)
+
+    @contextlib.contextmanager
+    def _fsdp_accumulate(self) -> Iterator[None]:
+        """Hold FSDP2's reduction back for the duration of the pass.
+
+        The whole pass, not each microbatch: ``sparse_backward_global`` is a
+        real backward that runs after the dense pipeline, so a dense-scoped
+        scheme would let the sparse half reduce on its own while the dense half
+        is still accumulating.
+
+        Re-arms on exit whether or not the body raised, so a failed pass cannot
+        leave the modules unable to reduce.
+        """
+        modules = self._fsdp_modules
+        for module in modules:
+            module.set_is_last_backward(False)
+            module.set_reshard_after_backward(False, recurse=False)
+            module.set_requires_gradient_sync(False, recurse=False)
+        try:
+            yield
+        finally:
+            for module in modules:
+                module.set_is_last_backward(True)
+                module.set_reshard_after_backward(True, recurse=False)
+                module.set_requires_gradient_sync(True, recurse=False)
+
+    def _reduce_gradients(self) -> None:
+        """Drive FSDP2's post-backward by hand, once, for the whole pass.
+
+        The split backward writes ``.grad`` through ``torch.autograd.grad``,
+        which runs no ``AccumulateGrad`` node, so FSDP2's post-backward hook
+        never fires on its own. This mirrors
+        :meth:`~torch.distributed.pipelining.PipelineStage.perform_reduce_grad`,
+        which upstream added for the same reason and schedules after a stage's
+        last ``W``.
+
+        A no-op when nothing is wrapped.
+        """
+        if not self._fsdp_modules:
+            return
+        with record_function("## torchrec_maglev:reduce_gradients ##"):
+            # Set here rather than relying on _fsdp_accumulate's exit: the
+            # finalize_backward that makes the compute stream wait on the
+            # reduce-scatter events is gated on is_last_backward, so moving this
+            # call inside the context would silently drop that wait.
+            for module in self._fsdp_modules:
+                module.set_is_last_backward(True)
+                module.set_reshard_after_backward(True, recurse=False)
+                module.set_requires_gradient_sync(True, recurse=False)
+            # Deduplicated by state identity: fully_shard([a, b]) maps several
+            # modules onto one FSDPState, so _get_fsdp_state() returns the same
+            # object more than once. (Nested modules do not need this -- their
+            # param groups are disjoint, and _validate_no_duplicate_params
+            # raises if they ever overlap.)
+            states = {}
+            for module in self._fsdp_modules:
+                state = module._get_fsdp_state()
+                states.setdefault(id(state), state)
+            for state in states.values():
+                for param_group in state._fsdp_param_groups:
+                    param_group.post_backward()
+            # Strictly after every post_backward: foreach_reduce writes
+            # sharded_param.grad on its own stream, and the only place the
+            # compute stream waits on those events is finalize_backward,
+            # reachable only from here. Without it optimizer.step() can read a
+            # gradient whose kernel has not run.
+            # Once per state *context*, not per state: the callback already
+            # iterates state_ctx.all_states, and a second call would find every
+            # group back at IDLE and re-enter post_backward on all of them.
+            # Upstream's perform_reduce_grad calls it exactly once for the same
+            # reason.
+            contexts = {}
+            for state in states.values():
+                contexts.setdefault(id(state._state_ctx), state)
+            for state in contexts.values():
+                state._root_post_backward_final_callback()
