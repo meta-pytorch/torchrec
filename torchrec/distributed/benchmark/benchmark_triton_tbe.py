@@ -28,7 +28,7 @@ managed-memory cache comparisons.
 
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
 
 import torch
@@ -137,7 +137,12 @@ class TBEComparisonConfig(BenchFuncConfig):
     output_dtype: str = "fp32"
     optimizer: str = "exact_row_wise_adagrad"
     fused_bounds_check: bool = False
-    enable_triton_tbe_optimizations: bool = False
+    enable_triton_tbe_optimizations: bool = field(
+        default=False,
+        metadata={
+            "cmd_conf_aliases": ("--enable-triton-tbe-optimizations",),
+        },
+    )
     use_clc: bool = False
     check_correctness: bool = True
     num_warmups: int = 3

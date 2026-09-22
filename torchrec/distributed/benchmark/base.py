@@ -774,7 +774,11 @@ class cmd_conf:
                     else:
                         arg_kwargs.update(type=ftype)
 
-                    parser.add_argument(f"--{arg_name}", **arg_kwargs)
+                    parser.add_argument(
+                        f"--{arg_name}",
+                        *f.metadata.get("cmd_conf_aliases", ()),
+                        **arg_kwargs,
+                    )
 
             args = parser.parse_args()
             logger.setLevel(logging.INFO)
