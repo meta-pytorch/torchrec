@@ -11,7 +11,12 @@ import unittest
 from typing import Any, Dict, Optional
 
 import torch
-from torchrec.metrics.gauc import compute_gauc_3d, compute_window_auc, GAUCMetric
+from torchrec.metrics.gauc import (
+    compute_gauc_3d,
+    compute_window_auc,
+    GAUCMetric,
+    get_auc_states,
+)
 from torchrec.metrics.metrics_config import DefaultTaskInfo
 from torchrec.metrics.test_utils import TestMetric
 
@@ -91,6 +96,31 @@ class GAUCMetricValueTest(unittest.TestCase):
                 "actual auc {} is not equal to expected auc {}".format(
                     actual_gauc, expected_gauc
                 )
+            )
+
+    def test_static_max_num_candidates_matches_dynamic_padding(self) -> None:
+        predictions = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5]])
+        labels = torch.tensor([[1, 0, 1, 1, 0]])
+        weights = torch.ones_like(predictions)
+        num_candidates = torch.tensor([3, 2])
+
+        dynamic_states = get_auc_states(
+            labels,
+            predictions,
+            weights,
+            num_candidates,
+        )
+        static_states = get_auc_states(
+            labels,
+            predictions,
+            weights,
+            num_candidates,
+            max_num_candidates=8,
+        )
+
+        for state_name in dynamic_states:
+            torch.testing.assert_close(
+                static_states[state_name], dynamic_states[state_name]
             )
 
     def test_calc_gauc_hard(self) -> None:
