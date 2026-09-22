@@ -8,14 +8,17 @@
 # pyre-strict
 
 import random
+import tempfile
 import unittest
 from dataclasses import dataclass
 from typing import Any, cast, Dict, List, Tuple
 from unittest.mock import call, MagicMock, patch
 
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
+from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.maglev.module import (
     activation_specs_from_tensors,
     Activations,
@@ -40,6 +43,10 @@ from torchrec.distributed.maglev.stage import (
     StageWrapper,
 )
 from torchrec.distributed.test_utils.model_input import ModelInput
+from torchrec.distributed.test_utils.multi_process import (
+    MultiProcessContext,
+    MultiProcessTestBase,
+)
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
 from torchrec.distributed.test_utils.test_model import (
     MaglevTestActivations,
@@ -50,6 +57,83 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 _WEIGHT_SEED = 100
 _INPUT_SEED = 500
+
+
+def _test_deferred_ddp_gradient_matches_full_batch(
+    rank: int,
+    world_size: int,
+) -> None:
+    class PartiallyUsed(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.used = torch.nn.Linear(2, 1, bias=False)
+            self.unused = torch.nn.Linear(2, 1, bias=False)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.used(value)
+
+    with MultiProcessContext(rank, world_size, "gloo"):
+        reference = PartiallyUsed()
+        distributed = PartiallyUsed()
+        with torch.no_grad():
+            reference.used.weight.copy_(torch.tensor([[0.25, -0.5]]))
+            distributed.load_state_dict(reference.state_dict())
+        module = DistributedDataParallel(
+            distributed,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            static_graph=False,
+        )
+        stage = MagicMock(spec=StageWrapper)
+        stage.module = module
+        stage.num_stages = 2
+        stage.stage_index = 1
+        stage.is_first = False
+        stage.in_activation_specs.return_value = (MagicMock(),)
+        pipeline = Maglev1F1B(
+            stage,
+            MagicMock(spec=torch.optim.Optimizer),
+            num_microbatches=2,
+        )
+        inputs = (
+            (
+                torch.tensor([[1.0, 2.0]]),
+                torch.tensor([[3.0, -1.0]]),
+            ),
+            (
+                torch.tensor([[-2.0, 4.0]]),
+                torch.tensor([[0.5, 3.0]]),
+            ),
+        )
+        targets = (
+            (torch.tensor([[0.5]]), torch.tensor([[-1.0]])),
+            (torch.tensor([[2.0]]), torch.tensor([[1.5]])),
+        )
+
+        for microbatch, (value, target) in enumerate(zip(inputs[rank], targets[rank])):
+            with pipeline._forward_context(microbatch, len(inputs[rank])):
+                loss = (module(value) - target).square().sum()
+            loss.backward()
+            pipeline._finalize_ddp_backward(microbatch, len(inputs[rank]))
+
+        full_input = torch.cat(
+            [value for rank_inputs in inputs for value in rank_inputs]
+        )
+        full_target = torch.cat(
+            [target for rank_targets in targets for target in rank_targets]
+        )
+        reference_loss = (
+            reference(full_input) - full_target
+        ).square().sum() / world_size
+        reference_loss.backward()
+
+        gradient = module.module.used.weight.grad
+        torch.testing.assert_close(gradient, reference.used.weight.grad)
+        gathered = [torch.empty_like(gradient) for _ in range(world_size)]
+        dist.all_gather(gathered, gradient)
+        for rank_gradient in gathered:
+            torch.testing.assert_close(rank_gradient, reference.used.weight.grad)
+        assert module.module.unused.weight.grad is None
 
 
 @dataclass(frozen=True)
@@ -599,6 +683,71 @@ class MaglevModuleListTest(unittest.TestCase):
             [call(False), call(True)],
         )
 
+    def test_pipeline_flushes_ddp_only_after_final_backward(self) -> None:
+        pipeline = cast(Any, object.__new__(MaglevPipelineBase))
+        ddp_module = MagicMock()
+        pipeline._ddp_modules = [ddp_module]
+
+        pipeline._finalize_ddp_backward(0, 2)
+        ddp_module.reducer.prepare_for_backward.assert_not_called()
+        ddp_module.reducer._delay_all_reduce.assert_not_called()
+
+        pipeline._finalize_ddp_backward(1, 2)
+        ddp_module.reducer.prepare_for_backward.assert_called_once_with([])
+        ddp_module.reducer._delay_all_reduce.assert_called_once_with()
+
+    def test_1f1b_ddp_reduces_after_the_final_backward(self) -> None:
+        class PartiallyUsed(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.used = torch.nn.Linear(2, 1, bias=False)
+                self.unused = torch.nn.Linear(2, 1, bias=False)
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                return self.used(value).sum()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dist.init_process_group(
+                "gloo",
+                init_method=f"file://{temp_dir}/store",
+                rank=0,
+                world_size=1,
+            )
+            try:
+                module = DistributedDataParallel(
+                    PartiallyUsed(),
+                    find_unused_parameters=True,
+                    gradient_as_bucket_view=True,
+                    static_graph=False,
+                )
+                stage = MagicMock(spec=StageWrapper)
+                stage.module = module
+                stage.num_stages = 2
+                stage.stage_index = 1
+                stage.is_first = False
+                stage.in_activation_specs.return_value = (MagicMock(),)
+                pipeline = Maglev1F1B(
+                    stage,
+                    MagicMock(spec=torch.optim.Optimizer),
+                    num_microbatches=2,
+                )
+
+                for microbatch in range(2):
+                    with pipeline._forward_context(microbatch, 2):
+                        loss = module(torch.ones(1, 2))
+                    loss.backward()
+                    pipeline._finalize_ddp_backward(microbatch, 2)
+
+                torch.testing.assert_close(
+                    module.module.used.weight.grad,
+                    torch.full((1, 2), 2.0),
+                )
+                self.assertIsNone(module.module.unused.weight.grad)
+                with pipeline._forward_context(0, 2):
+                    module(torch.ones(1, 2))
+            finally:
+                dist.destroy_process_group()
+
     def test_base_pipeline_delegates_full_round_to_stage(self) -> None:
         stage = MagicMock(spec=StageWrapper)
         stage.module = torch.nn.Linear(1, 1)
@@ -891,3 +1040,11 @@ class MaglevModuleListTest(unittest.TestCase):
             ],
         )
         self.assertIs(process_groups.handoff_pgs[0], process_groups.handoff_pgs[1])
+
+
+class MaglevDDPNumericsTest(MultiProcessTestBase):
+    def test_deferred_ddp_gradient_matches_full_batch(self) -> None:
+        self._run_multi_process_test(
+            callable=_test_deferred_ddp_gradient_matches_full_batch,
+            world_size=2,
+        )
