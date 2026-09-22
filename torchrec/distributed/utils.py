@@ -457,7 +457,6 @@ def add_params_from_parameter_sharding(
     }:
         fused_params.pop("fused_bounds_check", None)
         fused_params.pop("enable_triton_tbe_optimizations", None)
-        fused_params.pop("tbe_chunk_size_limit", None)
 
     # update fused_params using params from parameter_sharding
     # this will take precidence over the fused_params provided from sharders
