@@ -48,7 +48,7 @@ import logging
 from typing import Any, Callable, Dict, List, Tuple
 
 import torch
-from torchrec.distributed.benchmark import benchmark_module, benchmark_primitive
+from torchrec.distributed.benchmark import benchmark_ebc, benchmark_primitive
 from torchrec.distributed.test_utils.process_runner import (
     run_local_multi_process_func,
     run_single_process_func,
@@ -63,7 +63,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # ignores the value, so the registry is typed ``Callable[..., Any]``.
 _BENCHMARKS: Dict[str, Callable[..., Any]] = {
     "primitive": benchmark_primitive.benchmark_runner,
-    "module": benchmark_module.benchmark_runner,
+    "module": benchmark_ebc.benchmark_runner,
 }
 
 # torchrun/torchelastic inject args like ``--local-rank`` into the worker argv;

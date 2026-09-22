@@ -44,6 +44,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import torch
 from torchrec.distributed.benchmark.base import benchmark_func, BenchmarkResult
+from torchrec.distributed.benchmark.utils import as_bool
 from torchrec.distributed.dist_data import (
     KJTAllToAll,
     PooledEmbeddingsAllGather,
@@ -55,22 +56,6 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-def _as_bool(value: Any, default: bool) -> bool:
-    """Interpret a forwarded CLI value as a bool.
-
-    The launcher coerces unrecognized args to int/float and otherwise leaves them as
-    strings, so ``--memory_snapshot=false`` arrives as the string ``"false"`` -- truthy
-    to ``bool()``. Flag-style ``--memory_snapshot`` (no value) arrives as ``"true"``.
-    """
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _build_splits(num_features: int, world_size: int) -> List[int]:
@@ -184,7 +169,7 @@ def _benchmark_kjt_a2a(
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
-    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
+    memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "kjt_a2a"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
@@ -337,7 +322,7 @@ def _benchmark_kt_a2a(
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
-    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
+    memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "kt_a2a"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
@@ -485,7 +470,7 @@ def _benchmark_reduce_scatter(
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
-    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
+    memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "reduce_scatter"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
@@ -629,7 +614,7 @@ def _benchmark_all_gather(
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
-    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
+    memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "all_gather"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
