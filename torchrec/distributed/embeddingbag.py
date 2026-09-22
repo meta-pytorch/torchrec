@@ -15,6 +15,7 @@ from functools import partial
 from itertools import zip_longest
 from typing import (
     Any,
+    Callable,
     cast,
     Dict,
     Iterator,
@@ -65,7 +66,10 @@ from torchrec.distributed.fused_params import (
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.memory_stashing import MemoryStashingManager
-from torchrec.distributed.sharding.cw_sharding import CwPooledEmbeddingSharding
+from torchrec.distributed.sharding.cw_sharding import (
+    build_tpu_permute,
+    CwPooledEmbeddingSharding,
+)
 from torchrec.distributed.sharding.dp_sharding import DpPooledEmbeddingSharding
 from torchrec.distributed.sharding.dynamic_sharding import (
     CommP2PMetadata,
@@ -378,7 +382,7 @@ class VariableBatchEmbeddingBagCollectionAwaitable(
         uncombined_embedding_dims: List[int],
         embedding_names: List[str],
         embedding_dims: List[int],
-        permute_op: PermutePooledEmbeddings,
+        permute_op: Callable[[torch.Tensor], torch.Tensor],
         module_fqn: Optional[str] = None,
         sharding_types: Optional[List[str]] = None,
         resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
@@ -1739,9 +1743,15 @@ class ShardedEmbeddingBagCollection(
             ),
         )
 
-        self._permute_op: PermutePooledEmbeddings = PermutePooledEmbeddings(
-            self._uncombined_embedding_dims, permute_indices, self._device
-        )
+        self._permute_op: Callable[[torch.Tensor], torch.Tensor]
+        if self._device is not None and self._device.type == "tpu":
+            self._permute_op = build_tpu_permute(
+                self._uncombined_embedding_dims, permute_indices, self._device
+            )
+        else:
+            self._permute_op = PermutePooledEmbeddings(
+                self._uncombined_embedding_dims, permute_indices, self._device
+            )
 
     def _update_output_dist(self) -> None:
         """
@@ -1781,9 +1791,15 @@ class ShardedEmbeddingBagCollection(
             ),
         )
 
-        self._permute_op: PermutePooledEmbeddings = PermutePooledEmbeddings(
-            self._uncombined_embedding_dims, permute_indices, self._device
-        )
+        self._permute_op: Callable[[torch.Tensor], torch.Tensor]
+        if self._device is not None and self._device.type == "tpu":
+            self._permute_op = build_tpu_permute(
+                self._uncombined_embedding_dims, permute_indices, self._device
+            )
+        else:
+            self._permute_op = PermutePooledEmbeddings(
+                self._uncombined_embedding_dims, permute_indices, self._device
+            )
 
     def _create_inverse_indices_permute_indices(
         self, inverse_indices: Optional[Tuple[List[str], torch.Tensor]]
