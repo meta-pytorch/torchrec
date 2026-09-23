@@ -246,6 +246,102 @@ def _next_metadata(it: Iterator[int]) -> int:
         raise ValueError("not enough KJT metadata to reconstruct the example") from None
 
 
+def split_dense_inputs(
+    value: Any,
+    batch_size: int,
+    num_microbatches: int,
+) -> List[Any]:
+    r"""split_dense_inputs(value, batch_size, num_microbatches) -> List[Any]
+
+    Split the batch-major tensors in a structured input for dense execution.
+
+    Tensor leaves whose leading dimension equals ``batch_size`` are divided into
+    exactly ``num_microbatches`` views. Other tensor and non-tensor leaves are
+    shared. :class:`~torchrec.sparse.jagged_tensor.KeyedJaggedTensor` leaves are
+    dropped because the sparse half has already consumed them.
+
+    Args:
+        value (Any): Structured whole-pass input.
+        batch_size (int): Logical whole-pass batch size.
+        num_microbatches (int): Number of dense microbatches.
+
+    Returns:
+        List[Any]: One dense input per microbatch. Sparse leaves may be replaced
+            by ``None``.
+
+    Raises:
+        ValueError: If the batch size or microbatch count is invalid.
+    """
+    if batch_size < 0:
+        raise ValueError(f"batch_size must not be negative, got {batch_size}")
+    if num_microbatches <= 0:
+        raise ValueError(f"num_microbatches must be positive, got {num_microbatches}")
+    if batch_size < num_microbatches:
+        raise ValueError(
+            f"batch_size {batch_size} cannot produce {num_microbatches} "
+            "non-empty microbatches"
+        )
+    if batch_size % num_microbatches:
+        raise ValueError(
+            f"batch_size {batch_size} must divide evenly into "
+            f"{num_microbatches} microbatches"
+        )
+    return _split_dense_inputs(value, batch_size, num_microbatches)
+
+
+def _split_dense_inputs(obj: Any, batch_size: int, num_microbatches: int) -> List[Any]:
+    if isinstance(obj, KeyedJaggedTensor):
+        return [None] * num_microbatches
+    if isinstance(obj, torch.Tensor):
+        if obj.ndim > 0 and obj.shape[0] == batch_size:
+            return list(torch.tensor_split(obj, num_microbatches, dim=0))
+        return [obj] * num_microbatches
+    if is_dataclass(obj) and not isinstance(obj, type):
+        per_field = {
+            field.name: _split_dense_inputs(
+                getattr(obj, field.name), batch_size, num_microbatches
+            )
+            for field in fields(obj)
+        }
+        return [
+            type(obj)(
+                **{
+                    name: field_values[index]
+                    for name, field_values in per_field.items()
+                }
+            )
+            for index in range(num_microbatches)
+        ]
+    if isinstance(obj, tuple):
+        values = [
+            _split_dense_inputs(item, batch_size, num_microbatches) for item in obj
+        ]
+        if hasattr(obj, "_fields"):
+            return [
+                type(obj)(*(item[index] for item in values))
+                for index in range(num_microbatches)
+            ]
+        return [
+            type(obj)(item[index] for item in values)
+            for index in range(num_microbatches)
+        ]
+    if isinstance(obj, list):
+        values = [
+            _split_dense_inputs(item, batch_size, num_microbatches) for item in obj
+        ]
+        return [[item[index] for item in values] for index in range(num_microbatches)]
+    if isinstance(obj, dict):
+        values = {
+            key: _split_dense_inputs(item, batch_size, num_microbatches)
+            for key, item in obj.items()
+        }
+        return [
+            {key: item[index] for key, item in values.items()}
+            for index in range(num_microbatches)
+        ]
+    return [obj] * num_microbatches
+
+
 def inplace_copy_to_gpu(
     source_tensors: List[torch.Tensor],
     destination_tensors: List[torch.Tensor],
@@ -755,15 +851,14 @@ def input_dist(
 
 
 class InputDistDriver(Generic[T]):
-    """Feeds a pipeline schedule with microbatches produced by :func:`input_dist`.
+    """Feeds a pipeline schedule with carriers produced by :func:`input_dist`.
 
-    Every dataloader batch is already one microbatch; this driver redistributes
-    those batches and never splits them. One :func:`input_dist` round over a
-    cascade yields one carrier per stage --
-    i.e. as many microbatches as there are stages, all destined for the calling
-    rank. A schedule asks for ``n`` microbatches per pass, which need not match.
-    This buffers whole rounds in a FIFO and hands out ``n`` at a time,
-    decoupling the two:
+    Every dataloader batch is transported whole; this driver never splits it.
+    Ordinary schedules interpret a carrier as one microbatch, while
+    :class:`~torchrec.distributed.maglev.pipeline.MaglevRail` interprets it as a
+    whole pass. One :func:`input_dist` round over a cascade yields one carrier
+    per stage. A schedule asks for ``n`` carriers, which need not match the round
+    size, so the driver buffers whole rounds in a FIFO.
 
     * more microbatches than stages (8 wanted, 4 stages) -> 2 rounds per pass;
     * fewer (8 wanted, 16 stages) -> one round every other pass, drained ``n``
@@ -818,7 +913,7 @@ class InputDistDriver(Generic[T]):
 
     @property
     def pending(self) -> int:
-        """Microbatches already received and not yet handed out."""
+        """Carriers already received and not yet handed out."""
         return len(self._queue)
 
     def exchange(self, send: List[T]) -> LazyAwaitable[List[T]]:
@@ -853,14 +948,14 @@ class InputDistDriver(Generic[T]):
         )
 
     def take(self, next_send: Callable[[], List[T]], n: int) -> List[T]:
-        """Hand out ``n`` microbatches, running whole rounds as needed.
+        """Hand out ``n`` carriers, running whole rounds as needed.
 
         Args:
             next_send: produces one round's send set (one carrier per rank of the
                 cascade). Called once per round, and only when the queue runs
                 dry, so a caller reading a dataloader consumes exactly one batch
                 per round.
-            n: how many microbatches to return.
+            n: how many carriers to return.
 
         Returns:
             List[T]: ``n`` carriers for this rank; the remainder of the last

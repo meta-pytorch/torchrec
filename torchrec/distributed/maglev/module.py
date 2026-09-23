@@ -26,6 +26,7 @@ from typing import (
     get_args,
     get_origin,
     get_type_hints,
+    Iterator,
     List,
     Optional,
     Sequence,
@@ -590,7 +591,9 @@ def cast_activations(
 
 
 class MaglevLayer(nn.Module, abc.ABC):
-    """Base class for a Maglev layer -- the unit of compute in a Maglev model.
+    r"""MaglevLayer(sparse=None, dense=None)
+
+    Base class for a Maglev layer -- the unit of compute in a Maglev model.
 
     A layer consumes two things and produces one:
 
@@ -613,17 +616,41 @@ class MaglevLayer(nn.Module, abc.ABC):
     layer list directly. There is no separate stage type: a stage is just a run
     of layers plus the wrapper that distributes it.
 
+    A layer may expose two structural halves:
+
+    * ``sparse(layer_input)`` performs work independent of the incoming
+      activation, such as embedding pooling. It may be ``None``.
+    * ``dense(sparse_output, layer_input, in_activations)`` performs the
+      remaining work and returns the layer's activation tuple.
+
+    The default :meth:`forward` composes those halves. Existing subclasses may
+    continue to override :meth:`forward` and omit both halves; schedules that
+    need the split call :meth:`require_dense` and receive a descriptive error.
+
     Args:
-        Implementations define their own constructor arguments.
+        sparse (nn.Module, optional): Module that consumes ``layer_input`` and
+            produces the sparse output. Default: ``None``
+        dense (nn.Module, optional): Module that consumes the sparse output,
+            ``layer_input``, and incoming activations. Default: ``None``
 
     Example::
 
+        class BlockDense(nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.lin = nn.Linear(dim, dim)
+
+            def forward(self, sparse_output, layer_input, in_activations=()):
+                x = self.lin(layer_input)
+                if in_activations:
+                    x = x + in_activations[0]
+                return (x,)
+
         class Block(MaglevLayer):
             def __init__(self, dim: int, is_first: bool) -> None:
-                super().__init__()
+                super().__init__(dense=BlockDense(dim))
                 self._dim = dim
                 self._is_first = is_first
-                self.lin: nn.Linear = nn.Linear(dim, dim)
 
             def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
                 if self._is_first:
@@ -633,12 +660,77 @@ class MaglevLayer(nn.Module, abc.ABC):
             def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
                 return (ActivationSpec(torch.Size([-1, self._dim])),)
 
-            def forward(self, layer_input, in_activations=()):
-                x = self.lin(layer_input)
-                if in_activations:
-                    x = x + in_activations[0]
-                return (x,)
     """
+
+    def __init__(
+        self,
+        sparse: Optional[nn.Module] = None,
+        dense: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        self.sparse: Optional[nn.Module] = sparse
+        self.dense: Optional[nn.Module] = dense
+
+    def require_dense(self) -> nn.Module:
+        r"""require_dense() -> nn.Module
+
+        Return the dense half required by split-aware schedules.
+
+        Returns:
+            nn.Module: The layer's dense half.
+
+        Raises:
+            ValueError: If the layer was built without a dense half.
+        """
+        if self.dense is None:
+            raise ValueError(
+                f"{type(self).__name__} was built without a dense half; provide "
+                "dense= to MaglevLayer or use a schedule that executes whole layers"
+            )
+        return self.dense
+
+    def dense_parameters(self) -> Iterator[nn.Parameter]:
+        r"""dense_parameters() -> Iterator[nn.Parameter]
+
+        Return the parameters owned by the dense half.
+
+        Returns:
+            Iterator[nn.Parameter]: Dense parameters in module registration order.
+
+        Raises:
+            ValueError: If the layer was built without a dense half.
+        """
+        return self.require_dense().parameters()
+
+    def split_dense_input(
+        self,
+        layer_input: Any,
+        batch_size: int,
+        num_microbatches: int,
+    ) -> List[Any]:
+        r"""split_dense_input(layer_input, batch_size, num_microbatches) -> List[Any]
+
+        Split a whole-pass input for per-microbatch dense execution.
+
+        Split-capable layers must override this method. Keeping the operation on
+        the layer lets each architecture identify its batch-major fields without
+        adding sparse-input dependencies to the Maglev authoring API.
+
+        Args:
+            layer_input (Any): This layer's whole-pass input.
+            batch_size (int): Logical whole-pass batch size.
+            num_microbatches (int): Number of dense microbatches.
+
+        Returns:
+            List[Any]: Exactly one dense input per microbatch.
+
+        Raises:
+            NotImplementedError: Unless the layer overrides this method.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must override split_dense_input() to run "
+            "with MaglevRail"
+        )
 
     @abc.abstractmethod
     def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
@@ -650,11 +742,12 @@ class MaglevLayer(nn.Module, abc.ABC):
         """The activation tuple this layer produces."""
         ...
 
-    @abc.abstractmethod
     def forward(
         self, layer_input: Any, in_activations: Activations = ()
     ) -> Activations:
-        """Run the layer over its input and the previous layer's activation.
+        r"""forward(layer_input, in_activations=()) -> Activations
+
+        Run the sparse half followed by the dense half.
 
         Args:
             layer_input: this layer's own input (its feature partition).
@@ -665,8 +758,13 @@ class MaglevLayer(nn.Module, abc.ABC):
         Returns:
             Activations: this layer's output activation, matching
                 :meth:`out_activation_specs`.
+
+        Raises:
+            ValueError: If the layer has no dense half and does not override this
+                method.
         """
-        ...
+        sparse_output = None if self.sparse is None else self.sparse(layer_input)
+        return self.require_dense()(sparse_output, layer_input, in_activations)
 
 
 class ObservedActivationSpecsMixin:
@@ -777,9 +875,13 @@ class MaglevModuleList(nn.ModuleList):
     def get_batch_size(self, layer_inputs: Sequence[Any]) -> int:
         """Return the batch size represented by a local stage's layer inputs.
 
-        Pipeline schedules call this only when a stage boundary uses
-        batch-size-dependent activation specs. Models using such specs must
-        override this method because layer inputs may be arbitrary structured
+        Called when a stage boundary uses batch-size-dependent activation specs,
+        and on every pass under
+        :class:`~torchrec.distributed.maglev.pipeline.MaglevRail`, which needs it
+        to size the microbatch split. A Rail model must therefore override this
+        whatever its specs look like.
+
+        Override is required because layer inputs may be arbitrary structured
         values and the framework cannot infer which tensor carries the logical
         batch dimension.
         """
