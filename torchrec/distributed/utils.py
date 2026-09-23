@@ -14,7 +14,7 @@ import sys
 from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 import torch
@@ -48,99 +48,198 @@ _T = TypeVar("_T")
 _MAX_WEIGHT_CHUNKS: int = 16
 
 
-def _table_element_sizes(
-    embedding_specs: Sequence[tuple[int, int]],
-    weight_element_size: int,
-    tbe_chunk_size_limit: int,
-) -> tuple[list[int], int, int]:
-    if not embedding_specs:
-        raise ValueError("Chunked Triton TBE requires at least one local table")
-
-    table_element_sizes = []
-    oversized_table_count = 0
-    largest_oversized_table_nbytes = 0
-    for rows, dim in embedding_specs:
-        if rows <= 0 or dim <= 0:
-            raise ValueError(
-                "Chunked Triton TBE requires positive local table dimensions"
-            )
-        table_element_size = rows * dim
-        table_element_sizes.append(table_element_size)
-        table_nbytes = table_element_size * weight_element_size
-        if table_nbytes > tbe_chunk_size_limit:
-            oversized_table_count += 1
-            largest_oversized_table_nbytes = max(
-                largest_oversized_table_nbytes,
-                table_nbytes,
-            )
-    return (
-        table_element_sizes,
-        oversized_table_count,
-        largest_oversized_table_nbytes,
-    )
+@dataclass(frozen=True)
+class _WeightChunk:
+    elements: int
+    isolated_table_index: int | None
 
 
-def _pack_whole_tables(
+def _pack_complete_tables(
     table_element_sizes: Sequence[int],
     weight_element_size: int,
     tbe_chunk_size_limit: int,
-) -> tuple[tuple[int, ...], bool]:
-    weight_chunk_sizes = []
+    force_two_chunks: bool,
+) -> list[_WeightChunk]:
+    chunks = []
     current_chunk_size = 0
-    hit_chunk_cap = False
     for table_index, table_element_size in enumerate(table_element_sizes):
         is_final_table = table_index == len(table_element_sizes) - 1
         exceeds_limit = (
             current_chunk_size + table_element_size
         ) * weight_element_size > tbe_chunk_size_limit
-        needs_second_chunk = is_final_table and not weight_chunk_sizes
-        should_start_new_chunk = current_chunk_size > 0 and (
-            exceeds_limit or needs_second_chunk
-        )
-        if should_start_new_chunk:
-            if len(weight_chunk_sizes) < _MAX_WEIGHT_CHUNKS - 1:
-                weight_chunk_sizes.append(current_chunk_size)
-                current_chunk_size = 0
-            else:
-                hit_chunk_cap = True
+        needs_second_chunk = force_two_chunks and is_final_table and not chunks
+        if current_chunk_size > 0 and (exceeds_limit or needs_second_chunk):
+            chunks.append(_WeightChunk(current_chunk_size, None))
+            current_chunk_size = 0
         current_chunk_size += table_element_size
 
-    weight_chunk_sizes.append(current_chunk_size)
-    return tuple(weight_chunk_sizes), hit_chunk_cap
+    if current_chunk_size > 0:
+        chunks.append(_WeightChunk(current_chunk_size, None))
+    return chunks
+
+
+def _split_oversized_table(
+    table_index: int,
+    rows: int,
+    dim: int,
+    weight_element_size: int,
+    tbe_chunk_size_limit: int,
+) -> tuple[list[_WeightChunk], int, bool]:
+    row_nbytes = dim * weight_element_size
+    rows_per_chunk = max(tbe_chunk_size_limit // row_nbytes, 1)
+    required_chunks = (rows + rows_per_chunk - 1) // rows_per_chunk
+    actual_chunks = min(required_chunks, _MAX_WEIGHT_CHUNKS)
+
+    if actual_chunks == required_chunks:
+        chunk_rows = [
+            min(rows_per_chunk, rows - row_start)
+            for row_start in range(0, rows, rows_per_chunk)
+        ]
+    else:
+        rows_per_balanced_chunk, larger_chunk_count = divmod(rows, actual_chunks)
+        chunk_rows = [
+            rows_per_balanced_chunk + (chunk_index < larger_chunk_count)
+            for chunk_index in range(actual_chunks)
+        ]
+
+    return (
+        [
+            _WeightChunk(rows_in_chunk * dim, table_index)
+            for rows_in_chunk in chunk_rows
+        ],
+        required_chunks,
+        row_nbytes > tbe_chunk_size_limit,
+    )
+
+
+def _initial_weight_chunks(
+    embedding_specs: Sequence[tuple[int, int]],
+    weight_element_size: int,
+    tbe_chunk_size_limit: int,
+) -> tuple[list[_WeightChunk], int, int, int]:
+    chunks: list[_WeightChunk] = []
+    pending_complete_tables: list[int] = []
+    required_chunk_count = 0
+    oversized_row_count = 0
+    largest_oversized_row_nbytes = 0
+
+    for table_index, (rows, dim) in enumerate(embedding_specs):
+        if rows <= 0 or dim <= 0:
+            raise ValueError(
+                "Chunked Triton TBE requires positive local table dimensions"
+            )
+        table_element_size = rows * dim
+        if table_element_size * weight_element_size <= tbe_chunk_size_limit:
+            pending_complete_tables.append(table_element_size)
+            continue
+
+        complete_table_chunks = _pack_complete_tables(
+            pending_complete_tables,
+            weight_element_size,
+            tbe_chunk_size_limit,
+            force_two_chunks=False,
+        )
+        chunks.extend(complete_table_chunks)
+        required_chunk_count += len(complete_table_chunks)
+        pending_complete_tables = []
+
+        table_chunks, table_required_chunks, oversized_row = _split_oversized_table(
+            table_index,
+            rows,
+            dim,
+            weight_element_size,
+            tbe_chunk_size_limit,
+        )
+        chunks.extend(table_chunks)
+        required_chunk_count += table_required_chunks
+        if oversized_row:
+            oversized_row_count += 1
+            largest_oversized_row_nbytes = max(
+                largest_oversized_row_nbytes,
+                dim * weight_element_size,
+            )
+
+    complete_table_chunks = _pack_complete_tables(
+        pending_complete_tables,
+        weight_element_size,
+        tbe_chunk_size_limit,
+        force_two_chunks=not chunks and len(pending_complete_tables) > 1,
+    )
+    chunks.extend(complete_table_chunks)
+    required_chunk_count += len(complete_table_chunks)
+    return (
+        chunks,
+        required_chunk_count,
+        oversized_row_count,
+        largest_oversized_row_nbytes,
+    )
+
+
+def _cap_weight_chunks(chunks: list[_WeightChunk]) -> list[_WeightChunk]:
+    while len(chunks) > _MAX_WEIGHT_CHUNKS:
+        merge_index = None
+        merged_size = None
+        for chunk_index, (left, right) in enumerate(zip(chunks, chunks[1:])):
+            compatible = (
+                left.isolated_table_index is None and right.isolated_table_index is None
+            ) or (
+                left.isolated_table_index is not None
+                and left.isolated_table_index == right.isolated_table_index
+            )
+            candidate_size = left.elements + right.elements
+            if compatible and (merged_size is None or candidate_size < merged_size):
+                merge_index = chunk_index
+                merged_size = candidate_size
+
+        if merge_index is None:
+            raise ValueError(
+                "Chunked Triton TBE cannot satisfy the 16-chunk maximum without "
+                "placing a split-table fragment in a chunk with another table"
+            )
+        left = chunks[merge_index]
+        right = chunks[merge_index + 1]
+        chunks[merge_index : merge_index + 2] = [
+            _WeightChunk(
+                left.elements + right.elements,
+                left.isolated_table_index,
+            )
+        ]
+    return chunks
 
 
 def _log_partition_warnings(
     table_count: int,
-    oversized_table_count: int,
-    largest_oversized_table_nbytes: int,
+    required_chunk_count: int,
+    oversized_row_count: int,
+    largest_oversized_row_nbytes: int,
     weight_chunk_sizes: Sequence[int],
     weight_element_size: int,
     tbe_chunk_size_limit: int,
-    hit_chunk_cap: bool,
 ) -> None:
-    if table_count == 1:
+    if table_count == 1 and len(weight_chunk_sizes) == 1:
         logger.warning(
-            "ChunkedShardedTritonBatchedFusedEmbeddingBag has one local table, "
-            "so whole-table partitioning cannot produce the minimum 2 weight "
-            "chunks; proceeding with 1 chunk"
+            "ChunkedShardedTritonBatchedFusedEmbeddingBag has one local table "
+            "that cannot be row-split into the minimum 2 weight chunks; "
+            "proceeding with 1 chunk"
         )
-    if oversized_table_count > 0:
+    if oversized_row_count > 0:
         logger.warning(
             "ChunkedShardedTritonBatchedFusedEmbeddingBag has %d local table(s) "
-            "larger than tbe_chunk_size_limit=%d bytes; the largest is %d bytes. "
-            "Keeping each oversized table whole",
-            oversized_table_count,
+            "whose row size exceeds tbe_chunk_size_limit=%d bytes; the largest "
+            "row is %d bytes. Row-aligned chunks will exceed the limit",
+            oversized_row_count,
             tbe_chunk_size_limit,
-            largest_oversized_table_nbytes,
+            largest_oversized_row_nbytes,
         )
-    if hit_chunk_cap:
+    if required_chunk_count > _MAX_WEIGHT_CHUNKS:
         logger.warning(
-            "ChunkedShardedTritonBatchedFusedEmbeddingBag reached the maximum "
-            "supported 16 weight chunks, but whole-table packing requires "
-            "additional chunks; the final chunk is %d bytes, exceeding "
-            "tbe_chunk_size_limit=%d bytes; proceeding with 16 chunks",
-            weight_chunk_sizes[-1] * weight_element_size,
+            "ChunkedShardedTritonBatchedFusedEmbeddingBag requires %d isolated "
+            "table-fragment or complete-table chunks to honor "
+            "tbe_chunk_size_limit=%d bytes, exceeding the maximum supported 16; "
+            "proceeding with 16 chunks whose largest size is %d bytes",
+            required_chunk_count,
             tbe_chunk_size_limit,
+            max(weight_chunk_sizes) * weight_element_size,
         )
 
 
@@ -149,7 +248,9 @@ def infer_weight_chunk_sizes(
     weights_precision: SparseType,
     tbe_chunk_size_limit: int,
 ) -> tuple[int, ...]:
-    """Greedily pack complete local embedding tables into weight chunks."""
+    """Partition weights without mixing split-table fragments with other tables."""
+    if not embedding_specs:
+        raise ValueError("Chunked Triton TBE requires at least one local table")
     if tbe_chunk_size_limit <= 0:
         raise ValueError("tbe_chunk_size_limit must be positive")
 
@@ -159,26 +260,23 @@ def infer_weight_chunk_sizes(
             f"Unsupported sub-byte weight precision {weights_precision} for chunking"
         )
 
-    table_element_sizes, oversized_table_count, largest_oversized_table_nbytes = (
-        _table_element_sizes(
+    chunks, required_chunk_count, oversized_row_count, largest_row_nbytes = (
+        _initial_weight_chunks(
             embedding_specs,
             weight_element_size,
             tbe_chunk_size_limit,
         )
     )
-    weight_chunk_sizes, hit_chunk_cap = _pack_whole_tables(
-        table_element_sizes,
-        weight_element_size,
-        tbe_chunk_size_limit,
-    )
+    chunks = _cap_weight_chunks(chunks)
+    weight_chunk_sizes = tuple(chunk.elements for chunk in chunks)
     _log_partition_warnings(
-        len(table_element_sizes),
-        oversized_table_count,
-        largest_oversized_table_nbytes,
+        len(embedding_specs),
+        required_chunk_count,
+        oversized_row_count,
+        largest_row_nbytes,
         weight_chunk_sizes,
         weight_element_size,
         tbe_chunk_size_limit,
-        hit_chunk_cap,
     )
     return weight_chunk_sizes
 

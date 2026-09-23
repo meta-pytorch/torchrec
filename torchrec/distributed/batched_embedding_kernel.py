@@ -4757,7 +4757,7 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
             chunk_size * weight_element_size for chunk_size in weight_chunk_sizes
         )
         logger.info(
-            "Inferred %d whole-table Triton TBE weight chunks for %d local tables "
+            "Inferred %d table-aware Triton TBE weight chunks for %d local tables "
             "with total size %d bytes, minimum chunk size %d bytes, average chunk "
             "size %d bytes, maximum chunk size %d bytes, "
             "tbe_chunk_size_limit=%d bytes, and weight precision %s",
