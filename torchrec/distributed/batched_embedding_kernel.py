@@ -153,6 +153,8 @@ ENABLE_RAW_EMBEDDING_STREAMING_STR = "enable_raw_embedding_streaming"
 ENABLE_HBM_STREAMING_STR = "enable_hbm_streaming"
 RES_HBM_DRAIN_INTERVAL_STR = "res_hbm_drain_interval"
 RES_USE_COPY_DONE_TOKEN_STR = "res_use_copy_done_token"
+_DEFAULT_TBE_CHUNK_SIZE_LIMIT: int = 1024**3
+_SUPPORTED_WEIGHT_CHUNK_COUNTS: Tuple[int, ...] = (2, 4, 8, 16)
 
 
 class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
@@ -4707,6 +4709,41 @@ def _row_aligned_weight_chunk_sizes(
     return tuple(chunk_sizes)
 
 
+def _infer_weight_chunk_sizes(
+    embedding_specs: List[Tuple[int, int]],
+    weights_precision: SparseType,
+    tbe_chunk_size_limit: int,
+) -> Tuple[int, ...]:
+    if tbe_chunk_size_limit <= 0:
+        raise ValueError("tbe_chunk_size_limit must be positive")
+
+    weight_element_size = weights_precision.bit_rate() // 8
+    if weight_element_size <= 0:
+        raise ValueError(
+            f"Unsupported sub-byte weight precision {weights_precision} for chunking"
+        )
+
+    weight_chunk_sizes: Tuple[int, ...] = ()
+    largest_chunk_nbytes = 0
+    for num_weight_chunks in _SUPPORTED_WEIGHT_CHUNK_COUNTS:
+        weight_chunk_sizes = _row_aligned_weight_chunk_sizes(
+            embedding_specs,
+            num_weight_chunks,
+        )
+        largest_chunk_nbytes = max(weight_chunk_sizes) * weight_element_size
+        if largest_chunk_nbytes <= tbe_chunk_size_limit:
+            return weight_chunk_sizes
+
+    logger.warning(
+        "ChunkedShardedTritonBatchedFusedEmbeddingBag reached the maximum "
+        "supported 16 weight chunks, but the largest row-aligned chunk is %d "
+        "bytes, exceeding tbe_chunk_size_limit=%d bytes; proceeding with 16 chunks",
+        largest_chunk_nbytes,
+        tbe_chunk_size_limit,
+    )
+    return weight_chunk_sizes
+
+
 def _logical_table_weight_wrappers(
     weight_chunks: Tuple[torch.Tensor, ...],
     weight_chunk_sizes: Tuple[int, ...],
@@ -4790,14 +4827,29 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
         )
         stochastic_rounding = fused_params.get("stochastic_rounding", True)
         fused_bounds_check: bool = fused_params.get("fused_bounds_check", False)
-        requested_chunks = int(fused_params.get("num_weight_chunks", 4))
-        if requested_chunks <= 0:
-            raise ValueError("num_weight_chunks must be positive")
+        tbe_chunk_size_limit = int(
+            fused_params.get(
+                "tbe_chunk_size_limit",
+                _DEFAULT_TBE_CHUNK_SIZE_LIMIT,
+            )
+        )
 
         embedding_specs = list(zip(self._local_rows, self._local_cols))
-        weight_chunk_sizes = _row_aligned_weight_chunk_sizes(
+        weight_chunk_sizes = _infer_weight_chunk_sizes(
             embedding_specs,
-            requested_chunks,
+            weights_precision,
+            tbe_chunk_size_limit,
+        )
+        largest_chunk_nbytes = (
+            max(weight_chunk_sizes) * weights_precision.bit_rate() // 8
+        )
+        logger.info(
+            "Inferred %d chunked Triton TBE weight chunks with largest chunk "
+            "size %d bytes, tbe_chunk_size_limit=%d bytes, and weight precision %s",
+            len(weight_chunk_sizes),
+            largest_chunk_nbytes,
+            tbe_chunk_size_limit,
+            weights_precision,
         )
         self._emb_module = ChunkedTritonTableBatchedEmbeddingBags(
             embedding_specs=embedding_specs,
