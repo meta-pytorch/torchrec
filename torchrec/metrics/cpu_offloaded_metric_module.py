@@ -491,6 +491,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             CPUOffloadedRecMetricModule._move_state_to_cpu_after_load
         )
 
+        logger.info("Preserving QPS event time in ZORM is enabled")
         logger.info(
             f"CPUOffloadedRecMetricModule initialization complete with {model_out_device.type=}, {update_queue_size=}, {compute_queue_size=}."
         )
