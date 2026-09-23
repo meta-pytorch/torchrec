@@ -54,7 +54,9 @@ class HashZchEvictionScorer:
     def __init__(self, config: HashZchEvictionConfig) -> None:
         self._config: HashZchEvictionConfig = config
 
-    def gen_score(self, feature: JaggedTensor, device: torch.device) -> torch.Tensor:
+    def gen_score(
+        self, feature: JaggedTensor, device: torch.device, **kwargs
+    ) -> torch.Tensor:
         return torch.empty(0, device=device)
 
     def gen_threshold(self) -> int:
@@ -62,7 +64,9 @@ class HashZchEvictionScorer:
 
 
 class HashZchSingleTtlScorer(HashZchEvictionScorer):
-    def gen_score(self, feature: JaggedTensor, device: torch.device) -> torch.Tensor:
+    def gen_score(
+        self, feature: JaggedTensor, device: torch.device, **kwargs
+    ) -> torch.Tensor:
         assert (
             self._config.single_ttl is not None
         ), "To use scorer HashZchSingleTtlScorer, a single_ttl is required."
@@ -90,8 +94,13 @@ class HashZchPerFeatureTtlScorer(HashZchEvictionScorer):
 
         self._per_feature_ttl = torch.IntTensor(self._config.per_feature_ttl)
 
-    def gen_score(self, feature: JaggedTensor, device: torch.device) -> torch.Tensor:
-        feature_split = feature.weights()
+    def gen_score(
+        self, feature: JaggedTensor, device: torch.device, **kwargs
+    ) -> torch.Tensor:
+        assert (
+            "length_per_key" in kwargs
+        ), "feature lengths expected for per feature TTL Scorer"
+        feature_split = kwargs.get("length_per_key")
         assert feature_split.size(0) == self._per_feature_ttl.size(0)
 
         scores = self._per_feature_ttl.repeat_interleave(feature_split) + int(
@@ -154,19 +163,19 @@ class HashZchThresholdEvictionModule(torch.nn.Module):
         )
 
     def forward(
-        self, feature: JaggedTensor, device: torch.device
+        self, feature: JaggedTensor, device: torch.device, **kwargs
     ) -> Tuple[torch.Tensor, int]:
         """
         Args:
             feature: a jagged tensor that contains the input IDs, and their lengths and
-                weights (feature split).
+                kwargs["length_per_key"] (feature split).
             device: device of the tensor.
 
         Returns:
             a tensor that contains the eviction score for each ID, plus an eviction threshold.
         """
         return (
-            self._eviction_scorer.gen_score(feature, device),
+            self._eviction_scorer.gen_score(feature, device, **kwargs),
             self._eviction_scorer.gen_threshold(),
         )
 
@@ -240,13 +249,15 @@ class HashZchEvictionModule(torch.nn.Module):
 
         logger.info(f"HashZchEvictionModule: {self._policy_name=}, {self._device=}")
 
-    def forward(self, feature: JaggedTensor) -> Tuple[Optional[torch.Tensor], int]:
+    def forward(
+        self, feature: JaggedTensor, **kwargs
+    ) -> Tuple[Optional[torch.Tensor], int]:
         """
         Args:
             feature: a jagged tensor that contains the input IDs, and their lengths and
-            weights (feature split).
+                kwargs["length_per_key"] (feature split).
 
         Returns:
             For threshold eviction, a tensor that contains the eviction score for each ID, plus an eviction threshold. Otherwise None and -1.
         """
-        return self._eviction_module(feature, self._device)
+        return self._eviction_module(feature, self._device, **kwargs)

@@ -1044,18 +1044,22 @@ class ShardedManagedCollisionCollection(
             mc_input = self.global_to_local_index(mc_input_unify)
         else:
             # this is the default behavior, we will do remapper for all features at one call
-            mc_input: Dict[str, JaggedTensor] = {
-                table: JaggedTensor(
-                    values=features.values(),
-                    lengths=features.lengths(),
-                    # TODO: improve this temp solution by passing real weights, this is for eviction purpose since after we unify all feature to one key, we lost the original feature boundary information for per feature eviction
-                    weights=torch.tensor(features.length_per_key()),
-                )
-            }
+            mc_input, length_per_key = (
+                {
+                    table: JaggedTensor(
+                        values=features.values(),
+                        lengths=features.lengths(),
+                        weights=features.weights_or_none(),
+                    )
+                },
+                torch.tensor(features.length_per_key()),
+            )
             # pyrefly: ignore[not-callable]
             mc_input = mcm.profile(mc_input)
             # pyrefly: ignore[not-callable]
-            mc_input = mcm.remap(mc_input, write_weights=write_weights)
+            mc_input = mcm.remap(
+                mc_input, write_weights=write_weights, length_per_key=length_per_key
+            )
             mc_input = self.global_to_local_index(mc_input)
         self._retrieve_and_track_hash_zch_identities_and_metadata(
             mcm, mc_input, mc_input[table].values()
