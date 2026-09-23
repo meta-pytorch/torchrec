@@ -110,7 +110,11 @@ from torchrec.distributed.types import (
     ShardMetadata,
     TensorProperties,
 )
-from torchrec.distributed.utils import append_prefix, none_throws
+from torchrec.distributed.utils import (
+    append_prefix,
+    infer_weight_chunk_sizes,
+    none_throws,
+)
 from torchrec.modules.embedding_configs import (
     CountBasedEvictionPolicy,
     CountTimestampMixedEvictionPolicy,
@@ -154,7 +158,6 @@ ENABLE_HBM_STREAMING_STR = "enable_hbm_streaming"
 RES_HBM_DRAIN_INTERVAL_STR = "res_hbm_drain_interval"
 RES_USE_COPY_DONE_TOKEN_STR = "res_use_copy_done_token"
 _DEFAULT_TBE_CHUNK_SIZE_LIMIT: int = 1024**3
-_SUPPORTED_WEIGHT_CHUNK_COUNTS: Tuple[int, ...] = (2, 4, 8, 16)
 
 
 class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
@@ -4653,97 +4656,6 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
         self._emb_module.learning_rate = self.param_groups[0]["lr"]
 
 
-def _row_aligned_weight_chunk_sizes(
-    embedding_specs: List[Tuple[int, int]],
-    requested_chunks: int,
-) -> Tuple[int, ...]:
-    total_rows = sum(rows for rows, _ in embedding_specs)
-    if total_rows <= 0:
-        raise ValueError("Chunked Triton TBE requires at least one embedding row")
-
-    num_chunks = min(requested_chunks, total_rows)
-    table_element_starts: List[int] = []
-    table_row_starts: List[int] = []
-    total_elements = 0
-    rows_before_table = 0
-    for rows, dim in embedding_specs:
-        table_element_starts.append(total_elements)
-        table_row_starts.append(rows_before_table)
-        total_elements += rows * dim
-        rows_before_table += rows
-
-    chunk_ends: List[int] = []
-    previous_row = 0
-    for chunk_index in range(1, num_chunks):
-        target = (total_elements * chunk_index + num_chunks // 2) // num_chunks
-        remaining_chunks = num_chunks - chunk_index
-        best_boundary: Optional[Tuple[int, int, int]] = None
-        for table_start, table_row_start, (rows, dim) in zip(
-            table_element_starts,
-            table_row_starts,
-            embedding_specs,
-        ):
-            row_near_target = (target - table_start) // dim
-            for row in {
-                max(0, min(rows, row_near_target)),
-                max(0, min(rows, row_near_target + 1)),
-            }:
-                global_row = table_row_start + row
-                if not (previous_row < global_row <= total_rows - remaining_chunks):
-                    continue
-                boundary = table_start + row * dim
-                candidate = (abs(boundary - target), boundary, global_row)
-                if best_boundary is None or candidate < best_boundary:
-                    best_boundary = candidate
-
-        assert best_boundary is not None
-        _, boundary, previous_row = best_boundary
-        chunk_ends.append(boundary)
-
-    chunk_ends.append(total_elements)
-    chunk_sizes: List[int] = []
-    previous_end = 0
-    for chunk_end in chunk_ends:
-        chunk_sizes.append(chunk_end - previous_end)
-        previous_end = chunk_end
-    return tuple(chunk_sizes)
-
-
-def _infer_weight_chunk_sizes(
-    embedding_specs: List[Tuple[int, int]],
-    weights_precision: SparseType,
-    tbe_chunk_size_limit: int,
-) -> Tuple[int, ...]:
-    if tbe_chunk_size_limit <= 0:
-        raise ValueError("tbe_chunk_size_limit must be positive")
-
-    weight_element_size = weights_precision.bit_rate() // 8
-    if weight_element_size <= 0:
-        raise ValueError(
-            f"Unsupported sub-byte weight precision {weights_precision} for chunking"
-        )
-
-    weight_chunk_sizes: Tuple[int, ...] = ()
-    largest_chunk_nbytes = 0
-    for num_weight_chunks in _SUPPORTED_WEIGHT_CHUNK_COUNTS:
-        weight_chunk_sizes = _row_aligned_weight_chunk_sizes(
-            embedding_specs,
-            num_weight_chunks,
-        )
-        largest_chunk_nbytes = max(weight_chunk_sizes) * weight_element_size
-        if largest_chunk_nbytes <= tbe_chunk_size_limit:
-            return weight_chunk_sizes
-
-    logger.warning(
-        "ChunkedShardedTritonBatchedFusedEmbeddingBag reached the maximum "
-        "supported 16 weight chunks, but the largest row-aligned chunk is %d "
-        "bytes, exceeding tbe_chunk_size_limit=%d bytes; proceeding with 16 chunks",
-        largest_chunk_nbytes,
-        tbe_chunk_size_limit,
-    )
-    return weight_chunk_sizes
-
-
 def _logical_table_weight_wrappers(
     weight_chunks: Tuple[torch.Tensor, ...],
     weight_chunk_sizes: Tuple[int, ...],
@@ -4835,19 +4747,26 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
         )
 
         embedding_specs = list(zip(self._local_rows, self._local_cols))
-        weight_chunk_sizes = _infer_weight_chunk_sizes(
+        weight_chunk_sizes = infer_weight_chunk_sizes(
             embedding_specs,
             weights_precision,
             tbe_chunk_size_limit,
         )
-        largest_chunk_nbytes = (
-            max(weight_chunk_sizes) * weights_precision.bit_rate() // 8
+        weight_element_size = weights_precision.bit_rate() // 8
+        weight_chunk_nbytes = tuple(
+            chunk_size * weight_element_size for chunk_size in weight_chunk_sizes
         )
         logger.info(
-            "Inferred %d chunked Triton TBE weight chunks with largest chunk "
-            "size %d bytes, tbe_chunk_size_limit=%d bytes, and weight precision %s",
+            "Inferred %d whole-table Triton TBE weight chunks for %d local tables "
+            "with total size %d bytes, minimum chunk size %d bytes, average chunk "
+            "size %d bytes, maximum chunk size %d bytes, "
+            "tbe_chunk_size_limit=%d bytes, and weight precision %s",
             len(weight_chunk_sizes),
-            largest_chunk_nbytes,
+            len(embedding_specs),
+            sum(weight_chunk_nbytes),
+            min(weight_chunk_nbytes),
+            sum(weight_chunk_nbytes) // len(weight_chunk_nbytes),
+            max(weight_chunk_nbytes),
             tbe_chunk_size_limit,
             weights_precision,
         )

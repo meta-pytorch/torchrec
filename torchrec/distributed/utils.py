@@ -12,6 +12,7 @@ import logging
 import pdb  # noqa
 import sys
 from collections import OrderedDict
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
@@ -44,6 +45,143 @@ from torchrec.types import CopyMixIn
 
 logger: logging.Logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+_MAX_WEIGHT_CHUNKS: int = 16
+
+
+def _table_element_sizes(
+    embedding_specs: Sequence[tuple[int, int]],
+    weight_element_size: int,
+    tbe_chunk_size_limit: int,
+) -> tuple[list[int], int, int]:
+    if not embedding_specs:
+        raise ValueError("Chunked Triton TBE requires at least one local table")
+
+    table_element_sizes = []
+    oversized_table_count = 0
+    largest_oversized_table_nbytes = 0
+    for rows, dim in embedding_specs:
+        if rows <= 0 or dim <= 0:
+            raise ValueError(
+                "Chunked Triton TBE requires positive local table dimensions"
+            )
+        table_element_size = rows * dim
+        table_element_sizes.append(table_element_size)
+        table_nbytes = table_element_size * weight_element_size
+        if table_nbytes > tbe_chunk_size_limit:
+            oversized_table_count += 1
+            largest_oversized_table_nbytes = max(
+                largest_oversized_table_nbytes,
+                table_nbytes,
+            )
+    return (
+        table_element_sizes,
+        oversized_table_count,
+        largest_oversized_table_nbytes,
+    )
+
+
+def _pack_whole_tables(
+    table_element_sizes: Sequence[int],
+    weight_element_size: int,
+    tbe_chunk_size_limit: int,
+) -> tuple[tuple[int, ...], bool]:
+    weight_chunk_sizes = []
+    current_chunk_size = 0
+    hit_chunk_cap = False
+    for table_index, table_element_size in enumerate(table_element_sizes):
+        is_final_table = table_index == len(table_element_sizes) - 1
+        exceeds_limit = (
+            current_chunk_size + table_element_size
+        ) * weight_element_size > tbe_chunk_size_limit
+        needs_second_chunk = is_final_table and not weight_chunk_sizes
+        should_start_new_chunk = current_chunk_size > 0 and (
+            exceeds_limit or needs_second_chunk
+        )
+        if should_start_new_chunk:
+            if len(weight_chunk_sizes) < _MAX_WEIGHT_CHUNKS - 1:
+                weight_chunk_sizes.append(current_chunk_size)
+                current_chunk_size = 0
+            else:
+                hit_chunk_cap = True
+        current_chunk_size += table_element_size
+
+    weight_chunk_sizes.append(current_chunk_size)
+    return tuple(weight_chunk_sizes), hit_chunk_cap
+
+
+def _log_partition_warnings(
+    table_count: int,
+    oversized_table_count: int,
+    largest_oversized_table_nbytes: int,
+    weight_chunk_sizes: Sequence[int],
+    weight_element_size: int,
+    tbe_chunk_size_limit: int,
+    hit_chunk_cap: bool,
+) -> None:
+    if table_count == 1:
+        logger.warning(
+            "ChunkedShardedTritonBatchedFusedEmbeddingBag has one local table, "
+            "so whole-table partitioning cannot produce the minimum 2 weight "
+            "chunks; proceeding with 1 chunk"
+        )
+    if oversized_table_count > 0:
+        logger.warning(
+            "ChunkedShardedTritonBatchedFusedEmbeddingBag has %d local table(s) "
+            "larger than tbe_chunk_size_limit=%d bytes; the largest is %d bytes. "
+            "Keeping each oversized table whole",
+            oversized_table_count,
+            tbe_chunk_size_limit,
+            largest_oversized_table_nbytes,
+        )
+    if hit_chunk_cap:
+        logger.warning(
+            "ChunkedShardedTritonBatchedFusedEmbeddingBag reached the maximum "
+            "supported 16 weight chunks, but whole-table packing requires "
+            "additional chunks; the final chunk is %d bytes, exceeding "
+            "tbe_chunk_size_limit=%d bytes; proceeding with 16 chunks",
+            weight_chunk_sizes[-1] * weight_element_size,
+            tbe_chunk_size_limit,
+        )
+
+
+def infer_weight_chunk_sizes(
+    embedding_specs: Sequence[tuple[int, int]],
+    weights_precision: SparseType,
+    tbe_chunk_size_limit: int,
+) -> tuple[int, ...]:
+    """Greedily pack complete local embedding tables into weight chunks."""
+    if tbe_chunk_size_limit <= 0:
+        raise ValueError("tbe_chunk_size_limit must be positive")
+
+    weight_element_size = weights_precision.bit_rate() // 8
+    if weight_element_size <= 0:
+        raise ValueError(
+            f"Unsupported sub-byte weight precision {weights_precision} for chunking"
+        )
+
+    table_element_sizes, oversized_table_count, largest_oversized_table_nbytes = (
+        _table_element_sizes(
+            embedding_specs,
+            weight_element_size,
+            tbe_chunk_size_limit,
+        )
+    )
+    weight_chunk_sizes, hit_chunk_cap = _pack_whole_tables(
+        table_element_sizes,
+        weight_element_size,
+        tbe_chunk_size_limit,
+    )
+    _log_partition_warnings(
+        len(table_element_sizes),
+        oversized_table_count,
+        largest_oversized_table_nbytes,
+        weight_chunk_sizes,
+        weight_element_size,
+        tbe_chunk_size_limit,
+        hit_chunk_cap,
+    )
+    return weight_chunk_sizes
+
 
 """
 torch.package safe functions from pyre_extensions. However, pyre_extensions is
