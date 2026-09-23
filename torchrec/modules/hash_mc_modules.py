@@ -648,6 +648,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         features: Dict[str, JaggedTensor],
         mutate_miss_lengths: bool = True,
         write_weights: Optional[torch.Tensor] = None,
+        length_per_key: Optional[torch.Tensor] = None,
     ) -> Dict[str, JaggedTensor]:
         readonly: bool = False
         if self._output_global_offset_tensor is not None:
@@ -689,7 +690,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 self._assert_identity_dtype_matches_input(name, values)
 
                 input_metadata, eviction_threshold = (
-                    self._eviction_module(feature)
+                    self._eviction_module(feature, length_per_key=length_per_key)
                     if self._eviction_module is not None
                     else (None, -1)
                 )
