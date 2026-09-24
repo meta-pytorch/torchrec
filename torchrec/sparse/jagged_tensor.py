@@ -3083,6 +3083,12 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 permuted_length_per_key_sum,
             )
 
+        # FBGEMM CUDA may return an undefined Tensor instead of None for absent weights.
+        # Restore a real None so subsequent permutations do not treat it as supplied
+        # weights.
+        if self.weights_or_none() is None:
+            permuted_weights = None
+
         kjt = KeyedJaggedTensor(
             keys=permuted_keys,
             values=permuted_values,

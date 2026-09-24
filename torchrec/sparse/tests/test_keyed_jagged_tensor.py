@@ -13,6 +13,7 @@ from typing import List, Tuple
 
 import torch
 import torch.utils._pytree as pytree
+from hypothesis import given, settings, strategies as st
 from torch.testing import FileCheck
 from torchrec.fx import symbolic_trace
 from torchrec.sparse.jagged_tensor import (
@@ -1902,6 +1903,80 @@ class TestKeyedJaggedTensorGPU(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.device = torch.cuda.current_device()
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @given(has_weights=st.booleans(), empty=st.booleans())
+    @settings(deadline=None)
+    def test_scripted_permute_preserves_optional_weights(
+        self, has_weights: bool, empty: bool
+    ) -> None:
+        class PermuteModule(torch.nn.Module):
+            def forward(
+                self, kjt: KeyedJaggedTensor
+            ) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
+                first = kjt.permute([1, 0])
+                return first, first.permute([1, 0])
+
+        values = torch.tensor(
+            [] if empty else [1, 2, 3], dtype=torch.int64, device=self.device
+        )
+        lengths = torch.tensor(
+            [0, 0, 0, 0] if empty else [2, 0, 0, 1],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        weights = (
+            torch.tensor([] if empty else [0.5, 1.0, 1.5], device=self.device)
+            if has_weights
+            else None
+        )
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["index_0", "index_1"],
+            values=values,
+            lengths=lengths,
+            weights=weights,
+        )
+        module = torch.jit.script(PermuteModule())
+        # Bypass Python autograd wrappers, which can convert an undefined Tensor
+        # to None and mask the native TorchScript failure on the second permute.
+        with torch.inference_mode():
+            first, second = module(kjt)
+
+        self.assertEqual(first.keys(), ["index_1", "index_0"])
+        torch.testing.assert_close(
+            first.values(),
+            torch.tensor(
+                [] if empty else [3, 1, 2], dtype=torch.int64, device=self.device
+            ),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            first.lengths(),
+            torch.tensor(
+                [0, 0, 0, 0] if empty else [0, 1, 2, 0],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            rtol=0,
+            atol=0,
+        )
+        if has_weights:
+            torch.testing.assert_close(
+                first.weights(),
+                torch.tensor([] if empty else [1.5, 0.5, 1.0], device=self.device),
+                rtol=0,
+                atol=0,
+            )
+        else:
+            self.assertIsNone(first.weights_or_none())
+        self.assertEqual(second.keys(), kjt.keys())
+        torch.testing.assert_close(second.values(), values, rtol=0, atol=0)
+        torch.testing.assert_close(second.lengths(), lengths, rtol=0, atol=0)
+        torch.testing.assert_close(second.weights_or_none(), weights, rtol=0, atol=0)
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
