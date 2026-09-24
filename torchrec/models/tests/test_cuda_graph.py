@@ -22,6 +22,7 @@ is logged for the human reading the test output.
 """
 
 import logging
+import sys
 import time
 import unittest
 
@@ -64,6 +65,10 @@ def _gen_batch(device: torch.device) -> tuple[torch.Tensor, KeyedJaggedTensor]:
     )
 
 
+@unittest.skipIf(
+    sys.version_info >= (3, 15),
+    "Triton is not supported on Python 3.15+",
+)
 @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA Graphs require a GPU")
 class DLRMCudaGraphTest(unittest.TestCase):
