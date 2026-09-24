@@ -9,16 +9,33 @@
 
 import unittest
 from typing import cast, List, Tuple
+from unittest.mock import patch
 
 import torch
+from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    ComputeDevice,
+    DenseTableBatchedEmbeddingBagsCodegen,
+    EmbeddingLocation,
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata
 from torch.distributed._shard.sharded_tensor.metadata import TensorProperties
 from torchrec.distributed.batched_embedding_kernel import (
+    _gen_named_parameters_by_table_dense,
+    _gen_named_parameters_by_table_fused,
     _get_grid_shard_cw_count,
+    EmbeddingFusedOptimizer,
     KeyValueEmbeddingFusedOptimizer,
 )
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.distributed.sharding_plan import _calculate_grid_shard_sizes_and_offsets
+from torchrec.modules.embedding_configs import DataType, PoolingType
 
 
 def _grid_shards(
@@ -167,3 +184,137 @@ class GridShardPlannerLayoutTest(unittest.TestCase):
             sum(s.shard_sizes[0] for s in rowwise_md.shards_metadata),
         )
         self.assertEqual(rowwise_md.size, torch.Size([rows * 2]))
+
+
+class GridShardParameterSliceTest(unittest.TestCase):
+    def _config(
+        self, row_sizes: List[int], kernel: EmbeddingComputeKernel
+    ) -> GroupedEmbeddingConfig:
+        tables = []
+        for name, sizes in (("table", row_sizes), ("neighbor", [9])):
+            shards = []
+            row_offset = 0
+            for rows in sizes:
+                shards.append(
+                    ShardMetadata(
+                        shard_sizes=[rows, 32],
+                        shard_offsets=[row_offset, 0],
+                        placement="rank:0/cpu",
+                    )
+                )
+                row_offset += rows
+            metadata = ShardedTensorMetadata(
+                shards_metadata=shards,
+                size=torch.Size([sum(sizes), 32]),
+                tensor_properties=TensorProperties(dtype=torch.float32),
+            )
+            for shard in shards:
+                tables.append(
+                    ShardedEmbeddingTable(
+                        name=name,
+                        num_embeddings=sum(sizes),
+                        embedding_dim=32,
+                        feature_names=[name],
+                        local_rows=shard.shard_sizes[0],
+                        local_cols=32,
+                        local_metadata=shard,
+                        global_metadata=metadata,
+                        compute_kernel=kernel,
+                    )
+                )
+        return GroupedEmbeddingConfig(
+            data_type=DataType.FP32,
+            pooling=PoolingType.SUM,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=kernel,
+            embedding_tables=tables,
+        )
+
+    def _check_slices(
+        self,
+        row_sizes: List[int],
+        fused: bool,
+        precision: SparseType = SparseType.FP32,
+        row_slicing_enabled: bool = True,
+    ) -> None:
+        all_rows = row_sizes + [9]
+        counts = {"table": len(row_sizes), "neighbor": 1}
+        if fused:
+            fused_module = SplitTableBatchedEmbeddingBagsCodegen(
+                embedding_specs=[
+                    (rows, 32, EmbeddingLocation.HOST, ComputeDevice.CPU)
+                    for rows in all_rows
+                ],
+                optimizer=EmbOptimType.EXACT_SGD,
+                weights_precision=precision,
+                device=torch.device("cpu"),
+            )
+            native_weights = fused_module.split_embedding_weights()
+            config = self._config(row_sizes, EmbeddingComputeKernel.FUSED)
+            with patch(
+                "torch._utils_internal.justknobs_check",
+                return_value=row_slicing_enabled,
+            ):
+                parameters = dict(
+                    _gen_named_parameters_by_table_fused(fused_module, counts, config)
+                )
+            for weight in parameters.values():
+                optimizers = cast(
+                    List[EmbeddingFusedOptimizer],
+                    vars(weight)["_in_backward_optimizers"],
+                )
+                self.assertEqual(len(optimizers), 1)
+                self.assertIs(optimizers[0].params[""], weight)
+                self.assertIs(optimizers[0]._emb_module, fused_module)
+        else:
+            dense_module = DenseTableBatchedEmbeddingBagsCodegen(
+                embedding_specs=[(rows, 32) for rows in all_rows],
+                use_cpu=True,
+            )
+            native_weights = dense_module.split_embedding_weights()
+            config = self._config(row_sizes, EmbeddingComputeKernel.DENSE)
+            with patch(
+                "torch._utils_internal.justknobs_check",
+                return_value=row_slicing_enabled,
+            ):
+                parameters = dict(
+                    _gen_named_parameters_by_table_dense(dense_module, counts, config)
+                )
+        with torch.no_grad():
+            for index, weight in enumerate(native_weights):
+                weight.fill_(index + 1)
+        saved_table = torch.cat(native_weights[:-1]).clone()
+        saved_neighbor = native_weights[-1].clone()
+        torch.testing.assert_close(parameters["table"], saved_table)
+        torch.testing.assert_close(parameters["neighbor"], saved_neighbor)
+        self.assertEqual(parameters["table"].shape[0], sum(row_sizes))
+
+        model = torch.nn.Module()
+        for name, weight in parameters.items():
+            model.register_parameter(name, weight)
+        with torch.no_grad():
+            parameters["table"].fill_(42)
+        torch.testing.assert_close(native_weights[-1], saved_neighbor)
+        model.load_state_dict({"table": saved_table, "neighbor": saved_neighbor})
+        torch.testing.assert_close(torch.cat(native_weights[:-1]), saved_table)
+        torch.testing.assert_close(native_weights[-1], saved_neighbor)
+
+    def test_dense_slices_and_checkpoint_load(self) -> None:
+        for rows in ([7, 1], [7, 7, 3], [7, 7], [7]):
+            with self.subTest(rows=rows):
+                self._check_slices(rows, fused=False)
+
+    def test_fused_slices_and_checkpoint_load(self) -> None:
+        for rows in ([7, 1], [7, 7, 3], [7, 7], [7]):
+            with self.subTest(rows=rows):
+                self._check_slices(rows, fused=True)
+
+    def test_fused_int8_slices_include_quantization_bytes(self) -> None:
+        self._check_slices([7, 1], fused=True, precision=SparseType.INT8)
+
+    def test_uniform_slices_with_row_slicing_disabled(self) -> None:
+        for fused in (False, True):
+            for rows in ([7, 7], [7]):
+                with self.subTest(fused=fused, rows=rows):
+                    self._check_slices(rows, fused=fused, row_slicing_enabled=False)
