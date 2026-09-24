@@ -602,6 +602,7 @@ def _populate_zero_collision_tbe_params(
                     training_id_eviction_trigger_count[i] = (
                         policy_t.training_id_eviction_trigger_count
                     )
+                    training_id_keep_count[i] = policy_t.training_id_keep_count
                     ttls_in_mins[i] = policy_t.eviction_ttl_mins
                     if eviction_strategy == -1 or eviction_strategy == 0:
                         eviction_strategy = 0
