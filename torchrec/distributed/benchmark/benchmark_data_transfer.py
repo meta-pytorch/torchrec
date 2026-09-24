@@ -398,6 +398,96 @@ def lazyawaitable(
 
 
 @dataclass
+class KJTCumsumIndexConfig(DataCopyConfig):
+    """
+    run commands:
+    1. CPU index baseline, matching the old ``KeyedJaggedTensor.dist_init`` path
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer \
+        kjt_cumsum_index \
+        --name=cpu_index \
+        --copy_cumsum_to_cpu=True
+
+    2. Device index, avoiding the device-to-host synchronization
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer \
+        kjt_cumsum_index \
+        --name=device_index \
+        --copy_cumsum_to_cpu=False
+
+    use case:
+        verify that moving the stride cumsum to CPU introduces a host-visible CUDA
+        synchronization before it is used to index another CUDA tensor. GPU compute
+        queued immediately before the cumsum makes the difference visible in the
+        profiler: the CPU-index variant waits for that work during ``.cpu()``, while
+        the device-index variant queues the cumsum and indexing work asynchronously.
+        This isolates the synchronization behavior; it does not estimate the speedup
+        of a particular production model.
+    """
+
+    name: str = "kjt_cumsum_index"
+    world_size: int = 1
+    num_benchmarks: int = 0
+    num_profiles: int = 2
+    export_stacks: bool = True
+    num_workers: int = 256
+    num_keys: int = 1024
+    stride: int = 16
+    copy_cumsum_to_cpu: bool = True
+
+
+@register_benchmark(KJTCumsumIndexConfig)
+def kjt_cumsum_index(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    num_workers: int = 256,
+    num_keys: int = 1024,
+    stride: int = 16,
+    copy_cumsum_to_cpu: bool = True,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    if num_workers <= 0 or num_keys <= 0 or stride <= 0:
+        raise ValueError("num_workers, num_keys, and stride must be positive")
+
+    num_strides = num_workers * num_keys
+    # Citrine C3: construct benchmark inputs directly on the target device.
+    with record_function("## setup ##"):
+        stride_per_rank_per_key = torch.full(
+            (num_strides,),
+            stride,
+            dtype=torch.int64,
+            device=ctx.device,
+        )
+        lengths = torch.ones(
+            num_strides * stride,
+            dtype=torch.int64,
+            device=ctx.device,
+        )
+
+    with record_function("## irrelevant compute before cumsum and index ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx)
+
+    with record_function("## stride cumsum ##"):
+        strides_cumsum = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            stride_per_rank_per_key
+        )
+
+    if copy_cumsum_to_cpu:
+        with record_function("## stride cumsum to cpu (sync) ##"):
+            strides_cumsum = strides_cumsum.cpu()
+
+    with record_function("## lengths cumsum and index ##"):
+        cumsum_lengths = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        length_per_key_tensor = (
+            cumsum_lengths[strides_cumsum[1:]] - cumsum_lengths[strides_cumsum[:-1]]
+        )
+
+    assert length_per_key_tensor.device == ctx.device
+    assert length_per_key_tensor.numel() == num_strides
+
+
+@dataclass
 class H2DCopyConfig(DataCopyConfig):
     """
     run commands:
