@@ -605,6 +605,58 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    def test_ssd_key_value_fused_optimizer_multi_state(self) -> None:
+        """
+        KeyValueEmbeddingFusedOptimizer must support sparse optimizers with more
+        than one state (PARTIAL_ROWWISE_ADAM keeps momentum1+momentum2).
+        Regression test: per-table optimizer state keys were appended as a
+        single keys() view instead of flattened, so the second state raised
+        IndexError during DMP construction.
+        """
+        kernel_type = EmbeddingComputeKernel.KEY_VALUE.value
+        sharding_type = ShardingType.TABLE_WISE.value
+        constraints = {
+            table.name: ParameterConstraints(
+                sharding_types=[sharding_type],
+                compute_kernels=[kernel_type],
+                key_value_params=KeyValueParams(bulk_init_chunk_size=1024),
+            )
+            for _, table in enumerate(self.tables)
+        }
+        sharders = [
+            create_test_sharder(
+                SharderType.EMBEDDING_BAG_COLLECTION.value,
+                sharding_type,
+                kernel_type,
+                fused_params={
+                    "optimizer": EmbOptimType.PARTIAL_ROWWISE_ADAM,
+                    "learning_rate": 0.1,
+                },
+            ),
+        ]
+        models, _ = self._generate_dmps_and_batch(
+            # pyrefly: ignore[bad-argument-type]
+            sharders,
+            constraints=constraints,
+        )
+        model, _ = models
+
+        self._compare_ssd_fused_optimizer(model)
+
+        for table in self.tables:
+            table_keys = [
+                key
+                for param_state in model._optim.state.values()
+                for key in param_state.keys()
+                if key.startswith(f"{table.name}.")
+            ]
+            self.assertIn(f"{table.name}.momentum1", table_keys)
+            self.assertIn(f"{table.name}.momentum2", table_keys)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     @given(
         sharder_type=st.sampled_from(
             [
