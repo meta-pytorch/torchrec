@@ -37,6 +37,8 @@ class ThroughputMetricTest(unittest.TestCase):
             {
                 "throughput-throughput|total_examples": 0,
                 "throughput-throughput|attempt_examples": 0,
+                "throughput-throughput|attempt_warmup_examples": 0,
+                "throughput-throughput|attempt_time_lapse_after_warmup": 0,
             },
         )
 
@@ -54,6 +56,9 @@ class ThroughputMetricTest(unittest.TestCase):
                 * self.world_size,
                 "throughput-throughput|attempt_examples": self.batch_size
                 * self.world_size,
+                "throughput-throughput|attempt_warmup_examples": self.batch_size
+                * self.world_size,
+                "throughput-throughput|attempt_time_lapse_after_warmup": 0,
             },
         )
 
@@ -105,6 +110,8 @@ class ThroughputMetricTest(unittest.TestCase):
                     {
                         "throughput-throughput|total_examples": total_examples,
                         "throughput-throughput|attempt_examples": total_examples,
+                        "throughput-throughput|attempt_warmup_examples": total_examples,
+                        "throughput-throughput|attempt_time_lapse_after_warmup": 0,
                     },
                 )
                 continue
@@ -142,6 +149,32 @@ class ThroughputMetricTest(unittest.TestCase):
                 ret["throughput-throughput|attempt_throughput"], lifetime_throughput
             )
 
+            attempt_warmup_examples = ret[
+                "throughput-throughput|attempt_warmup_examples"
+            ]
+            attempt_time_lapse = ret[
+                "throughput-throughput|attempt_time_lapse_after_warmup"
+            ]
+            self.assertEqual(
+                attempt_warmup_examples,
+                self.world_size * self.batch_size * warmup_steps,
+            )
+            self.assertEqual(
+                attempt_time_lapse,
+                update_timestamps[i] - update_timestamps[warmup_steps - 1],
+            )
+            # The emitted numerator and denominator must reconstruct the emitted
+            # ratio exactly; downstream aggregation sums them instead of
+            # averaging attempt_throughput.
+            self.assertEqual(
+                (
+                    ret["throughput-throughput|attempt_examples"]
+                    - attempt_warmup_examples
+                )
+                / attempt_time_lapse,
+                ret["throughput-throughput|attempt_throughput"],
+            )
+
     def test_throughput_warmup_steps_0(self) -> None:
         with self.assertRaises(ValueError):
             self._test_throughput(warmup_steps=0)
@@ -154,6 +187,31 @@ class ThroughputMetricTest(unittest.TestCase):
 
     def test_throughput_warmup_steps_10(self) -> None:
         self._test_throughput(warmup_steps=10)
+
+    @patch(THROUGHPUT_PATH + ".time.monotonic")
+    def test_attempt_terms_reported_during_warmup(self, time_mock: Mock) -> None:
+        # An attempt that dies before leaving warmup still has to report both
+        # terms, so a consumer summing numerators and denominators counts it as a
+        # real 0/0 rather than dropping it from the aggregate.
+        time_mock.return_value = 1
+        throughput_metric = ThroughputMetric(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_seconds=100,
+            warmup_steps=10,
+        )
+        for _ in range(3):
+            throughput_metric.update()
+        ret = throughput_metric.compute()
+
+        self.assertEqual(
+            ret["throughput-throughput|attempt_warmup_examples"],
+            3 * self.batch_size * self.world_size,
+        )
+        self.assertEqual(
+            ret["throughput-throughput|attempt_time_lapse_after_warmup"], 0
+        )
+        self.assertNotIn("throughput-throughput|attempt_throughput", ret)
 
     def test_warmup_checkpointing(self) -> None:
         warmup_steps = 5
@@ -220,6 +278,8 @@ class ThroughputMetricTest(unittest.TestCase):
             {
                 "throughput-throughput|total_examples": total_examples,
                 "throughput-throughput|attempt_examples": total_examples,
+                "throughput-throughput|attempt_warmup_examples": total_examples,
+                "throughput-throughput|attempt_time_lapse_after_warmup": 0,
                 "throughput-throughput|batch_size": 256,
             },
         )
@@ -231,6 +291,8 @@ class ThroughputMetricTest(unittest.TestCase):
             {
                 "throughput-throughput|total_examples": total_examples,
                 "throughput-throughput|attempt_examples": total_examples,
+                "throughput-throughput|attempt_warmup_examples": total_examples,
+                "throughput-throughput|attempt_time_lapse_after_warmup": 0,
                 "throughput-throughput|batch_size": 512,
             },
         )

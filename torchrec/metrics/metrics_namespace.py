@@ -46,6 +46,8 @@ class MetricName(MetricNameBase):
     THROUGHPUT = "throughput"
     TOTAL_EXAMPLES = "total_examples"
     ATTEMPT_EXAMPLES = "attempt_examples"
+    ATTEMPT_WARMUP_EXAMPLES = "attempt_warmup_examples"
+    ATTEMPT_TIME_LAPSE_AFTER_WARMUP = "attempt_time_lapse_after_warmup"
     BATCH_SIZE = "batch_size"
     CTR = "ctr"
     CALIBRATION = "calibration"

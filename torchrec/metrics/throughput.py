@@ -74,6 +74,8 @@ class ThroughputMetric(nn.Module):
     _attempt_throughput_key: str
     _total_examples_key: str
     _attempt_examples_key: str
+    _attempt_warmup_examples_key: str
+    _attempt_time_lapse_after_warmup_key: str
     _batch_size_key: str
     _steps: int
 
@@ -170,6 +172,16 @@ class ThroughputMetric(nn.Module):
             self._namespace,
             str(self._namespace),
             MetricName.ATTEMPT_EXAMPLES,
+        )
+        self._attempt_warmup_examples_key = compose_metric_key(
+            self._namespace,
+            str(self._namespace),
+            MetricName.ATTEMPT_WARMUP_EXAMPLES,
+        )
+        self._attempt_time_lapse_after_warmup_key = compose_metric_key(
+            self._namespace,
+            str(self._namespace),
+            MetricName.ATTEMPT_TIME_LAPSE_AFTER_WARMUP,
         )
         self._batch_size_key = compose_metric_key(
             self._namespace,
@@ -270,6 +282,13 @@ class ThroughputMetric(nn.Module):
         ret = {
             self._total_examples_key: self.total_examples,
             self._attempt_examples_key: self.attempt_examples,
+            # attempt_throughput below is a ratio, so it cannot be averaged across
+            # attempts. Consumers that roll QPS up to a job or fleet level have to
+            # sum the numerator and denominator separately, which means an attempt
+            # that never left warmup still has to report an explicit zero for both
+            # rather than be absent from the aggregate.
+            self._attempt_warmup_examples_key: self.attempt_warmup_examples,
+            self._attempt_time_lapse_after_warmup_key: self.attempt_time_lapse_after_warmup,
         }
         if self._steps > self._warmup_steps and (
             # pyrefly: ignore[not-callable]
