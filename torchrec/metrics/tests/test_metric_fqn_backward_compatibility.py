@@ -19,24 +19,48 @@ If you need to add a new buffer/state to a metric:
 1. Consider if it can be non-persistent (won't appear in state_dict)
 2. If it must be persistent, coordinate with the trainers team to enable
    allow_partial_load for metrics, OR add a migration path
-3. Update the golden snapshot with --update-golden after confirming the change
-   won't break production training jobs
+3. Edit the affected entries in metric_fqn_golden_snapshot.json by hand, then
+   regenerate to confirm the edit matches what the code produces. The updater
+   refuses to rewrite an entry whose keys changed, so the hand edit is the
+   acknowledgement.
 
-To update the golden snapshot after intentional changes:
-    python -m torchrec.metrics.tests.test_metric_fqn_backward_compatibility --update-golden
+To update the golden snapshot after intentional changes, from fbcode:
+    buck2 run //torchrec/metrics/tests:update_metric_fqn_golden_snapshot -- --update-golden
 """
 
+import contextlib
+import copy
 import inspect
 import json
 import os
 import sys
+import tempfile
 import unittest
+import unittest.mock
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+)
 
 import torch
+from torch.distributed._shard.metadata import ShardMetadata
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.metrics.accuracy import AccuracyMetric
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.auprc import AUPRCMetric
@@ -46,6 +70,8 @@ from torchrec.metrics.calibration import CalibrationMetric
 from torchrec.metrics.calibration_with_recalibration import (
     RecalibratedCalibrationMetric,
 )
+from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
+from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.ctr import CTRMetric
 from torchrec.metrics.gauc import GAUCMetric
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
@@ -60,6 +86,7 @@ from torchrec.metrics.ne import NEMetric
 from torchrec.metrics.ne_positive import NEPositiveMetric
 from torchrec.metrics.ne_with_recalibration import RecalibratedNEMetric
 from torchrec.metrics.nmse import NMSEMetric
+from torchrec.metrics.noop_metric_module import NoOpMetricModule
 from torchrec.metrics.num_missing_labels import NumMissingLabelsMetric
 from torchrec.metrics.num_positive_samples import NumPositiveSamplesMetric
 from torchrec.metrics.output import OutputMetric
@@ -82,10 +109,49 @@ from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
+from torchrec.modules.activation import SwishLayerNorm
+from torchrec.modules.crossnet import (
+    CrossNet,
+    LowRankCrossNet,
+    LowRankMixtureCrossNet,
+    VectorCrossNet,
+)
+from torchrec.modules.embedding_configs import (
+    DataType,
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+    PoolingType,
+)
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+from torchrec.modules.hash_mc_evictions import (
+    HashZchEvictionConfig,
+    HashZchEvictionPolicyName,
+)
+from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
+from torchrec.modules.itep_embedding_modules import (
+    ITEPEmbeddingBagCollection,
+    ITEPEmbeddingCollection,
+)
+from torchrec.modules.itep_modules import GenericITEPModule
+from torchrec.modules.keyed_jagged_tensor_pool import KeyedJaggedTensorPool
+from torchrec.modules.mc_modules import (
+    DistanceLFU_EvictionPolicy,
+    LFU_EvictionPolicy,
+    LRU_EvictionPolicy,
+    MCHEvictionPolicy,
+    MCHManagedCollisionModule,
+)
+from torchrec.modules.mlp import MLP, Perceptron
+from torchrec.modules.tensor_pool import TensorPool
 
 
 # Path to the golden snapshot file
 GOLDEN_SNAPSHOT_PATH = Path(__file__).parent / "metric_fqn_golden_snapshot.json"
+
+_ModuleT = TypeVar("_ModuleT", bound=torch.nn.Module)
 
 
 def create_test_task(
@@ -146,16 +212,6 @@ def build_metric(
     )
 
 
-def extract_state_dict_keys(
-    metric_class: Type[RecMetric],
-    compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-    **kwargs: Any,
-) -> List[str]:
-    return sorted(
-        build_metric(metric_class, compute_mode, **kwargs).state_dict().keys()
-    )
-
-
 def get_metric_snapshot_key(
     metric_class: Type[RecMetric],
     compute_mode: RecComputeMode,
@@ -167,30 +223,38 @@ def get_metric_snapshot_key(
     return key
 
 
-def load_golden_snapshot() -> Dict[str, Dict[str, Any]]:
-    if not GOLDEN_SNAPSHOT_PATH.exists():
+def load_golden_snapshot(
+    path: Path = GOLDEN_SNAPSHOT_PATH,
+) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
         return {}
-    with open(GOLDEN_SNAPSHOT_PATH, "r") as f:
+    with open(path, "r") as f:
         return json.load(f)
 
 
-def load_required_golden_snapshot() -> Dict[str, Dict[str, Any]]:
+def load_required_golden_snapshot(
+    path: Path = GOLDEN_SNAPSHOT_PATH,
+) -> Dict[str, Dict[str, Any]]:
     """The golden snapshot, or raise.
 
     An empty file makes the orphan check pass by having nothing to compare.
+    Regenerating against one would make every entry look new to the gates.
     """
-    snapshot = load_golden_snapshot()
+    snapshot = load_golden_snapshot(path)
     if not snapshot:
         raise RuntimeError(
-            f"{GOLDEN_SNAPSHOT_PATH} is missing or empty. It is checked in, so "
+            f"{path} is missing or empty. It is checked in, so "
             "restore it from source control rather than writing a new one. A "
             "regenerated baseline authorizes whatever the code produces today."
         )
     return snapshot
 
 
-def save_golden_snapshot(snapshot: Dict[str, Dict[str, Any]]) -> None:
-    with open(GOLDEN_SNAPSHOT_PATH, "w") as f:
+def save_golden_snapshot(
+    snapshot: Dict[str, Dict[str, Any]],
+    path: Path = GOLDEN_SNAPSHOT_PATH,
+) -> None:
+    with open(path, "w") as f:
         json.dump(snapshot, f, indent=2, sort_keys=True)
         f.write("\n")
 
@@ -217,23 +281,8 @@ def _make_throughput_metric(
 def _make_rec_metric_module(
     throughput_metric: Optional[ThroughputMetric] = None,
 ) -> RecMetricModule:
-    tasks = [create_test_task("task1")]
     return RecMetricModule(
-        batch_size=32,
-        world_size=1,
-        rec_tasks=tasks,
-        rec_metrics=RecMetricList(
-            [
-                NEMetric(
-                    world_size=1,
-                    my_rank=0,
-                    batch_size=32,
-                    tasks=tasks,
-                    compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-                    window_size=100,
-                )
-            ]
-        ),
+        **_module_fixture_kwargs(),
         throughput_metric=throughput_metric,
     )
 
@@ -286,6 +335,8 @@ _REC_METRIC_MODULE_DEFAULT = _GoldenCase(
     "rec_metric_module", RecMetricModule, "", _make_rec_metric_module
 )
 
+# Each stable_id is the golden file's key. It has to survive a rename of the
+# class beside it, which is why it is snake_case and not a class name.
 _CORE_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
     _GoldenCase("throughput_metric", ThroughputMetric, "", _make_throughput_metric),
     _GoldenCase(
@@ -300,6 +351,385 @@ _CORE_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
         RecMetricModule,
         "with_throughput",
         lambda: _make_rec_metric_module(_make_throughput_metric()),
+    ),
+)
+
+
+def _module_fixture_kwargs() -> Dict[str, Any]:
+    """Construction args shared by every RecMetricModule case.
+
+    One real metric, because an empty RecMetricList produces an empty
+    state_dict. Shared so the enrolled modules keep describing comparable
+    shapes.
+    """
+    tasks = [create_test_task("task1")]
+    return {
+        "batch_size": 32,
+        "world_size": 1,
+        "rec_tasks": tasks,
+        "rec_metrics": RecMetricList(
+            [
+                NEMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=32,
+                    tasks=tasks,
+                    compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+                    window_size=100,
+                )
+            ]
+        ),
+    }
+
+
+class _InertThread:
+    """A Thread that never runs.
+
+    This file only reads a module's state_dict, so CPUOffloadedRecMetricModule's
+    workers do nothing here. It constructs its threads directly, with no seam to
+    pass a substitute through, which is why this one arrives by patch. Without
+    it the module spawns two real workers that then need shutting down.
+
+    The patch target resolves to the shared threading module, so Thread is
+    replaced process-wide for the duration. Safe here: the block wraps one
+    synchronous constructor in a single-threaded suite.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def start(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return False
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        pass
+
+
+def _make_cpu_offloaded_module(
+    throughput_metric: Optional[ThroughputMetric] = None,
+) -> CPUOffloadedRecMetricModule:
+    with unittest.mock.patch(
+        "torchrec.metrics.cpu_offloaded_metric_module.threading.Thread",
+        new=_InertThread,
+    ):
+        return CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            **_module_fixture_kwargs(),
+            throughput_metric=throughput_metric,
+        )
+
+
+def _make_mch_module(policy: MCHEvictionPolicy) -> MCHManagedCollisionModule:
+    return MCHManagedCollisionModule(
+        zch_size=64,
+        device=torch.device("cpu"),
+        eviction_interval=2,
+        eviction_policy=policy,
+    )
+
+
+def _make_hash_zch_module(**overrides: Any) -> HashZchManagedCollisionModule:
+    return HashZchManagedCollisionModule(
+        zch_size=64,
+        device=torch.device("cpu"),
+        total_num_buckets=4,
+        **overrides,
+    )
+
+
+_TABLE_NAME = "table1"
+_FEATURE_NAME = "feature1"
+
+
+class _ITEPEmbedding(torch.nn.Module):
+    def __init__(self, table: ShardedEmbeddingTable) -> None:
+        super().__init__()
+        self._config = GroupedEmbeddingConfig(
+            data_type=DataType.FP32,
+            pooling=PoolingType.SUM,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=EmbeddingComputeKernel.DENSE,
+            embedding_tables=[table],
+        )
+
+
+class _ITEPLookup(torch.nn.Module):
+    def __init__(self, table: ShardedEmbeddingTable) -> None:
+        super().__init__()
+        self._emb_modules = [_ITEPEmbedding(table)]
+
+
+def _make_itep_module() -> GenericITEPModule:
+    """One ITEP module with the pruning buffers, built without a GPU.
+
+    The table and config are real. The shells above stand in for sharded
+    lookups, which need a process group this suite does not have.
+    """
+    table = ShardedEmbeddingTable(
+        name=_TABLE_NAME,
+        embedding_dim=4,
+        num_embeddings=50,
+        feature_names=[_FEATURE_NAME],
+        local_metadata=ShardMetadata(
+            shard_offsets=[0, 0],
+            shard_sizes=[50, 4],
+            placement="rank:0/cpu",
+        ),
+    )
+    lookups: List[torch.nn.Module] = [_ITEPLookup(table)]
+
+    # init_address_lookup only fills the buffers and has no CPU kernel.
+    # Patching it keeps the names, which is all the golden records.
+    with unittest.mock.patch(
+        "torchrec.modules.itep_modules.torch.ops.fbgemm.init_address_lookup"
+    ):
+        return GenericITEPModule(
+            table_name_to_unpruned_hash_sizes={_TABLE_NAME: 100},
+            lookups=lookups,
+        )
+
+
+# Not RecMetric subclasses, so _discover_all_recmetric_subclasses cannot see
+# them. test_all_rec_metric_modules_are_covered catches a missing
+# RecMetricModule; anything else here is enrolled only by its row.
+_MODULE_CASES: Tuple[_GoldenCase, ...] = (
+    _GoldenCase("noop_metric_module", NoOpMetricModule, "", NoOpMetricModule),
+    _GoldenCase(
+        "cpu_comms_rec_metric_module",
+        CPUCommsRecMetricModule,
+        "",
+        lambda: CPUCommsRecMetricModule(**_module_fixture_kwargs()),
+    ),
+    _GoldenCase(
+        "cpu_comms_rec_metric_module",
+        CPUCommsRecMetricModule,
+        "with_throughput",
+        lambda: CPUCommsRecMetricModule(
+            **_module_fixture_kwargs(), throughput_metric=_make_throughput_metric()
+        ),
+    ),
+    # state_dict() reads the comms tree and load_state_dict() writes the offloaded
+    # one, but both carry the same keys, so this pins the shape and not which tree
+    # a load reached. test_cpu_offloaded_metric_module covers the load direction.
+    _GoldenCase(
+        "cpu_offloaded_rec_metric_module",
+        CPUOffloadedRecMetricModule,
+        "",
+        _make_cpu_offloaded_module,
+    ),
+    # The throughput keys reach this tree too, so the base entry above cannot
+    # tell a dropped throughput state from a module that never had one.
+    _GoldenCase(
+        "cpu_offloaded_rec_metric_module",
+        CPUOffloadedRecMetricModule,
+        "with_throughput",
+        lambda: _make_cpu_offloaded_module(_make_throughput_metric()),
+    ),
+    # Buffer names come from the eviction policy, and DistanceLFU is the union
+    # of the other two, so each policy needs its own row.
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "",
+        lambda: _make_mch_module(DistanceLFU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "lfu",
+        lambda: _make_mch_module(LFU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "lru",
+        lambda: _make_mch_module(LRU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "tensor_pool",
+        TensorPool,
+        "",
+        lambda: TensorPool(
+            pool_size=16, dim=4, dtype=torch.float, device=torch.device("cpu")
+        ),
+    ),
+    # enable_uvm adds two CUDA-only buffers, while this test target runs on CPU.
+    _GoldenCase(
+        "keyed_jagged_tensor_pool",
+        KeyedJaggedTensorPool,
+        "",
+        lambda: KeyedJaggedTensorPool(
+            pool_size=16,
+            feature_max_lengths={"f1": 2},
+            device=torch.device("cpu"),
+        ),
+    ),
+    # is_weighted adds a "weights" key; both directions are pinned.
+    _GoldenCase(
+        "keyed_jagged_tensor_pool",
+        KeyedJaggedTensorPool,
+        "weighted",
+        lambda: KeyedJaggedTensorPool(
+            pool_size=16,
+            feature_max_lengths={"f1": 2},
+            is_weighted=True,
+            device=torch.device("cpu"),
+        ),
+    ),
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "",
+        _make_hash_zch_module,
+    ),
+    # persist_hash_zch_bucket=False drops the bucket buffer, for warm-loading
+    # checkpoints written before it existed. Both shapes are real.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "without_bucket_buffer",
+        lambda: _make_hash_zch_module(persist_hash_zch_bucket=False),
+    ),
+    # With no eviction policy the metadata buffer is None and state_dict leaves
+    # it out. Callers normally set one, so pin both shapes.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_eviction",
+        lambda: _make_hash_zch_module(
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(features=[], single_ttl=1),
+        ),
+    ),
+    # track_id_freq adds _hash_zch_runtime_meta, which write_runtime_meta_dim
+    # also adds. The two are mutually exclusive, so one case covers the key.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_runtime_meta",
+        lambda: _make_hash_zch_module(track_id_freq=True),
+    ),
+    # Eviction and runtime metadata compose. Only whether a policy is set
+    # changes the key set, not which one, so pin the pair.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_eviction_and_runtime_meta",
+        lambda: _make_hash_zch_module(
+            eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
+            eviction_config=HashZchEvictionConfig(features=[], single_ttl=-1),
+            track_id_freq=True,
+        ),
+    ),
+    # These entries carry the wrapped collection's weight names too, so a rename
+    # inside the collection fails here, reported under an ITEP id.
+    _GoldenCase(
+        "itep_embedding_bag_collection",
+        ITEPEmbeddingBagCollection,
+        "",
+        lambda: ITEPEmbeddingBagCollection(
+            embedding_bag_collection=EmbeddingBagCollection(
+                tables=[
+                    EmbeddingBagConfig(
+                        name=_TABLE_NAME,
+                        embedding_dim=4,
+                        num_embeddings=50,
+                        feature_names=[_FEATURE_NAME],
+                    )
+                ],
+                device=torch.device("cpu"),
+            ),
+            itep_module=_make_itep_module(),
+        ),
+    ),
+    _GoldenCase(
+        "itep_embedding_collection",
+        ITEPEmbeddingCollection,
+        "",
+        lambda: ITEPEmbeddingCollection(
+            embedding_collection=EmbeddingCollection(
+                tables=[
+                    EmbeddingConfig(
+                        name=_TABLE_NAME,
+                        embedding_dim=4,
+                        num_embeddings=50,
+                        feature_names=[_FEATURE_NAME],
+                    )
+                ],
+                device=torch.device("cpu"),
+            ),
+            itep_module=_make_itep_module(),
+        ),
+    ),
+    # Redundant with the ITEP rows above, which already pin these key paths.
+    # These keep the coverage if the ITEP wrappers are ever removed.
+    _GoldenCase(
+        "embedding_bag_collection",
+        EmbeddingBagCollection,
+        "",
+        lambda: EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name=_TABLE_NAME,
+                    embedding_dim=4,
+                    num_embeddings=50,
+                    feature_names=[_FEATURE_NAME],
+                )
+            ],
+            device=torch.device("cpu"),
+        ),
+    ),
+    _GoldenCase(
+        "embedding_collection",
+        EmbeddingCollection,
+        "",
+        lambda: EmbeddingCollection(
+            tables=[
+                EmbeddingConfig(
+                    name=_TABLE_NAME,
+                    embedding_dim=4,
+                    num_embeddings=50,
+                    feature_names=[_FEATURE_NAME],
+                )
+            ],
+            device=torch.device("cpu"),
+        ),
+    ),
+    # Dense modules. Their state is nn.Parameter reached through submodules,
+    # so a scan for register_buffer does not find them. Keys are attribute
+    # names and positional indices, so a rename or a Sequential reorder moves
+    # every one.
+    _GoldenCase("mlp", MLP, "", lambda: MLP(in_size=4, layer_sizes=[8, 4])),
+    _GoldenCase(
+        "perceptron", Perceptron, "", lambda: Perceptron(in_size=4, out_size=8)
+    ),
+    _GoldenCase(
+        "swish_layer_norm", SwishLayerNorm, "", lambda: SwishLayerNorm(input_dims=4)
+    ),
+    _GoldenCase(
+        "cross_net", CrossNet, "", lambda: CrossNet(in_features=4, num_layers=2)
+    ),
+    _GoldenCase(
+        "low_rank_cross_net",
+        LowRankCrossNet,
+        "",
+        lambda: LowRankCrossNet(in_features=4, num_layers=2),
+    ),
+    _GoldenCase(
+        "vector_cross_net",
+        VectorCrossNet,
+        "",
+        lambda: VectorCrossNet(in_features=4, num_layers=2),
+    ),
+    _GoldenCase(
+        "low_rank_mixture_cross_net",
+        LowRankMixtureCrossNet,
+        "",
+        lambda: LowRankMixtureCrossNet(in_features=4, num_layers=2),
     ),
 )
 
@@ -370,7 +800,9 @@ _METRIC_SPECS: Tuple[_GoldenCase, ...] = (
 )
 
 
-_SCHEMA_CASES: Tuple[_GoldenCase, ...] = _CORE_SCHEMA_CASES + _METRIC_SPECS
+_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
+    _CORE_SCHEMA_CASES + _MODULE_CASES + _METRIC_SPECS
+)
 
 
 def _validate_case_entry(
@@ -504,9 +936,8 @@ class GoldenCaseTest(unittest.TestCase):
         """
         by_id: Dict[str, List[FrozenSet[str]]] = {}
         for case in _SCHEMA_CASES:
-            module = case.build()
             by_id.setdefault(case.stable_id, []).append(
-                frozenset(module.state_dict().keys())
+                frozenset(case.build().state_dict().keys())
             )
 
         for stable_id, entries in by_id.items():
@@ -535,6 +966,107 @@ class RecMetricModuleBackwardCompatibilityTest(unittest.TestCase):
         fresh_module.load_state_dict(state_dict, strict=True)
 
 
+class GoldenRegenerationTest(unittest.TestCase):
+    """The gates on the real generate-validate-save path.
+
+    The tests above call the comparison helpers directly, which says nothing
+    about whether `update_golden_snapshot` consults them or writes anyway. Each
+    case here makes a baseline disagree with the code, runs the whole path
+    against a temporary file, and requires that file to come back untouched.
+
+    Each case passes a temporary path, so the generation, the gates, and the
+    file I/O are all the real ones.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Building every case is the slow part, so pay it once and reuse the
+        # result as the baseline each case then modifies.
+        cls.current: Dict[str, Dict[str, Any]] = generate_schema_case_entries()
+
+    @contextlib.contextmanager
+    def _baseline(self, snapshot: Dict[str, Dict[str, Any]]) -> Iterator[Path]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "golden.json"
+            path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+            yield path
+
+    def _assert_refused(self, baseline: Dict[str, Dict[str, Any]], reason: str) -> None:
+        with self._baseline(baseline) as path:
+            before = path.read_bytes()
+            with self.assertRaises((ValueError, RuntimeError)) as cm:
+                update_golden_snapshot(path)
+            self.assertIn(reason, str(cm.exception))
+            self.assertEqual(path.read_bytes(), before, "the golden was rewritten")
+
+    def _entry_holding_keys(self, baseline: Dict[str, Dict[str, Any]]) -> str:
+        """An entry with at least one state key.
+
+        Six entries legitimately have none, the AUC family among them, and they
+        sort first. Modifying one of those changes nothing and the gate has
+        nothing to catch.
+        """
+        for key in sorted(baseline):
+            if baseline[key]["state_dict_keys"]:
+                return key
+        self.fail("no golden entry holds a state key")
+
+    def test_an_empty_baseline_is_refused(self) -> None:
+        self._assert_refused({}, "restore it from source control")
+
+    def test_a_changed_entry_is_refused(self) -> None:
+        """Both directions, because they break different loads.
+
+        An added key is rejected by the planner before load_state_dict runs.
+        A removed key is still carried by older checkpoints and read back by a
+        checkpoint-derived load.
+        """
+        for label, modify_keys_fn in (
+            # Drop a key from the baseline, so the live code looks like it
+            # added one.
+            ("added", lambda keys: keys[1:]),
+            ("removed", lambda keys: keys + ["a_key_the_code_no_longer_produces"]),
+        ):
+            with self.subTest(label):
+                baseline = copy.deepcopy(type(self).current)
+                key = self._entry_holding_keys(baseline)
+                baseline[key]["state_dict_keys"] = modify_keys_fn(
+                    baseline[key]["state_dict_keys"]
+                )
+                self._assert_refused(baseline, "change the state_dict keys")
+
+    def test_a_dropped_entry_is_refused(self) -> None:
+        baseline = copy.deepcopy(type(self).current)
+        baseline["AnEntryTheCodeNoLongerProduces"] = {"state_dict_keys": []}
+        self._assert_refused(baseline, "remove golden entries")
+
+    def test_a_brand_new_entry_is_written(self) -> None:
+        """A new case has no baseline to break, so it needs no acknowledgement.
+
+        Named, not searched for: most key sets are shared by several entries,
+        so asking whether one appears anywhere would accept a sibling's.
+        """
+        baseline = copy.deepcopy(type(self).current)
+        key = self._entry_holding_keys(baseline)
+        fresh = baseline.pop(key)
+        with self._baseline(baseline) as path:
+            update_golden_snapshot(path)
+            written = json.loads(path.read_text())
+        self.assertIn(key, written)
+        self.assertEqual(written[key], fresh)
+
+    def test_an_unchanged_baseline_is_rewritten_identically(self) -> None:
+        """Byte-identical, so regeneration never churns the file on its own.
+
+        The other cases parse what was written, which says nothing about
+        indent, key order, or the trailing newline.
+        """
+        with self._baseline(type(self).current) as path:
+            before = path.read_bytes()
+            update_golden_snapshot(path)
+            self.assertEqual(path.read_bytes(), before)
+
+
 class MetricCoverageTest(unittest.TestCase):
     """
     Test that ensures all RecMetric subclasses are covered by backward compatibility tests.
@@ -546,8 +1078,8 @@ class MetricCoverageTest(unittest.TestCase):
 
     # Metrics that are intentionally excluded from testing (with reason)
     EXCLUDED_METRICS: Dict[str, str] = {
-        # Add metrics here that should be excluded, with a reason
-        # e.g., "SomeMetric": "deprecated, will be removed in next release",
+        # Class names, with a reason, e.g.
+        # "SomeMetric": "deprecated, removed next release",
     }
 
     @unittest.skipIf(
@@ -563,6 +1095,15 @@ class MetricCoverageTest(unittest.TestCase):
             spec.expected_class.__name__ for spec in _METRIC_SPECS
         }
 
+        # A metric the walk stops finding drops out of the check below without
+        # failing it. That happens when torchrec.metrics is reorganized, which
+        # is a change nobody reviewing this file sees.
+        self.assertEqual(
+            covered_metrics - discovered_metrics,
+            set(),
+            "METRICS_TO_TEST names classes that discovery does not find",
+        )
+
         missing_metrics = (
             discovered_metrics - covered_metrics - set(self.EXCLUDED_METRICS.keys())
         )
@@ -576,6 +1117,49 @@ class MetricCoverageTest(unittest.TestCase):
                 f"so the row is the whole registration.\n"
                 f"2. Run with --update-golden to write its entry.\n\n"
                 f"If the metric should be excluded, add it to EXCLUDED_METRICS with a reason."
+            )
+
+    @unittest.skipIf(
+        sys.version_info < (3, 11),
+        "concurrent.futures._base.Future is type but not a class",
+    )
+    def test_all_rec_metric_modules_are_covered(self) -> None:
+        """Deleting an id fails, but never adding one does not.
+
+        The orphan check only compares golden entries to the table, so a
+        subclass that was never enrolled leaves both sides agreeing.
+        """
+        # Compared as classes, not names, so two classes sharing a __name__
+        # cannot satisfy each other. Names are formatted for the message only.
+        discovered_modules: Set[Type[torch.nn.Module]] = set(
+            _discover_subclasses(RecMetricModule)
+        )
+
+        covered_modules: Set[Type[torch.nn.Module]] = {
+            case.expected_class
+            for case in _SCHEMA_CASES
+            if issubclass(case.expected_class, RecMetricModule)
+            and case.expected_class is not RecMetricModule
+        }
+
+        self.assertEqual(
+            covered_modules - discovered_modules,
+            set(),
+            "_MODULE_CASES names classes that discovery does not find",
+        )
+
+        missing_modules = discovered_modules - covered_modules
+
+        if missing_modules:
+            names = sorted(f"{c.__module__}.{c.__qualname__}" for c in missing_modules)
+            self.fail(
+                f"The following RecMetricModule subclasses are not covered by "
+                f"backward compatibility tests: {names}.\n\n"
+                f"To fix this:\n"
+                f"1. Add a _MODULE_CASES row with a snake_case stable_id and a "
+                f"builder. The row is the whole registration.\n"
+                f"2. Run with --update-golden to write its entry.\n\n"
+                f"There is no exclusion list; add one if a module must stay out."
             )
 
 
@@ -629,6 +1213,10 @@ _PARAM_ALTERNATIVES: Dict[str, List[Any]] = {
     "description": ["test_description"],
     "is_negative_task_mask": [[True]],
     "label_names": [["label_a", "label_b"]],
+    # default + 1.0 is 1.0, which collides with max_prediction and trips the
+    # min < max check, so the auto-generated value is never usable.
+    "min_prediction": [0.1],
+    "number_of_classes": [5],
     "pairwise_weight_key": ["pairwise_weight"],
     "score_key": ["score"],
 }
@@ -653,10 +1241,28 @@ def _get_metric_specific_params(
     return params
 
 
+_CONSTRUCTION_KWARGS: Dict[str, Dict[str, Any]] = {
+    # Required, so the probe cannot build the metric without it.
+    "MulticlassRecallMetric": {"number_of_classes": 3},
+    # Its computation rejects any task without a tensor_name.
+    "TensorWeightedAvgMetric": {"use_tensor_task": True},
+}
+
+
+def _construction_kwargs(metric_cls: Type[RecMetric]) -> Dict[str, Any]:
+    return _CONSTRUCTION_KWARGS.get(metric_cls.__name__, {})
+
+
 def _generate_alternatives(
     param: inspect.Parameter,
+    baseline: Any = None,
 ) -> List[Any]:
-    """Auto-generate alternative values for a param based on its default."""
+    """Auto-generate alternative values for a param based on its default.
+
+    A required param has no signature default, so the caller can supply the
+    value its fixture builds with instead. Without that, every required param
+    reads as unprobeable even when varying it is trivial.
+    """
     name = param.name
     default = param.default
 
@@ -664,6 +1270,9 @@ def _generate_alternatives(
         return _PARAM_ALTERNATIVES[name]
 
     if default is inspect.Parameter.empty:
+        default = baseline
+
+    if default is inspect.Parameter.empty or default is None:
         return []
 
     if isinstance(default, bool):
@@ -677,7 +1286,8 @@ def _generate_alternatives(
     return []
 
 
-# Params that produce different state_dict keys. Uses strings (includes ThroughputMetric/nn.Module).
+# Params that change the state_dict keys. Compared for exact equality, so a
+# param that stops changing them must lose its entry here.
 KNOWN_CONDITIONAL_STATE: Set[Tuple[str, str]] = {
     ("MSEMetric", "include_r_squared"),
     ("MultiLabelPrecisionMetric", "label_names"),
@@ -687,43 +1297,46 @@ KNOWN_CONDITIONAL_STATE: Set[Tuple[str, str]] = {
     ("TowerQPSMetric", "batch_size_stages"),
 }
 
-# Params that do NOT affect state_dict keys. Every non-base param must be here
-# or in KNOWN_CONDITIONAL_STATE.
-KNOWN_SAFE_PARAMS: Set[Tuple[str, str]] = {
-    ("AUCMetric", "apply_bin"),
-    ("AUCMetric", "grouped_auc"),
-    ("AUPRCMetric", "grouped_auprc"),
-    ("AUPRCMetric", "max_prediction"),
-    ("AUPRCMetric", "min_prediction"),
-    ("AUPRCMetric", "num_bins"),
-    ("AccuracyMetric", "threshold"),
-    ("HindsightTargetPRMetric", "target_precision"),
-    ("NDCGMetric", "exponential_gain"),
-    ("NDCGMetric", "is_negative_task_mask"),
-    ("NDCGMetric", "k"),
-    ("NDCGMetric", "remove_single_length_sessions"),
-    ("NDCGMetric", "report_ndcg_as_decreasing_curve"),
-    ("NDCGMetric", "scale_by_weights_tensor"),
-    ("NDCGMetric", "session_key"),
-    ("NEMetric", "include_logloss"),
-    ("PrecisionMetric", "threshold"),
-    ("RAUCMetric", "grouped_rauc"),
-    ("RecalibratedCalibrationMetric", "recalibration_coefficient"),
-    ("RecalibratedNEMetric", "include_logloss"),
-    ("RecalibratedNEMetric", "recalibration_coefficient"),
-    ("RecallMetric", "threshold"),
-    ("SegmentedNEMetric", "cast_keys_to_int"),
-    ("SegmentedNEMetric", "grouping_keys"),
-    ("SegmentedNEMetric", "include_logloss"),
-    ("SegmentedNEMetric", "num_groups"),  # changes tensor shapes, not key names
-    ("SessionPairwiseAUCMetric", "pairwise_weight_key"),
-    ("SessionPairwiseAUCMetric", "rank_order_label"),
-    ("SessionPairwiseAUCMetric", "remove_zero_weight_from_pair"),
-    ("SessionPairwiseAUCMetric", "score_key"),
-    ("SessionPairwiseAUCMetric", "session_key"),
-    ("SessionPairwiseAUCMetric", "weight_pairs"),
-    ("TensorWeightedAvgMetric", "description"),
-    ("TowerQPSMetric", "warmup_steps"),
+# Params no probe can settle, each with the reason the probe gives. Safe is
+# the default: a param in neither this map nor KNOWN_CONDITIONAL_STATE was
+# probed and left the keys alone, so it needs no entry anywhere.
+#
+# The reason is declared, not just reported. "empty state_dict" means the
+# probe ran and found nothing; the others mean it never ran. A param sliding
+# between those is a regression from verified to unprobed, and comparing only
+# the pairs would not see it.
+UNVERIFIABLE_PARAMS: Dict[Tuple[str, str], str] = {
+    ("AUCMetric", "apply_bin"): "state_dict is empty under every probed value",
+    ("AUCMetric", "grouped_auc"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "grouped_auprc"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "max_prediction"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "min_prediction"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "num_bins"): "state_dict is empty under every probed value",
+    ("RAUCMetric", "grouped_rauc"): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "pairwise_weight_key",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "rank_order_label",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "remove_zero_weight_from_pair",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "score_key",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "session_key",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "weight_pairs",
+    ): "state_dict is empty under every probed value",
 }
 
 # Subset with proper always-pop hooks (cross-config load tests use these).
@@ -752,96 +1365,176 @@ _THROUGHPUT_COMMON_KWARGS: Dict[str, Any] = {
 _cached_recmetric_subclasses: Optional[Set[Type[RecMetric]]] = None
 
 
-def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
-    """Discover all RecMetric subclasses in torchrec.metrics."""
-    global _cached_recmetric_subclasses
-    if _cached_recmetric_subclasses is not None:
-        return _cached_recmetric_subclasses
+def _discover_subclasses(base: Type[_ModuleT]) -> Set[Type[_ModuleT]]:
+    """Every public strict subclass of base in torchrec.metrics.
 
+    A module that would not import used to be skipped in silence. All 51
+    modules import today, so a failure here is news rather than noise.
+    """
     import importlib
     import pkgutil
 
     import torchrec.metrics
 
-    subclasses: Set[Type[RecMetric]] = set()
+    subclasses: Set[Type[_ModuleT]] = set()
+    failures: List[str] = []
     for _, module_name, _ in pkgutil.iter_modules(torchrec.metrics.__path__):
         try:
             module = importlib.import_module(f"torchrec.metrics.{module_name}")
-            for attr_name in dir(module):
-                attr = getattr(module, attr_name)
-                if (
-                    isinstance(attr, type)
-                    and issubclass(attr, RecMetric)
-                    and attr is not RecMetric
-                    and not attr_name.startswith("_")
-                ):
-                    subclasses.add(attr)
-        except ImportError:
+        except Exception as e:
+            failures.append(
+                f"  torchrec.metrics.{module_name}: {type(e).__name__}: {e}"
+            )
             continue
-    _cached_recmetric_subclasses = subclasses
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if (
+                isinstance(attr, type)
+                and issubclass(attr, base)
+                and attr is not base
+                and not attr_name.startswith("_")
+            ):
+                subclasses.add(attr)
+
+    if failures:
+        detail = "\n".join(failures)
+        raise RuntimeError(
+            f"Could not import every torchrec.metrics module:\n{detail}\n"
+            "A module skipped here hides its classes from the coverage checks, "
+            "which assert discovery is a subset of the table. Anything that "
+            "shrinks discovery makes that assertion easier to satisfy."
+        )
+
     return subclasses
 
 
-def _get_default_keys_cached(
-    metric_cls: Type[RecMetric],
-    cls_name: str,
-    default_keys_cache: Optional[Dict[str, Set[str]]] = None,
-) -> Optional[Set[str]]:
-    """Get default state_dict keys for a metric, using cache if available."""
-    if default_keys_cache is not None and cls_name in default_keys_cache:
-        return default_keys_cache[cls_name]
+def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
+    global _cached_recmetric_subclasses
+    if _cached_recmetric_subclasses is None:
+        _cached_recmetric_subclasses = _discover_subclasses(RecMetric)
+    return _cached_recmetric_subclasses
+
+
+def _default_keys(metric_cls: Type[RecMetric]) -> Optional[Set[str]]:
+    """The state_dict keys a metric has under its default configuration.
+
+    None when it will not build, which the caller reports as unverifiable.
+    """
     try:
-        default_keys = set(extract_state_dict_keys(metric_cls))
+        return set(
+            build_metric(metric_cls, **_construction_kwargs(metric_cls)).state_dict()
+        )
     except (TypeError, ValueError, KeyError, RecMetricException):
         return None
-    if default_keys_cache is not None:
-        default_keys_cache[cls_name] = default_keys
-    return default_keys
 
 
-def _probe_alternatives(
-    metric_cls: Type[RecMetric],
-    param_name: str,
-    alternatives: List[Any],
-    default_keys: Set[str],
-) -> Optional[str]:
-    """Probe alternative param values. Returns 'misclassified', 'unprobed', or None."""
+def _recmetric_variant_keys(
+    metric_cls: Type[RecMetric], param_name: str, alt_value: Any
+) -> Optional[Set[str]]:
+    try:
+        # Merged, not double-splatted: the probed param may BE the hint, and
+        # duplicate keyword arguments raise.
+        probe_kwargs = {
+            **_construction_kwargs(metric_cls),
+            param_name: alt_value,
+        }
+        return set(build_metric(metric_cls, **probe_kwargs).state_dict())
+    except (TypeError, ValueError, KeyError, RecMetricException):
+        return None
+
+
+def _throughput_keys(**overrides: Any) -> Optional[Set[str]]:
+    try:
+        return set(
+            ThroughputMetric(**{**_THROUGHPUT_COMMON_KWARGS, **overrides}).state_dict()
+        )
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _classify_param(
+    pair: Tuple[str, str],
+    param: inspect.Parameter,
+    default_keys: Optional[Set[str]],
+    probe: Callable[[str, Any], Optional[Set[str]]],
+    conditional: Set[Tuple[str, str]],
+    unverifiable: Dict[Tuple[str, str], str],
+    baseline: Any = None,
+) -> None:
+    """File one param into exactly one bucket, or neither when it is safe.
+
+    Probed even when the baseline is empty. An alternative that adds the first
+    key is still a change, and skipping the probe would file it as unverifiable
+    for good.
+    """
+    if default_keys is None:
+        unverifiable[pair] = "the metric will not build"
+        return
+
+    alternatives = _generate_alternatives(param, baseline)
+    if not alternatives:
+        unverifiable[pair] = "no alternative value to probe with"
+        return
+
     tested_any = False
     for alt_value in alternatives:
-        try:
-            variant_keys = set(
-                extract_state_dict_keys(metric_cls, **{param_name: alt_value})
-            )
-            tested_any = True
-        except (TypeError, ValueError, KeyError, RecMetricException):
+        variant_keys = probe(pair[1], alt_value)
+        if variant_keys is None:
             continue
-        if default_keys != variant_keys:
-            return "misclassified"
+        tested_any = True
+        if variant_keys != default_keys:
+            conditional.add(pair)
+            return
+
     if not tested_any:
-        return "unprobed"
-    return None
+        unverifiable[pair] = "no alternative value could be built"
+    elif not default_keys:
+        unverifiable[pair] = "state_dict is empty under every probed value"
 
 
-def _classify_known_safe_param(
-    cls_name: str,
-    param_name: str,
-    metrics_by_name: Dict[str, Type[RecMetric]],
-    default_keys_cache: Optional[Dict[str, Set[str]]] = None,
-) -> Optional[str]:
-    """Classify a KNOWN_SAFE_PARAMS entry. Returns category or None if verified safe."""
-    metric_cls = metrics_by_name.get(cls_name)
-    if metric_cls is None:
-        return "stale"
-    params = _get_metric_specific_params(metric_cls)
-    if param_name not in params:
-        return "stale"
-    alternatives = _generate_alternatives(params[param_name])
-    if not alternatives:
-        return "unprobed"
-    default_keys = _get_default_keys_cached(metric_cls, cls_name, default_keys_cache)
-    if default_keys is None:
-        return "unprobed"
-    return _probe_alternatives(metric_cls, param_name, alternatives, default_keys)
+def classify_params() -> Tuple[Set[Tuple[str, str]], Dict[Tuple[str, str], str]]:
+    """Probe every metric-specific param once.
+
+    Returns the pairs observed to change the state_dict keys, and the pairs no
+    probe can settle mapped to why not. A pair in neither was probed and left
+    the keys alone.
+    """
+    conditional: Set[Tuple[str, str]] = set()
+    unverifiable: Dict[Tuple[str, str], str] = {}
+
+    for metric_cls in _discover_all_recmetric_subclasses():
+        cls_name = metric_cls.__name__
+        default_keys = _default_keys(metric_cls)
+        for param_name, param in _get_metric_specific_params(metric_cls).items():
+            _classify_param(
+                (cls_name, param_name),
+                param,
+                default_keys,
+                partial(_recmetric_variant_keys, metric_cls),
+                conditional,
+                unverifiable,
+            )
+
+    # ThroughputMetric is not a RecMetric, so discovery misses it. Walked the
+    # same way rather than varying one argument by hand, so every param of it
+    # is classified and not just the one the golden happens to cover.
+    throughput_default = _throughput_keys()
+    for param_name, param in inspect.signature(
+        ThroughputMetric.__init__
+    ).parameters.items():
+        if param_name == "self":
+            continue
+        _classify_param(
+            ("ThroughputMetric", param_name),
+            param,
+            throughput_default,
+            lambda name, value: _throughput_keys(**{name: value}),
+            conditional,
+            unverifiable,
+            baseline=_THROUGHPUT_COMMON_KWARGS.get(param_name),
+        )
+
+    return conditional, unverifiable
 
 
 class ConditionalStateRegistryTest(unittest.TestCase):
@@ -850,141 +1543,20 @@ class ConditionalStateRegistryTest(unittest.TestCase):
         sys.version_info < (3, 11),
         "concurrent.futures._base.Future is type but not a class",
     )
-    def test_validate_state_affecting_params_recmetrics(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        for metric_cls in all_metrics:
-            try:
-                default_keys = set(extract_state_dict_keys(metric_cls))
-            except (TypeError, ValueError, KeyError, RecMetricException):
-                continue
-            for param_name, param in _get_metric_specific_params(metric_cls).items():
-                alternatives = _generate_alternatives(param)
-                if not alternatives:
-                    continue
-                for alt_value in alternatives:
-                    with self.subTest(metric=metric_cls.__name__, param=param_name):
-                        try:
-                            variant_keys = set(
-                                extract_state_dict_keys(
-                                    metric_cls, **{param_name: alt_value}
-                                )
-                            )
-                        except (TypeError, ValueError, KeyError, RecMetricException):
-                            continue
+    def test_param_classification_is_exactly_declared(self) -> None:
+        """One probe pass, both maps compared for equality, both directions.
 
-                        if default_keys != variant_keys:
-                            self.assertIn(
-                                (metric_cls.__name__, param_name),
-                                KNOWN_CONDITIONAL_STATE,
-                                f"{metric_cls.__name__}.{param_name} affects "
-                                f"state_dict keys but is not in "
-                                f"KNOWN_CONDITIONAL_STATE. "
-                                f"Added: {variant_keys - default_keys}, "
-                                f"Removed: {default_keys - variant_keys}",
-                            )
-
-    @unittest.skipIf(
-        sys.version_info < (3, 11),
-        "concurrent.futures._base.Future is type but not a class",
-    )
-    def test_all_params_categorized(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        uncategorized = []
-        for metric_cls in all_metrics:
-            for param_name in _get_metric_specific_params(metric_cls):
-                pair = (metric_cls.__name__, param_name)
-                if (
-                    pair not in KNOWN_CONDITIONAL_STATE
-                    and pair not in KNOWN_SAFE_PARAMS
-                ):
-                    uncategorized.append(pair)
-
-        if uncategorized:
-            formatted = "\n".join(
-                f'    ("{cls}", "{param}"),' for cls, param in sorted(uncategorized)
-            )
-            self.fail(
-                f"Found {len(uncategorized)} uncategorized metric param(s).\n"
-                f"Each param must be in KNOWN_CONDITIONAL_STATE (if it conditionally\n"
-                f"registers buffers/state) or KNOWN_SAFE_PARAMS (if it does not).\n"
-                f"Add these to the appropriate set:\n{formatted}"
-            )
-
-    @unittest.skipIf(
-        sys.version_info < (3, 11),
-        "concurrent.futures._base.Future is type but not a class",
-    )
-    def test_none_default_params_have_test_values(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        missing = []
-        for metric_cls in all_metrics:
-            for param_name, param in _get_metric_specific_params(metric_cls).items():
-                if param.default is None and param_name not in _PARAM_ALTERNATIVES:
-                    missing.append((metric_cls.__name__, param_name))
-
-        if missing:
-            formatted = "\n".join(
-                f'    "{p}",' for _, p in sorted(set(missing), key=lambda x: x[1])
-            )
-            self.fail(
-                f"Found None-default params without _PARAM_ALTERNATIVES entries.\n"
-                f"These params can't be auto-probed for conditional state.\n"
-                f"Add test values to _PARAM_ALTERNATIVES for:\n{formatted}"
-            )
-
-    @unittest.skipIf(
-        sys.version_info < (3, 11),
-        "concurrent.futures._base.Future is type but not a class",
-    )
-    def test_known_safe_params_are_actually_safe(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        metrics_by_name = {cls.__name__: cls for cls in all_metrics}
-        default_keys_cache: Dict[str, Set[str]] = {}
-        buckets: Dict[str, List[Tuple[str, str]]] = {
-            "stale": [],
-            "misclassified": [],
-            "unprobed": [],
-        }
-        for cls_name, param_name in sorted(KNOWN_SAFE_PARAMS):
-            category = _classify_known_safe_param(
-                cls_name, param_name, metrics_by_name, default_keys_cache
-            )
-            if category is not None:
-                buckets[category].append((cls_name, param_name))
-
-        error_messages = {
-            "stale": "Stale entries (param not in any signature)",
-            "misclassified": (
-                "Misclassified (actually affects state_dict keys, "
-                "move to KNOWN_CONDITIONAL_STATE)"
-            ),
-        }
-        errors = []
-        for key, label in error_messages.items():
-            if buckets[key]:
-                formatted = "\n".join(f'    ("{c}", "{p}"),' for c, p in buckets[key])
-                errors.append(f"{label}:\n{formatted}")
-        if errors:
-            self.fail("KNOWN_SAFE_PARAMS issues:\n" + "\n\n".join(errors))
-
-    def test_validate_state_affecting_params_throughput(self) -> None:
-        default_metric = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
-        variant_metric = ThroughputMetric(
-            **_THROUGHPUT_COMMON_KWARGS,
-            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
-        )
-        default_keys = set(default_metric.state_dict().keys())
-        variant_keys = set(variant_metric.state_dict().keys())
-
-        if default_keys != variant_keys:
-            self.assertIn(
-                ("ThroughputMetric", "batch_size_stages"),
-                KNOWN_CONDITIONAL_STATE,
-                f"ThroughputMetric.batch_size_stages affects state_dict "
-                f"keys but is not in KNOWN_CONDITIONAL_STATE. "
-                f"Added keys: {variant_keys - default_keys}, "
-                f"Removed keys: {default_keys - variant_keys}",
-            )
+        A param that starts changing the keys has to be declared. One that
+        stops has to lose its entry, which an assertIn would never notice.
+        The conditional set is compared against the whole declaration, so an
+        entry naming a class that no longer exists fails here too.
+        """
+        observed, unverifiable = classify_params()
+        self.assertEqual(observed, KNOWN_CONDITIONAL_STATE)
+        # Reasons compared too. A pair whose reason changes has moved between
+        # "probed, nothing to see" and "never probed", which the pairs alone
+        # would not show.
+        self.assertEqual(unverifiable, UNVERIFIABLE_PARAMS)
 
 
 class CrossConfigLoadTest(unittest.TestCase):
@@ -1092,26 +1664,96 @@ def generate_schema_case_entries() -> Dict[str, Dict[str, Any]]:
 
     The comparison path fails rather than writing a missing entry, so this is
     the only way a new case gets one.
+
     """
     entries: Dict[str, Dict[str, Any]] = {}
     for case in _SCHEMA_CASES:
         if case.key in entries:
             raise ValueError(
-                f"Two cases share the key {case.key!r}. One would overwrite the "
-                "other's golden entry."
+                f"Two cases share the key {case.key!r}. One would overwrite "
+                "the other's golden entry."
             )
-        module = case.build()
         entries[case.key] = {
-            "state_dict_keys": sorted(module.state_dict().keys()),
+            "state_dict_keys": sorted(case.build().state_dict().keys()),
         }
     return entries
 
 
-def update_golden_snapshot() -> None:
+def changed_entries(
+    old: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]
+) -> Dict[str, Tuple[List[str], List[str]]]:
+    """For entries both snapshots hold, the state keys regeneration would change.
+
+    Returns key -> (added, removed). Entries missing from either side are
+    skipped: a brand-new case has no baseline to break, and a dropped one is
+    removed_entries' business.
+    """
+    changed: Dict[str, Tuple[List[str], List[str]]] = {}
+    for golden_key, entry in old.items():
+        if golden_key not in new:
+            continue
+        before = set(entry["state_dict_keys"])
+        after = set(new[golden_key]["state_dict_keys"])
+        if before != after:
+            changed[golden_key] = (sorted(after - before), sorted(before - after))
+    return changed
+
+
+def removed_entries(
+    old: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    """Golden entries that regeneration would drop.
+
+    A renamed metric moves its entry, and the replacement looks brand new, so
+    an added key could ride through on the new-entry exemption. Refusing the
+    drop is what closes that.
+    """
+    return sorted(set(old) - set(new))
+
+
+def update_golden_snapshot(path: Path = GOLDEN_SNAPSHOT_PATH) -> None:
     print("Generating golden snapshot...")
     snapshot = generate_schema_case_entries()
-    save_golden_snapshot(snapshot)
-    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
+
+    # Not load_golden_snapshot: an absent file reads as {}, which turns every
+    # generated entry into a brand-new one and silences both gates below.
+    previous = load_required_golden_snapshot(path)
+
+    dropped = removed_entries(previous, snapshot)
+    if dropped:
+        raise ValueError(
+            f"Regenerating would remove golden entries: {dropped}.\n"
+            "If the removal is right, delete those entries from "
+            f"{path.name} by hand and run again, in the same "
+            "diff that renames or drops the class. The hand edit is the "
+            "acknowledgement, and the diff is the record.\n"
+            "If it is not right, a case lost its coverage and the table needs "
+            "the row back."
+        )
+
+    changed = changed_entries(previous, snapshot)
+    if changed:
+        detail = "\n".join(
+            f"  {key}: added {added}, removed {removed}"
+            for key, (added, removed) in sorted(changed.items())
+        )
+        raise ValueError(
+            "Regenerating would change the state_dict keys of entries that "
+            f"already exist:\n{detail}\n"
+            "An added key makes every older checkpoint unloadable, and no "
+            "module hook can repair that: the planner rejects the load before "
+            "any hook runs. A removed key is still carried by older "
+            "checkpoints, and a checkpoint-derived load reads it back and "
+            "finds nobody claiming it.\n"
+            f"If the change is right, edit those entries in "
+            f"{path.name} by hand and run again. The hand edit "
+            "is the acknowledgement, and the diff is the record."
+        )
+
+    save_golden_snapshot(snapshot, path)
+    # Resolved: the path runs through buck-out's link tree, which symlinks back
+    # to the source. Printing it unresolved suggests the write went to buck-out.
+    print(f"Golden snapshot saved to {path.resolve()}")
     print(f"Total metrics captured: {len(snapshot)}")
     for key in sorted(snapshot.keys()):
         info = snapshot[key]
