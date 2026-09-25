@@ -49,7 +49,7 @@ from torchrec.distributed.utils import (
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.sparse.test_utils import keyed_jagged_tensor_equals
-from torchrec.test_utils import get_free_port
+from torchrec.test_utils import init_process_group_single_rank
 
 
 class UtilsTest(unittest.TestCase):
@@ -58,10 +58,9 @@ class UtilsTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         device = torch.device("cpu")
         backend = "gloo"
-        dist.init_process_group(backend=backend)
+        init_process_group_single_rank(backend=backend)
         tables = [
             EmbeddingBagConfig(
                 num_embeddings=10,
