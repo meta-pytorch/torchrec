@@ -109,6 +109,13 @@ from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
+from torchrec.modules.activation import SwishLayerNorm
+from torchrec.modules.crossnet import (
+    CrossNet,
+    LowRankCrossNet,
+    LowRankMixtureCrossNet,
+    VectorCrossNet,
+)
 from torchrec.modules.embedding_configs import (
     DataType,
     EmbeddingBagConfig,
@@ -137,6 +144,7 @@ from torchrec.modules.mc_modules import (
     MCHEvictionPolicy,
     MCHManagedCollisionModule,
 )
+from torchrec.modules.mlp import MLP, Perceptron
 from torchrec.modules.tensor_pool import TensorPool
 
 
@@ -690,6 +698,38 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
             ],
             device=torch.device("cpu"),
         ),
+    ),
+    # Dense modules. Their state is nn.Parameter reached through submodules,
+    # so a scan for register_buffer does not find them. Keys are attribute
+    # names and positional indices, so a rename or a Sequential reorder moves
+    # every one.
+    _GoldenCase("mlp", MLP, "", lambda: MLP(in_size=4, layer_sizes=[8, 4])),
+    _GoldenCase(
+        "perceptron", Perceptron, "", lambda: Perceptron(in_size=4, out_size=8)
+    ),
+    _GoldenCase(
+        "swish_layer_norm", SwishLayerNorm, "", lambda: SwishLayerNorm(input_dims=4)
+    ),
+    _GoldenCase(
+        "cross_net", CrossNet, "", lambda: CrossNet(in_features=4, num_layers=2)
+    ),
+    _GoldenCase(
+        "low_rank_cross_net",
+        LowRankCrossNet,
+        "",
+        lambda: LowRankCrossNet(in_features=4, num_layers=2),
+    ),
+    _GoldenCase(
+        "vector_cross_net",
+        VectorCrossNet,
+        "",
+        lambda: VectorCrossNet(in_features=4, num_layers=2),
+    ),
+    _GoldenCase(
+        "low_rank_mixture_cross_net",
+        LowRankMixtureCrossNet,
+        "",
+        lambda: LowRankMixtureCrossNet(in_features=4, num_layers=2),
     ),
 )
 
