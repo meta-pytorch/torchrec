@@ -80,6 +80,26 @@ class InitProcessGroupSingleRankTest(unittest.TestCase):
 
 
 class InitDistributedSingleHostTest(unittest.TestCase):
+    def setUp(self) -> None:
+        env = patch.dict(os.environ, {})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def tearDown(self) -> None:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    def test_single_rank_ignores_a_contested_master_port(self) -> None:
+        with _occupied_port() as taken_port:
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = str(taken_port)
+
+            init_distributed_single_host(rank=0, world_size=1, backend="gloo")
+
+        self.assertTrue(dist.is_initialized())
+        self.assertEqual(dist.get_world_size(), 1)
+        self.assertEqual(dist.get_rank(), 0)
+
     @patch("torchrec.test_utils.dist.init_process_group")
     @patch("torchrec.test_utils.dist.is_initialized", return_value=False)
     def test_forwards_bound_device_to_process_group(
@@ -102,4 +122,5 @@ class InitDistributedSingleHostTest(unittest.TestCase):
             world_size=4,
             backend="nccl",
             device_id=device,
+            store=None,
         )

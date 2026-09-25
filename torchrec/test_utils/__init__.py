@@ -159,11 +159,15 @@ def init_distributed_single_host(
     os.environ["LOCAL_RANK"] = str(rank % local_size if local_size else rank)
     if dist.is_initialized():
         dist.destroy_process_group()
+    # A single-rank group has no peer to rendezvous with, so an in-process store
+    # works and nothing needs to bind MASTER_PORT.
+    store = dist.HashStore() if world_size == 1 else None
     dist.init_process_group(
         rank=rank,
         world_size=world_size,
         backend=backend,
         device_id=device_id,
+        store=store,
     )
     #  `Optional[_distributed_c10d.ProcessGroup]`.
     # pyrefly: ignore[bad-return]

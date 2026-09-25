@@ -27,7 +27,7 @@ from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from torchrec.test_utils import get_free_port, init_distributed_single_host
+from torchrec.test_utils import init_distributed_single_host
 
 SHARDING_TYPES: List[str] = [
     ShardingType.TABLE_WISE.value,
@@ -39,7 +39,6 @@ SHARDING_TYPES: List[str] = [
 class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
     def setUp(self) -> None:
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         self.backend = "nccl"
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
