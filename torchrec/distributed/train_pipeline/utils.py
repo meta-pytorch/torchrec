@@ -994,11 +994,13 @@ def use_context_for_postprocs(
     for postproc_mod in pipelined_postprocs:
         postproc_mod.set_context(next_batch_context)
 
-    yield
-
-    # Restore context for model fwd
-    for module, context in zip(pipelined_postprocs, original_contexts):
-        module.set_context(context)
+    try:
+        yield
+    finally:
+        # Restore context for model fwd. This undoes the swap only. A failed
+        # body still leaves unwaited input-dist collectives behind.
+        for module, context in zip(pipelined_postprocs, original_contexts):
+            module.set_context(context)
 
 
 class FutureDeque(deque):

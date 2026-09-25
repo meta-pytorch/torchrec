@@ -49,6 +49,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _start_embedding_lookup,
     DataLoadingThread,
     find_ddp_modules,
+    use_context_for_postprocs,
 )
 from torchrec.distributed.types import (
     Awaitable,
@@ -749,6 +750,45 @@ class DataLoadingExceptionTest(unittest.TestCase):
             thread.get_next_batch(none_throws=True)
         self.assertIs(ctx.exception, error)
         self.assertIsNone(thread._exception)
+
+
+class UseContextForPostprocsTest(unittest.TestCase):
+    def _make_postprocs(self, context: TrainPipelineContext) -> List[PipelinedPostproc]:
+        return [
+            PipelinedPostproc(
+                postproc_module=torch.nn.Identity(),
+                fqn=f"postproc_{i}",
+                args=CallArgs(args=[], kwargs={}),
+                context=context,
+                default_stream=None,
+                dist_stream=None,
+            )
+            for i in range(2)
+        ]
+
+    def test_restores_context_on_normal_exit(self) -> None:
+        original = TrainPipelineContext(index=0)
+        next_batch = TrainPipelineContext(index=1)
+        postprocs = self._make_postprocs(original)
+
+        with use_context_for_postprocs(postprocs, next_batch):
+            for postproc in postprocs:
+                self.assertIs(postproc.get_context(), next_batch)
+
+        for postproc in postprocs:
+            self.assertIs(postproc.get_context(), original)
+
+    def test_restores_context_when_body_raises(self) -> None:
+        original = TrainPipelineContext(index=0)
+        next_batch = TrainPipelineContext(index=1)
+        postprocs = self._make_postprocs(original)
+
+        with self.assertRaises(RuntimeError):
+            with use_context_for_postprocs(postprocs, next_batch):
+                raise RuntimeError("_start_data_dist failed")
+
+        for postproc in postprocs:
+            self.assertIs(postproc.get_context(), original)
 
 
 class _FindDDPModulesTestModel(torch.nn.Module):
