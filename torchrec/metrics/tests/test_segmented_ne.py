@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import Any, Dict, Iterable, Union
+from typing import Any, cast, Dict, Iterable, List, Union
 
 import torch
 from torch import no_grad
@@ -18,6 +18,7 @@ from torchrec.metrics.segmented_ne import (
     _normalize_grouping_keys_config,
     GroupingKeyConfig,
     SegmentedNEMetric,
+    SegmentedNEMetricComputation,
 )
 
 
@@ -850,3 +851,340 @@ class MultipleGroupingKeysTest(unittest.TestCase):
                     self.assertIn(
                         logloss_key, actual_ne, f"Missing logloss metric: {logloss_key}"
                     )
+
+
+class IntervalSegmentTest(unittest.TestCase):
+    """Tests for selecting a segment by value range (lower_bound/upper_bound)."""
+
+    TASKS: List[RecTaskInfo] = [
+        RecTaskInfo(
+            name="Task:0",
+            label_name="label",
+            prediction_name="prediction",
+            weight_name="weight",
+        )
+    ]
+
+    # A continuous feature of the kind interval mode exists for: the model passes
+    # it through to model_out unbucketized.
+    FEATURE: torch.Tensor = torch.tensor([0.5, 1.0, 2.9, 3.0, -4.0, 7.0])
+    LABELS: torch.Tensor = torch.tensor([1, 0, 0, 1, 1, 0])
+    PREDICTIONS: torch.Tensor = torch.tensor([0.2, 0.6, 0.8, 0.4, 0.9, 0.1])
+    WEIGHTS: torch.Tensor = torch.tensor([0.13, 0.2, 0.5, 0.8, 0.75, 0.6])
+
+    def _metric(
+        self,
+        grouping_keys: List[Dict[str, Any]],
+        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+    ) -> SegmentedNEMetric:
+        return SegmentedNEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=self.FEATURE.numel(),
+            tasks=self.TASKS,
+            # pyrefly: ignore[bad-argument-type]
+            grouping_keys=grouping_keys,
+            compute_mode=compute_mode,
+            window_size=100,
+        )
+
+    def _window_state(self, metric: SegmentedNEMetric, name: str) -> torch.Tensor:
+        """Read a window state off the metric's single computation.
+
+        `_metrics_computations` is an nn.ModuleList, so indexing it yields
+        `Module`; cast so the state accessor resolves.
+        """
+        computation = cast(
+            SegmentedNEMetricComputation, metric._metrics_computations[0]
+        )
+        return computation.get_window_state(name)
+
+    def _inputs(self, **required: torch.Tensor) -> Dict[str, Any]:
+        return {
+            "predictions": {"Task:0": self.PREDICTIONS},
+            "labels": {"Task:0": self.LABELS},
+            "weights": {"Task:0": self.WEIGHTS},
+            "required_inputs": dict(required),
+        }
+
+    @no_grad()
+    def test_interval_matches_equivalent_integer_grouping_key_unfused(self) -> None:
+        self._test_interval_matches_equivalent_integer_grouping_key(
+            RecComputeMode.UNFUSED_TASKS_COMPUTATION
+        )
+
+    @no_grad()
+    def test_interval_matches_equivalent_integer_grouping_key_fused(self) -> None:
+        self._test_interval_matches_equivalent_integer_grouping_key(
+            RecComputeMode.FUSED_TASKS_COMPUTATION
+        )
+
+    @no_grad()
+    def test_interval_matches_equivalent_integer_grouping_key_fused_and_states(
+        self,
+    ) -> None:
+        self._test_interval_matches_equivalent_integer_grouping_key(
+            RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+        )
+
+    def _test_interval_matches_equivalent_integer_grouping_key(
+        self, compute_mode: RecComputeMode
+    ) -> None:
+        """Interval mode must be exactly `lower <= x < upper`.
+
+        Rather than recomputing NE here, assert that segmenting the raw feature
+        in-metric gives the same numbers as feeding a pre-bucketized key -- so a
+        drift in the comparison shows up as a value difference, not just a
+        missing report. Run under every compute mode: bucketization happens in
+        `update()`, which each mode reaches by a different path.
+        """
+        lower, upper = 1.0, 3.0
+        pre_bucketized = ((self.FEATURE >= lower) & (self.FEATURE < upper)).to(
+            torch.int64
+        )
+
+        interval = self._metric(
+            [
+                {
+                    "name": "feat",
+                    "lower_bound": lower,
+                    "upper_bound": upper,
+                    "label": "seg",
+                }
+            ],
+            compute_mode=compute_mode,
+        )
+        interval.update(**self._inputs(feat=self.FEATURE))
+
+        explicit = self._metric(
+            [{"name": "seg", "num_groups": 2}], compute_mode=compute_mode
+        )
+        explicit.update(**self._inputs(seg=pre_bucketized))
+
+        interval_out, explicit_out = interval.compute(), explicit.compute()
+        for group in (0, 1):
+            for prefix in ("lifetime", "window"):
+                got = interval_out[
+                    f"segmented_ne-Task:0|{prefix}_segmented_ne_{group}@seg"
+                ]
+                want = explicit_out[
+                    f"segmented_ne-Task:0|{prefix}_segmented_ne_{group}@seg"
+                ]
+                torch.testing.assert_close(
+                    got, want, msg=f"{prefix} group {group} diverged"
+                )
+
+    @no_grad()
+    def test_bounds_are_lower_inclusive_upper_exclusive(self) -> None:
+        """1.0 is in [1, 3); 3.0 is not."""
+        metric = self._metric(
+            [
+                {
+                    "name": "feat",
+                    "lower_bound": 1.0,
+                    "upper_bound": 3.0,
+                    "label": "seg",
+                }
+            ]
+        )
+        metric.update(**self._inputs(feat=self.FEATURE))
+        # Weighted sample count in group 1 == sum of weights of in-segment rows.
+        in_segment = (self.FEATURE >= 1.0) & (self.FEATURE < 3.0)
+        self.assertEqual(in_segment.tolist(), [False, True, True, False, False, False])
+        state = self._window_state(metric, "seg_weighted_num_samples")
+        torch.testing.assert_close(
+            state[0][1].item(), self.WEIGHTS[in_segment].sum().double().item()
+        )
+
+    @no_grad()
+    def test_nan_falls_outside_the_segment(self) -> None:
+        """NaN compares false against both bounds, so it must land in group 0."""
+        feature = torch.tensor([float("nan"), 2.0, float("nan")])
+        metric = SegmentedNEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=3,
+            tasks=self.TASKS,
+            # pyrefly: ignore[bad-argument-type]
+            grouping_keys=[
+                {
+                    "name": "feat",
+                    "lower_bound": 1.0,
+                    "upper_bound": 3.0,
+                    "label": "seg",
+                }
+            ],
+            window_size=100,
+        )
+        metric.update(
+            predictions={"Task:0": torch.tensor([0.2, 0.6, 0.8])},
+            labels={"Task:0": torch.tensor([1, 0, 1])},
+            weights={"Task:0": torch.tensor([1.0, 1.0, 1.0])},
+            required_inputs={"feat": feature},
+        )
+        state = self._window_state(metric, "seg_weighted_num_samples")
+        self.assertEqual(state[0][1].item(), 1.0, "only the 2.0 row is in-segment")
+        self.assertEqual(state[0][0].item(), 2.0, "both NaN rows are out-of-segment")
+
+    @no_grad()
+    def test_two_intervals_over_one_feature(self) -> None:
+        """The motivating case: several segments of the same feature at once."""
+        metric = self._metric(
+            [
+                {
+                    "name": "feat",
+                    "upper_bound": 1.0,
+                    "label": "lt1",
+                },
+                {
+                    "name": "feat",
+                    "lower_bound": 1.0,
+                    "upper_bound": 3.0,
+                    "label": "1to3",
+                },
+            ]
+        )
+        metric.update(**self._inputs(feat=self.FEATURE))
+        out = metric.compute()
+        for label in ("lt1", "1to3"):
+            for group in (0, 1):
+                self.assertIn(
+                    f"segmented_ne-Task:0|window_segmented_ne_{group}@{label}", out
+                )
+        # Distinct labels must not collapse onto one another's state.
+        lt1 = self._window_state(metric, "lt1_weighted_num_samples")
+        seg = self._window_state(metric, "1to3_weighted_num_samples")
+        self.assertEqual(
+            lt1[0][1].item(), self.WEIGHTS[self.FEATURE < 1.0].sum().item()
+        )
+        self.assertNotEqual(lt1[0][1].item(), seg[0][1].item())
+
+    @no_grad()
+    def test_two_tasks_segment_independently_unfused(self) -> None:
+        self._test_two_tasks_segment_independently(
+            RecComputeMode.UNFUSED_TASKS_COMPUTATION
+        )
+
+    @no_grad()
+    def test_two_tasks_segment_independently_fused(self) -> None:
+        self._test_two_tasks_segment_independently(
+            RecComputeMode.FUSED_TASKS_COMPUTATION
+        )
+
+    @no_grad()
+    def test_two_tasks_segment_independently_fused_and_states(self) -> None:
+        self._test_two_tasks_segment_independently(
+            RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+        )
+
+    def _test_two_tasks_segment_independently(
+        self, compute_mode: RecComputeMode
+    ) -> None:
+        """One interval, two tasks: fusion must not conflate their segment states.
+
+        The single-task cases exercise the interval arithmetic. This is what
+        exercises *fusion* -- with more than one task the per-task states are
+        slices of a shared tensor, which is where a bucketized key of the wrong
+        shape would show up.
+        """
+        tasks = [
+            RecTaskInfo(
+                name=f"Task:{i}",
+                label_name=f"label{i}",
+                prediction_name=f"prediction{i}",
+                weight_name=f"weight{i}",
+            )
+            for i in range(2)
+        ]
+        metric = SegmentedNEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=self.FEATURE.numel(),
+            tasks=tasks,
+            # pyrefly: ignore[bad-argument-type]
+            grouping_keys=[
+                {
+                    "name": "feat",
+                    "lower_bound": 1.0,
+                    "upper_bound": 3.0,
+                    "label": "seg",
+                }
+            ],
+            compute_mode=compute_mode,
+            window_size=100,
+        )
+        metric.update(
+            predictions={
+                "Task:0": self.PREDICTIONS,
+                "Task:1": 1.0 - self.PREDICTIONS,
+            },
+            labels={"Task:0": self.LABELS, "Task:1": self.LABELS},
+            weights={"Task:0": self.WEIGHTS, "Task:1": self.WEIGHTS},
+            required_inputs={"feat": self.FEATURE},
+        )
+        out = metric.compute()
+
+        for task in ("Task:0", "Task:1"):
+            for group in (0, 1):
+                for prefix in ("lifetime", "window"):
+                    key = f"segmented_ne-{task}|{prefix}_segmented_ne_{group}@seg"
+                    self.assertIn(key, out, f"Missing metric: {key}")
+
+        # Identical labels/weights but inverted predictions: the in-segment NE
+        # must differ per task. Equality would mean the states were conflated.
+        self.assertFalse(
+            torch.allclose(
+                out["segmented_ne-Task:0|window_segmented_ne_1@seg"],
+                out["segmented_ne-Task:1|window_segmented_ne_1@seg"],
+                equal_nan=True,
+            ),
+            "per-task segment states were conflated under fusion",
+        )
+
+    def test_num_groups_is_derived_and_conflict_rejected(self) -> None:
+        self.assertEqual(GroupingKeyConfig(name="f", lower_bound=1.0).num_groups, 2)
+        self.assertEqual(GroupingKeyConfig(name="f", upper_bound=1.0).num_groups, 2)
+        # No bounds -> untouched.
+        self.assertEqual(GroupingKeyConfig(name="f", num_groups=7).num_groups, 7)
+        with self.assertRaisesRegex(ValueError, "exactly 2 groups"):
+            GroupingKeyConfig(name="f", lower_bound=1.0, num_groups=7)
+
+    def test_empty_interval_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "empty interval"):
+            GroupingKeyConfig(name="f", lower_bound=3.0, upper_bound=1.0)
+        with self.assertRaisesRegex(ValueError, "empty interval"):
+            GroupingKeyConfig(name="f", lower_bound=1.0, upper_bound=1.0)
+
+    def test_duplicate_keys_rejected(self) -> None:
+        """Two intervals over one feature without labels would silently merge."""
+        with self.assertRaisesRegex(ValueError, "Duplicate grouping key"):
+            self._metric(
+                [
+                    {"name": "feat", "upper_bound": 1.0},
+                    {"name": "feat", "lower_bound": 1.0, "upper_bound": 3.0},
+                ]
+            )
+
+    def test_key_falls_back_to_name_without_label(self) -> None:
+        self.assertEqual(GroupingKeyConfig(name="feat").key, "feat")
+        self.assertEqual(GroupingKeyConfig(name="feat", label="seg").key, "seg")
+
+    def test_normalize_parses_interval_fields(self) -> None:
+        configs = _normalize_grouping_keys_config(
+            [
+                {"name": "feat", "lower_bound": 1.0, "upper_bound": 3.0, "label": "s"},
+                {"name": "other"},
+            ],
+            num_groups=4,
+            cast_keys_to_int=True,
+        )
+        self.assertEqual(configs[0].lower_bound, 1.0)
+        self.assertEqual(configs[0].upper_bound, 3.0)
+        self.assertEqual(configs[0].label, "s")
+        # Interval config must not inherit the metric-level num_groups default,
+        # which would otherwise trip the conflict check the caller never wrote.
+        self.assertEqual(configs[0].num_groups, 2)
+        # Non-interval config still inherits the defaults.
+        self.assertEqual(configs[1].num_groups, 4)
+        self.assertTrue(configs[1].cast_keys_to_int)
+        self.assertFalse(configs[1].is_interval)

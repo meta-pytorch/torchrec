@@ -217,15 +217,73 @@ def _state_reduction_sum(state: torch.Tensor) -> torch.Tensor:
 class GroupingKeyConfig:
     """Configuration for a single grouping key.
 
+    There are two ways of turning the values of `name` into group ids:
+
+    1. The values already are group ids, optionally via `cast_keys_to_int`.
+    2. Interval mode: set `lower_bound` and/or `upper_bound` to select a segment
+       of a continuous feature. Rows with `lower_bound <= value < upper_bound`
+       land in group 1 ("in segment"), everything else in group 0, so
+       `num_groups` is always 2.
+
+    Interval mode is what allows per-segment NE over a continuous feature
+    without the model bucketizing the feature itself: the raw feature is passed
+    through to `model_out` unchanged and segmented here.
+
+    Several configs may share one `name` -- e.g. disjoint or overlapping
+    intervals over the same feature. State and report names are derived from the
+    grouping key, so each such config needs a distinct `label` to tell them
+    apart.
+
     Args:
         name: The name of the tensor containing the grouping key values.
-        num_groups: Number of groups for this grouping key.
+        num_groups: Number of groups for this grouping key. Always 2 in interval
+            mode, where it must not be set explicitly.
         cast_keys_to_int: Whether to cast the grouping key values to int64.
+            Unused in interval mode: the bounds are compared in the input dtype
+            and produce int64 group ids directly.
+        lower_bound: Inclusive lower bound of the segment. Defaults to -inf.
+        upper_bound: Exclusive upper bound of the segment. Defaults to +inf.
+        label: Name used for this config's states and metric reports in place of
+            `name`. Required when several configs share a `name`.
     """
 
     name: str
     num_groups: int = 1
     cast_keys_to_int: bool = False
+    lower_bound: float = float("-inf")
+    upper_bound: float = float("inf")
+    label: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.is_interval:
+            return
+        if self.lower_bound >= self.upper_bound:
+            raise ValueError(
+                f"Grouping key '{self.key}' has an empty interval: lower_bound="
+                f"{self.lower_bound} must be < upper_bound={self.upper_bound}."
+            )
+        # Interval mode fixes the group count at 2, so an explicit num_groups can
+        # only disagree. Letting it through would be silent: group ids outside
+        # [0, num_groups) are dropped by the scatter in
+        # get_segemented_ne_states_fused, which reports NE over a subset of rows
+        # rather than raising. 1 is the dataclass default, i.e. "unset".
+        if self.num_groups != 1:
+            raise ValueError(
+                f"Grouping key '{self.key}' sets num_groups={self.num_groups} "
+                "together with lower_bound/upper_bound. Interval mode always has "
+                "exactly 2 groups (0 = outside, 1 = inside); drop num_groups."
+            )
+        self.num_groups = 2
+
+    @property
+    def is_interval(self) -> bool:
+        """Whether this config selects a segment by value range."""
+        return self.lower_bound != float("-inf") or self.upper_bound != float("inf")
+
+    @property
+    def key(self) -> str:
+        """Identifier used for state names and metric report suffixes."""
+        return self.label if self.label is not None else self.name
 
 
 def _normalize_grouping_keys_config(
@@ -239,7 +297,8 @@ def _normalize_grouping_keys_config(
         grouping_keys: Can be:
             - A string (single key name) - uses num_groups and cast_keys_to_int
             - A list of strings (multiple key names) - each uses num_groups and cast_keys_to_int
-            - A list of dicts with keys: name, num_groups (optional), cast_keys_to_int (optional)
+            - A list of dicts with keys: name, num_groups (optional), cast_keys_to_int
+              (optional), lower_bound (optional), upper_bound (optional), label (optional)
             - A list of GroupingKeyConfig objects
         num_groups: Default number of groups (used when grouping_keys is a string or list of strings)
         cast_keys_to_int: Default cast setting (used when grouping_keys is a string or list of strings)
@@ -267,11 +326,19 @@ def _normalize_grouping_keys_config(
                 )
             )
         elif isinstance(item, dict):
+            # An interval config must not inherit the metric-level num_groups
+            # default: GroupingKeyConfig rejects an explicit num_groups in
+            # interval mode, and inheriting one would turn a perfectly valid
+            # config into an error the caller never wrote.
+            is_interval = "lower_bound" in item or "upper_bound" in item
             configs.append(
                 GroupingKeyConfig(
                     name=item["name"],
-                    num_groups=item.get("num_groups", num_groups),
+                    num_groups=item.get("num_groups", 1 if is_interval else num_groups),
                     cast_keys_to_int=item.get("cast_keys_to_int", cast_keys_to_int),
+                    lower_bound=item.get("lower_bound", float("-inf")),
+                    upper_bound=item.get("upper_bound", float("inf")),
+                    label=item.get("label"),
                 )
             )
         elif isinstance(item, GroupingKeyConfig):
@@ -325,13 +392,33 @@ class SegmentedNEMetricComputation(RecMetricComputation):
             grouping_keys, num_groups, cast_keys_to_int
         )
 
+        # States and reports are keyed by config.key, so two configs sharing one
+        # key would register the same state names twice and emit reports that
+        # cannot be told apart. That is easy to hit on purpose -- several
+        # intervals over a single feature all share `name` -- so reject it here
+        # instead of silently merging two segments.
+        keys = [config.key for config in self._grouping_key_configs]
+        duplicate_keys = sorted({key for key in keys if keys.count(key) > 1})
+        if duplicate_keys:
+            raise ValueError(
+                f"Duplicate grouping key(s) {duplicate_keys} in grouping_keys. "
+                "Configs sharing a 'name' (e.g. several intervals over the same "
+                "feature) each need a distinct 'label'."
+            )
+
         # Track whether we're in single-default-key mode for backward compat.
         # Use no prefix/suffix when:
         #   - Original input was a plain string (not wrapped in a list), OR
         #   - There is exactly one config with the default name "grouping_keys"
-        self._is_single_default_key: bool = isinstance(grouping_keys, str) or (
-            len(self._grouping_key_configs) == 1
-            and self._grouping_key_configs[0].name == "grouping_keys"
+        # An explicit label always wins: it is only ever set to name a report.
+        self._is_single_default_key: bool = self._grouping_key_configs[
+            0
+        ].label is None and (
+            isinstance(grouping_keys, str)
+            or (
+                len(self._grouping_key_configs) == 1
+                and self._grouping_key_configs[0].name == "grouping_keys"
+            )
         )
 
         # For backward compatibility only: expose _num_groups and _grouping_keys
@@ -347,7 +434,7 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
         # Create states for each grouping key config
         for config in self._grouping_key_configs:
-            state_prefix = self._get_state_prefix(config.name)
+            state_prefix = self._get_state_prefix(config.key)
             self._add_state(
                 f"{state_prefix}cross_entropy_sum",
                 torch.zeros((self._n_tasks, config.num_groups), dtype=torch.double),
@@ -420,8 +507,11 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
         # Process each grouping key configuration
         for config in self._grouping_key_configs:
+            # `name` addresses the tensor in model_out; `key` names this config's
+            # states and reports. They differ whenever `label` is set, which is
+            # how several intervals can share one feature.
             key_name = config.name
-            state_prefix = self._get_state_prefix(key_name)
+            state_prefix = self._get_state_prefix(config.key)
 
             if required_inputs.get(key_name) is None:
                 raise RecMetricException(
@@ -430,8 +520,16 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
             grouping_keys_tensor = required_inputs[key_name]
 
+            if config.is_interval:
+                # Group 1 = inside [lower_bound, upper_bound), group 0 = outside.
+                # NaN compares false against both bounds and so lands in group 0,
+                # which keeps it out of the segment being measured.
+                grouping_keys_tensor = (
+                    (grouping_keys_tensor >= config.lower_bound)
+                    & (grouping_keys_tensor < config.upper_bound)
+                ).to(torch.int64)
             # Validate and cast dtype
-            if grouping_keys_tensor.dtype != torch.int64:
+            elif grouping_keys_tensor.dtype != torch.int64:
                 if config.cast_keys_to_int and grouping_keys_tensor.dtype in (
                     torch.float32,
                     torch.float64,
@@ -478,9 +576,8 @@ class SegmentedNEMetricComputation(RecMetricComputation):
         reports = []
 
         for config in self._grouping_key_configs:
-            key_name = config.name
-            state_prefix = self._get_state_prefix(key_name)
-            description_suffix = self._get_description_suffix(key_name)
+            state_prefix = self._get_state_prefix(config.key)
+            description_suffix = self._get_description_suffix(config.key)
 
             # Compute lifetime NE
             computed_ne = compute_ne_fused(
@@ -563,9 +660,8 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
         # For non-fused mode, iterate over all grouping key configs
         for config in self._grouping_key_configs:
-            key_name = config.name
-            state_prefix = self._get_state_prefix(key_name)
-            description_suffix = self._get_description_suffix(key_name)
+            state_prefix = self._get_state_prefix(config.key)
+            description_suffix = self._get_description_suffix(config.key)
 
             # Compute lifetime NE
             computed_ne = compute_ne(
