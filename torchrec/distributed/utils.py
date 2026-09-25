@@ -25,6 +25,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
 )
 from torch import nn
 from torch.autograd.profiler import record_function
+from torch.distributed import _remote_device
 from torchrec import optim as trec_optim
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
@@ -35,6 +36,7 @@ from torchrec.distributed.types import (
     EmbeddingEvent,
     ParameterSharding,
     ShardedModule,
+    ShardedTensorMetadata,
     ShardingBucketMetadata,
     ShardingType,
     ShardMetadata,
@@ -968,6 +970,64 @@ def _group_sharded_modules(
 
     _find_sharded_modules(module)
     return sharded_modules
+
+
+def _placement_on_device(
+    placement: _remote_device, device: torch.device
+) -> _remote_device:
+    """For a `placement`, change its device to `device`, preserving its rank."""
+    rank = placement.rank()
+    return _remote_device(str(device) if rank is None else f"rank:{rank}/{device}")
+
+
+def align_shard_metadata_to_device(
+    local_metadata: ShardMetadata,
+    device: torch.device,
+) -> ShardMetadata:
+    """Make one shard's metadata match the tensor's actual device.
+
+    For example::
+
+        rank:3/cuda:1  ->  rank:3/cpu
+
+    It:
+
+    - preserves the owning rank, shard offsets, and shard sizes;
+    - returns the original object if the device already matches;
+    - otherwise returns a deep-copied `ShardMetadata` with the placement
+      changed. The input is never mutated -- the same object is shared with the
+      table config and the fused optimizer, and the sharding plan's metadata is
+      reachable from it by reference.
+
+    This is needed because `weight_init_on_cpu` creates the tensor on CPU while
+    the plan still says CUDA, and `ShardedTensor` validates that the tensor and
+    its local metadata agree.
+
+    Callers must gate this on `weight_init_on_cpu`. Applied unconditionally it
+    would paper over a genuine device mismatch in some other kernel, which is
+    exactly the bug `ShardedTensor`'s assertion exists to catch.
+    """
+    placement = local_metadata.placement
+    if placement is None or placement.device() == device:
+        return local_metadata
+    aligned = copy.deepcopy(local_metadata)
+    # pyrefly: ignore[bad-assignment]
+    aligned.placement = _placement_on_device(placement, device)
+    return aligned
+
+
+def align_shards_metadata_to_device(
+    sharded_tensor_metadata: ShardedTensorMetadata,
+    device: torch.device,
+) -> None:
+    """Point every shard placement in `sharded_tensor_metadata` at `device`.
+
+    Check align_shard_metadata_to_device for more details
+    """
+    sharded_tensor_metadata.shards_metadata = [
+        align_shard_metadata_to_device(shard_metadata, device)
+        for shard_metadata in sharded_tensor_metadata.shards_metadata
+    ]
 
 
 def _convert_weights(

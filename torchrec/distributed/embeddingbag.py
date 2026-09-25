@@ -38,6 +38,7 @@ from torch.distributed._tensor import DTensor
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.embedding_kernel import _any_weights_off_plan_device
 from torchrec.distributed.embedding_lookup import (
     GroupedPooledEmbeddingsLookup,
     PartiallyMaterializedTensor,
@@ -106,6 +107,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.distributed.utils import (
     add_params_from_parameter_sharding,
+    align_shards_metadata_to_device,
     append_prefix,
     convert_to_fbgemm_types,
     create_global_tensor_shape_stride_from_metadata,
@@ -1409,6 +1411,10 @@ class ShardedEmbeddingBagCollection(
                         tensor_sizes=self._name_to_table_size[table_name],
                         tensor_properties=tensor_properties,
                     )
+                    if local_shards and _any_weights_off_plan_device(self):
+                        align_shards_metadata_to_device(
+                            sharded_tensor_metadata, local_shards[0].tensor.device
+                        )
 
                     # Use global_rank: torch core's assert in
                     # ShardedTensor._init_from_local_shards_and_global_metadata
