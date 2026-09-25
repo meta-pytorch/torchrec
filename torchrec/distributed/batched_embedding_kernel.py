@@ -755,7 +755,7 @@ def _get_grid_shard_cw_count(shards_metadata: List[ShardMetadata]) -> int:
 @dataclass
 class ShardParams:
     optimizer_states: List[Optional[Tuple[torch.Tensor]]]
-    optimizer_states_keys: List[torch.Tensor]
+    optimizer_states_keys: List[str]
     local_metadata: List[ShardMetadata]
     global_metadata: ShardedTensorMetadata
     embedding_weights: List[torch.Tensor]
@@ -824,9 +824,8 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                         or optimizer_state_value.nelement() == 1  # single value state
                     )
                 # Saving the optimizer keys for every table
-                table_to_shard_params[table_config.name].optimizer_states_keys.append(
-                    # pyrefly: ignore [bad-argument-type]
-                    optimizer_states.keys()
+                table_to_shard_params[table_config.name].optimizer_states_keys.extend(
+                    list(optimizer_states.keys())
                 )
 
             # Adding data to the shard params for every table
@@ -1535,7 +1534,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
         )
 
         all_optimizer_states = all_optimizer_states or emb_module.get_optimizer_state()
-        optimizer_states_keys_by_table: Dict[str, List[torch.Tensor]] = {}
+        optimizer_states_keys_by_table: Dict[str, List[str]] = {}
         for (
             table_config,
             optimizer_states,
