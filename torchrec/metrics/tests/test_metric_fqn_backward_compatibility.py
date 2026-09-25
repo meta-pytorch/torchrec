@@ -55,6 +55,12 @@ from typing import (
 )
 
 import torch
+from torch.distributed._shard.metadata import ShardMetadata
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.metrics.accuracy import AccuracyMetric
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.auprc import AUPRCMetric
@@ -103,6 +109,35 @@ from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
+from torchrec.modules.embedding_configs import (
+    DataType,
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+    PoolingType,
+)
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+from torchrec.modules.hash_mc_evictions import (
+    HashZchEvictionConfig,
+    HashZchEvictionPolicyName,
+)
+from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
+from torchrec.modules.itep_embedding_modules import (
+    ITEPEmbeddingBagCollection,
+    ITEPEmbeddingCollection,
+)
+from torchrec.modules.itep_modules import GenericITEPModule
+from torchrec.modules.keyed_jagged_tensor_pool import KeyedJaggedTensorPool
+from torchrec.modules.mc_modules import (
+    DistanceLFU_EvictionPolicy,
+    LFU_EvictionPolicy,
+    LRU_EvictionPolicy,
+    MCHEvictionPolicy,
+    MCHManagedCollisionModule,
+)
+from torchrec.modules.tensor_pool import TensorPool
 
 
 # Path to the golden snapshot file
@@ -389,6 +424,77 @@ def _make_cpu_offloaded_module(
         )
 
 
+def _make_mch_module(policy: MCHEvictionPolicy) -> MCHManagedCollisionModule:
+    return MCHManagedCollisionModule(
+        zch_size=64,
+        device=torch.device("cpu"),
+        eviction_interval=2,
+        eviction_policy=policy,
+    )
+
+
+def _make_hash_zch_module(**overrides: Any) -> HashZchManagedCollisionModule:
+    return HashZchManagedCollisionModule(
+        zch_size=64,
+        device=torch.device("cpu"),
+        total_num_buckets=4,
+        **overrides,
+    )
+
+
+_TABLE_NAME = "table1"
+_FEATURE_NAME = "feature1"
+
+
+class _ITEPEmbedding(torch.nn.Module):
+    def __init__(self, table: ShardedEmbeddingTable) -> None:
+        super().__init__()
+        self._config = GroupedEmbeddingConfig(
+            data_type=DataType.FP32,
+            pooling=PoolingType.SUM,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=EmbeddingComputeKernel.DENSE,
+            embedding_tables=[table],
+        )
+
+
+class _ITEPLookup(torch.nn.Module):
+    def __init__(self, table: ShardedEmbeddingTable) -> None:
+        super().__init__()
+        self._emb_modules = [_ITEPEmbedding(table)]
+
+
+def _make_itep_module() -> GenericITEPModule:
+    """One ITEP module with the pruning buffers, built without a GPU.
+
+    The table and config are real. The shells above stand in for sharded
+    lookups, which need a process group this suite does not have.
+    """
+    table = ShardedEmbeddingTable(
+        name=_TABLE_NAME,
+        embedding_dim=4,
+        num_embeddings=50,
+        feature_names=[_FEATURE_NAME],
+        local_metadata=ShardMetadata(
+            shard_offsets=[0, 0],
+            shard_sizes=[50, 4],
+            placement="rank:0/cpu",
+        ),
+    )
+    lookups: List[torch.nn.Module] = [_ITEPLookup(table)]
+
+    # init_address_lookup only fills the buffers and has no CPU kernel.
+    # Patching it keeps the names, which is all the golden records.
+    with unittest.mock.patch(
+        "torchrec.modules.itep_modules.torch.ops.fbgemm.init_address_lookup"
+    ):
+        return GenericITEPModule(
+            table_name_to_unpruned_hash_sizes={_TABLE_NAME: 100},
+            lookups=lookups,
+        )
+
+
 # Not RecMetric subclasses, so _discover_all_recmetric_subclasses cannot see
 # them. test_all_rec_metric_modules_are_covered catches a missing
 # RecMetricModule; anything else here is enrolled only by its row.
@@ -424,6 +530,176 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         CPUOffloadedRecMetricModule,
         "with_throughput",
         lambda: _make_cpu_offloaded_module(_make_throughput_metric()),
+    ),
+    # Buffer names come from the eviction policy, and DistanceLFU is the union
+    # of the other two, so each policy needs its own row.
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "",
+        lambda: _make_mch_module(DistanceLFU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "lfu",
+        lambda: _make_mch_module(LFU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "lru",
+        lambda: _make_mch_module(LRU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "tensor_pool",
+        TensorPool,
+        "",
+        lambda: TensorPool(
+            pool_size=16, dim=4, dtype=torch.float, device=torch.device("cpu")
+        ),
+    ),
+    # enable_uvm adds two CUDA-only buffers, while this test target runs on CPU.
+    _GoldenCase(
+        "keyed_jagged_tensor_pool",
+        KeyedJaggedTensorPool,
+        "",
+        lambda: KeyedJaggedTensorPool(
+            pool_size=16,
+            feature_max_lengths={"f1": 2},
+            device=torch.device("cpu"),
+        ),
+    ),
+    # is_weighted adds a "weights" key; both directions are pinned.
+    _GoldenCase(
+        "keyed_jagged_tensor_pool",
+        KeyedJaggedTensorPool,
+        "weighted",
+        lambda: KeyedJaggedTensorPool(
+            pool_size=16,
+            feature_max_lengths={"f1": 2},
+            is_weighted=True,
+            device=torch.device("cpu"),
+        ),
+    ),
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "",
+        _make_hash_zch_module,
+    ),
+    # persist_hash_zch_bucket=False drops the bucket buffer, for warm-loading
+    # checkpoints written before it existed. Both shapes are real.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "without_bucket_buffer",
+        lambda: _make_hash_zch_module(persist_hash_zch_bucket=False),
+    ),
+    # With no eviction policy the metadata buffer is None and state_dict leaves
+    # it out. Callers normally set one, so pin both shapes.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_eviction",
+        lambda: _make_hash_zch_module(
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(features=[], single_ttl=1),
+        ),
+    ),
+    # track_id_freq adds _hash_zch_runtime_meta, which write_runtime_meta_dim
+    # also adds. The two are mutually exclusive, so one case covers the key.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_runtime_meta",
+        lambda: _make_hash_zch_module(track_id_freq=True),
+    ),
+    # Eviction and runtime metadata compose. Only whether a policy is set
+    # changes the key set, not which one, so pin the pair.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_eviction_and_runtime_meta",
+        lambda: _make_hash_zch_module(
+            eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
+            eviction_config=HashZchEvictionConfig(features=[], single_ttl=-1),
+            track_id_freq=True,
+        ),
+    ),
+    # These entries carry the wrapped collection's weight names too, so a rename
+    # inside the collection fails here, reported under an ITEP id.
+    _GoldenCase(
+        "itep_embedding_bag_collection",
+        ITEPEmbeddingBagCollection,
+        "",
+        lambda: ITEPEmbeddingBagCollection(
+            embedding_bag_collection=EmbeddingBagCollection(
+                tables=[
+                    EmbeddingBagConfig(
+                        name=_TABLE_NAME,
+                        embedding_dim=4,
+                        num_embeddings=50,
+                        feature_names=[_FEATURE_NAME],
+                    )
+                ],
+                device=torch.device("cpu"),
+            ),
+            itep_module=_make_itep_module(),
+        ),
+    ),
+    _GoldenCase(
+        "itep_embedding_collection",
+        ITEPEmbeddingCollection,
+        "",
+        lambda: ITEPEmbeddingCollection(
+            embedding_collection=EmbeddingCollection(
+                tables=[
+                    EmbeddingConfig(
+                        name=_TABLE_NAME,
+                        embedding_dim=4,
+                        num_embeddings=50,
+                        feature_names=[_FEATURE_NAME],
+                    )
+                ],
+                device=torch.device("cpu"),
+            ),
+            itep_module=_make_itep_module(),
+        ),
+    ),
+    # Redundant with the ITEP rows above, which already pin these key paths.
+    # These keep the coverage if the ITEP wrappers are ever removed.
+    _GoldenCase(
+        "embedding_bag_collection",
+        EmbeddingBagCollection,
+        "",
+        lambda: EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name=_TABLE_NAME,
+                    embedding_dim=4,
+                    num_embeddings=50,
+                    feature_names=[_FEATURE_NAME],
+                )
+            ],
+            device=torch.device("cpu"),
+        ),
+    ),
+    _GoldenCase(
+        "embedding_collection",
+        EmbeddingCollection,
+        "",
+        lambda: EmbeddingCollection(
+            tables=[
+                EmbeddingConfig(
+                    name=_TABLE_NAME,
+                    embedding_dim=4,
+                    num_embeddings=50,
+                    feature_names=[_FEATURE_NAME],
+                )
+            ],
+            device=torch.device("cpu"),
+        ),
     ),
 )
 
