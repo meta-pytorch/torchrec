@@ -42,11 +42,30 @@ MAST or locally.
 """
 
 import gc
+import itertools
 import logging
 import socket
-from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TYPE_CHECKING,
+    Union,
+)
 
 import torch
+
+# Must precede the sharding_plan import below. sharding_plan imports
+# planner.constants, which runs planner/__init__ -> planners -> enumerators, and
+# enumerators imports back out of sharding_plan. Whichever of the two is imported
+# first has to be the planner: entering through sharding_plan leaves it half-built
+# when enumerators reaches back into it, which is an ImportError at startup.
+import torchrec.distributed.planner  # noqa: F401
 from torch import nn
 from torchrec.distributed.benchmark.base import benchmark_func, BenchmarkResult
 from torchrec.distributed.benchmark.utils import as_bool
@@ -74,6 +93,9 @@ from torchrec.optim.keyed import (
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+if TYPE_CHECKING:
+    from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
+
 logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -81,6 +103,17 @@ logger.setLevel(logging.INFO)
 # convergence, so the value only has to be finite -- it is the step's memory
 # traffic that is being measured, not where it lands.
 _LEARNING_RATE: float = 0.01
+
+# Batches ``TrainPipelineSparseDist`` keeps in flight: one in forward/backward, one
+# in input_dist, one being copied to device. A batch stream no longer than this
+# never leaves fill/drain, so it is the floor for ``num_batches``.
+_PIPELINE_DEPTH: int = 3
+
+# Distinct batches allocated for a pipelined run, cycled to reach ``num_batches``.
+# Bounds host memory independently of the iteration count. Must stay above
+# ``_PIPELINE_DEPTH`` so a batch is never in flight in two stages at once -- that is
+# the invariant to preserve if this is ever retuned.
+_BATCH_POOL_SIZE: int = _PIPELINE_DEPTH + 1
 
 
 # Sharding types this benchmark can run, each mapped to the factory that builds a
@@ -230,6 +263,70 @@ def _make_input_kjt(
     )
 
 
+def _make_input_batch_pool(
+    tables: List[EmbeddingBagConfig],
+    batch_size: int,
+    pooling_factor: int,
+    values_dtype: torch.dtype,
+    num_unique_batches: int,
+) -> List[KeyedJaggedTensor]:
+    """Build the bounded pool of host-resident batches the pipeline cycles over.
+
+    The batches stay on CPU: the pipeline's first stage is the H2D copy, and it can
+    only overlap that with compute if there is a copy left to do. Handing it batches
+    already on the GPU would silently retire one of the three stages being measured.
+
+    Only ``num_unique_batches`` of them are allocated, and
+    :func:`_run_pipelined_iteration` cycles the pool to reach ``num_batches``. Host
+    memory therefore scales with the pool, not with the iteration count -- a full
+    batch here is ``num_tables * batch_size * pooling_factor`` indices, so
+    materializing one per iteration is what exhausts host memory at large
+    ``num_batches``.
+
+    The pool size is fixed at :data:`_BATCH_POOL_SIZE` rather than exposed: it has to
+    stay above the pipeline depth so a given batch is never in flight in two stages at
+    once, and there is no reason to tune it per run. Note that cycling a small pool
+    narrows the index footprint, which would flatter a caching compute kernel by
+    keeping the working set warm in the TBE cache; raise the constant if that ever
+    becomes the configuration under test.
+    """
+    return [
+        _make_input_kjt(
+            tables=tables,
+            batch_size=batch_size,
+            pooling_factor=pooling_factor,
+            values_dtype=values_dtype,
+            device=torch.device("cpu"),
+        )
+        for _ in range(num_unique_batches)
+    ]
+
+
+# @lint-ignore TORCHRECDOCSTRING Private benchmark adapter, not a public API to document.
+class _PipelinedModel(nn.Module):
+    """Adapts the sharded ``EmbeddingBagCollection`` to what the pipeline expects.
+
+    ``TrainPipelineSparseDist`` calls ``losses, output = model(batch)`` and runs
+    ``torch.sum(losses, dim=0).backward()`` itself, so the bare sharded module --
+    which returns a ``LazyAwaitable[KeyedTensor]`` -- cannot be pipelined as-is.
+    The loss is the per-row sum rather than a scalar because that backward reduces
+    over dim 0, which a 0-dim tensor has not got.
+
+    Wrapping also places the sharded module one level down, where
+    ``_rewrite_model`` looks for it. ``forward`` hands the batch straight to it with
+    no intervening op, which is the condition for the module to count as top-level
+    and have its ``input_dist`` hoisted into the pipeline's own stage.
+    """
+
+    def __init__(self, ebc: ShardedEmbeddingBagCollection) -> None:
+        super().__init__()
+        self._ebc = ebc
+
+    def forward(self, batch: KeyedJaggedTensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        values = self._ebc(batch).values()
+        return values.sum(dim=1), values
+
+
 def _shard_ebc(
     tables: List[EmbeddingBagConfig],
     sharding_type: str,
@@ -313,11 +410,13 @@ def _run_iteration(
     ``optimizer is None`` selects forward-only. Otherwise the iteration is a full
     training step: ``values.sum()`` stands in for the dense arch, and its backward
     runs the ``output_dist`` collective in reverse plus the embedding backward.
-    Under the ``fused`` compute kernel the TBE applies the weight update during
-    that backward, so ``step()`` / ``zero_grad()`` are documented no-ops there
-    (see ``torchrec.optim.fused.FusedOptimizer``); they are still called because
-    they are what a real training loop does and they are what updates the dense
-    parameters the ``dense`` compute kernel produces.
+    Under the ``fused`` compute kernel the TBE applies the weight update during that
+    backward, so ``step()`` / ``zero_grad()`` never touch the embedding weights. They
+    are not free, though, and calling them is not a formality:
+    ``EmbeddingFusedOptimizer`` implements both as a push of the current learning rate
+    into the TBE (a device-side ``learning_rate_tensor.fill_``), which is the channel
+    LR scheduling reaches the kernel through. They also drive the dense parameters the
+    ``dense`` compute kernel produces.
 
     We ``torch.cuda.synchronize()`` at the end to actually block the host on the
     whole chain inside the measured region; that is what makes the wall-clock timer
@@ -332,6 +431,49 @@ def _run_iteration(
         optimizer.step()
     if values.is_cuda:
         torch.cuda.synchronize(values.device)
+
+
+def _run_pipelined_iteration(
+    _batch_inputs: List[Any],
+    *,
+    pipeline: "TrainPipelineSparseDist[KeyedJaggedTensor, torch.Tensor]",
+    batch_pool: List[KeyedJaggedTensor],
+    num_batches: int,
+    device: torch.device,
+) -> None:
+    """One measured iteration: drive ``TrainPipelineSparseDist`` over ``num_batches``.
+
+    The stream is ``batch_pool`` cycled and cut to ``num_batches``, so the iteration
+    count is independent of how many batches were actually allocated -- the pool is
+    re-read rather than extended, which is what keeps host memory flat as
+    ``num_batches`` grows.
+
+    The measured unit is the whole pass, not a single ``progress()``. That is
+    deliberate: ``PerfWrapper`` barriers between measured iterations, and a barrier
+    between individual ``progress()`` calls would serialize exactly the copy /
+    input_dist / compute overlap the pipeline exists to create. Dividing the reported
+    latency by ``num_batches`` gives the per-batch cost; the reported QPS already
+    accounts for it via ``sample_count``.
+
+    ``progress()`` owns ``zero_grad()``, the backward and ``step()`` -- running them
+    only while the model is training -- so unlike :func:`_run_iteration` this function
+    must not call them, and forward-only is selected by handing it a model in eval
+    mode rather than by branching here. It raises
+    ``StopIteration`` once the iterator is drained and the in-flight batches have
+    been executed (``execute_all_batches`` defaults to True), which is the loop's
+    exit condition. ``reset()`` clears the batch/context queues so each measured
+    iteration starts from an empty pipeline rather than inheriting the last one's
+    tail.
+    """
+    pipeline.reset()
+    dataloader = itertools.islice(itertools.cycle(batch_pool), num_batches)
+    while True:
+        try:
+            pipeline.progress(dataloader)
+        except StopIteration:
+            break
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _benchmark_sharding_type(
@@ -367,6 +509,13 @@ def _benchmark_sharding_type(
             backward (bool): measure a full training iteration -- ``values.sum()``
                 as the stand-in dense arch, its backward, and the optimizer step --
                 rather than the forward alone. Default True.
+            pipeline (bool): drive the iteration through ``TrainPipelineSparseDist``,
+                which overlaps the H2D copy and ``input_dist`` with compute, instead
+                of running the module directly. Honours ``backward`` -- the pipeline
+                skips its update when the model is in eval mode. Default False.
+            num_batches (int): batches driven through the pipeline per measured
+                iteration; must exceed the pipeline depth (3). Ignored unless
+                ``pipeline``. Default 10.
             num_tables (int): number of embedding tables, one feature each. For
                 table-wise they are assigned to ranks round-robin, so a multiple of
                 ``world_size`` keeps the assignment balanced. Default 256.
@@ -393,7 +542,8 @@ def _benchmark_sharding_type(
 
     Raises:
         ValueError: if ``column_wise`` is selected but ``embedding_dim`` is not
-            divisible by ``world_size``.
+            divisible by ``world_size``, or if ``pipeline`` is combined with a
+            ``num_batches`` at or below the pipeline depth.
     """
     compute_kernel: str = str(
         kwargs.get("compute_kernel", EmbeddingComputeKernel.FUSED.value)
@@ -405,15 +555,28 @@ def _benchmark_sharding_type(
     pooling_factor: int = int(kwargs.get("pooling_factor", 20))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.int64)
     backward: bool = as_bool(kwargs.get("backward"), True)
+    pipeline: bool = as_bool(kwargs.get("pipeline"), False)
+    num_batches: int = int(kwargs.get("num_batches", 10))
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 100))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
     memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
 
-    name = f"ebc_{sharding_type}"
+    name = f"ebc_{sharding_type}_pipelined" if pipeline else f"ebc_{sharding_type}"
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
     assert pg is not None, "ctx.pg must be initialized by the process runner"
+
+    if pipeline:
+        # The pipeline holds three batches in flight, so a stream at or below that
+        # depth is all fill and drain and never reaches the steady state the
+        # benchmark is trying to measure.
+        if num_batches <= _PIPELINE_DEPTH:
+            raise ValueError(
+                f"pipeline=True needs num_batches ({num_batches}) greater than the "
+                f"pipeline depth ({_PIPELINE_DEPTH}) to reach steady state; "
+                "use a larger --num_batches."
+            )
 
     if sharding_type == ShardingType.COLUMN_WISE.value:
         # column_wise() splits the width evenly over the ranks it is given and
@@ -447,19 +610,11 @@ def _benchmark_sharding_type(
         device=ctx.device,
         pg=pg,
     )
-    kjt = _make_input_kjt(
-        tables=tables,
-        batch_size=batch_size,
-        pooling_factor=pooling_factor,
-        values_dtype=values_dtype,
-        device=ctx.device,
-    )
-    optimizer = _make_optimizer(module) if backward else None
-
     logger.info(
         "rank=%d local_rank=%d host=%s running module benchmark: sharding_type=%s "
         "compute_kernel=%s num_tables=%d num_embeddings=%d embedding_dim=%d "
-        "batch_size=%d pooling_factor=%d backward=%s device=%s",
+        "batch_size=%d pooling_factor=%d backward=%s pipeline=%s num_batches=%d "
+        "device=%s",
         rank,
         ctx.local_rank,
         socket.gethostname(),
@@ -471,29 +626,77 @@ def _benchmark_sharding_type(
         batch_size,
         pooling_factor,
         backward,
+        pipeline,
+        num_batches if pipeline else 1,
         ctx.device,
     )
+
+    func_to_benchmark: Callable[..., None]
+    if pipeline:
+        batch_pool = _make_input_batch_pool(
+            tables=tables,
+            batch_size=batch_size,
+            pooling_factor=pooling_factor,
+            values_dtype=values_dtype,
+            num_unique_batches=_BATCH_POOL_SIZE,
+        )
+        # Imported here, not at module scope: torchrec.distributed.train_pipeline
+        # pulls in the planner, which imports sharding_plan -- already half-loaded by
+        # this module's own import of it. Hoisting this to the top turns that latent
+        # cycle into an ImportError on every run, pipelined or not.
+        from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
+
+        pipelined_model = _PipelinedModel(module)
+        if not backward:
+            # progress() gates zero_grad / backward / step on ``model.training``, so
+            # eval mode is how the pipeline itself expresses forward-only. The copy
+            # and input_dist stages still overlap; only the update is dropped.
+            pipelined_model.eval()
+
+        func_to_benchmark = _run_pipelined_iteration
+        benchmark_func_kwargs: Dict[str, Any] = {
+            "pipeline": TrainPipelineSparseDist(
+                model=pipelined_model,
+                optimizer=_make_optimizer(module),
+                device=ctx.device,
+            ),
+            "batch_pool": batch_pool,
+            "num_batches": num_batches,
+            "device": ctx.device,
+        }
+        # One measured iteration now drives the whole batch stream, so the QPS
+        # denominator has to count every batch in it, not just one.
+        sample_count = batch_size * num_batches
+    else:
+        func_to_benchmark = _run_iteration
+        benchmark_func_kwargs = {
+            "module": module,
+            "kjt": _make_input_kjt(
+                tables=tables,
+                batch_size=batch_size,
+                pooling_factor=pooling_factor,
+                values_dtype=values_dtype,
+                device=ctx.device,
+            ),
+            "optimizer": _make_optimizer(module) if backward else None,
+        }
+        sample_count = batch_size
 
     result = benchmark_func(
         name=name,
         rank=rank,
         world_size=world_size,
-        func_to_benchmark=_run_iteration,
+        func_to_benchmark=func_to_benchmark,
         bench_inputs=[],
         prof_inputs=[],
-        benchmark_func_kwargs={
-            "module": module,
-            "kjt": kjt,
-            "optimizer": optimizer,
-        },
+        benchmark_func_kwargs=benchmark_func_kwargs,
         num_profiles=num_profiles,
         num_benchmarks=num_benchmarks,
         profile_dir=profile_dir,
         memory_snapshot=memory_snapshot,
         device_type=ctx.device.type,
-        # One iteration consumes this rank's local batch, so the reported QPS is
-        # per-rank samples/s; multiply by world_size for the job-wide figure.
-        sample_count=batch_size,
+        # QPS is per-rank samples/s; multiply by world_size for the job-wide figure.
+        sample_count=sample_count,
         pg=pg,
     )
 
