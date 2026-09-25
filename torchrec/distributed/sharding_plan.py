@@ -16,6 +16,7 @@ from typing import Callable, cast, Dict, List, Optional, Tuple, Type, Union
 import torch
 from torch import distributed as dist, nn
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.constants import MIN_CW_DIM
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
@@ -29,7 +30,6 @@ from torchrec.distributed.mc_embeddingbag import (
 )
 from torchrec.distributed.mc_modules import InferManagedCollisionCollectionSharder
 from torchrec.distributed.pec_embedding import PECEmbeddingCollectionSharder
-from torchrec.distributed.planner.constants import MIN_CW_DIM
 from torchrec.distributed.quant_embedding import (
     QuantEmbeddingCollectionSharder,
     QuantManagedCollisionEmbeddingCollectionSharder,
