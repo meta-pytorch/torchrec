@@ -28,14 +28,13 @@ from torchrec.distributed.pec_collision_handlers import (
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.pec_embedding_modules import OverlappingCheckerType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from torchrec.test_utils import get_free_port
+from torchrec.test_utils import init_process_group_single_rank
 
 
 def _get_single_rank_pg() -> dist.ProcessGroup:
     if not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", str(get_free_port()))
-        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        init_process_group_single_rank(backend="gloo")
     return dist.group.WORLD  # pyre-ignore[7]
 
 

@@ -25,7 +25,7 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
 from torchrec.optim.warmup import WarmupOptimizer, WarmupPolicy, WarmupStage
-from torchrec.test_utils import get_free_port
+from torchrec.test_utils import init_process_group_single_rank
 
 
 class TestFusedOptim(unittest.TestCase):
@@ -34,7 +34,6 @@ class TestFusedOptim(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["NCCL_SOCKET_IFNAME"] = "lo"
         if torch.cuda.is_available():
             self.curr_device = torch.device("cuda:0")
@@ -43,7 +42,7 @@ class TestFusedOptim(unittest.TestCase):
         else:
             self.curr_device = torch.device("cpu")
             backend = "gloo"
-        dist.init_process_group(backend=backend)
+        init_process_group_single_rank(backend=backend)
 
     def tearDown(self) -> None:
         dist.destroy_process_group()
