@@ -2703,6 +2703,10 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             else _stride_per_key_per_rank.tolist()
         )
 
+    def stride_per_key_per_rank_tensor_or_none(self) -> Optional[torch.Tensor]:
+        """Returns the runtime stride-per-key-per-rank tensor without copying."""
+        return self._stride_per_key_per_rank
+
     def variable_stride_per_key(self) -> bool:
         """
         Returns whether the KeyedJaggedTensor has variable stride per key.

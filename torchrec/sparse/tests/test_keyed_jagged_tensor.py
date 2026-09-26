@@ -27,6 +27,24 @@ torch.fx.wrap("len")
 
 
 class TestKeyedJaggedTensor(unittest.TestCase):
+    def test_stride_per_key_per_rank_tensor_or_none(self) -> None:
+        layout = torch.tensor([[2], [4]], dtype=torch.int32)
+        variable = KeyedJaggedTensor(
+            keys=["index_0", "index_1"],
+            values=torch.arange(6),
+            lengths=torch.ones(6, dtype=torch.int32),
+            stride_per_key_per_rank=layout,
+        )
+        fixed = KeyedJaggedTensor(
+            keys=["index_0", "index_1"],
+            values=torch.arange(6),
+            lengths=torch.ones(6, dtype=torch.int32),
+            stride=3,
+        )
+
+        self.assertIs(variable.stride_per_key_per_rank_tensor_or_none(), layout)
+        self.assertIsNone(fixed.stride_per_key_per_rank_tensor_or_none())
+
     def test_key_lookup(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
         weights = torch.Tensor([1.0, 0.5, 1.5, 1.0, 0.5, 1.0, 1.0, 1.5])
