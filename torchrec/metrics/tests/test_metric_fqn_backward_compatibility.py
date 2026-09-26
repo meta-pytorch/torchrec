@@ -19,22 +19,38 @@ If you need to add a new buffer/state to a metric:
 1. Consider if it can be non-persistent (won't appear in state_dict)
 2. If it must be persistent, coordinate with the trainers team to enable
    allow_partial_load for metrics, OR add a migration path
-3. Update the golden snapshot with --update-golden after confirming the change
-   won't break production training jobs
+3. Edit the affected entries in metric_fqn_golden_snapshot.json by hand, then
+   regenerate to confirm the edit matches what the code produces. The updater
+   refuses to rewrite an entry whose keys changed, so the hand edit is the
+   acknowledgement.
 
-To update the golden snapshot after intentional changes:
-    python -m torchrec.metrics.tests.test_metric_fqn_backward_compatibility --update-golden
+To update the golden snapshot after intentional changes, from fbcode:
+    buck2 run //torchrec/metrics/tests:update_metric_fqn_golden_snapshot -- --update-golden
 """
 
+import contextlib
+import copy
 import inspect
 import json
 import os
 import sys
+import tempfile
 import unittest
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 import torch
 from torchrec.metrics.accuracy import AccuracyMetric
@@ -167,30 +183,38 @@ def get_metric_snapshot_key(
     return key
 
 
-def load_golden_snapshot() -> Dict[str, Dict[str, Any]]:
-    if not GOLDEN_SNAPSHOT_PATH.exists():
+def load_golden_snapshot(
+    path: Path = GOLDEN_SNAPSHOT_PATH,
+) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
         return {}
-    with open(GOLDEN_SNAPSHOT_PATH, "r") as f:
+    with open(path, "r") as f:
         return json.load(f)
 
 
-def load_required_golden_snapshot() -> Dict[str, Dict[str, Any]]:
+def load_required_golden_snapshot(
+    path: Path = GOLDEN_SNAPSHOT_PATH,
+) -> Dict[str, Dict[str, Any]]:
     """The golden snapshot, or raise.
 
     An empty file makes the orphan check pass by having nothing to compare.
+    Regenerating against one would make every entry look new to the gates.
     """
-    snapshot = load_golden_snapshot()
+    snapshot = load_golden_snapshot(path)
     if not snapshot:
         raise RuntimeError(
-            f"{GOLDEN_SNAPSHOT_PATH} is missing or empty. It is checked in, so "
+            f"{path} is missing or empty. It is checked in, so "
             "restore it from source control rather than writing a new one. A "
             "regenerated baseline authorizes whatever the code produces today."
         )
     return snapshot
 
 
-def save_golden_snapshot(snapshot: Dict[str, Dict[str, Any]]) -> None:
-    with open(GOLDEN_SNAPSHOT_PATH, "w") as f:
+def save_golden_snapshot(
+    snapshot: Dict[str, Dict[str, Any]],
+    path: Path = GOLDEN_SNAPSHOT_PATH,
+) -> None:
+    with open(path, "w") as f:
         json.dump(snapshot, f, indent=2, sort_keys=True)
         f.write("\n")
 
@@ -535,6 +559,107 @@ class RecMetricModuleBackwardCompatibilityTest(unittest.TestCase):
         fresh_module.load_state_dict(state_dict, strict=True)
 
 
+class GoldenRegenerationTest(unittest.TestCase):
+    """The gates on the real generate-validate-save path.
+
+    The tests above call the comparison helpers directly, which says nothing
+    about whether `update_golden_snapshot` consults them or writes anyway. Each
+    case here makes a baseline disagree with the code, runs the whole path
+    against a temporary file, and requires that file to come back untouched.
+
+    Each case passes a temporary path, so the generation, the gates, and the
+    file I/O are all the real ones.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Building every case is the slow part, so pay it once and reuse the
+        # result as the baseline each case then modifies.
+        cls.current: Dict[str, Dict[str, Any]] = generate_schema_case_entries()
+
+    @contextlib.contextmanager
+    def _baseline(self, snapshot: Dict[str, Dict[str, Any]]) -> Iterator[Path]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "golden.json"
+            path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+            yield path
+
+    def _assert_refused(self, baseline: Dict[str, Dict[str, Any]], reason: str) -> None:
+        with self._baseline(baseline) as path:
+            before = path.read_bytes()
+            with self.assertRaises((ValueError, RuntimeError)) as cm:
+                update_golden_snapshot(path)
+            self.assertIn(reason, str(cm.exception))
+            self.assertEqual(path.read_bytes(), before, "the golden was rewritten")
+
+    def _entry_holding_keys(self, baseline: Dict[str, Dict[str, Any]]) -> str:
+        """An entry with at least one state key.
+
+        Six entries legitimately have none, the AUC family among them, and they
+        sort first. Modifying one of those changes nothing and the gate has
+        nothing to catch.
+        """
+        for key in sorted(baseline):
+            if baseline[key]["state_dict_keys"]:
+                return key
+        self.fail("no golden entry holds a state key")
+
+    def test_an_empty_baseline_is_refused(self) -> None:
+        self._assert_refused({}, "restore it from source control")
+
+    def test_a_changed_entry_is_refused(self) -> None:
+        """Both directions, because they break different loads.
+
+        An added key is rejected by the planner before load_state_dict runs.
+        A removed key is still carried by older checkpoints and read back by a
+        checkpoint-derived load.
+        """
+        for label, modify_keys_fn in (
+            # Drop a key from the baseline, so the live code looks like it
+            # added one.
+            ("added", lambda keys: keys[1:]),
+            ("removed", lambda keys: keys + ["a_key_the_code_no_longer_produces"]),
+        ):
+            with self.subTest(label):
+                baseline = copy.deepcopy(type(self).current)
+                key = self._entry_holding_keys(baseline)
+                baseline[key]["state_dict_keys"] = modify_keys_fn(
+                    baseline[key]["state_dict_keys"]
+                )
+                self._assert_refused(baseline, "change the state_dict keys")
+
+    def test_a_dropped_entry_is_refused(self) -> None:
+        baseline = copy.deepcopy(type(self).current)
+        baseline["AnEntryTheCodeNoLongerProduces"] = {"state_dict_keys": []}
+        self._assert_refused(baseline, "remove golden entries")
+
+    def test_a_brand_new_entry_is_written(self) -> None:
+        """A new case has no baseline to break, so it needs no acknowledgement.
+
+        Named, not searched for: most key sets are shared by several entries,
+        so asking whether one appears anywhere would accept a sibling's.
+        """
+        baseline = copy.deepcopy(type(self).current)
+        key = self._entry_holding_keys(baseline)
+        fresh = baseline.pop(key)
+        with self._baseline(baseline) as path:
+            update_golden_snapshot(path)
+            written = json.loads(path.read_text())
+        self.assertIn(key, written)
+        self.assertEqual(written[key], fresh)
+
+    def test_an_unchanged_baseline_is_rewritten_identically(self) -> None:
+        """Byte-identical, so regeneration never churns the file on its own.
+
+        The other cases parse what was written, which says nothing about
+        indent, key order, or the trailing newline.
+        """
+        with self._baseline(type(self).current) as path:
+            before = path.read_bytes()
+            update_golden_snapshot(path)
+            self.assertEqual(path.read_bytes(), before)
+
+
 class MetricCoverageTest(unittest.TestCase):
     """
     Test that ensures all RecMetric subclasses are covered by backward compatibility tests.
@@ -546,8 +671,8 @@ class MetricCoverageTest(unittest.TestCase):
 
     # Metrics that are intentionally excluded from testing (with reason)
     EXCLUDED_METRICS: Dict[str, str] = {
-        # Add metrics here that should be excluded, with a reason
-        # e.g., "SomeMetric": "deprecated, will be removed in next release",
+        # Class names, with a reason, e.g.
+        # "SomeMetric": "deprecated, removed next release",
     }
 
     @unittest.skipIf(
@@ -562,6 +687,15 @@ class MetricCoverageTest(unittest.TestCase):
         covered_metrics: Set[str] = {
             spec.expected_class.__name__ for spec in _METRIC_SPECS
         }
+
+        # A metric the walk stops finding drops out of the check below without
+        # failing it. That happens when torchrec.metrics is reorganized, which
+        # is a change nobody reviewing this file sees.
+        self.assertEqual(
+            covered_metrics - discovered_metrics,
+            set(),
+            "METRICS_TO_TEST names classes that discovery does not find",
+        )
 
         missing_metrics = (
             discovered_metrics - covered_metrics - set(self.EXCLUDED_METRICS.keys())
@@ -753,7 +887,11 @@ _cached_recmetric_subclasses: Optional[Set[Type[RecMetric]]] = None
 
 
 def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
-    """Discover all RecMetric subclasses in torchrec.metrics."""
+    """Every RecMetric subclass in torchrec.metrics.
+
+    A module that would not import used to be skipped in silence. All 51
+    modules import today, so a failure here is news rather than noise.
+    """
     global _cached_recmetric_subclasses
     if _cached_recmetric_subclasses is not None:
         return _cached_recmetric_subclasses
@@ -764,20 +902,34 @@ def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
     import torchrec.metrics
 
     subclasses: Set[Type[RecMetric]] = set()
+    failures: List[str] = []
     for _, module_name, _ in pkgutil.iter_modules(torchrec.metrics.__path__):
         try:
             module = importlib.import_module(f"torchrec.metrics.{module_name}")
-            for attr_name in dir(module):
-                attr = getattr(module, attr_name)
-                if (
-                    isinstance(attr, type)
-                    and issubclass(attr, RecMetric)
-                    and attr is not RecMetric
-                    and not attr_name.startswith("_")
-                ):
-                    subclasses.add(attr)
-        except ImportError:
+        except Exception as e:
+            failures.append(
+                f"  torchrec.metrics.{module_name}: {type(e).__name__}: {e}"
+            )
             continue
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if (
+                isinstance(attr, type)
+                and issubclass(attr, RecMetric)
+                and attr is not RecMetric
+                and not attr_name.startswith("_")
+            ):
+                subclasses.add(attr)
+
+    if failures:
+        detail = "\n".join(failures)
+        raise RuntimeError(
+            f"Could not import every torchrec.metrics module:\n{detail}\n"
+            "A module skipped here hides its metrics from the coverage check, "
+            "which asserts discovery is a subset of the table. Anything that "
+            "shrinks discovery makes that assertion easier to satisfy."
+        )
+
     _cached_recmetric_subclasses = subclasses
     return subclasses
 
@@ -1107,11 +1259,81 @@ def generate_schema_case_entries() -> Dict[str, Dict[str, Any]]:
     return entries
 
 
-def update_golden_snapshot() -> None:
+def changed_entries(
+    old: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]
+) -> Dict[str, Tuple[List[str], List[str]]]:
+    """For entries both snapshots hold, the state keys regeneration would change.
+
+    Returns key -> (added, removed). Entries missing from either side are
+    skipped: a brand-new case has no baseline to break, and a dropped one is
+    removed_entries' business.
+    """
+    changed: Dict[str, Tuple[List[str], List[str]]] = {}
+    for golden_key, entry in old.items():
+        if golden_key not in new:
+            continue
+        before = set(entry["state_dict_keys"])
+        after = set(new[golden_key]["state_dict_keys"])
+        if before != after:
+            changed[golden_key] = (sorted(after - before), sorted(before - after))
+    return changed
+
+
+def removed_entries(
+    old: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    """Golden entries that regeneration would drop.
+
+    A renamed metric moves its entry, and the replacement looks brand new, so
+    an added key could ride through on the new-entry exemption. Refusing the
+    drop is what closes that.
+    """
+    return sorted(set(old) - set(new))
+
+
+def update_golden_snapshot(path: Path = GOLDEN_SNAPSHOT_PATH) -> None:
     print("Generating golden snapshot...")
     snapshot = generate_schema_case_entries()
-    save_golden_snapshot(snapshot)
-    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
+
+    # Not load_golden_snapshot: an absent file reads as {}, which turns every
+    # generated entry into a brand-new one and silences both gates below.
+    previous = load_required_golden_snapshot(path)
+
+    dropped = removed_entries(previous, snapshot)
+    if dropped:
+        raise ValueError(
+            f"Regenerating would remove golden entries: {dropped}.\n"
+            "If the removal is right, delete those entries from "
+            f"{path.name} by hand and run again, in the same "
+            "diff that renames or drops the class. The hand edit is the "
+            "acknowledgement, and the diff is the record.\n"
+            "If it is not right, a case lost its coverage and the table needs "
+            "the row back."
+        )
+
+    changed = changed_entries(previous, snapshot)
+    if changed:
+        detail = "\n".join(
+            f"  {key}: added {added}, removed {removed}"
+            for key, (added, removed) in sorted(changed.items())
+        )
+        raise ValueError(
+            "Regenerating would change the state_dict keys of entries that "
+            f"already exist:\n{detail}\n"
+            "An added key makes every older checkpoint unloadable, and no "
+            "module hook can repair that: the planner rejects the load before "
+            "any hook runs. A removed key is still carried by older "
+            "checkpoints, and a checkpoint-derived load reads it back and "
+            "finds nobody claiming it.\n"
+            f"If the change is right, edit those entries in "
+            f"{path.name} by hand and run again. The hand edit "
+            "is the acknowledgement, and the diff is the record."
+        )
+
+    save_golden_snapshot(snapshot, path)
+    # Resolved: the path runs through buck-out's link tree, which symlinks back
+    # to the source. Printing it unresolved suggests the write went to buck-out.
+    print(f"Golden snapshot saved to {path.resolve()}")
     print(f"Total metrics captured: {len(snapshot)}")
     for key in sorted(snapshot.keys()):
         info = snapshot[key]
