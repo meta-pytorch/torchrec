@@ -27,13 +27,12 @@ from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNN
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.types import ModuleSharder, ShardingEnv
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
-from torchrec.test_utils import get_free_port, init_distributed_single_host
+from torchrec.test_utils import init_distributed_single_host
 
 
 class TrainPipelineSparseDistTestBase(unittest.TestCase):
     def setUp(self) -> None:
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         backend = "gloo"
         if torch.cuda.is_available():
             backend = "nccl"
