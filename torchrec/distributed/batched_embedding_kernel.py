@@ -82,6 +82,8 @@ from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
 from torchrec.distributed.embedding_kernel import (
+    _weight_init_on_cpu_from_config,
+    _weights_may_be_off_plan_device,
     BaseEmbedding,
     create_virtual_sharded_tensors,
     create_virtual_table_local_metadata,
@@ -111,6 +113,7 @@ from torchrec.distributed.types import (
     TensorProperties,
 )
 from torchrec.distributed.utils import (
+    align_shard_metadata_to_device,
     append_prefix,
     infer_weight_chunk_sizes,
     none_throws,
@@ -1361,6 +1364,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
         """
         self._emb_module: SplitTableBatchedEmbeddingBagsCodegen = emb_module
         self._pg = pg
+        realign_shard_devices: bool = _weight_init_on_cpu_from_config(config)
 
         @dataclass
         class ShardParams:
@@ -1601,6 +1605,14 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                 for local_weight, local_metadata in zip(
                     shard_params.embedding_weights, shard_params.local_metadata
                 ):
+                    # Under `weight_init_on_cpu` the weights are not on the device
+                    # the plan recorded, so the metadata has to follow them. Gated
+                    # so that for every other kernel a device mismatch still trips
+                    # ShardedTensor's assertion instead of being papered over.
+                    if realign_shard_devices:
+                        local_metadata = align_shard_metadata_to_device(
+                            local_metadata, local_weight.device
+                        )
                     local_weight_shards.append(Shard(local_weight, local_metadata))
                     table_config_global_metadata.tensor_properties.dtype = (
                         local_weight.dtype
@@ -2024,6 +2036,7 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
             self._pg,
             destination,
             prefix,
+            realign_shard_devices=_weights_may_be_off_plan_device(self),
         )
 
     def split_embedding_weights(self) -> List[SplitWeightType]:
@@ -2719,6 +2732,10 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
             f"BatchedFusedEmbedding: uvm_host_mapped={fused_params.get('uvm_host_mapped', False)}"
         )
 
+        self._weight_init_on_cpu: bool = _weight_init_on_cpu_from_config(
+            config, type(self).__name__
+        )
+
         self._emb_module: SplitTableBatchedEmbeddingBagsCodegen = (
             SplitTableBatchedEmbeddingBagsCodegen(
                 embedding_specs=list(
@@ -3248,6 +3265,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
             self._pg,
             destination,
             prefix,
+            realign_shard_devices=_weights_may_be_off_plan_device(self),
         )
 
     def split_embedding_weights(self) -> List[SplitWeightType]:
@@ -3921,6 +3939,10 @@ class BatchedFusedEmbeddingBag(
             f"BatchedFusedEmbeddingBag: uvm_host_mapped={fused_params.get('uvm_host_mapped', False)}"
         )
 
+        self._weight_init_on_cpu: bool = _weight_init_on_cpu_from_config(
+            config, type(self).__name__
+        )
+
         self._emb_module: SplitTableBatchedEmbeddingBagsCodegen = (
             SplitTableBatchedEmbeddingBagsCodegen(
                 embedding_specs=list(
@@ -4295,6 +4317,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
         """
         self._emb_module = emb_module
         self._pg = pg
+        realign_shard_devices: bool = _weight_init_on_cpu_from_config(config)
 
         @dataclass
         class ShardParams:
@@ -4512,6 +4535,14 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                 for local_weight, local_metadata in zip(
                     shard_params.embedding_weights, shard_params.local_metadata
                 ):
+                    # Under `weight_init_on_cpu` the weights are not on the device
+                    # the plan recorded, so the metadata has to follow them. Gated
+                    # so that for every other kernel a device mismatch still trips
+                    # ShardedTensor's assertion instead of being papered over.
+                    if realign_shard_devices:
+                        local_metadata = align_shard_metadata_to_device(
+                            local_metadata, local_weight.device
+                        )
                     local_weight_shards.append(Shard(local_weight, local_metadata))
                     table_config_global_metadata.tensor_properties.dtype = (
                         local_weight.dtype
