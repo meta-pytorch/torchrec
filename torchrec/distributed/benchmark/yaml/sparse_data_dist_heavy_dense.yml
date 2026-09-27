@@ -2,13 +2,15 @@
 # runs on 2 ranks, showing traces with reasonable workloads
 RunOptions:
   world_size: 2
+  batch_size: 1024
   num_batches: 10
-  num_benchmarks: 1
-  num_profiles: 1
+  num_benchmarks: 0
+  num_profiles: 2
   sharding_type: table_wise
   profile_dir: "."
   name: "sparse_data_dist_heavy_dense"
   memory_snapshot: True
+  profile_model_init: True
   # export_stacks: True # enable this to export stack traces
   loglevel: "info"
 PipelineConfig:
@@ -25,9 +27,14 @@ ModelSelectionConfig:
     num_float_features: 100
     submodule_kwargs:
       dense_arch_out_size: 128
-      over_arch_out_size: 4096
-      over_arch_hidden_layers: 10
-      dense_arch_hidden_sizes: [2048, 2048, 2048, 2048]
+      over_arch_out_size: 1024
+      over_arch_hidden_layers: 5
+      dense_arch_hidden_sizes: [
+        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+      ]
       skip_regroup: true
 EmbeddingTablesConfig:
   num_unweighted_features: 90
@@ -53,3 +60,5 @@ PlannerConfig:
   additional_constraints:
     large_table:
       sharding_types: [column_wise]
+ShardingConfig:
+  ddp_bucket_cap_mb: 512

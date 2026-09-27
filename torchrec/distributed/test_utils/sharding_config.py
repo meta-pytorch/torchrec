@@ -432,6 +432,7 @@ class ShardingConfig:
             Set to False to save memory when the original model is not needed.
         allreduce_comm_precision: Reduced precision for the dense gradient
             allreduce, e.g. "bf16" or "bf16_stream". None keeps FP32.
+        ddp_bucket_cap_mb: DDP reducer bucket capacity in MiB for dense parameters.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -445,6 +446,7 @@ class ShardingConfig:
     skip_dense_optimizer: bool = False
     deepcopy_model: bool = True
     allreduce_comm_precision: Optional[str] = None
+    ddp_bucket_cap_mb: int = 25
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -511,13 +513,17 @@ class ShardingConfig:
         """
         sharders, plan = self._plan_and_sharders(model, pg, planner)
 
-        # Only override the wrapper when a precision is configured; otherwise
-        # let DMP build its default wrapper so existing behavior is unchanged.
-        data_parallel_wrapper = (
-            DefaultDataParallelWrapper(
-                allreduce_comm_precision=self.allreduce_comm_precision,
+        data_parallel_wrapper_kwargs: Dict[str, Any] = {}
+        if self.allreduce_comm_precision is not None:
+            data_parallel_wrapper_kwargs["allreduce_comm_precision"] = (
+                self.allreduce_comm_precision
             )
-            if self.allreduce_comm_precision is not None
+        if self.ddp_bucket_cap_mb != 25:
+            data_parallel_wrapper_kwargs["bucket_cap_mb"] = self.ddp_bucket_cap_mb
+
+        data_parallel_wrapper = (
+            DefaultDataParallelWrapper(**data_parallel_wrapper_kwargs)
+            if data_parallel_wrapper_kwargs
             else None
         )
 
@@ -570,7 +576,8 @@ class ShardingConfig:
         If skip_dense_optimizer is True, returns a dummy optimizer.
         """
         if self.skip_dense_optimizer:
-            return torch.optim.SGD([torch.zeros(1)], lr=0.0)
+            # Citrine C2: use the optimizer's multi-tensor implementation.
+            return torch.optim.SGD([torch.zeros(1)], lr=0.0, foreach=True)
 
         dense_params = [
             param
