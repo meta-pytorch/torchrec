@@ -36,6 +36,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -50,6 +51,7 @@ from typing import (
     Set,
     Tuple,
     Type,
+    TypeVar,
 )
 
 import torch
@@ -62,6 +64,8 @@ from torchrec.metrics.calibration import CalibrationMetric
 from torchrec.metrics.calibration_with_recalibration import (
     RecalibratedCalibrationMetric,
 )
+from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
+from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.ctr import CTRMetric
 from torchrec.metrics.gauc import GAUCMetric
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
@@ -76,6 +80,7 @@ from torchrec.metrics.ne import NEMetric
 from torchrec.metrics.ne_positive import NEPositiveMetric
 from torchrec.metrics.ne_with_recalibration import RecalibratedNEMetric
 from torchrec.metrics.nmse import NMSEMetric
+from torchrec.metrics.noop_metric_module import NoOpMetricModule
 from torchrec.metrics.num_missing_labels import NumMissingLabelsMetric
 from torchrec.metrics.num_positive_samples import NumPositiveSamplesMetric
 from torchrec.metrics.output import OutputMetric
@@ -102,6 +107,8 @@ from torchrec.metrics.xauc import XAUCMetric
 
 # Path to the golden snapshot file
 GOLDEN_SNAPSHOT_PATH = Path(__file__).parent / "metric_fqn_golden_snapshot.json"
+
+_ModuleT = TypeVar("_ModuleT", bound=torch.nn.Module)
 
 
 def create_test_task(
@@ -241,23 +248,8 @@ def _make_throughput_metric(
 def _make_rec_metric_module(
     throughput_metric: Optional[ThroughputMetric] = None,
 ) -> RecMetricModule:
-    tasks = [create_test_task("task1")]
     return RecMetricModule(
-        batch_size=32,
-        world_size=1,
-        rec_tasks=tasks,
-        rec_metrics=RecMetricList(
-            [
-                NEMetric(
-                    world_size=1,
-                    my_rank=0,
-                    batch_size=32,
-                    tasks=tasks,
-                    compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-                    window_size=100,
-                )
-            ]
-        ),
+        **_module_fixture_kwargs(),
         throughput_metric=throughput_metric,
     )
 
@@ -310,6 +302,8 @@ _REC_METRIC_MODULE_DEFAULT = _GoldenCase(
     "rec_metric_module", RecMetricModule, "", _make_rec_metric_module
 )
 
+# Each stable_id is the golden file's key. It has to survive a rename of the
+# class beside it, which is why it is snake_case and not a class name.
 _CORE_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
     _GoldenCase("throughput_metric", ThroughputMetric, "", _make_throughput_metric),
     _GoldenCase(
@@ -324,6 +318,112 @@ _CORE_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
         RecMetricModule,
         "with_throughput",
         lambda: _make_rec_metric_module(_make_throughput_metric()),
+    ),
+)
+
+
+def _module_fixture_kwargs() -> Dict[str, Any]:
+    """Construction args shared by every RecMetricModule case.
+
+    One real metric, because an empty RecMetricList produces an empty
+    state_dict. Shared so the enrolled modules keep describing comparable
+    shapes.
+    """
+    tasks = [create_test_task("task1")]
+    return {
+        "batch_size": 32,
+        "world_size": 1,
+        "rec_tasks": tasks,
+        "rec_metrics": RecMetricList(
+            [
+                NEMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=32,
+                    tasks=tasks,
+                    compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+                    window_size=100,
+                )
+            ]
+        ),
+    }
+
+
+class _InertThread:
+    """A Thread that never runs.
+
+    This file only reads a module's state_dict, so CPUOffloadedRecMetricModule's
+    workers do nothing here. It constructs its threads directly, with no seam to
+    pass a substitute through, which is why this one arrives by patch. Without
+    it the module spawns two real workers that then need shutting down.
+
+    The patch target resolves to the shared threading module, so Thread is
+    replaced process-wide for the duration. Safe here: the block wraps one
+    synchronous constructor in a single-threaded suite.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def start(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return False
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        pass
+
+
+def _make_cpu_offloaded_module(
+    throughput_metric: Optional[ThroughputMetric] = None,
+) -> CPUOffloadedRecMetricModule:
+    with unittest.mock.patch(
+        "torchrec.metrics.cpu_offloaded_metric_module.threading.Thread",
+        new=_InertThread,
+    ):
+        return CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            **_module_fixture_kwargs(),
+            throughput_metric=throughput_metric,
+        )
+
+
+# Not RecMetric subclasses, so _discover_all_recmetric_subclasses cannot see
+# them. test_all_rec_metric_modules_are_covered catches a missing
+# RecMetricModule; anything else here is enrolled only by its row.
+_MODULE_CASES: Tuple[_GoldenCase, ...] = (
+    _GoldenCase("noop_metric_module", NoOpMetricModule, "", NoOpMetricModule),
+    _GoldenCase(
+        "cpu_comms_rec_metric_module",
+        CPUCommsRecMetricModule,
+        "",
+        lambda: CPUCommsRecMetricModule(**_module_fixture_kwargs()),
+    ),
+    _GoldenCase(
+        "cpu_comms_rec_metric_module",
+        CPUCommsRecMetricModule,
+        "with_throughput",
+        lambda: CPUCommsRecMetricModule(
+            **_module_fixture_kwargs(), throughput_metric=_make_throughput_metric()
+        ),
+    ),
+    # state_dict() reads the comms tree and load_state_dict() writes the offloaded
+    # one, but both carry the same keys, so this pins the shape and not which tree
+    # a load reached. test_cpu_offloaded_metric_module covers the load direction.
+    _GoldenCase(
+        "cpu_offloaded_rec_metric_module",
+        CPUOffloadedRecMetricModule,
+        "",
+        _make_cpu_offloaded_module,
+    ),
+    # The throughput keys reach this tree too, so the base entry above cannot
+    # tell a dropped throughput state from a module that never had one.
+    _GoldenCase(
+        "cpu_offloaded_rec_metric_module",
+        CPUOffloadedRecMetricModule,
+        "with_throughput",
+        lambda: _make_cpu_offloaded_module(_make_throughput_metric()),
     ),
 )
 
@@ -394,7 +494,9 @@ _METRIC_SPECS: Tuple[_GoldenCase, ...] = (
 )
 
 
-_SCHEMA_CASES: Tuple[_GoldenCase, ...] = _CORE_SCHEMA_CASES + _METRIC_SPECS
+_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
+    _CORE_SCHEMA_CASES + _MODULE_CASES + _METRIC_SPECS
+)
 
 
 def _validate_case_entry(
@@ -528,9 +630,8 @@ class GoldenCaseTest(unittest.TestCase):
         """
         by_id: Dict[str, List[FrozenSet[str]]] = {}
         for case in _SCHEMA_CASES:
-            module = case.build()
             by_id.setdefault(case.stable_id, []).append(
-                frozenset(module.state_dict().keys())
+                frozenset(case.build().state_dict().keys())
             )
 
         for stable_id, entries in by_id.items():
@@ -712,6 +813,49 @@ class MetricCoverageTest(unittest.TestCase):
                 f"If the metric should be excluded, add it to EXCLUDED_METRICS with a reason."
             )
 
+    @unittest.skipIf(
+        sys.version_info < (3, 11),
+        "concurrent.futures._base.Future is type but not a class",
+    )
+    def test_all_rec_metric_modules_are_covered(self) -> None:
+        """Deleting an id fails, but never adding one does not.
+
+        The orphan check only compares golden entries to the table, so a
+        subclass that was never enrolled leaves both sides agreeing.
+        """
+        # Compared as classes, not names, so two classes sharing a __name__
+        # cannot satisfy each other. Names are formatted for the message only.
+        discovered_modules: Set[Type[torch.nn.Module]] = set(
+            _discover_subclasses(RecMetricModule)
+        )
+
+        covered_modules: Set[Type[torch.nn.Module]] = {
+            case.expected_class
+            for case in _SCHEMA_CASES
+            if issubclass(case.expected_class, RecMetricModule)
+            and case.expected_class is not RecMetricModule
+        }
+
+        self.assertEqual(
+            covered_modules - discovered_modules,
+            set(),
+            "_MODULE_CASES names classes that discovery does not find",
+        )
+
+        missing_modules = discovered_modules - covered_modules
+
+        if missing_modules:
+            names = sorted(f"{c.__module__}.{c.__qualname__}" for c in missing_modules)
+            self.fail(
+                f"The following RecMetricModule subclasses are not covered by "
+                f"backward compatibility tests: {names}.\n\n"
+                f"To fix this:\n"
+                f"1. Add a _MODULE_CASES row with a snake_case stable_id and a "
+                f"builder. The row is the whole registration.\n"
+                f"2. Run with --update-golden to write its entry.\n\n"
+                f"There is no exclusion list; add one if a module must stay out."
+            )
+
 
 # Cross-config state_dict tests: detect config-dependent keys and verify
 # cross-config loads succeed with strict=True. New conditional-state params
@@ -886,22 +1030,18 @@ _THROUGHPUT_COMMON_KWARGS: Dict[str, Any] = {
 _cached_recmetric_subclasses: Optional[Set[Type[RecMetric]]] = None
 
 
-def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
-    """Every RecMetric subclass in torchrec.metrics.
+def _discover_subclasses(base: Type[_ModuleT]) -> Set[Type[_ModuleT]]:
+    """Every public strict subclass of base in torchrec.metrics.
 
     A module that would not import used to be skipped in silence. All 51
     modules import today, so a failure here is news rather than noise.
     """
-    global _cached_recmetric_subclasses
-    if _cached_recmetric_subclasses is not None:
-        return _cached_recmetric_subclasses
-
     import importlib
     import pkgutil
 
     import torchrec.metrics
 
-    subclasses: Set[Type[RecMetric]] = set()
+    subclasses: Set[Type[_ModuleT]] = set()
     failures: List[str] = []
     for _, module_name, _ in pkgutil.iter_modules(torchrec.metrics.__path__):
         try:
@@ -915,8 +1055,8 @@ def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
             attr = getattr(module, attr_name)
             if (
                 isinstance(attr, type)
-                and issubclass(attr, RecMetric)
-                and attr is not RecMetric
+                and issubclass(attr, base)
+                and attr is not base
                 and not attr_name.startswith("_")
             ):
                 subclasses.add(attr)
@@ -925,13 +1065,19 @@ def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
         detail = "\n".join(failures)
         raise RuntimeError(
             f"Could not import every torchrec.metrics module:\n{detail}\n"
-            "A module skipped here hides its metrics from the coverage check, "
-            "which asserts discovery is a subset of the table. Anything that "
+            "A module skipped here hides its classes from the coverage checks, "
+            "which assert discovery is a subset of the table. Anything that "
             "shrinks discovery makes that assertion easier to satisfy."
         )
 
-    _cached_recmetric_subclasses = subclasses
     return subclasses
+
+
+def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
+    global _cached_recmetric_subclasses
+    if _cached_recmetric_subclasses is None:
+        _cached_recmetric_subclasses = _discover_subclasses(RecMetric)
+    return _cached_recmetric_subclasses
 
 
 def _get_default_keys_cached(
@@ -1244,17 +1390,17 @@ def generate_schema_case_entries() -> Dict[str, Dict[str, Any]]:
 
     The comparison path fails rather than writing a missing entry, so this is
     the only way a new case gets one.
+
     """
     entries: Dict[str, Dict[str, Any]] = {}
     for case in _SCHEMA_CASES:
         if case.key in entries:
             raise ValueError(
-                f"Two cases share the key {case.key!r}. One would overwrite the "
-                "other's golden entry."
+                f"Two cases share the key {case.key!r}. One would overwrite "
+                "the other's golden entry."
             )
-        module = case.build()
         entries[case.key] = {
-            "state_dict_keys": sorted(module.state_dict().keys()),
+            "state_dict_keys": sorted(case.build().state_dict().keys()),
         }
     return entries
 
