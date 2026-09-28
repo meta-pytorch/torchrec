@@ -973,3 +973,116 @@ class TestIntraAndCrossNodePg2DNodeWidth(unittest.TestCase):
         self.assertIsNone(intra)
         self.assertIsNone(cross)
         fake_dist.new_group.assert_not_called()
+
+
+def _reference_recat(
+    grad_output: torch.Tensor, dim_sum_per_rank: List[int]
+) -> torch.Tensor:
+    grad_outputs_by_rank = grad_output.split(dim_sum_per_rank, dim=1)
+    return torch.cat(
+        [g.contiguous().view(-1) for g in grad_outputs_by_rank],
+        dim=0,
+    )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "test requires a GPU")
+class TestRecatPooledEmbeddingGradOut(unittest.TestCase):
+    """
+    `_recat_pooled_embedding_grad_out` has a fbgemm fast path behind
+    `USE_FBGEMM_RECAT`. It is a pure permutation of the input values, so every
+    path must agree bit for bit with the split/contiguous/cat reference.
+    """
+
+    def setUp(self) -> None:
+        self._original: bool = comm_ops.get_use_fbgemm_recat()
+
+    def tearDown(self) -> None:
+        comm_ops.set_use_fbgemm_recat(self._original)
+
+    def _make_case(
+        self, b_local: int, dim_sum_per_rank: List[int], dtype: torch.dtype
+    ) -> torch.Tensor:
+        return torch.randn(b_local, sum(dim_sum_per_rank), device="cuda", dtype=dtype)
+
+    def _recat_tensors(
+        self, dim_sum_per_rank: List[int], dtype: torch.dtype = torch.int64
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        cumsum = list(itertools.accumulate(dim_sum_per_rank))
+        return (
+            torch.tensor(dim_sum_per_rank, device="cuda", dtype=dtype),
+            torch.tensor([0] + cumsum[:-1], device="cuda", dtype=dtype),
+        )
+
+    @given(
+        b_local=st.sampled_from([1, 4, 128]),
+        dtype=st.sampled_from([torch.float32, torch.float16]),
+    )
+    @settings(deadline=None, max_examples=6)
+    def test_batch_kernel_matches_reference(
+        self, b_local: int, dtype: torch.dtype
+    ) -> None:
+        dim_sum_per_rank = [8, 16, 4, 32, 12, 4, 20, 8]
+        grad_output = self._make_case(b_local, dim_sum_per_rank, dtype)
+        expected = _reference_recat(grad_output, dim_sum_per_rank)
+
+        dims, cumsum = self._recat_tensors(dim_sum_per_rank)
+        comm_ops.set_use_fbgemm_recat(True)
+        actual = comm_ops._recat_pooled_embedding_grad_out(
+            grad_output, dim_sum_per_rank, dims, cumsum
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_mixed_d_kernel_matches_reference(self) -> None:
+        # No recat tensors supplied -> the cudaMemcpy2D-per-rank fbgemm path.
+        dim_sum_per_rank = [8, 16, 4, 32]
+        grad_output = self._make_case(16, dim_sum_per_rank, torch.float32)
+        expected = _reference_recat(grad_output, dim_sum_per_rank)
+
+        comm_ops.set_use_fbgemm_recat(True)
+        actual = comm_ops._recat_pooled_embedding_grad_out(
+            grad_output, dim_sum_per_rank
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_flag_off_uses_reference(self) -> None:
+        dim_sum_per_rank = [8, 16, 4, 32]
+        grad_output = self._make_case(16, dim_sum_per_rank, torch.float32)
+        dims, cumsum = self._recat_tensors(dim_sum_per_rank)
+
+        comm_ops.set_use_fbgemm_recat(False)
+        actual = comm_ops._recat_pooled_embedding_grad_out(
+            grad_output, dim_sum_per_rank, dims, cumsum
+        )
+        torch.testing.assert_close(
+            actual, _reference_recat(grad_output, dim_sum_per_rank), rtol=0, atol=0
+        )
+
+    def test_int32_tensors_fall_back(self) -> None:
+        # The legacy All2AllPooledInfo tensors are int32 with an *inclusive*
+        # cumsum. Feeding those to the batch kernel would silently shift every
+        # rank's stripe, so the dtype guard must route them to the safe path.
+        dim_sum_per_rank = [8, 16, 4, 32]
+        grad_output = self._make_case(16, dim_sum_per_rank, torch.float32)
+        dims, cumsum = self._recat_tensors(dim_sum_per_rank, dtype=torch.int32)
+
+        comm_ops.set_use_fbgemm_recat(True)
+        actual = comm_ops._recat_pooled_embedding_grad_out(
+            grad_output, dim_sum_per_rank, dims, cumsum
+        )
+        torch.testing.assert_close(
+            actual, _reference_recat(grad_output, dim_sum_per_rank), rtol=0, atol=0
+        )
+
+    def test_unsupported_dtype_falls_back(self) -> None:
+        # fbgemm dispatches float and half only.
+        dim_sum_per_rank = [8, 16, 4, 32]
+        grad_output = self._make_case(16, dim_sum_per_rank, torch.bfloat16)
+        dims, cumsum = self._recat_tensors(dim_sum_per_rank)
+
+        comm_ops.set_use_fbgemm_recat(True)
+        actual = comm_ops._recat_pooled_embedding_grad_out(
+            grad_output, dim_sum_per_rank, dims, cumsum
+        )
+        torch.testing.assert_close(
+            actual, _reference_recat(grad_output, dim_sum_per_rank), rtol=0, atol=0
+        )
