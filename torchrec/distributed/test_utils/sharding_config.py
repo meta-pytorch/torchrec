@@ -428,11 +428,13 @@ class ShardingConfig:
             placement (CPU embeddings + GPU dense).
         skip_dense_optimizer: If True, return a dummy optimizer instead of creating
             a real one for dense parameters. Useful for eval-only workflows.
-        deepcopy_model: If True (default), deepcopy the model before passing to DMP.
-            Set to False to save memory when the original model is not needed.
+        deepcopy_model: If True, deepcopy the model before passing it to DMP so
+            the original model remains available for comparison or reuse.
         allreduce_comm_precision: Reduced precision for the dense gradient
             allreduce, e.g. "bf16" or "bf16_stream". None keeps FP32.
         ddp_bucket_cap_mb: DDP reducer bucket capacity in MiB for dense parameters.
+        lazy_reducer: Whether DDP reducer bucket storage is allocated during
+            backward and released after backward finishes.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -444,9 +446,10 @@ class ShardingConfig:
     init_data_parallel: bool = True
     embedding_device: Optional[str] = None
     skip_dense_optimizer: bool = False
-    deepcopy_model: bool = True
+    deepcopy_model: bool = False
     allreduce_comm_precision: Optional[str] = None
     ddp_bucket_cap_mb: int = 25
+    lazy_reducer: bool = False
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -520,6 +523,12 @@ class ShardingConfig:
             )
         if self.ddp_bucket_cap_mb != 25:
             data_parallel_wrapper_kwargs["bucket_cap_mb"] = self.ddp_bucket_cap_mb
+
+        ddp_kwargs: Dict[str, Any] = {}
+        if self.lazy_reducer:
+            ddp_kwargs["lazy_bucket_allocation"] = True
+        if ddp_kwargs:
+            data_parallel_wrapper_kwargs["ddp_kwargs"] = ddp_kwargs
 
         data_parallel_wrapper = (
             DefaultDataParallelWrapper(**data_parallel_wrapper_kwargs)
