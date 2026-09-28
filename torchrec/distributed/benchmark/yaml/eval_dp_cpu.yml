@@ -41,4 +41,3 @@ ShardingConfig:
   init_data_parallel: false
   embedding_device: "cpu"
   skip_dense_optimizer: true
-  deepcopy_model: false
