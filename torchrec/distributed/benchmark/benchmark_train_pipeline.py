@@ -5,8 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 """
 Example usage:
 
@@ -116,6 +114,8 @@ class RunOptions(BenchFuncConfig):
             reached. This allows simulating long training runs without the CPU
             memory cost of generating unique batches. When None (default),
             num_batches iterations are run (no cycling).
+        profile_model_init (bool): Initialize the model once inside the first
+            profiling iteration. Requires profiling-only mode.
     """
 
     world_size: int = 2
@@ -133,6 +133,94 @@ class RunOptions(BenchFuncConfig):
     output_json: bool = False
     sync_fwd: bool = True
     sync_batch: bool = False
+    profile_model_init: bool = False
+
+
+@dataclass
+class _InitializedModel:
+    unsharded_model: nn.Module
+    sharded_model: nn.Module
+    pipeline: TrainPipeline | GradientAccumulationWrapper
+    metric_module: RecMetricModule | None
+    metric_model_out: dict[str, torch.Tensor] | None
+    fwd_event: Any | None
+
+    @classmethod
+    def initialize(
+        cls,
+        tables: list[EmbeddingBagConfig],
+        weighted_tables: list[EmbeddingBagConfig],
+        run_option: RunOptions,
+        model_config: BaseModelConfig,
+        pipeline_config: PipelineConfig,
+        planner_config: PlannerConfig,
+        sharding_config: ShardingConfig,
+        metric_config: RecMetricConfig,
+        ctx: MultiProcessContext,
+        table_related_configs: TableExtendedConfigs | None,
+    ) -> "_InitializedModel":
+        unsharded_model = model_config.generate_model(
+            tables=tables,
+            weighted_tables=weighted_tables,
+            dense_device=ctx.device,
+            mc_configs=(
+                table_related_configs.mc_configs if table_related_configs else None
+            ),
+        )
+        planner = planner_config.generate_planner(tables=tables + weighted_tables)
+        sharded_model, optimizer = sharding_config.generate_sharded_model_and_optimizer(
+            model=unsharded_model,
+            # pyrefly: ignore[bad-argument-type]
+            pg=ctx.pg,
+            device=ctx.device,
+            planner=planner,
+        )
+        metric_module = metric_config.generate_metric_module(
+            batch_size=run_option.batch_size,
+            world_size=run_option.world_size,
+            rank=ctx.rank,
+            device=ctx.device,
+            process_group=ctx.pg,
+        )
+        metric_model_out = (
+            metric_config.generate_model_output(run_option.batch_size, ctx.device)
+            if metric_module is not None
+            else None
+        )
+        fwd_event = (
+            torch.cuda.Event(enable_timing=True) if run_option.sync_fwd else None
+        )
+        if fwd_event is not None:
+
+            def sync_fwd_hook(
+                module: nn.Module,
+                inputs: Tuple[Any, ...],
+                outputs: Any,
+            ) -> None:
+                fwd_event.record()
+
+            sharded_model.register_forward_hook(sync_fwd_hook)
+
+        pipeline = pipeline_config.generate_pipeline(
+            model=sharded_model,
+            opt=optimizer,
+            device=ctx.device,
+        )
+        if run_option.ga_num_steps > 1:
+            pipeline = GradientAccumulationWrapper(
+                pipeline=pipeline,
+                optimizer=optimizer,
+                model=sharded_model,
+                config=GradientAccumulationConfig(num_steps=run_option.ga_num_steps),
+            )
+        return cls(
+            unsharded_model=unsharded_model,
+            sharded_model=sharded_model,
+            pipeline=pipeline,
+            metric_module=metric_module,
+            metric_model_out=metric_model_out,
+            fwd_event=fwd_event,
+        )
 
 
 # single-rank runner
@@ -179,26 +267,22 @@ def runner(
         attach_debugger()
 
     run_option.set_log_level()
+    if run_option.profile_model_init and (
+        run_option.num_benchmarks != 0
+        or run_option.num_profiles == 0
+        or not run_option.profile_dir
+    ):
+        raise ValueError(
+            "profile_model_init requires num_benchmarks=0, num_profiles>0, "
+            "and a non-empty profile_dir"
+        )
+
     with MultiProcessContext(
         rank=rank,
         world_size=run_option.world_size,
         backend="cpu:gloo,cuda:nccl",
         use_deterministic_algorithms=False,
     ) as ctx:
-        unsharded_model = model_config.generate_model(
-            tables=tables,
-            weighted_tables=weighted_tables,
-            dense_device=ctx.device,
-            mc_configs=(
-                table_related_configs.mc_configs if table_related_configs else None
-            ),
-        )
-
-        # Create a planner for sharding based on the specified type
-        planner = planner_config.generate_planner(
-            tables=tables + weighted_tables,
-        )
-
         bench_inputs = input_config.generate_batches(
             tables=tables,
             weighted_tables=weighted_tables,
@@ -223,52 +307,47 @@ def runner(
             f"Rank {rank} total input size: {total_size_str} ({len(bench_inputs)} batches)"
         )
 
-        sharded_model, optimizer = sharding_config.generate_sharded_model_and_optimizer(
-            model=unsharded_model,
-            # pyrefly: ignore[bad-argument-type]
-            pg=ctx.pg,
-            device=ctx.device,
-            planner=planner,
-        )
-
-        metric_module: Optional[RecMetricModule] = metric_config.generate_metric_module(
-            batch_size=run_option.batch_size,
-            world_size=run_option.world_size,
-            rank=rank,
-            device=ctx.device,
-            process_group=ctx.pg,
-        )
-
-        try:
-            # Pre-allocate synthetic model_out to avoid CUDA allocator noise
-            # in the timing loop. Values don't matter for benchmarking overhead.
-            metric_model_out = (
-                metric_config.generate_model_output(run_option.batch_size, ctx.device)
-                if metric_module is not None
-                else None
+        initialized_model: Optional[_InitializedModel] = None
+        if not run_option.profile_model_init:
+            initialized_model = _InitializedModel.initialize(
+                tables,
+                weighted_tables,
+                run_option,
+                model_config,
+                pipeline_config,
+                planner_config,
+                sharding_config,
+                metric_config,
+                ctx,
+                table_related_configs,
             )
 
-            fwd_event = torch.cuda.Event(enable_timing=True)
-            if run_option.sync_fwd:
-
-                def sync_fwd_hook(
-                    module: nn.Module,
-                    inputs: Tuple[Any, ...],
-                    outputs: Any,
-                ) -> None:
-                    fwd_event.record()
-
-                sharded_model.register_forward_hook(sync_fwd_hook)
+        try:
 
             def _func_to_benchmark(
                 bench_inputs: List[ModelInput],
-                model: nn.Module,
-                pipeline: TrainPipeline,
             ) -> None:
-                pipeline.reset()
-                if metric_module is not None:
-                    metric_module.reset()
-                    metric_module.trained_batches = 0
+                nonlocal initialized_model
+                if initialized_model is None:
+                    with record_function("## model init ##"):
+                        initialized_model = _InitializedModel.initialize(
+                            tables,
+                            weighted_tables,
+                            run_option,
+                            model_config,
+                            pipeline_config,
+                            planner_config,
+                            sharding_config,
+                            metric_config,
+                            ctx,
+                            table_related_configs,
+                        )
+
+                initialized = initialized_model
+                initialized.pipeline.reset()
+                if initialized.metric_module is not None:
+                    initialized.metric_module.reset()
+                    initialized.metric_module.trained_batches = 0
 
                 if run_option.num_iters is not None:
                     dataloader = itertools.islice(
@@ -280,7 +359,7 @@ def runner(
                 not_nan_awaitable: Optional[DeviceToHostTensorAwaitable] = None
                 while True:
                     try:
-                        output = pipeline.progress(dataloader)
+                        output = initialized.pipeline.progress(dataloader)
                         if isinstance(output, torch.Tensor):
                             not_nan_awaitable = DeviceToHostTensorAwaitable(
                                 ~torch.any(torch.isnan(output))
@@ -290,21 +369,24 @@ def runner(
                                 f"Pipeline output is not a tensor: {type(output)}, skipping NaN check"
                             )
 
-                        if metric_module is not None and output is not None:
-                            assert metric_model_out is not None
+                        if initialized.metric_module is not None and output is not None:
+                            assert initialized.metric_model_out is not None
                             with record_function("## metric_update ##"):
-                                metric_module.update(metric_model_out)
-                            if metric_module.should_compute():
+                                initialized.metric_module.update(
+                                    initialized.metric_model_out
+                                )
+                            if initialized.metric_module.should_compute():
                                 with record_function("## metric_compute ##"):
                                     if isinstance(
-                                        metric_module, CPUOffloadedRecMetricModule
+                                        initialized.metric_module,
+                                        CPUOffloadedRecMetricModule,
                                     ):
-                                        metric_module.async_compute()
+                                        initialized.metric_module.async_compute()
                                     else:
-                                        metric_module.compute()
+                                        initialized.metric_module.compute()
 
-                        if run_option.sync_fwd:
-                            fwd_event.synchronize()
+                        if initialized.fwd_event is not None:
+                            initialized.fwd_event.synchronize()
                         if run_option.sync_batch:
                             torch.cuda.synchronize()
                         if (
@@ -320,29 +402,13 @@ def runner(
                             ), "Pipeline output contains NaN"
                         break
 
-            pipeline = pipeline_config.generate_pipeline(
-                model=sharded_model,
-                opt=optimizer,
-                device=ctx.device,
-            )
-
-            if run_option.ga_num_steps > 1:
-                ga_config = GradientAccumulationConfig(
-                    num_steps=run_option.ga_num_steps,
-                )
-                pipeline = GradientAccumulationWrapper(
-                    pipeline=pipeline,
-                    optimizer=optimizer,
-                    model=sharded_model,
-                    config=ga_config,
-                )
             result = benchmark_func(
                 # pyrefly: ignore[bad-argument-type]
                 bench_inputs=bench_inputs,
                 # pyrefly: ignore[bad-argument-type]
                 prof_inputs=bench_inputs,
                 func_to_benchmark=_func_to_benchmark,
-                benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},
+                benchmark_func_kwargs={},
                 sample_count=(
                     input_config.batch_size * run_option.num_iters
                     if run_option.num_iters is not None
@@ -361,9 +427,12 @@ def runner(
 
             return result
         finally:
-            if metric_module is not None:
+            if (
+                initialized_model is not None
+                and initialized_model.metric_module is not None
+            ):
                 # Must drain background threads before MultiProcessContext exits.
-                metric_module.shutdown()
+                initialized_model.metric_module.shutdown()
 
 
 # a standalone function to run the benchmark in multi-process mode
