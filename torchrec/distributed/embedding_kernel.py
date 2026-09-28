@@ -37,12 +37,15 @@ from torchrec.distributed.types import (
     Shard,
     ShardedTensor,
     ShardedTensorMetadata,
+    ShardingEnv,
     ShardMetadata,
 )
-from torchrec.distributed.utils import none_throws
+from torchrec.distributed.utils import align_shard_metadata_to_device, none_throws
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+WEIGHT_INIT_ON_CPU_STR: str = "weight_init_on_cpu"
 
 
 class RawIdTrackerWrapper:
@@ -350,6 +353,66 @@ def create_virtual_sharded_tensors(
     return result
 
 
+def _weight_init_on_cpu_from_config(
+    config: GroupedEmbeddingConfig, kernel_name: str = ""
+) -> bool:
+    """Read the opt-in TBE weight init flag out of `fused_params`.
+
+    `fused_params` is splatted straight into the FBGEMM TBE constructor, so this
+    key reaches the kernel on its own -- this helper exists for the torchrec-side
+    consumers that also need to know, and to keep the string in one place.
+
+    Logged rather than silent because the kernel is unusable for a forward pass
+    until the caller relocates the weights, and a stray `weight_init_on_cpu` is
+    otherwise only visible as a device mismatch deep inside FBGEMM.
+    """
+    weight_init_on_cpu = bool(
+        (config.fused_params or {}).get(WEIGHT_INIT_ON_CPU_STR, False)
+    )
+    if weight_init_on_cpu and kernel_name:
+        logger.info(
+            "[TorchRec] %s: weight_init_on_cpu is set for tables %s. These weights "
+            "are NOT usable for a forward pass until they are relocated to the "
+            "compute device, normally by EmbeddingQuantizationUtils."
+            "quantize_embedding_modules(target_device=...). Skipping that step "
+            "fails inside the FBGEMM op with a bare device mismatch that does not "
+            "mention this flag.",
+            kernel_name,
+            [t.name for t in config.embedding_tables],
+        )
+    return weight_init_on_cpu
+
+
+def _weights_may_be_off_plan_device(kernel: nn.Module) -> bool:
+    """True when this kernel was built with `weight_init_on_cpu`.
+
+    Only such a kernel is allowed to have its shard metadata realigned to wherever
+    its tensors ended up. For every other kernel, a shard whose device disagrees
+    with the plan is a genuine bug and `ShardedTensor`'s device assertion is what
+    surfaces it -- so keep that assertion armed rather than realigning blindly.
+
+    Takes the torchrec kernel wrapper, not the FBGEMM TBE: the flag is recorded
+    here from `fused_params`, so the source of truth stays in this codebase and a
+    rename on the FBGEMM side cannot silently turn every realignment into a no-op.
+    Wrappers that never accept the argument (dense, SSD/KV) do not record it.
+    """
+    return getattr(kernel, "_weight_init_on_cpu", False)
+
+
+def _any_weights_off_plan_device(module: nn.Module) -> bool:
+    """True when any fused kernel under `module` was built with `weight_init_on_cpu`.
+
+    For the sharded-module level, which decides whether the *global* shard
+    metadata needs realigning. Lookups hold their kernels in a plain list rather
+    than as child modules, so `named_modules()` does not reach them.
+    """
+    for lookup in getattr(module, "_lookups", []):
+        for kernel in getattr(lookup, "_emb_modules", []):
+            if _weights_may_be_off_plan_device(kernel):
+                return True
+    return False
+
+
 def get_state_dict(
     embedding_tables: List[ShardedEmbeddingTable],
     params: Union[
@@ -362,7 +425,17 @@ def get_state_dict(
     pg: Optional[dist.ProcessGroup] = None,
     destination: Optional[Dict[str, Any]] = None,
     prefix: str = "",
+    realign_shard_devices: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Args:
+        realign_shard_devices: only set this for kernels built with
+            `weight_init_on_cpu`, whose weights are deliberately not on the device
+            the sharding plan assigned. It makes each shard's metadata follow its
+            tensor instead of the plan. Leave it False everywhere else: a device
+            mismatch is otherwise a real bug, and ShardedTensor's assertion is
+            what catches it.
+    """
     if destination is None:
         destination = OrderedDict()
         # pyrefly: ignore[missing-attribute]
@@ -489,6 +562,16 @@ def get_state_dict(
                         shards_metadata.shard_sizes = [0, 0]
 
             key_to_global_metadata[weights_key] = glb_metadata
+
+            # `weight_init_on_cpu` can leave a shard somewhere other than the
+            # device the plan assigned it, and ShardedTensor validates the two
+            # against each other.
+            if realign_shard_devices and local_metadata is not None:
+                local_metadata = align_shard_metadata_to_device(
+                    local_metadata,
+                    # pyrefly: ignore[missing-attribute]
+                    param.device,
+                )
 
             # for kv zch cases, we use virtual space, the logic will be the same as non-kv zch cases
             key_to_local_shards[weights_key].append(
