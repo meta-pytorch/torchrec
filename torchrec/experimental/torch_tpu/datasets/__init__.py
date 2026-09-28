@@ -31,6 +31,7 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torchrec.experimental.torch_tpu.datasets.dataloader import (
+        PrefetchDataLoader,
         SparseCoreBatch,
         SparseCoreDataLoader,
     )
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 _SYMBOL_TO_MODULE: dict[str, str] = {
     "KeyedSparseCorePreprocessedInput": "torchrec.experimental.torch_tpu.datasets.input_preprocessing",
+    "PrefetchDataLoader": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreBatch": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreDataLoader": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreInputPreprocessor": "torchrec.experimental.torch_tpu.datasets.input_preprocessing",
@@ -64,6 +66,7 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "PrefetchDataLoader",
     "SparseCoreBatch",
     "SparseCoreDataLoader",
     "SparseCoreInputPreprocessor",

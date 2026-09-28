@@ -389,3 +389,85 @@ dcp.load(
 ```
 
 ---
+
+## Table Stacking (`auto_stack_tables` & `stack_tables`)
+
+To maximize TPU SparseCore utilization when training models with many embedding tables, compatible tables (sharing pooling mode and padded embedding dimension, or padded up to the maximum dimension in a stack) can be physically stacked into combined SparseCore tables.
+
+### Automatic Table Stacking
+Enable `auto_stack=True` on `SparseCoreInputPreprocessor` before creating the embedding collection. The preprocessor automatically groups compatible tables within the activation memory limit (`activation_mem_bytes_limit`) and populates `table.stacked_config` in-place:
+
+```python
+from torchrec.experimental.torch_tpu.datasets.input_preprocessing import SparseCoreInputPreprocessor
+from torchrec.experimental.torch_tpu.modules.fused_embedding_modules import SparseCoreFusedEmbeddingBagCollection
+
+preprocessor = SparseCoreInputPreprocessor(
+    tables=sc_table_configs,
+    batch_size=batch_size,
+    global_device_count=world_size,
+    num_sc_per_device=2,
+    auto_stack=True,
+)
+
+# SparseCoreFusedEmbeddingBagCollection automatically consumes the stacked configs
+ebc = SparseCoreFusedEmbeddingBagCollection(
+    tables=sc_table_configs,
+    optimizer_type=torch.optim.SGD,
+    optimizer_kwargs={"lr": 0.1},
+    batch_size=batch_size,
+    global_device_count=world_size,
+    num_sc_per_device=2,
+)
+```
+
+### Manual Table Stacking
+You can also explicitly group specific tables using `stack_tables` or by setting `stack_table_name` on `SparseCoreEmbeddingConfig`:
+
+```python
+from torchrec.experimental.torch_tpu.modules.table_stacking import stack_tables
+
+stack_tables(
+    tables=sc_table_configs,
+    table_names=["table_a", "table_b"],
+    global_device_count=world_size,
+    num_sc_per_device=2,
+    batch_size=batch_size,
+    stack_table_name="stacked_ab",
+)
+```
+
+---
+
+## 3-Stage SparseCore/TensorCore Pipelining (`SparseCoreTrainPipeline`)
+
+`SparseCoreTrainPipeline` overlaps three stages across consecutive batches (`t`, `t+1`, `t+2`) inside a single compiled step:
+1. **Stage 1 (Batch `t+2`)**: SparseCore Forward (embedding lookup)
+2. **Stage 2 (Batch `t+1`)**: TensorCore Forward + Backward + AllReduce + Dense Optimizer
+3. **Stage 3 (Batch `t`)**: SparseCore Backward (in-place or functional table weight update)
+
+Combine `SparseCoreTrainPipeline` with `PrefetchDataLoader` (which runs CPU input preprocessing in a background thread and performs non-blocking H2D transfers) and functional optimizers (`torchrec.experimental.torch_tpu.modules.optimizers`):
+
+```python
+from torchrec.experimental.torch_tpu.datasets.dataloader import PrefetchDataLoader
+from torchrec.experimental.torch_tpu.modules import optimizers
+from torchrec.experimental.torch_tpu.pipelining import SparseCoreTrainPipeline
+
+dense_optimizer = optimizers.KeyedStatelessOptimizer(
+    params=dense_params_dict,
+    optimizer=optimizers.ReferenceAdamw(lr=1e-3),
+)
+
+pipeline = SparseCoreTrainPipeline(
+    model=dlrm_model,
+    optimizer=dense_optimizer,
+    criterion=loss_fn,
+    compile=True,
+)
+
+with PrefetchDataLoader(raw_dataloader, preprocessor, device=device) as loader:
+    for loss in pipeline.iterate(loader):
+        pass
+```
+
+---
+

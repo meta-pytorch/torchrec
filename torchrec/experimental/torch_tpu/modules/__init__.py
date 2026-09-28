@@ -30,6 +30,7 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from torchrec.experimental.torch_tpu.modules.embedding_configs import (
         SparseCoreEmbeddingConfig,
+        StackedSparseCoreEmbeddingConfig,
     )
     from torchrec.experimental.torch_tpu.modules.embedding_modules import (
         TPUEmbeddingUnfused,
@@ -38,13 +39,26 @@ if TYPE_CHECKING:
         SparseCoreFusedEmbeddingBagCollection,
         SparseCoreFusedEmbeddingCollection,
     )
+    from torchrec.experimental.torch_tpu.modules.table_stacking import (
+        auto_stack_tables,
+        prepare_tables_for_stacking,
+        stack_and_shard_tables,
+        stack_tables,
+        unshard_and_unstack_tables,
+    )
 
 
 _SYMBOL_TO_MODULE: dict[str, str] = {
     "SparseCoreEmbeddingConfig": "torchrec.experimental.torch_tpu.modules.embedding_configs",
     "SparseCoreFusedEmbeddingBagCollection": "torchrec.experimental.torch_tpu.modules.fused_embedding_modules",
     "SparseCoreFusedEmbeddingCollection": "torchrec.experimental.torch_tpu.modules.fused_embedding_modules",
+    "StackedSparseCoreEmbeddingConfig": "torchrec.experimental.torch_tpu.modules.embedding_configs",
     "TPUEmbeddingUnfused": "torchrec.experimental.torch_tpu.modules.embedding_modules",
+    "auto_stack_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "prepare_tables_for_stacking": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "stack_and_shard_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "stack_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "unshard_and_unstack_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
 }
 
 
@@ -63,7 +77,13 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "SparseCoreEmbeddingConfig",
+    "StackedSparseCoreEmbeddingConfig",
     "SparseCoreFusedEmbeddingBagCollection",
     "SparseCoreFusedEmbeddingCollection",
     "TPUEmbeddingUnfused",
+    "stack_tables",
+    "auto_stack_tables",
+    "prepare_tables_for_stacking",
+    "stack_and_shard_tables",
+    "unshard_and_unstack_tables",
 ]
