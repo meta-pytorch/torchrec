@@ -195,7 +195,7 @@ def _wait_for_batch(
 
     # batch is loaded/processed in the given stream, but will be used in the current
     device = stream.device
-    curr_stream = torch.get_device_module(device).current_stream()
+    curr_stream = torch.accelerator.current_stream(device)
 
     # current stream needs to wait for the given stream to complete
     curr_stream.wait_stream(stream)
@@ -373,7 +373,7 @@ def _start_embedding_lookup_stream_synced(
     current_stream = None
     device_stream = source_stream or target_stream
     if device_stream:
-        current_stream = torch.get_device_module(device_stream.device).current_stream()
+        current_stream = torch.accelerator.current_stream(device_stream.device)
 
     # Waiting here keeps the collective-completion wait and the recat kernels off
     # the consumer stream, and their output in the data-dist allocator pool.
@@ -880,7 +880,7 @@ def prefetch_embeddings(
     if data_dist_stream is None:
         return
 
-    cur_stream = torch.get_device_module(device).current_stream()
+    cur_stream = torch.accelerator.current_stream(device)
 
     for sharded_module in pipelined_modules:
         forward = sharded_module.forward
@@ -954,10 +954,8 @@ def _prefetch_embeddings(
         # are properly transferred to the current stream.
         module_context = context.module_contexts[forward._name]
         if data_dist_stream is not None:
-            torch.get_device_module(device).current_stream().wait_stream(
-                data_dist_stream
-            )
-            cur_stream = torch.get_device_module(device).current_stream()
+            cur_stream = torch.accelerator.current_stream(device)
+            cur_stream.wait_stream(data_dist_stream)
 
             assert isinstance(
                 data, (torch.Tensor, Multistreamable)
@@ -1104,7 +1102,7 @@ class AsyncInplaceCopyMixin(Generic[In]):
     ) -> "Future[In]":
         # Capture the consumer's current stream on the MAIN thread; the worker
         # re-enters it so the destination is allocated on the consumer stream.
-        alloc_stream = torch.get_device_module(device).current_stream(device)
+        alloc_stream = torch.accelerator.current_stream(device)
 
         def _work() -> In:
             device_module = torch.get_device_module(device)

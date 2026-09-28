@@ -512,7 +512,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
             with self._stream_context(self._memcpy_stream):
                 if self._memcpy_stream:
                     self._memcpy_stream.wait_stream(
-                        torch.get_device_module(self._device).current_stream()
+                        torch.accelerator.current_stream(self._device)
                     )
                 for name, (embeddings, gpu_values) in gpu_embedding_buffers.items():
                     if gpu_values is not None:
@@ -599,7 +599,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         """
         with record_function(f"## dense_forward {context.index} ##"):
             if self._memcpy_stream:
-                torch.get_device_module(self._device).current_stream().wait_stream(
+                torch.accelerator.current_stream(self._device).wait_stream(
                     self._memcpy_stream
                 )
             self._set_module_context(context)
@@ -677,7 +677,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         if len(self.batches) > 1 and self._pipeline_depth == 2:
             if self._memcpy_stream:
                 self._memcpy_stream.wait_stream(
-                    torch.get_device_module(self._device).current_stream()
+                    torch.accelerator.current_stream(self._device)
                 )
             self.batches[1] = self.copy_data_to_gpu(self.batches[1], self.contexts[1])
 

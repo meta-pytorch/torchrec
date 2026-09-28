@@ -960,7 +960,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             model=self._model,
             context=context,
             dist_stream=self._data_dist_stream,
-            default_stream=torch.get_device_module(self._device).current_stream(),
+            default_stream=torch.accelerator.current_stream(self._device),
             batch=batch,
             apply_jit=self._apply_jit,
             pipelined_forward=pipelined_forward,
@@ -1557,7 +1557,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         """
         Waits on the embedding lookup requests to get the embedding lookup tensors requests
         """
-        current_stream = torch.get_device_module(self._device).current_stream()
+        current_stream = torch.accelerator.current_stream(self._device)
         current_stream.wait_stream(self._emb_lookup_stream)
 
     def start_embedding_lookup(
@@ -1572,7 +1572,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             return
 
         with record_function(f"## start_embedding_lookup {context.index} ##"):
-            current_stream = torch.get_device_module(self._device).current_stream()
+            current_stream = torch.accelerator.current_stream(self._device)
             # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._emb_lookup_stream):
                 for module in self._pipelined_modules:
@@ -1892,7 +1892,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
     ) -> Tuple[torch.Tensor, Out]:
         with record_function(f"## forward {context.index} ##"):
             _wait_for_events(
-                batch, context, torch.get_device_module(self._device).current_stream()
+                batch, context, torch.accelerator.current_stream(self._device)
             )
             return self._model_fwd(batch)
 
@@ -1985,7 +1985,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             return
 
         with record_function(f"## start_embedding_lookup {context.index} ##"):
-            current_stream = torch.get_device_module(self._device).current_stream()
+            current_stream = torch.accelerator.current_stream(self._device)
             _wait_for_events(batch, context, current_stream)
             for module in self._pipelined_modules:
                 _start_embedding_lookup(
@@ -2682,9 +2682,9 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         self._dataloader_exhausted: bool = False
         self._compute_stream: torch.Stream = (
             compute_stream
-            or torch.get_device_module(
+            or torch.accelerator.current_stream(
                 self._pipeline_stages[0].stream.device
-            ).current_stream()
+            )
         )
 
         self._stream_context = (

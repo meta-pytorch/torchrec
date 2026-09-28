@@ -106,7 +106,7 @@ class ModelInput(Pipelineable):
         else:
             # Async copy using dedicated stream
             device_module = torch.get_device_module(device)
-            current_stream = device_module.current_stream(device)
+            current_stream = torch.accelerator.current_stream(device)
 
             # Pre-allocate dense tensors on target device
             float_features = torch.empty_like(self.float_features, device=device)
