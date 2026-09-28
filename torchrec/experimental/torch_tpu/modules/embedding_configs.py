@@ -40,7 +40,7 @@ class SparseCoreEmbeddingConfig:
     max_seq_len: Optional[int] = None
     max_ids_per_partition: int = 256
     max_unique_ids_per_partition: int = 256
-    suggested_coo_buffer_size_per_device: int = 32
+    suggested_coo_buffer_size_per_device: Optional[int] = None
     stack_table_name: Optional[str] = None
     _stacked_config: Optional["StackedSparseCoreEmbeddingConfig"] = (
         dataclasses.field(default=None, repr=False, compare=False)
@@ -121,10 +121,15 @@ class StackedSparseCoreEmbeddingConfig:
         self._max_unique_ids_per_partition = value
 
     @property
-    def suggested_coo_buffer_size_per_device(self) -> int:
+    def suggested_coo_buffer_size_per_device(self) -> Optional[int]:
         if self._suggested_coo_buffer_size_per_device is not None:
             return self._suggested_coo_buffer_size_per_device
-        return max(t.suggested_coo_buffer_size_per_device for t in self.tables)
+        vals = [
+            t.suggested_coo_buffer_size_per_device
+            for t in self.tables
+            if t.suggested_coo_buffer_size_per_device is not None
+        ]
+        return max(vals) if vals else None
 
     @suggested_coo_buffer_size_per_device.setter
     def suggested_coo_buffer_size_per_device(self, value: Optional[int]) -> None:

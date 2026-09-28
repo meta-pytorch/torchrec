@@ -421,6 +421,9 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                 if fqn in self._cpu_buffers
                 else self.lookup_tensor(read_item.dest_index)
             )
+            dest = (
+                self._target_tensors[fqn] if fqn in self._target_tensors else target
+            )
 
             if key in old_stacked_configs:
                 stack_config = old_stacked_configs[key]
@@ -441,7 +444,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                         stack_config,
                         num_shards=1,
                     )
-                    target.data[: cpu_stacked.size(0), : cpu_stacked.size(1)].copy_(
+                    dest.data[: cpu_stacked.size(0), : cpu_stacked.size(1)].copy_(
                         cpu_stacked
                     )
             elif key in table_to_stack_name:
@@ -454,7 +457,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                 )
                 if key in unstacked_dict:
                     t_w = unstacked_dict[key]
-                    target.data[: t_w.size(0), : t_w.size(1)].copy_(t_w)
+                    dest.data[: t_w.size(0), : t_w.size(1)].copy_(t_w)
             else:
                 unsharded = utils.reverse_mod_shard(
                     target,
@@ -462,12 +465,9 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                     embedding_dim=embedding_dim,
                     num_shards=old_num_shards,
                 )
-                dest = (
-                    self._target_tensors[fqn]
-                    if fqn in self._target_tensors
-                    else target
-                )
-                dest.data[:vocab_size, :embedding_dim].copy_(unsharded)
+                rows = min(dest.size(0), unsharded.size(0))
+                cols = min(dest.size(1), unsharded.size(1))
+                dest.data[:rows, :cols].copy_(unsharded[:rows, :cols])
 
             if fqn in self._cpu_buffers:
                 del self._cpu_buffers[fqn]

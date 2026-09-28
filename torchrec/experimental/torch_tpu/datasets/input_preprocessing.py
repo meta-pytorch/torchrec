@@ -332,6 +332,30 @@ class SparseCoreInputPreprocessor:
                     updated_max_ids > table.max_ids_per_partition
                     or updated_max_unique_ids > table.max_unique_ids_per_partition
                 ):
+                    if table.suggested_coo_buffer_size_per_device is not None:
+                        num_scs = self._global_device_count * self._num_sc_per_device
+                        max_ids_rounded_up = ((updated_max_ids + 7) // 8) * 8
+                        theoretical_max = (
+                            max_ids_rounded_up * self._num_sc_per_device * num_scs
+                        )
+                        alignment = 8 * self._num_sc_per_device
+                        old_rounded = max(8, ((table.max_ids_per_partition + 7) // 8) * 8)
+                        scaled_buf = int(
+                            math.ceil(
+                                table.suggested_coo_buffer_size_per_device
+                                * (max_ids_rounded_up / old_rounded)
+                            )
+                        )
+                        scaled_buf = ((scaled_buf + alignment - 1) // alignment) * alignment
+                        min_device_buf = max_ids_rounded_up * self._num_sc_per_device
+                        table.suggested_coo_buffer_size_per_device = min(
+                            theoretical_max,
+                            max(
+                                table.suggested_coo_buffer_size_per_device,
+                                scaled_buf,
+                                min_device_buf,
+                            ),
+                        )
                     table.max_ids_per_partition = updated_max_ids
                     table.max_unique_ids_per_partition = updated_max_unique_ids
                     changed = True
@@ -390,7 +414,7 @@ class SparseCoreInputPreprocessor:
                     stack_config.max_unique_ids_per_partition
                 ),
                 "suggested_coo_buffer_size_per_device": (
-                    stack_config.suggested_coo_buffer_size_per_device
+                    stack_config.suggested_coo_buffer_size_per_device or 0
                 ),
                 "features": features,
             })
