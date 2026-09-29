@@ -13,6 +13,15 @@ implemented, the CPU version is used.
 from __future__ import annotations
 
 import torch
+from torch_tpu._internal import pallas  # pyrefly: ignore[missing-import]
+from torchrec.experimental.torch_tpu.pallas import associative_scan
+
+
+_complete_cumsum = pallas.jax_op(
+    "torchrec_pallas::associative_complete_cumsum",
+    associative_scan.complete_cumsum_jax,
+)
+
 
 lib = torch.library.Library("fbgemm", "IMPL")
 
@@ -157,22 +166,7 @@ def segment_sum_csr_tpu(batch_size, csr_seg, values):
 
 
 def asynchronous_complete_cumsum_tpu(array):
-    row_width = 16
-    if array.numel() % row_width != 0:
-        return torch.cat(
-            [
-                array.new_zeros(1, dtype=torch.int32),
-                array.cumsum(0, dtype=torch.int32),
-            ]
-        )
-    array_2d = array.reshape(-1, row_width)
-    local_ends = torch.cumsum(array_2d, dim=1, dtype=torch.int32)
-    zero = array.new_zeros(1, dtype=torch.int32)
-    row_bases = torch.cat(
-        [zero, torch.cumsum(local_ends[:, -1], dim=0, dtype=torch.int32)[:-1]]
-    )
-    global_ends = local_ends + row_bases.unsqueeze(1)
-    return torch.cat([zero, global_ends.reshape(-1)])
+    return _complete_cumsum(array=array.to(torch.int32))
 
 
 def batch_index_select_dim0_tpu(
