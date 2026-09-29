@@ -90,9 +90,7 @@ class Optimizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def load_state_dict(
-        self, param_group: Any, state_dict: dict[str, Any]
-    ) -> Any:
+    def load_state_dict(self, param_group: Any, state_dict: dict[str, Any]) -> Any:
         """Loads state dictionary matching PyTorch/TorchRec optimizer format and returns updated ParamGroup."""
         pass
 
@@ -110,12 +108,8 @@ class AdamW(Optimizer):
     class ParamGroup(Optimizer.ParamGroup):
         """Holds optimizer state for AdamW."""
 
-        opt_state_m: dict[str, torch.Tensor] = dataclasses.field(
-            default_factory=dict
-        )
-        opt_state_v: dict[str, torch.Tensor] = dataclasses.field(
-            default_factory=dict
-        )
+        opt_state_m: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
+        opt_state_v: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
         opt_steps: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
         extra_state: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -137,9 +131,7 @@ class AdamW(Optimizer):
     ) -> ParamGroup:
         """Initializes AdamW optimizer state from model parameters or nn.Module."""
         if isinstance(params, torch.nn.Module):
-            params = {
-                name: param.detach() for name, param in params.named_parameters()
-            }
+            params = {name: param.detach() for name, param in params.named_parameters()}
         if not params:
             return self.ParamGroup(params={})
 
@@ -188,13 +180,15 @@ class AdamW(Optimizer):
             state[name] = s
         return {
             "state": state,
-            "param_groups": [{
-                "lr": self.lr,
-                "betas": (self.beta1, self.beta2),
-                "eps": self.eps,
-                "weight_decay": self.weight_decay,
-                "params": list(param_group.params.keys()),
-            }],
+            "param_groups": [
+                {
+                    "lr": self.lr,
+                    "betas": (self.beta1, self.beta2),
+                    "eps": self.eps,
+                    "weight_decay": self.weight_decay,
+                    "params": list(param_group.params.keys()),
+                }
+            ],
         }
 
     def load_state_dict(
@@ -278,9 +272,7 @@ class ReferenceAdamw(AdamW):
         else:
             p_decayed = param
 
-        step_val = (
-            step.to(torch.float32) if isinstance(step, torch.Tensor) else step
-        )
+        step_val = step.to(torch.float32) if isinstance(step, torch.Tensor) else step
         bias_correction1 = 1.0 - torch.pow(
             torch.tensor(self.beta1, device=param.device), step_val
         )
@@ -347,9 +339,7 @@ class FusedAdamw(AdamW):
         self, param_group: AdamW.ParamGroup, grads: dict[str, torch.Tensor]
     ) -> AdamW.ParamGroup:
         """Fused AdamW step calling torch.optim.adamw.adamw directly."""
-        param_keys = [
-            k for k in param_group.params.keys() if grads.get(k) is not None
-        ]
+        param_keys = [k for k in param_group.params.keys() if grads.get(k) is not None]
         if not param_keys:
             return param_group
         param_list = [param_group.params[k] for k in param_keys]
@@ -386,9 +376,7 @@ class SGD(Optimizer):
     class ParamGroup(Optimizer.ParamGroup):
         """Holds optimizer state for SGD."""
 
-        opt_state_m: dict[str, torch.Tensor] = dataclasses.field(
-            default_factory=dict
-        )
+        opt_state_m: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
         opt_steps: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
         extra_state: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -410,9 +398,7 @@ class SGD(Optimizer):
     ) -> ParamGroup:
         """Initializes SGD optimizer state from model parameters or nn.Module."""
         if isinstance(params, torch.nn.Module):
-            params = {
-                name: param.detach() for name, param in params.named_parameters()
-            }
+            params = {name: param.detach() for name, param in params.named_parameters()}
         if not params:
             return self.ParamGroup(params={})
 
@@ -452,14 +438,16 @@ class SGD(Optimizer):
             state[name] = s
         return {
             "state": state,
-            "param_groups": [{
-                "lr": self.lr,
-                "momentum": self.momentum,
-                "dampening": self.dampening,
-                "weight_decay": self.weight_decay,
-                "nesterov": self.nesterov,
-                "params": list(param_group.params.keys()),
-            }],
+            "param_groups": [
+                {
+                    "lr": self.lr,
+                    "momentum": self.momentum,
+                    "dampening": self.dampening,
+                    "weight_decay": self.weight_decay,
+                    "nesterov": self.nesterov,
+                    "params": list(param_group.params.keys()),
+                }
+            ],
         }
 
     def load_state_dict(
@@ -599,9 +587,7 @@ class FusedSgd(SGD):
         self, param_group: SGD.ParamGroup, grads: dict[str, torch.Tensor]
     ) -> SGD.ParamGroup:
         """Fused SGD step calling torch.optim.sgd.sgd directly."""
-        param_keys = [
-            k for k in param_group.params.keys() if grads.get(k) is not None
-        ]
+        param_keys = [k for k in param_group.params.keys() if grads.get(k) is not None]
         if not param_keys:
             return param_group
         param_list = [param_group.params[k] for k in param_keys]
@@ -638,9 +624,7 @@ class Adagrad(Optimizer):
     class ParamGroup(Optimizer.ParamGroup):
         """Holds optimizer state for Adagrad."""
 
-        opt_state_sum: dict[str, torch.Tensor] = dataclasses.field(
-            default_factory=dict
-        )
+        opt_state_sum: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
         opt_steps: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
         extra_state: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -662,9 +646,7 @@ class Adagrad(Optimizer):
     ) -> ParamGroup:
         """Initializes Adagrad optimizer state from model parameters or nn.Module."""
         if isinstance(params, torch.nn.Module):
-            params = {
-                name: param.detach() for name, param in params.named_parameters()
-            }
+            params = {name: param.detach() for name, param in params.named_parameters()}
         if not params:
             return self.ParamGroup(params={})
 
@@ -702,14 +684,16 @@ class Adagrad(Optimizer):
             state[name] = s
         return {
             "state": state,
-            "param_groups": [{
-                "lr": self.lr,
-                "lr_decay": self.lr_decay,
-                "weight_decay": self.weight_decay,
-                "initial_accumulator_value": self.initial_accumulator_value,
-                "eps": self.eps,
-                "params": list(param_group.params.keys()),
-            }],
+            "param_groups": [
+                {
+                    "lr": self.lr,
+                    "lr_decay": self.lr_decay,
+                    "weight_decay": self.weight_decay,
+                    "initial_accumulator_value": self.initial_accumulator_value,
+                    "eps": self.eps,
+                    "params": list(param_group.params.keys()),
+                }
+            ],
         }
 
     def load_state_dict(
@@ -934,10 +918,12 @@ class KeyedStatelessOptimizer(KeyedOptimizer):
         state_by_tensor = {
             param: sd["state"].get(name, {}) for name, param in params_dict.items()
         }
-        param_groups_by_tensor = [{
-            "params": list(params_dict.values()),
-            **{k: v for k, v in sd["param_groups"][0].items() if k != "params"},
-        }]
+        param_groups_by_tensor = [
+            {
+                "params": list(params_dict.values()),
+                **{k: v for k, v in sd["param_groups"][0].items() if k != "params"},
+            }
+        ]
         super().__init__(
             params=params_dict,
             state=state_by_tensor,
@@ -986,9 +972,7 @@ class KeyedStatelessOptimizer(KeyedOptimizer):
             }
 
         if grads_dict:
-            self._param_group = self._functional_opt.step(
-                self._param_group, grads_dict
-            )
+            self._param_group = self._functional_opt.step(self._param_group, grads_dict)
             with torch.no_grad():
                 for name, new_p in self._param_group.params.items():
                     if name in self.params:
@@ -1007,7 +991,9 @@ class KeyedStatelessOptimizer(KeyedOptimizer):
         self.state = {
             param: sd["state"].get(name, {}) for name, param in self.params.items()
         }
-        self.param_groups = [{
-            "params": list(self.params.values()),
-            **{k: v for k, v in sd["param_groups"][0].items() if k != "params"},
-        }]
+        self.param_groups = [
+            {
+                "params": list(self.params.values()),
+                **{k: v for k, v in sd["param_groups"][0].items() if k != "params"},
+            }
+        ]

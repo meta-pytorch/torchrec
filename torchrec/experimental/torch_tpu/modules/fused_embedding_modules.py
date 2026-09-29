@@ -383,8 +383,8 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             optimizer_kwargs["eps"] = optimizer_kwargs.pop("epsilon")
 
         if "betas" in optimizer_kwargs:
-            optimizer_kwargs["beta1"], optimizer_kwargs["beta2"] = (
-                optimizer_kwargs.pop("betas")
+            optimizer_kwargs["beta1"], optimizer_kwargs["beta2"] = optimizer_kwargs.pop(
+                "betas"
             )
 
         self._optimizer_kwargs = optimizer_kwargs
@@ -402,9 +402,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         self._device = torch.device("tpu")
         self._device_mesh = None
         if dist.is_initialized() and self._global_device_count > 1:
-            self._device_mesh = dt.init_device_mesh(
-                "tpu", (self._global_device_count,)
-            )
+            self._device_mesh = dt.init_device_mesh("tpu", (self._global_device_count,))
 
         self.learning_rates = nn.ParameterDict()
 
@@ -440,9 +438,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         self.velocities = nn.ParameterDict()
         self._table_configs: Dict[str, SparseCoreEmbeddingConfig] = {}
         self._feature_to_table_config: Dict[str, SparseCoreEmbeddingConfig] = {}
-        self._feature_to_stack_config: Dict[
-            str, StackedSparseCoreEmbeddingConfig
-        ] = {}
+        self._feature_to_stack_config: Dict[str, StackedSparseCoreEmbeddingConfig] = {}
         self._stack_unstack_metadata: Dict[
             str, tuple[list[tuple[str, SparseCoreEmbeddingConfig]], list[int]]
         ] = {}
@@ -527,7 +523,9 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                         sharded_accumulator
                     )
                 else:
-                    self.accumulators[stack_config.stack_name] = nn.Parameter(accumulator)
+                    self.accumulators[stack_config.stack_name] = nn.Parameter(
+                        accumulator
+                    )
             elif self._optimizer_type == torch.optim.Adam:
                 momentum = torch.zeros(
                     stack_shape, dtype=torch.float32, device=self._device
@@ -598,9 +596,9 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
 
     def _shard_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         num_shards = self._global_device_count * self._num_sc_per_device
-        return torch.cat(
-            [tensor[i::num_shards] for i in range(num_shards)], dim=0
-        ).to(self._device)
+        return torch.cat([tensor[i::num_shards] for i in range(num_shards)], dim=0).to(
+            self._device
+        )
 
     def _unstack_activation(
         self,
@@ -693,9 +691,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         stack_inputs = features.table_tensors[stack_config.stack_name]
 
         # Unwrap DTensors to local tensors for custom ops.
-        local_weight = (
-            weight.to_local() if isinstance(weight, dt.DTensor) else weight
-        )
+        local_weight = weight.to_local() if isinstance(weight, dt.DTensor) else weight
 
         accumulator = self.accumulators.get(stack_config.stack_name, None)
         local_accumulator = (
@@ -745,9 +741,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         weight_dict = getattr(self, self._weight_dict_name)
         stacked_weights = {
             name: (
-                mod.weight.to_local()
-                if hasattr(mod.weight, "to_local")
-                else mod.weight
+                mod.weight.to_local() if hasattr(mod.weight, "to_local") else mod.weight
             )
             for name, mod in weight_dict.items()
         }
@@ -783,13 +777,10 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
     def unstacked_state_dict(self) -> Dict[str, torch.Tensor]:
         """Returns state dict containing individual table weights on CPU for checkpointing."""
         return {
-            name: w.to("cpu")
-            for name, w in self.get_unstacked_table_weights().items()
+            name: w.to("cpu") for name, w in self.get_unstacked_table_weights().items()
         }
 
-    def load_unstacked_state_dict(
-        self, state_dict: Dict[str, torch.Tensor]
-    ) -> None:
+    def load_unstacked_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         """Loads individual table weights from state dict into stacked parameters."""
         self.set_unstacked_table_weights(state_dict)
 
@@ -888,9 +879,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         else:
             updated = new_local_tensor
 
-        if torch.compiler.is_compiling() and isinstance(
-            param_dict, nn.ParameterDict
-        ):
+        if torch.compiler.is_compiling() and isinstance(param_dict, nn.ParameterDict):
             param_dict._parameters[key] = updated
         elif isinstance(param_dict, nn.ParameterDict):
             param_dict[key] = nn.Parameter(
@@ -932,12 +921,8 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                 continue
             grad_output = raw_gradients[stack_name]
             table_inputs = features.table_tensors[stack_name]
-            table = embedding_tables.get(
-                stack_name, self._get_table_weight(stack_name)
-            )
-            local_weight = (
-                table.to_local() if isinstance(table, dt.DTensor) else table
-            )
+            table = embedding_tables.get(stack_name, self._get_table_weight(stack_name))
+            local_weight = table.to_local() if isinstance(table, dt.DTensor) else table
 
             accumulator = self.accumulators.get(stack_name, None)
             local_accumulator = (
@@ -1217,10 +1202,7 @@ class SparseCoreFusedEmbeddingCollection(
             optimizer_kwargs = dict(optimizer_kwargs)
 
         for table in tables:
-            if (
-                isinstance(table.config, EmbeddingConfig)
-                and table.max_seq_len is None
-            ):
+            if isinstance(table.config, EmbeddingConfig) and table.max_seq_len is None:
                 raise ValueError(
                     "max_seq_len must be provided for EmbeddingConfig table"
                     f" {table.name}"

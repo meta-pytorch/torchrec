@@ -120,9 +120,7 @@ class SparseCoreSavePlanner(default_planner.DefaultSavePlanner):
             loaded_planner_data["sparsecore"] = sparsecore_metadata
             metadata = dataclasses.replace(metadata, planner_data=loaded_planner_data)
         else:
-            logging.warning(
-                "planner_data is not a dict, skipping metadata injection."
-            )
+            logging.warning("planner_data is not a dict, skipping metadata injection.")
         return global_plan, metadata
 
 
@@ -185,19 +183,25 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
             if isinstance(metadata.planner_data, dict):
                 self.old_topology = metadata.planner_data.get("sparsecore", None)
                 if self.old_topology:
-                    logging.info("Read native SparseCore metadata: %s", self.old_topology)
+                    logging.info(
+                        "Read native SparseCore metadata: %s", self.old_topology
+                    )
                     if "stacked_configs" in self.old_topology:
                         stacked_meta = self.old_topology["stacked_configs"]
                         # Handle both list and dict formats for stacked configs.
                         if isinstance(stacked_meta, dict):
                             for _, sc_data in stacked_meta.items():
                                 if isinstance(sc_data, dict):
-                                    sc = StackedSparseCoreEmbeddingConfig.from_dict(sc_data)
+                                    sc = StackedSparseCoreEmbeddingConfig.from_dict(
+                                        sc_data
+                                    )
                                     self.old_stacked_configs[sc.stack_name] = sc
                         elif isinstance(stacked_meta, list):
                             for sc_data in stacked_meta:
                                 if isinstance(sc_data, dict):
-                                    sc = StackedSparseCoreEmbeddingConfig.from_dict(sc_data)
+                                    sc = StackedSparseCoreEmbeddingConfig.from_dict(
+                                        sc_data
+                                    )
                                     self.old_stacked_configs[sc.stack_name] = sc
             else:
                 logging.warning(
@@ -350,9 +354,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
 
     def resolve_tensor(self, read_item: planner_mod.ReadItem) -> torch.Tensor:
         fqn = read_item.dest_index.fqn
-        if (
-            self.cross_topology or self.unshard_for_cpu
-        ) and fqn in self._cpu_buffers:
+        if (self.cross_topology or self.unshard_for_cpu) and fqn in self._cpu_buffers:
             return self.transform_tensor(read_item, self._cpu_buffers[fqn])
 
         return super().resolve_tensor(read_item)
@@ -368,8 +370,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
 
         # Only process if post-processing is needed
         if not (
-            self.unshard_for_cpu
-            or (fqn in self._cpu_buffers and self.cross_topology)
+            self.unshard_for_cpu or (fqn in self._cpu_buffers and self.cross_topology)
         ):
             return
 
@@ -421,9 +422,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                 if fqn in self._cpu_buffers
                 else self.lookup_tensor(read_item.dest_index)
             )
-            dest = (
-                self._target_tensors[fqn] if fqn in self._target_tensors else target
-            )
+            dest = self._target_tensors[fqn] if fqn in self._target_tensors else target
 
             if key in old_stacked_configs:
                 stack_config = old_stacked_configs[key]
@@ -546,9 +545,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
             if hasattr(target_param, "to_local")
             else target_param.size(0)
         )
-        local_slice = target_sharded_cpu[
-            rank * local_rows : (rank + 1) * local_rows
-        ]
+        local_slice = target_sharded_cpu[rank * local_rows : (rank + 1) * local_rows]
 
         logging.info("SparseCoreLoadPlanner: Copying slice to TPU for %s", fqn)
         with torch.no_grad():

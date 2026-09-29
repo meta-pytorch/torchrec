@@ -125,9 +125,7 @@ class SparseCoreTrainPipeline:
     def __init__(
         self,
         model: nn.Module,
-        optimizer: Optional[
-            Union[torch.optim.Optimizer, optimizers.Optimizer]
-        ] = None,
+        optimizer: Optional[Union[torch.optim.Optimizer, optimizers.Optimizer]] = None,
         criterion: Optional[Callable[..., torch.Tensor]] = None,
         *,
         embedding_layer: Optional[nn.Module] = None,
@@ -185,9 +183,7 @@ class SparseCoreTrainPipeline:
                     "Please pass embedding_layer explicitly."
                 )
 
-        self._unstack_fn = getattr(
-            self.embedding_layer, "unstack_activations", None
-        )
+        self._unstack_fn = getattr(self.embedding_layer, "unstack_activations", None)
 
         # Resolve dense forward callable
         if dense_forward_fn is not None:
@@ -234,8 +230,8 @@ class SparseCoreTrainPipeline:
 
         # Initialize functional dense optimizer
         self.optimizer = optimizer
-        self.dense_optimizer: Optional[optimizers.Optimizer] = (
-            _adapt_dense_optimizer(optimizer)
+        self.dense_optimizer: Optional[optimizers.Optimizer] = _adapt_dense_optimizer(
+            optimizer
         )
         if self.dense_optimizer is not None and self.dense_params_dict:
             self.dense_param_group: Optional[Any] = (
@@ -627,9 +623,9 @@ class SparseCoreTrainPipeline:
             # SparseCore Forward on Batch t+2 (using current or updated tables)
             raw_acts_t2, _ = self._sc_fwd_stage(
                 sparse_inputs_t2,
-                embedding_tables=new_tables
-                if new_tables is not None
-                else embedding_tables_t,
+                embedding_tables=(
+                    new_tables if new_tables is not None else embedding_tables_t
+                ),
             )
             return (
                 raw_acts_t2,

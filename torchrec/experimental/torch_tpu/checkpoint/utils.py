@@ -100,9 +100,7 @@ def reverse_mod_shard(
 
 
 def serialize_stacked_configs(
-    stacked_configs: Union[
-        Sequence[StackedSparseCoreEmbeddingConfig], Dict[str, Any]
-    ],
+    stacked_configs: Union[Sequence[StackedSparseCoreEmbeddingConfig], Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Serializes stacked embedding configs into a DCP-compatible dictionary."""
     if hasattr(stacked_configs, "_stacked_configs"):

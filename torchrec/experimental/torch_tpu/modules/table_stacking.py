@@ -201,9 +201,7 @@ def stack_tables(
     total_sample_count_multiplier = 0
 
     for table in group:
-        padded_vocab = _round_up_to_multiple(
-            table.num_embeddings, 8 * num_sparsecores
-        )
+        padded_vocab = _round_up_to_multiple(table.num_embeddings, 8 * num_sparsecores)
         padded_dim = _round_up_to_multiple(table.embedding_dim, 8)
         padded_vocab_sizes[table.name] = padded_vocab
         padded_embedding_dims[table.name] = padded_dim
@@ -251,9 +249,7 @@ def stack_tables(
 
         num_rows_in_shard = padded_vocab // num_sparsecores
         current_row_offset_in_shard += num_rows_in_shard
-        current_shard_rotation = (
-            current_shard_rotation + rot_step
-        ) % num_sparsecores
+        current_shard_rotation = (current_shard_rotation + rot_step) % num_sparsecores
         total_padded_vocab_size += padded_vocab
 
     stack_config = StackedSparseCoreEmbeddingConfig(
@@ -299,9 +295,7 @@ def auto_stack_tables(
     stacked_configs = []
     for group in groups:
         table_names = [t.name for t in group]
-        stack_table_name = _get_stack_name(
-            table_names, use_short_names=use_short_names
-        )
+        stack_table_name = _get_stack_name(table_names, use_short_names=use_short_names)
         stack_config = stack_tables(
             tables=tables,
             table_names=table_names,
@@ -326,9 +320,7 @@ def prepare_tables_for_stacking(
     stack_table_name if specified, or creates a 1-table stack and populates
     authoritative padded vocabulary and embedding dimensions.
     """
-    groups: Dict[str, List[SparseCoreEmbeddingConfig]] = collections.defaultdict(
-        list
-    )
+    groups: Dict[str, List[SparseCoreEmbeddingConfig]] = collections.defaultdict(list)
     for t in tables:
         if t.stacked_config is None:
             group_name = t.stack_table_name or t.name
@@ -423,9 +415,7 @@ def unshard_and_unstack_tables(
             row_offset_in_shard = stack_config.row_offsets_in_shard[table.name]
             rotation = stack_config.shard_rotations[table.name]
             padded_vocab_size = stack_config.padded_vocab_sizes[table.name]
-            chunk_size = (
-                padded_vocab_size // global_device_count
-            ) // num_sc_per_device
+            chunk_size = (padded_vocab_size // global_device_count) // num_sc_per_device
 
             w_slice = stacked_3d[
                 :, row_offset_in_shard : row_offset_in_shard + chunk_size, :

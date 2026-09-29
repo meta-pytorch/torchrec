@@ -42,8 +42,8 @@ class SparseCoreEmbeddingConfig:
     max_unique_ids_per_partition: int = 256
     suggested_coo_buffer_size_per_device: Optional[int] = None
     stack_table_name: Optional[str] = None
-    _stacked_config: Optional["StackedSparseCoreEmbeddingConfig"] = (
-        dataclasses.field(default=None, repr=False, compare=False)
+    _stacked_config: Optional["StackedSparseCoreEmbeddingConfig"] = dataclasses.field(
+        default=None, repr=False, compare=False
     )
 
     @property
@@ -216,19 +216,21 @@ class StackedSparseCoreEmbeddingConfig:
             else:
                 max_seq_len = getattr(t, "max_seq_len", None)
 
-            tables_info.append({
-                "name": t.name,
-                "num_embeddings": t_num_embeddings,
-                "embedding_dim": t_embedding_dim,
-                "is_bag": is_bag,
-                "pooling": pooling,
-                "max_seq_len": max_seq_len,
-                "feature_names": getattr(t, "feature_names", []),
-                "padded_vocab_size": self.padded_vocab_sizes[t.name],
-                "padded_embedding_dim": self.padded_embedding_dims[t.name],
-                "row_offset_in_shard": self.row_offsets_in_shard[t.name],
-                "shard_rotation": self.shard_rotations[t.name],
-            })
+            tables_info.append(
+                {
+                    "name": t.name,
+                    "num_embeddings": t_num_embeddings,
+                    "embedding_dim": t_embedding_dim,
+                    "is_bag": is_bag,
+                    "pooling": pooling,
+                    "max_seq_len": max_seq_len,
+                    "feature_names": getattr(t, "feature_names", []),
+                    "padded_vocab_size": self.padded_vocab_sizes[t.name],
+                    "padded_embedding_dim": self.padded_embedding_dims[t.name],
+                    "row_offset_in_shard": self.row_offsets_in_shard[t.name],
+                    "shard_rotation": self.shard_rotations[t.name],
+                }
+            )
         return {
             "stack_name": self.stack_name,
             "stack_table_name": self.stack_name,
@@ -244,9 +246,7 @@ class StackedSparseCoreEmbeddingConfig:
         }
 
     @classmethod
-    def from_dict(
-        cls, data: Dict[str, Any]
-    ) -> "StackedSparseCoreEmbeddingConfig":
+    def from_dict(cls, data: Dict[str, Any]) -> "StackedSparseCoreEmbeddingConfig":
         """Deserializes a dictionary into a StackedSparseCoreEmbeddingConfig."""
         tables = []
         for t_data in data["tables"]:
@@ -292,9 +292,7 @@ class StackedSparseCoreEmbeddingConfig:
             feature_names=feature_names,
             stack_num_embeddings=data["stack_num_embeddings"],
             stack_embedding_dim=data["stack_embedding_dim"],
-            total_sample_count_multiplier=data.get(
-                "total_sample_count_multiplier", 0
-            ),
+            total_sample_count_multiplier=data.get("total_sample_count_multiplier", 0),
             row_offsets_in_shard=data["row_offsets_in_shard"],
             shard_rotations=data["shard_rotations"],
             padded_vocab_sizes=data["padded_vocab_sizes"],

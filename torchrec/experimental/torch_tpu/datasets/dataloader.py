@@ -54,9 +54,7 @@ class SparseCoreBatch(Batch):
             labels=batch.labels,
         )
 
-    def to(
-        self, device: torch.device, non_blocking: bool = False
-    ) -> "SparseCoreBatch":
+    def to(self, device: torch.device, non_blocking: bool = False) -> "SparseCoreBatch":
         """Moves all batch tensors to the specified target device."""
         return SparseCoreBatch(
             dense_features=(
@@ -64,9 +62,7 @@ class SparseCoreBatch(Batch):
                 if self.dense_features is not None
                 else None
             ),
-            sparse_features=self.sparse_features.to(
-                device, non_blocking=non_blocking
-            ),
+            sparse_features=self.sparse_features.to(device, non_blocking=non_blocking),
             labels=(
                 self.labels.to(device, non_blocking=non_blocking)
                 if self.labels is not None
@@ -78,9 +74,7 @@ class SparseCoreBatch(Batch):
 class SparseCoreDataLoader:
     """Wrapper around a PyTorch DataLoader to perform CPU preprocessing eagerly."""
 
-    def __init__(
-        self, dataloader: Any, preprocessor: SparseCoreInputPreprocessor
-    ):
+    def __init__(self, dataloader: Any, preprocessor: SparseCoreInputPreprocessor):
         self.dataloader = dataloader
         self.preprocessor = preprocessor
 

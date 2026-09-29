@@ -75,8 +75,7 @@ class SparseCorePreprocessedInput:
           A new SparseCorePreprocessedInput container on the target device.
         """
         new_lengths = {
-            k: v.to(device, non_blocking=non_blocking)
-            for k, v in self.lengths.items()
+            k: v.to(device, non_blocking=non_blocking) for k, v in self.lengths.items()
         }
         return SparseCorePreprocessedInput(
             row_pointers=self.row_pointers.to(device, non_blocking=non_blocking),
@@ -218,10 +217,7 @@ class SparseCoreInputPreprocessor:
         self._last_stats: Optional[KeyedSparseCoreInputStats] = None
 
         for table in tables:
-            if (
-                isinstance(table.config, EmbeddingConfig)
-                and table.max_seq_len is None
-            ):
+            if isinstance(table.config, EmbeddingConfig) and table.max_seq_len is None:
                 raise ValueError(
                     "max_seq_len must be provided for EmbeddingConfig table"
                     f" {table.name}"
@@ -243,14 +239,16 @@ class SparseCoreInputPreprocessor:
 
         if fdo_client is None and fdo_dir is not None:
             rank = dist.get_rank() if dist.is_initialized() else 0
-            initial_stats = KeyedSparseCoreInputStats({
-                t.name: SparseCoreInputStats(
-                    dropped_count=0,
-                    observed_max_ids=t.max_ids_per_partition,
-                    observed_max_unique_ids=t.max_unique_ids_per_partition,
-                )
-                for t in tables
-            })
+            initial_stats = KeyedSparseCoreInputStats(
+                {
+                    t.name: SparseCoreInputStats(
+                        dropped_count=0,
+                        observed_max_ids=t.max_ids_per_partition,
+                        observed_max_unique_ids=t.max_unique_ids_per_partition,
+                    )
+                    for t in tables
+                }
+            )
             fdo_client = csv_file_fdo_client.CSVFileFDOClient(
                 fdo_dir, process_id=rank, initial_stats=initial_stats
             )
@@ -339,14 +337,18 @@ class SparseCoreInputPreprocessor:
                             max_ids_rounded_up * self._num_sc_per_device * num_scs
                         )
                         alignment = 8 * self._num_sc_per_device
-                        old_rounded = max(8, ((table.max_ids_per_partition + 7) // 8) * 8)
+                        old_rounded = max(
+                            8, ((table.max_ids_per_partition + 7) // 8) * 8
+                        )
                         scaled_buf = int(
                             math.ceil(
                                 table.suggested_coo_buffer_size_per_device
                                 * (max_ids_rounded_up / old_rounded)
                             )
                         )
-                        scaled_buf = ((scaled_buf + alignment - 1) // alignment) * alignment
+                        scaled_buf = (
+                            (scaled_buf + alignment - 1) // alignment
+                        ) * alignment
                         min_device_buf = max_ids_rounded_up * self._num_sc_per_device
                         table.suggested_coo_buffer_size_per_device = min(
                             theoretical_max,
@@ -396,33 +398,35 @@ class SparseCoreInputPreprocessor:
                     else:
                         raise TypeError(f"Unsupported table type: {type(table.config)}")
 
-                    features.append({
-                        "name": feature_name,
-                        "row_offset": row_offset,
-                        "col_offset": col_offset,
-                        "col_shift": col_shift,
-                        "batch_size": feat_batch_size,
-                        "combiner": combiner,
-                        "max_col_id": table.config.num_embeddings,
-                    })
+                    features.append(
+                        {
+                            "name": feature_name,
+                            "row_offset": row_offset,
+                            "col_offset": col_offset,
+                            "col_shift": col_shift,
+                            "batch_size": feat_batch_size,
+                            "combiner": combiner,
+                            "max_col_id": table.config.num_embeddings,
+                        }
+                    )
                     row_offset += batch_size_global
 
-            tables_metadata.append({
-                "name": stack_config.stack_name,
-                "max_ids_per_partition": stack_config.max_ids_per_partition,
-                "max_unique_ids_per_partition": (
-                    stack_config.max_unique_ids_per_partition
-                ),
-                "suggested_coo_buffer_size_per_device": (
-                    stack_config.suggested_coo_buffer_size_per_device or 0
-                ),
-                "features": features,
-            })
+            tables_metadata.append(
+                {
+                    "name": stack_config.stack_name,
+                    "max_ids_per_partition": stack_config.max_ids_per_partition,
+                    "max_unique_ids_per_partition": (
+                        stack_config.max_unique_ids_per_partition
+                    ),
+                    "suggested_coo_buffer_size_per_device": (
+                        stack_config.suggested_coo_buffer_size_per_device or 0
+                    ),
+                    "features": features,
+                }
+            )
         return tables_metadata
 
-    def __call__(
-        self, features: KeyedJaggedTensor
-    ) -> KeyedSparseCorePreprocessedInput:
+    def __call__(self, features: KeyedJaggedTensor) -> KeyedSparseCorePreprocessedInput:
         """Preprocesses a batch of sparse features on CPU into CSR-wrapped COO tensors for SparseCore.
 
         Args:
@@ -465,7 +469,9 @@ class SparseCoreInputPreprocessor:
                         padded_indices[:actual_num_ids] = indices
 
                         # Build offsets: [0, 1, 2, ..., N, N, N, ..., N] of length max_ids + 1
-                        padded_offsets = torch.empty(seq_batch_size + 1, dtype=torch.int32)
+                        padded_offsets = torch.empty(
+                            seq_batch_size + 1, dtype=torch.int32
+                        )
                         padded_offsets[: actual_num_ids + 1] = torch.arange(
                             0, actual_num_ids + 1, dtype=torch.int32
                         )
