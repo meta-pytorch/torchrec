@@ -5,6 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import os
 import unittest
 from typing import cast, List
@@ -12,6 +13,9 @@ from typing import cast, List
 import torch
 import torch.nn as nn
 from fbgemm_gpu.split_embedding_configs import SparseType
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
 from torch.distributed import _remote_device
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.batched_embedding_kernel import BatchedFusedEmbeddingBag
@@ -47,6 +51,19 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port, init_distributed_single_host
+
+
+# OSS CI installs whatever fbgemm-gpu nightly the index serves for its
+# CUDA/Python combo, and some of those predate the kwarg, so the TBE would
+# reject it with a TypeError.
+_FBGEMM_SUPPORTS_WEIGHT_INIT_ON_CPU: bool = (
+    "weight_init_on_cpu"
+    in inspect.signature(SplitTableBatchedEmbeddingBagsCodegen.__init__).parameters
+)
+_requires_fbgemm_weight_init_on_cpu = unittest.skipIf(
+    not _FBGEMM_SUPPORTS_WEIGHT_INIT_ON_CPU,
+    "installed fbgemm_gpu does not support weight_init_on_cpu",
+)
 
 
 def _placement(metadata: ShardMetadata) -> _remote_device:
@@ -265,6 +282,7 @@ class WeightInitOnCpuTest(unittest.TestCase):
             init_data_parallel=False,
         )
 
+    @_requires_fbgemm_weight_init_on_cpu
     def test_weights_land_on_init_device_and_metadata_stays_on_compute(self) -> None:
         sharded_model = self._shard(True)
         kernels = _group_sharded_modules(sharded_model)
@@ -282,6 +300,7 @@ class WeightInitOnCpuTest(unittest.TestCase):
         kernel = _group_sharded_modules(sharded_model)[0]
         self.assertEqual(kernel.weights_dev.device.type, "cuda")
 
+    @_requires_fbgemm_weight_init_on_cpu
     def test_metadata_realignment_is_gated_on_the_flag(self) -> None:
         # Asserted on the torchrec wrapper, not the FBGEMM TBE: the wrapper is
         # where the flag is recorded, so a rename on the FBGEMM side cannot turn
@@ -297,6 +316,7 @@ class WeightInitOnCpuTest(unittest.TestCase):
             )
         )
 
+    @_requires_fbgemm_weight_init_on_cpu
     def test_module_level_gate_sees_the_kernels(self) -> None:
         # The sharded module decides whether to realign *global* metadata by
         # asking its own kernels. Lookups keep those in a plain list, so the walk
@@ -320,6 +340,7 @@ class WeightInitOnCpuTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "device"):
             kernel_module.state_dict()
 
+    @_requires_fbgemm_weight_init_on_cpu
     def test_state_dict_reflects_the_init_device(self) -> None:
         sharded_model = self._shard(True)
         state_dict = sharded_model.state_dict()
@@ -332,6 +353,7 @@ class WeightInitOnCpuTest(unittest.TestCase):
             _placement(local_shards[0].metadata).device(), torch.device("cpu")
         )
 
+    @_requires_fbgemm_weight_init_on_cpu
     def test_quantize_relocates_weights_to_the_compute_device(self) -> None:
         sharded_model = self._shard(True)
         EmbeddingQuantizationUtils().quantize_embedding_modules(
@@ -346,6 +368,7 @@ class WeightInitOnCpuTest(unittest.TestCase):
         self.assertEqual(kernel.weights_dev.device.type, "cuda")
         self.assertEqual(kernel.weights_dev.dtype, torch.float16)
 
+    @_requires_fbgemm_weight_init_on_cpu
     def test_recalculating_torch_state_reinitializes_weights(self) -> None:
         # Pins the contract that makes `recreate_embedding_modules` the only
         # legitimate caller: `_initialize_torch_state` ends in `reset_parameters`,
@@ -364,6 +387,7 @@ class WeightInitOnCpuTest(unittest.TestCase):
             "expected reset_parameters to overwrite the weights",
         )
 
+    @_requires_fbgemm_weight_init_on_cpu
     def test_forward_runs_once_weights_reach_the_compute_device(self) -> None:
         sharded_model = self._shard(True)
         EmbeddingQuantizationUtils().quantize_embedding_modules(
