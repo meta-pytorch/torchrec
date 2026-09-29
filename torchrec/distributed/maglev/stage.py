@@ -61,6 +61,9 @@ class HandoffPGMode(Enum):
     SPLIT = "split"
 
 
+_PendingSend = Tuple[List[Any], List[torch.Tensor]]
+
+
 @dataclass(frozen=True)
 class MaglevProcessGroups:
     """The rank-local process groups and global rank layout for a Maglev stage.
@@ -154,7 +157,7 @@ class MaglevProcessGroups:
         *,
         stage_mesh_dim_name: str,
         pipeline_mesh_dim_name: str,
-        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SPLIT,
+        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SHARED,
     ) -> "MaglevProcessGroups":
         """Build Maglev process groups from a two-dimensional device mesh.
 
@@ -207,7 +210,7 @@ class MaglevProcessGroups:
         cls,
         stage_size: int,
         num_stages: int,
-        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SPLIT,
+        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SHARED,
     ) -> "MaglevProcessGroups":
         """Create every Maglev process group for a contiguous rank layout.
 
@@ -930,12 +933,10 @@ class StageWrapper(nn.Module):
         self._recv_act: Deque[Tuple[List[Any], List[torch.Tensor]]] = deque()
         # pyre-ignore[4]
         self._recv_grad: Deque[Tuple[List[Any], List[torch.Tensor]]] = deque()
-        # The one send in flight per direction: one (work, buffer) per tensor,
-        # the buffer keeping the send open.
-        # pyre-ignore[4]
-        self._send_act: List[Tuple[Any, torch.Tensor]] = []
-        # pyre-ignore[4]
-        self._send_grad: List[Tuple[Any, torch.Tensor]] = []
+        # Keep work handles and buffers independent: a backend may coalesce
+        # several tensor operations into one work handle.
+        self._send_act: _PendingSend = ([], [])
+        self._send_grad: _PendingSend = ([], [])
         # The model's own input seam. Kept as the bound method, not the model:
         # holding the model would register every other stage's layers as
         # submodules of this wrapper.
@@ -1207,7 +1208,6 @@ class StageWrapper(nn.Module):
         batch_size = self._activation_batch_size(stage_input)
         act_pg, _ = self.handoff_pgs
         src = self.neighbor_rank(-1)
-        works: List[Any] = []
         tensors: List[torch.Tensor] = []
         for spec in self._in_specs:
             tensor = torch.empty(
@@ -1215,8 +1215,8 @@ class StageWrapper(nn.Module):
                 device=self._placed_device,
                 dtype=spec.dtype,
             )
-            works.append(dist.irecv(tensor, src=src, group=act_pg))
             tensors.append(tensor)
+        works = self._irecv(tensors, src, act_pg)
         self._recv_act.append((works, tensors))
 
     def wait_for_act(self) -> Activations:
@@ -1262,7 +1262,7 @@ class StageWrapper(nn.Module):
         """
         if self.is_last:
             return
-        if self._send_act:
+        if self._send_act[0]:
             raise ValueError(
                 f"stage {self.stage_index}: an activation send is still in "
                 "flight; call finish_send_act() before starting the next"
@@ -1273,6 +1273,7 @@ class StageWrapper(nn.Module):
     def finish_send_act(self) -> None:
         """Complete the activation send in flight, if any."""
         self._drain(self._send_act)
+        self._send_act = ([], [])
 
     def start_recv_grad(self) -> None:
         """Ensure a receive is posted for the next HSD's output gradients.
@@ -1285,15 +1286,14 @@ class StageWrapper(nn.Module):
             return
         _, grad_pg = self.handoff_pgs
         src = self.neighbor_rank(1)
-        works: List[Any] = []
         tensors: List[torch.Tensor] = []
         outputs = cast(Activations, self._pending[len(self._recv_grad)][1])
         for output, spec in zip(outputs, self._out_specs):
             if not spec.requires_grad:
                 continue
             grad = torch.empty_like(output, memory_format=torch.contiguous_format)
-            works.append(dist.irecv(grad, src=src, group=grad_pg))
             tensors.append(grad)
+        works = self._irecv(tensors, src, grad_pg)
         self._recv_grad.append((works, tensors))
 
     def wait_for_grad(self) -> List[torch.Tensor]:
@@ -1415,7 +1415,7 @@ class StageWrapper(nn.Module):
         """
         if self.is_first:
             return
-        if self._send_grad:
+        if self._send_grad[0]:
             raise ValueError(
                 f"stage {self.stage_index}: a gradient send is still in flight; "
                 "call finish_send_grad() before starting the next"
@@ -1433,6 +1433,7 @@ class StageWrapper(nn.Module):
     def finish_send_grad(self) -> None:
         """Complete the gradient send in flight, if any."""
         self._drain(self._send_grad)
+        self._send_grad = ([], [])
 
     def group_by_stage(self, layer_inputs: Sequence[Any]) -> List[List[Any]]:
         """Regroup a full per-layer input list into one carrier per stage.
@@ -1588,29 +1589,41 @@ class StageWrapper(nn.Module):
         if pairs:
             torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
 
+    def _irecv(
+        self, tensors: Sequence[torch.Tensor], src: int, pg: dist.ProcessGroup
+    ) -> List[Any]:
+        """Issue ordered non-blocking receives for a later wait."""
+        if self._uses_batched_p2p():
+            ops = [dist.P2POp(dist.irecv, tensor, src, pg) for tensor in tensors]
+            return dist.batch_isend_irecv(ops) if ops else []
+        return [dist.irecv(tensor, src=src, group=pg) for tensor in tensors]
+
+    def _uses_batched_p2p(self) -> bool:
+        """Batch handoffs only when both directions share one communicator."""
+        return self.handoff_pg_mode is HandoffPGMode.SHARED
+
     # pyre-ignore[3]: dist work handle has no public type
     def _isend(
         self, tensors: Sequence[torch.Tensor], dst: int, pg: dist.ProcessGroup
-    ) -> List[Tuple[Any, torch.Tensor]]:
-        """Issue non-blocking sends, in order, for a later drain.
+    ) -> _PendingSend:
+        """Issue ordered non-blocking sends and retain buffers for a later drain.
 
-        The detached buffer is returned alongside the work handle so it stays
-        alive until the send completes. ``.contiguous()`` is a no-op for an
-        already contiguous tensor, so this aliases the activation rather than
-        copying it.
+        Detached buffers keep sends alive. ``.contiguous()`` only copies
+        strided tensors and aliases already contiguous activations.
         """
-        out: List[Tuple[Any, torch.Tensor]] = []
-        for tensor in tensors:
-            buffer = tensor.detach().contiguous()
-            out.append((dist.isend(buffer, dst=dst, group=pg), buffer))
-        return out
+        buffers = [tensor.detach().contiguous() for tensor in tensors]
+        if self._uses_batched_p2p():
+            ops = [dist.P2POp(dist.isend, buffer, dst, pg) for buffer in buffers]
+            works = dist.batch_isend_irecv(ops) if ops else []
+        else:
+            works = [dist.isend(buffer, dst=dst, group=pg) for buffer in buffers]
+        return works, buffers
 
-    # pyre-ignore[2]: dist work handle has no public type
-    def _drain(self, sends: List[Tuple[Any, torch.Tensor]]) -> None:
-        """Wait every send in ``sends`` and release the buffers holding it open."""
-        for work, _buf in sends:
+    def _drain(self, sends: _PendingSend) -> None:
+        """Wait every send while retaining its buffer."""
+        works, _buffers = sends
+        for work in works:
             work.wait()
-        sends.clear()
 
     # ---- one microbatch of this stage's work ----
 
@@ -1986,8 +1999,8 @@ class StageWrapper(nn.Module):
         across ranks and the job cannot continue; restart it. What this buys is
         that the wreckage is loud rather than quiet.
         """
-        self._send_act = []
-        self._send_grad = []
+        self._send_act = ([], [])
+        self._send_grad = ([], [])
         self._recv_act.clear()
         self._recv_grad.clear()
         self._pending = []

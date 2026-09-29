@@ -7,9 +7,11 @@
 
 # pyre-strict
 
+import gc
 import random
 import tempfile
 import unittest
+import weakref
 from dataclasses import dataclass
 from typing import Any, cast, Dict, List, Optional, Tuple
 from unittest.mock import call, MagicMock, patch
@@ -48,6 +50,10 @@ from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
+)
+from torchrec.distributed.test_utils.process_runner import (
+    run_local_multi_process_func,
+    SingleProcessContext,
 )
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
 from torchrec.distributed.test_utils.test_model import (
@@ -286,6 +292,71 @@ class _PassThroughDense(torch.nn.Module):
         return (sparse_output,)
 
 
+class _TwoTensorHandoffLayer(MaglevLayer):
+    def __init__(self, is_first: bool) -> None:
+        super().__init__()
+        self._is_first = is_first
+        self._specs = (
+            ActivationSpec(torch.Size([2, 3])),
+            ActivationSpec(torch.Size([4])),
+        )
+
+    def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return () if self._is_first else self._specs
+
+    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return self._specs
+
+    def forward(
+        self, layer_input: Any, in_activations: Activations = ()
+    ) -> Activations:
+        return cast(Activations, layer_input) if self._is_first else in_activations
+
+
+def _run_real_batched_handoff(
+    ctx: SingleProcessContext,
+    rank: int,
+    world_size: int,
+) -> None:
+    if world_size != 2:
+        raise ValueError(f"expected two ranks, got {world_size}")
+    process_group = cast(dist.ProcessGroup, ctx.pg)
+    process_groups = MaglevProcessGroups(
+        stage_ranks=((0,), (1,)),
+        stage_pg=process_group,
+        handoff_pgs=(process_group, process_group),
+        cascade_pg=process_group,
+        cascade_gloo_pg=process_group,
+        handoff_pg_mode=HandoffPGMode.SHARED,
+    )
+    device = torch.device("cpu")
+    model = MaglevModuleList(
+        [_TwoTensorHandoffLayer(is_first=True), _TwoTensorHandoffLayer(False)]
+    )
+    with patch("torchrec.distributed.maglev.stage.InputDistDriver"):
+        stage = StageWrapper(
+            model,
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        ).to(device)
+    expected = (
+        torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        torch.arange(4, dtype=torch.float32),
+    )
+    if rank == 0:
+        stage.start_send_act(expected)
+        stage.finish_send_act()
+        dist.barrier(group=process_group)
+        return
+
+    stage.start_recv_act()
+    received = stage.wait_for_act()
+    for actual, wanted in zip(received, expected):
+        torch.testing.assert_close(actual, wanted)
+    dist.barrier(group=process_group)
+
+
 class MaglevModuleListTest(unittest.TestCase):
     """Single-process checks of the authoring API (no distributed setup needed)."""
 
@@ -303,14 +374,24 @@ class MaglevModuleListTest(unittest.TestCase):
     def _inputs(self, num_layers: int = 4, batch_size: int = 4) -> List[Any]:
         return [
             _make_input(
-                _make_tables(l, 2, 16, 4),
+                _make_tables(layer_index, 2, 16, 4),
                 batch_size,
                 4,
-                _INPUT_SEED + l,
+                _INPUT_SEED + layer_index,
                 torch.device("cpu"),
             )
-            for l in range(num_layers)
+            for layer_index in range(num_layers)
         ]
+
+    def test_real_batched_handoff(self) -> None:
+        self.assertEqual(
+            run_local_multi_process_func(
+                _run_real_batched_handoff,
+                world_size=2,
+                backend="gloo",
+            ),
+            [None, None],
+        )
 
     def test_standalone_matches_stage_by_stage(self) -> None:
         """Running the model one stage's layers at a time reproduces its forward."""
@@ -626,6 +707,271 @@ class MaglevModuleListTest(unittest.TestCase):
         self.assertEqual(stage.neighbor_rank(1), 3)
         self.assertIs(stage.stage_pg, stage_pg)
         self.assertIs(stage.cascade_pg, cascade_pg)
+
+    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
+    @patch("torchrec.distributed.maglev.stage.dist.get_rank")
+    def test_split_handoffs_use_individual_p2p(
+        self,
+        get_rank: Any,
+        _input_dist_driver: Any,
+    ) -> None:
+        activation_pg = MagicMock(name="activation_pg")
+        gradient_pg = MagicMock(name="gradient_pg")
+        process_groups = MaglevProcessGroups(
+            stage_ranks=((0,), (1,)),
+            stage_pg=MagicMock(),
+            handoff_pgs=(activation_pg, gradient_pg),
+            cascade_pg=MagicMock(),
+            cascade_gloo_pg=MagicMock(),
+            handoff_pg_mode=HandoffPGMode.SPLIT,
+        )
+        get_rank.side_effect = [0, 1]
+        stage_zero = StageWrapper(
+            self._model(num_layers=2),
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        ).to(torch.device("cpu"))
+        stage_one = StageWrapper(
+            self._model(num_layers=2),
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        ).to(torch.device("cpu"))
+        inputs = self._inputs(num_layers=2, batch_size=2)
+        send_works: List[Any] = []
+        recv_works: List[Any] = []
+
+        def record_send(*_args: Any, **_kwargs: Any) -> Any:
+            work = MagicMock()
+            send_works.append(work)
+            return work
+
+        def record_recv(*_args: Any, **_kwargs: Any) -> Any:
+            work = MagicMock()
+            recv_works.append(work)
+            return work
+
+        with (
+            patch("torchrec.distributed.maglev.stage.dist.P2POp") as p2p_op,
+            patch(
+                "torchrec.distributed.maglev.stage.dist.batch_isend_irecv"
+            ) as batch_isend_irecv,
+            patch(
+                "torchrec.distributed.maglev.stage.dist.isend",
+                side_effect=record_send,
+            ) as isend,
+            patch(
+                "torchrec.distributed.maglev.stage.dist.irecv",
+                side_effect=record_recv,
+            ) as irecv,
+        ):
+            stage_zero_outputs = cast(
+                Activations,
+                stage_zero.compute_forward_micro([inputs[0]], (), 0),
+            )
+            stage_zero.start_send_act(stage_zero_outputs)
+            stage_one.start_recv_act([inputs[1]])
+            stage_one_inputs = stage_one.wait_for_act()
+            stage_zero.start_recv_grad()
+            stage_one.start_send_grad(stage_one_inputs)
+            stage_zero.wait_for_grad()
+            stage_zero.finish_send_act()
+            stage_one.finish_send_grad()
+
+        p2p_op.assert_not_called()
+        batch_isend_irecv.assert_not_called()
+        self.assertEqual(isend.call_count, 2)
+        self.assertEqual(isend.call_args_list[0].kwargs["dst"], 1)
+        self.assertIs(isend.call_args_list[0].kwargs["group"], activation_pg)
+        self.assertEqual(isend.call_args_list[1].kwargs["dst"], 0)
+        self.assertIs(isend.call_args_list[1].kwargs["group"], gradient_pg)
+        self.assertEqual(irecv.call_count, 2)
+        self.assertEqual(irecv.call_args_list[0].kwargs["src"], 0)
+        self.assertIs(irecv.call_args_list[0].kwargs["group"], activation_pg)
+        self.assertEqual(irecv.call_args_list[1].kwargs["src"], 1)
+        self.assertIs(irecv.call_args_list[1].kwargs["group"], gradient_pg)
+        for work in send_works + recv_works:
+            work.wait.assert_called_once_with()
+
+    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
+    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
+    def test_batched_activation_send_retains_every_buffer(
+        self,
+        _get_rank: Any,
+        _input_dist_driver: Any,
+    ) -> None:
+        handoff_pg = MagicMock(name="handoff_pg")
+        process_groups = MaglevProcessGroups(
+            stage_ranks=((0,), (1,)),
+            stage_pg=MagicMock(),
+            handoff_pgs=(handoff_pg, handoff_pg),
+            cascade_pg=MagicMock(),
+            cascade_gloo_pg=MagicMock(),
+            handoff_pg_mode=HandoffPGMode.SHARED,
+        )
+        stage = StageWrapper(
+            self._model(num_layers=2),
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        )
+        tensors = tuple(torch.ones(3, 2).t() for _ in range(3))
+        buffer_refs: List[weakref.ReferenceType[torch.Tensor]] = []
+        coalesced_work = MagicMock()
+        pending_works = [coalesced_work]
+
+        def capture_op(
+            op: Any,
+            tensor: torch.Tensor,
+            peer: int,
+            group: Any,
+        ) -> Tuple[Any, int, Any]:
+            buffer_refs.append(weakref.ref(tensor))
+            return op, peer, group
+
+        with (
+            patch(
+                "torchrec.distributed.maglev.stage.dist.P2POp",
+                side_effect=capture_op,
+            ) as p2p_op,
+            patch(
+                "torchrec.distributed.maglev.stage.dist.batch_isend_irecv",
+                return_value=pending_works,
+            ) as batch_isend_irecv,
+        ):
+            stage.start_send_act(tensors)
+            self.assertEqual(len(buffer_refs), 3)
+            p2p_op.reset_mock()
+            batch_isend_irecv.reset_mock()
+            del tensors
+            gc.collect()
+            self.assertTrue(all(buffer() is not None for buffer in buffer_refs))
+
+            stage.finish_send_act()
+            gc.collect()
+
+        self.assertTrue(all(buffer() is None for buffer in buffer_refs))
+        coalesced_work.wait.assert_called_once_with()
+        self.assertEqual(len(pending_works), 1)
+        self.assertIs(pending_works[0], coalesced_work)
+
+    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
+    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
+    def test_send_without_work_handle_is_not_in_flight(
+        self,
+        _get_rank: Any,
+        _input_dist_driver: Any,
+    ) -> None:
+        process_group = MagicMock()
+        process_groups = MaglevProcessGroups(
+            stage_ranks=((0,), (1,)),
+            stage_pg=process_group,
+            handoff_pgs=(process_group, process_group),
+            cascade_pg=process_group,
+            cascade_gloo_pg=process_group,
+            handoff_pg_mode=HandoffPGMode.SHARED,
+        )
+        stage = StageWrapper(
+            self._model(num_layers=2),
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        )
+        tensors = (torch.ones(2, 3),)
+
+        with (
+            patch("torchrec.distributed.maglev.stage.dist.P2POp") as p2p_op,
+            patch(
+                "torchrec.distributed.maglev.stage.dist.batch_isend_irecv",
+                return_value=[],
+            ) as batch_isend_irecv,
+        ):
+            stage.start_send_act(tensors)
+            stage.start_send_act(tensors)
+            stage.finish_send_act()
+
+        self.assertEqual(batch_isend_irecv.call_count, 2)
+        self.assertEqual(p2p_op.call_count, 2)
+
+    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
+    @patch("torchrec.distributed.maglev.stage.dist.get_rank")
+    def test_shared_handoffs_batch_one_way_tensor_lists(
+        self,
+        get_rank: Any,
+        _input_dist_driver: Any,
+    ) -> None:
+        process_group = MagicMock()
+        process_groups = MaglevProcessGroups(
+            stage_ranks=((0,), (1,)),
+            stage_pg=process_group,
+            handoff_pgs=(process_group, process_group),
+            cascade_pg=process_group,
+            cascade_gloo_pg=process_group,
+            handoff_pg_mode=HandoffPGMode.SHARED,
+        )
+        get_rank.side_effect = [0, 1]
+        stage_zero = StageWrapper(
+            self._model(num_layers=2),
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        ).to(torch.device("cpu"))
+        stage_one = StageWrapper(
+            self._model(num_layers=2),
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        ).to(torch.device("cpu"))
+        inputs = self._inputs(num_layers=2, batch_size=2)
+        coalesced_works = [MagicMock() for _ in range(4)]
+
+        with (
+            patch(
+                "torchrec.distributed.maglev.stage.dist.P2POp",
+                side_effect=lambda op, tensor, peer, group: (
+                    op,
+                    tensor,
+                    peer,
+                    group,
+                ),
+            ),
+            patch(
+                "torchrec.distributed.maglev.stage.dist.batch_isend_irecv",
+                side_effect=[[work] for work in coalesced_works],
+            ) as batch_isend_irecv,
+            patch("torchrec.distributed.maglev.stage.dist.isend") as isend,
+            patch("torchrec.distributed.maglev.stage.dist.irecv") as irecv,
+        ):
+            outputs = cast(
+                Activations,
+                stage_zero.compute_forward_micro([inputs[0]], (), 0),
+            )
+            stage_zero.start_send_act(outputs)
+            stage_one.start_recv_act([inputs[1]])
+            stage_one_inputs = stage_one.wait_for_act()
+            stage_zero.finish_send_act()
+            stage_zero.start_recv_grad()
+            stage_one.start_send_grad(stage_one_inputs)
+            stage_zero.wait_for_grad()
+            stage_one.finish_send_grad()
+
+        self.assertEqual(batch_isend_irecv.call_count, 4)
+        for batch_call, expected_op, expected_peer in zip(
+            batch_isend_irecv.call_args_list,
+            (isend, irecv, irecv, isend),
+            (1, 0, 1, 0),
+        ):
+            ops = batch_call.args[0]
+            self.assertGreater(len(ops), 0)
+            for op, _tensor, peer, group in ops:
+                self.assertIs(op, expected_op)
+                self.assertEqual(peer, expected_peer)
+                self.assertIs(group, process_group)
+        for work in coalesced_works:
+            work.wait.assert_called_once_with()
+        isend.assert_not_called()
+        irecv.assert_not_called()
 
     def test_empty_model_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -1290,18 +1636,17 @@ class MaglevModuleListTest(unittest.TestCase):
 
     @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=2)
     @patch("torchrec.distributed.maglev.stage.dist.new_group")
-    def test_from_device_mesh_reuses_mesh_process_groups(
+    def test_from_device_mesh_defaults_to_shared_handoff(
         self,
         new_group: Any,
         _get_rank: Any,
     ) -> None:
-        activation_pg = MagicMock(name="activation_pg")
-        gradient_pg = MagicMock(name="gradient_pg")
+        handoff_pg = MagicMock(name="handoff_pg")
         cascade_gloo_pgs = [
             MagicMock(name="cascade_gloo_0"),
             MagicMock(name="cascade_gloo_1"),
         ]
-        new_group.side_effect = [activation_pg, gradient_pg, *cascade_gloo_pgs]
+        new_group.side_effect = [handoff_pg, *cascade_gloo_pgs]
         stage_pg = MagicMock(name="stage_pg")
         cascade_pg = MagicMock(name="cascade_pg")
         stage_mesh = MagicMock()
@@ -1321,18 +1666,17 @@ class MaglevModuleListTest(unittest.TestCase):
             cast(DeviceMesh, device_mesh),
             stage_mesh_dim_name="dp",
             pipeline_mesh_dim_name="pp",
-            handoff_pg_mode=HandoffPGMode.SPLIT,
         )
 
         self.assertEqual(process_groups.stage_ranks, ((0, 1), (2, 3)))
         self.assertIs(process_groups.stage_pg, stage_pg)
-        self.assertEqual(process_groups.handoff_pgs, (activation_pg, gradient_pg))
+        self.assertEqual(process_groups.handoff_pgs, (handoff_pg, handoff_pg))
+        self.assertIs(process_groups.handoff_pg_mode, HandoffPGMode.SHARED)
         self.assertIs(process_groups.cascade_pg, cascade_pg)
         self.assertIs(process_groups.cascade_gloo_pg, cascade_gloo_pgs[0])
         self.assertEqual(
             new_group.call_args_list,
             [
-                call(ranks=[0, 1, 2, 3]),
                 call(ranks=[0, 1, 2, 3]),
                 call(ranks=[0, 2], backend="gloo"),
                 call(ranks=[1, 3], backend="gloo"),
@@ -1341,7 +1685,7 @@ class MaglevModuleListTest(unittest.TestCase):
 
     @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
     @patch("torchrec.distributed.maglev.stage.dist.new_group")
-    def test_from_scratch_shared_reuses_one_handoff_pg(
+    def test_from_scratch_defaults_to_shared_handoff_pg(
         self,
         new_group: Any,
         _get_rank: Any,
@@ -1352,7 +1696,6 @@ class MaglevModuleListTest(unittest.TestCase):
         process_groups = MaglevProcessGroups.from_scratch(
             stage_size=2,
             num_stages=3,
-            handoff_pg_mode=HandoffPGMode.SHARED,
         )
 
         self.assertEqual(
@@ -1369,6 +1712,7 @@ class MaglevModuleListTest(unittest.TestCase):
             ],
         )
         self.assertIs(process_groups.handoff_pgs[0], process_groups.handoff_pgs[1])
+        self.assertIs(process_groups.handoff_pg_mode, HandoffPGMode.SHARED)
 
 
 class MaglevDDPNumericsTest(MultiProcessTestBase):
