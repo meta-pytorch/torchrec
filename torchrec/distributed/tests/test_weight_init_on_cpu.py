@@ -11,6 +11,7 @@ from typing import cast, List
 
 import torch
 import torch.nn as nn
+from fbgemm_gpu.split_embedding_configs import SparseType
 from torch.distributed import _remote_device
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.batched_embedding_kernel import BatchedFusedEmbeddingBag
@@ -25,6 +26,7 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessTestBase,
 )
 from torchrec.distributed.types import (
+    DataType,
     EnumerableShardingSpec,
     ModuleSharder,
     ShardedTensor,
@@ -35,6 +37,7 @@ from torchrec.distributed.types import (
     TensorProperties,
 )
 from torchrec.distributed.utils import (
+    _convert_weights,
     _group_sharded_modules,
     align_shard_metadata_to_device,
     align_shards_metadata_to_device,
@@ -42,6 +45,7 @@ from torchrec.distributed.utils import (
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port, init_distributed_single_host
 
 
@@ -154,6 +158,33 @@ class PlacementAlignmentTest(unittest.TestCase):
             [_placement(sm).device() for sm in spec.shards],
             [torch.device("cuda:0"), torch.device("cuda:1")],
         )
+
+
+class ConvertWeightsTargetDeviceTest(unittest.TestCase):
+    def test_converts_dtype_in_place_without_target_device(self) -> None:
+        weights = torch.ones(8, dtype=torch.float32)
+        converted = _convert_weights(weights, SparseType.FP16)
+        self.assertEqual(converted.dtype, torch.float16)
+        self.assertEqual(converted.device.type, "cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires a GPU")
+    def test_casts_and_moves_in_one_step(self) -> None:
+        weights = torch.ones(8, dtype=torch.float32)
+        converted = _convert_weights(
+            weights, SparseType.FP16, target_device=torch.device("cuda:0")
+        )
+        self.assertEqual(converted.dtype, torch.float16)
+        self.assertEqual(converted.device.type, "cuda")
+        # Source storage is released rather than left behind on the host.
+        self.assertEqual(weights.untyped_storage().size(), 0)
+
+    def test_no_op_conversion_keeps_storage_alive(self) -> None:
+        weights = torch.ones(8, dtype=torch.float32)
+        converted = _convert_weights(
+            weights, SparseType.FP32, target_device=torch.device("cpu")
+        )
+        self.assertEqual(converted.numel(), 8)
+        self.assertGreater(converted.untyped_storage().size(), 0)
 
 
 def _assert_plan_placements_intact(rank: int, world_size: int) -> None:
@@ -301,6 +332,20 @@ class WeightInitOnCpuTest(unittest.TestCase):
             _placement(local_shards[0].metadata).device(), torch.device("cpu")
         )
 
+    def test_quantize_relocates_weights_to_the_compute_device(self) -> None:
+        sharded_model = self._shard(True)
+        EmbeddingQuantizationUtils().quantize_embedding_modules(
+            sharded_model,
+            converted_dtype=DataType.FP16,
+            target_device=self.device,
+        )
+        # Asserted on the kernel, not on state_dict: quantize deliberately does
+        # not rebuild torch state, so the registered views stay stale until the
+        # next recreate.
+        kernel = _group_sharded_modules(sharded_model)[0]
+        self.assertEqual(kernel.weights_dev.device.type, "cuda")
+        self.assertEqual(kernel.weights_dev.dtype, torch.float16)
+
     def test_recalculating_torch_state_reinitializes_weights(self) -> None:
         # Pins the contract that makes `recreate_embedding_modules` the only
         # legitimate caller: `_initialize_torch_state` ends in `reset_parameters`,
@@ -318,6 +363,21 @@ class WeightInitOnCpuTest(unittest.TestCase):
             torch.equal(weights, torch.full_like(weights, 0.5)),
             "expected reset_parameters to overwrite the weights",
         )
+
+    def test_forward_runs_once_weights_reach_the_compute_device(self) -> None:
+        sharded_model = self._shard(True)
+        EmbeddingQuantizationUtils().quantize_embedding_modules(
+            sharded_model,
+            converted_dtype=DataType.FP16,
+            target_device=self.device,
+        )
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["feature_0"],
+            values=torch.LongTensor([1, 2, 3]),
+            lengths=torch.LongTensor([2, 0, 1]),
+        ).to(self.device)
+        output = sharded_model(features)
+        self.assertEqual(output.values().device.type, "cuda")
 
 
 @unittest.skipIf(

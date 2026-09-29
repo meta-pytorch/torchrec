@@ -1030,10 +1030,30 @@ def align_shards_metadata_to_device(
     ]
 
 
+def move_dense_to_device(module: nn.Module, device: torch.device) -> None:
+    """Move everything except `ShardedModule` subtrees onto `device`.
+
+    For use by `DataParallelWrapper` implementations under `weight_init_on_cpu`,
+    where the usual unconditional `module.to(device)` would be wrong: the sharded
+    embeddings' TBE weights are deliberately off the accelerator, and dragging
+    them back here would undo the saving before quantization gets a chance to
+    cast them straight onto it. Everything torchrec does not consider sharded --
+    arch MLPs, norms, their buffers -- still moves.
+    """
+    if isinstance(module, ShardedModule):
+        return
+    for child in module.children():
+        move_dense_to_device(child, device)
+    # recurse=False: children are handled above, so the ShardedModule skip is
+    # honored at every level rather than only at the root.
+    module._apply(lambda t: t.to(device), recurse=False)
+
+
 def _convert_weights(
     weights: torch.Tensor,
     converted_dtype: SparseType,
     use_cpu_turnaround_optimization: bool = False,
+    target_device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     torch_dtype = converted_dtype.as_dtype()
 
@@ -1054,7 +1074,14 @@ def _convert_weights(
         new_weights = cpu_weights.to(dtype=torch_dtype).to(device)
         return new_weights
 
-    new_weights = weights.to(dtype=torch_dtype)
+    new_weights = weights.to(
+        dtype=torch_dtype,
+        device=weights.device if target_device is None else target_device,
+    )
+    if new_weights is weights:
+        # `.to()` is a no-op when dtype and device already match; resizing the
+        # storage here would free the tensor we are about to return.
+        return new_weights
     weights.untyped_storage().resize_(0)
     return new_weights
 
@@ -1082,11 +1109,15 @@ class EmbeddingQuantizationUtils:
         module: nn.Module,
         converted_dtype: DataType,
         use_cpu_turnaround_optimization: bool = False,
+        target_device: Optional[torch.device] = None,
     ) -> None:
         sharded_embs = _group_sharded_modules(module)
         sharded_embs.sort(key=weights_bytes_in_emb_kernel)
         logger.info(
-            f"[TorchRec] Converting embedding modules to converted_dtype={converted_dtype.value} quantization"
+            "[TorchRec] Converting embedding modules to converted_dtype=%s "
+            "quantization, target_device=%s",
+            converted_dtype.value,
+            target_device,
         )
         converted_sparse_dtype = data_type_to_sparse_type(converted_dtype)
 
@@ -1096,6 +1127,7 @@ class EmbeddingQuantizationUtils:
                 emb_kernel.weights_dev,
                 converted_sparse_dtype,
                 use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
+                target_device=target_device,
             )
             emb_kernel.weights_host = _convert_weights(
                 # pyrefly: ignore[bad-argument-type]
@@ -1121,9 +1153,15 @@ class EmbeddingQuantizationUtils:
         self,
         module: nn.Module,
         use_cpu_turnaround_optimization: bool = False,
+        target_device: Optional[torch.device] = None,
     ) -> None:
         sharded_embs = _group_sharded_modules(module)
         sharded_embs.sort(key=weights_bytes_in_emb_kernel)
+        logger.info(
+            "[TorchRec] Recreating embedding modules at original precision, "
+            "target_device=%s",
+            target_device,
+        )
 
         for emb_kernel in sharded_embs:
             # pyrefly: ignore[bad-index]
@@ -1134,6 +1172,7 @@ class EmbeddingQuantizationUtils:
                 emb_kernel.weights_dev,
                 converted_sparse_dtype,
                 use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
+                target_device=target_device,
             )
             emb_kernel.weights_host = _convert_weights(
                 # pyrefly: ignore[bad-argument-type]

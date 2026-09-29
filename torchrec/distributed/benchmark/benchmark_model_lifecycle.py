@@ -33,6 +33,24 @@ Buck2 (internal):
 OSS (external):
     python -m torchrec.distributed.benchmark.benchmark_model_lifecycle \
         --world_size=2 --batch_size=4096 --num_batches=5 --pipeline=sparse
+
+Comparing embedding placement during checkpoint eval -- run both and diff
+"GPU Peak Mem alloc". `--num_benchmarks` must be > 0 or nothing is measured and
+every metric reports zero:
+
+    buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_model_lifecycle -- \
+        --world_size=2 --batch_size=1024 --num_batches=2 \
+        --num_unweighted_features=10 --num_weighted_features=10 \
+        --num_float_features=10 --feature_pooling_avg=10 \
+        --num_benchmarks=2 --loglevel=INFO \
+        --name=baseline --workflow=quant_model_init1
+
+    buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_model_lifecycle -- \
+        --world_size=2 --batch_size=1024 --num_batches=2 \
+        --num_unweighted_features=10 --num_weighted_features=10 \
+        --num_float_features=10 --feature_pooling_avg=10 \
+        --num_benchmarks=2 --loglevel=INFO \
+        --name=wioc --workflow=weight_init_on_cpu --weight_init_on_cpu=True
 """
 
 import json
@@ -49,6 +67,7 @@ from torchrec.distributed.benchmark.base import (
     BenchmarkResult,
     cmd_conf,
 )
+from torchrec.distributed.model_parallel import HybridEvalDMP
 from torchrec.distributed.test_utils.input_config import ModelInputConfig
 from torchrec.distributed.test_utils.metric_config import RecMetricConfig
 from torchrec.distributed.test_utils.model_config import (
@@ -69,6 +88,7 @@ from torchrec.distributed.test_utils.table_config import (
     EmbeddingTablesConfig,
     TableExtendedConfigs,
 )
+from torchrec.distributed.types import ShardingEnv
 from torchrec.distributed.utils import EmbeddingQuantizationUtils
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.types import DataType
@@ -108,6 +128,8 @@ class RunOptions(BenchFuncConfig):
     checkpoint_id: str = "/tmp/benchmark_checkpoint"
     save_checkpoint: bool = True
     load_checkpoint: bool = True
+    # Allocate TBE weight buffers on CPU in the `weight_init_on_cpu` workflow.
+    weight_init_on_cpu: bool = True
 
 
 def _setup(
@@ -354,6 +376,145 @@ def quant_model_init1_runner(
         return result
 
 
+def weight_init_on_cpu_runner(
+    rank: int,
+    world_size: int,
+    tables: List[EmbeddingBagConfig],
+    weighted_tables: List[EmbeddingBagConfig],
+    run_option: RunOptions,
+    model_config: BaseModelConfig,
+    pipeline_config: PipelineConfig,
+    input_config: ModelInputConfig,
+    planner_config: PlannerConfig,
+    sharding_config: ShardingConfig,
+    metric_config: RecMetricConfig,
+    table_related_configs: Optional[TableExtendedConfigs] = None,
+) -> BenchmarkResult:
+    """Init TBE weights off-device, load a checkpoint, then quantize onto the GPU.
+
+    This is the ``weight_init_on_cpu`` counterpart to ``quant_model_init1``:
+    identical work, except the full precision embedding weights stay on the host
+    until the quantize step casts and moves them, so they never occupy HBM.
+    Compare the two workflows' peak memory to measure what the deferred
+    placement buys.
+    """
+
+    bench_inputs = _setup(run_option, input_config, tables, weighted_tables, rank)
+
+    with MultiProcessContext(
+        rank=rank,
+        world_size=world_size,
+        backend="cpu:gloo,cuda:nccl",
+        use_deterministic_algorithms=False,
+    ) as ctx:
+
+        def _func_to_benchmark(
+            bench_inputs: List[ModelInput],
+        ) -> None:
+            with record_function("## model_creation ##"):
+                unsharded_model = model_config.generate_model(
+                    tables=tables,
+                    weighted_tables=weighted_tables,
+                    dense_device=ctx.device,
+                    mc_configs=(
+                        table_related_configs.mc_configs
+                        if table_related_configs
+                        else None
+                    ),
+                )
+
+            with record_function("## shard ##"):
+                planner = planner_config.generate_planner(
+                    tables=tables + weighted_tables,
+                )
+                # Built here rather than via `ShardingConfig.generate_hybrid_dmp_model`,
+                # which asserts `embedding_device` and pins the compute device to
+                # it. Here the embeddings are only *temporarily* off-device, so the
+                # compute device stays the accelerator.
+                #
+                # `HybridEvalDMP` defaults to `init_data_parallel=False`, which this
+                # workflow requires rather than merely prefers: DDP's wrapper does an
+                # unconditional `dmp._dmp_wrapped_module.to(device)` before wrapping,
+                # which would drag the deferred embeddings onto the accelerator and
+                # undo the saving.
+                #
+                # `weight_init_on_cpu` rides `fused_params` into the TBE; there
+                # is no DMP-level or ShardingEnv-level knob for it.
+                if run_option.weight_init_on_cpu:
+                    sharding_config.fused_params["weight_init_on_cpu"] = True
+                sharders, plan = sharding_config._plan_and_sharders(
+                    unsharded_model,
+                    # pyrefly: ignore[bad-argument-type]
+                    ctx.pg,
+                    planner,
+                )
+                sharded_model = HybridEvalDMP(
+                    module=unsharded_model,
+                    # pyrefly: ignore[bad-argument-type]
+                    env=ShardingEnv.from_process_group(ctx.pg),
+                    device=ctx.device,
+                    sharders=sharders,
+                    plan=plan,
+                )
+
+            with record_function("## checkpoint_save ##"):
+                state_dict = sharded_model.state_dict()
+                if run_option.save_checkpoint:
+                    dcp_save(state_dict, checkpoint_id=run_option.checkpoint_id)
+
+            with record_function("## checkpoint_load ##"):
+                if run_option.load_checkpoint:
+                    state_dict = sharded_model.state_dict()
+                    dcp_load(state_dict, checkpoint_id=run_option.checkpoint_id)
+                    # pyrefly: ignore[bad-argument-type]
+                    sharded_model.load_state_dict(dict(state_dict))
+
+            with record_function("## quantize ##"):
+                # Casts and relocates in one step: this is what makes the model
+                # runnable, not just smaller.
+                quant_utils = EmbeddingQuantizationUtils()
+                quant_utils.quantize_embedding_modules(
+                    sharded_model,
+                    converted_dtype=DataType.NFP8,
+                    target_device=ctx.device,
+                )
+
+            with record_function("## move_dense ##"):
+                # `HybridEvalDMP.to()` is selective: it recurses only into
+                # non-`ShardedModule` children, so this moves the dense side
+                # without dragging the sharded embeddings along. Kept after
+                # quantize so the dense params do not add to the pre-quantize peak.
+                sharded_model.to(ctx.device)
+
+            with record_function("## forward ##"):
+                if run_option.run_forward:
+                    batch = bench_inputs[0]
+                    sharded_model(batch.to(ctx.device))
+
+            torch.cuda.synchronize()
+
+        result = benchmark_func(
+            # pyrefly: ignore[bad-argument-type]
+            bench_inputs=bench_inputs,
+            # pyrefly: ignore[bad-argument-type]
+            prof_inputs=bench_inputs,
+            func_to_benchmark=_func_to_benchmark,
+            benchmark_func_kwargs={},
+            sample_count=0,
+            **run_option.benchmark_func_kwargs(rank=rank),
+        )
+
+        if rank == 0:
+            logger.setLevel(logging.INFO)
+            if run_option.output_json:
+                print(json.dumps(result.to_dict(), indent=2))
+            else:
+                logger.info(result.prettify())
+                logger.info("\nMarkdown format:\n%s", result)
+
+        return result
+
+
 @cmd_conf
 def main(
     run_option: RunOptions,
@@ -381,6 +542,8 @@ def main(
             runner = model_init_runner
         case "quant_model_init1":
             runner = quant_model_init1_runner
+        case "weight_init_on_cpu":
+            runner = weight_init_on_cpu_runner
         case _:
             raise ValueError(f"Unknown workflow {run_option.workflow}")
 
