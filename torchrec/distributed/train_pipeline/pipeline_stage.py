@@ -645,7 +645,7 @@ class SparseDataDistUtil(Generic[In]):
         """
         context = self._embedding_lookup_context()
         with record_function(f"## start_embedding_lookup {context.index} ##"):
-            current_stream = torch.get_device_module(self._device).current_stream()
+            current_stream = torch.accelerator.current_stream(self._device)
             with self._stream_context(self.embedding_lookup_stream):
                 for module in self._pipelined_modules:
                     _start_embedding_lookup(

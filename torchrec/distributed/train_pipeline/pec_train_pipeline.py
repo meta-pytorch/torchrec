@@ -198,7 +198,7 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
             current_ctx: context of the batch being distributed (None at finalize).
             prev_ctx: context of the previous batch (None for the first batch).
         """
-        default_stream = torch.get_device_module(self._device).current_stream()
+        default_stream = torch.accelerator.current_stream(self._device)
         # pyrefly: ignore [bad-argument-type]
         with self._stream_context(self._data_dist_stream):
             for name, pec in self._pec_modules.items():
@@ -251,7 +251,7 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
         Args:
             context: context whose input_dist tensors are looked up.
         """
-        main_stream = torch.get_device_module(self._device).current_stream()
+        main_stream = torch.accelerator.current_stream(self._device)
         non_pec_modules = [
             module
             for module in self._pipelined_modules
@@ -434,7 +434,7 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
         # ctx(0) and records _overlap_dist_event. NOL compute(0) consumes the
         # forward ctx on the main stream, so order it after the event.
         self._pec_overlap_dist(ctx0, None)
-        torch.get_device_module(self._device).current_stream().wait_event(
+        torch.accelerator.current_stream(self._device).wait_event(
             self._overlap_dist_event
         )
         self._pec_nol_compute(ctx0)
@@ -513,7 +513,7 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
         #    keeps it alive through forward/backward. Inplace copy reuses a
         #    persistent buffer, so there is nothing to protect.
         if not self._enable_inplace_copy_batch:
-            main_stream = torch.get_device_module(self._device).current_stream()
+            main_stream = torch.accelerator.current_stream(self._device)
             # pyrefly: ignore [missing-attribute]
             self.batches[0].record_stream(main_stream)
 
@@ -537,7 +537,7 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
         #     skipped on the finalize step (ctx1 None, no forward ctx produced).
         #     Done after forward so the data-dist work overlapped it.
         if ctx1 is not None:
-            torch.get_device_module(self._device).current_stream().wait_event(
+            torch.accelerator.current_stream(self._device).wait_event(
                 self._overlap_dist_event
             )
             with record_function("## pec_nol_compute ##"):
@@ -553,7 +553,7 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
             # below. If #10's NOL compute didn't already order the main stream
             # after overlap_dist (finalize step, ctx1 None), do it now.
             if ctx1 is None:
-                torch.get_device_module(self._device).current_stream().wait_event(
+                torch.accelerator.current_stream(self._device).wait_event(
                     self._overlap_dist_event
                 )
 

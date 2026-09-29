@@ -143,10 +143,8 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
         ctx = self._context.module_contexts.pop(self._name)
 
         if self._stream is not None:
-            torch.get_device_module(self._device).current_stream().wait_stream(
-                self._stream
-            )
-            cur_stream = torch.get_device_module(self._device).current_stream()
+            cur_stream = torch.accelerator.current_stream(self._device)
+            cur_stream.wait_stream(self._stream)
 
             assert isinstance(
                 data, (torch.Tensor, Multistreamable)
@@ -185,12 +183,10 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
         # once in the model's forward pass. For more details: https://github.com/meta-pytorch/torchrec/pull/3294
 
         ctx = self._context.module_contexts.pop(self._name)
-        cur_stream = torch.get_device_module(self._device).current_stream()
+        cur_stream = torch.accelerator.current_stream(self._device)
 
         if self._stream is not None:
-            torch.get_device_module(self._device).current_stream().wait_stream(
-                self._stream
-            )
+            cur_stream.wait_stream(self._stream)
             ctx.record_stream(cur_stream)
 
         awaitable = self._context.embedding_a2a_requests.pop(self._name)
@@ -380,10 +376,8 @@ class PrefetchPipelinedForward(BaseForward[PrefetchTrainPipelineContext]):
         # Make sure that both result of input_dist and context
         # are properly transferred to the current stream.
         if self._stream is not None:
-            torch.get_device_module(self._device).current_stream().wait_stream(
-                self._stream
-            )
-            cur_stream = torch.get_device_module(self._device).current_stream()
+            cur_stream = torch.accelerator.current_stream(self._device)
+            cur_stream.wait_stream(self._stream)
 
             assert isinstance(
                 data, (torch.Tensor, Multistreamable)
@@ -431,10 +425,8 @@ class PrefetchEmbeddingPipelinedForward(PrefetchPipelinedForward):
         # Make sure that both result of input_dist and context
         # are properly transferred to the current stream.
         if self._stream is not None:
-            torch.get_device_module(self._device).current_stream().wait_stream(
-                self._stream
-            )
-            cur_stream = torch.get_device_module(self._device).current_stream()
+            cur_stream = torch.accelerator.current_stream(self._device)
+            cur_stream.wait_stream(self._stream)
 
             assert isinstance(
                 data, (torch.Tensor, Multistreamable)

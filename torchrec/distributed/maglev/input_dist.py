@@ -357,7 +357,7 @@ def inplace_copy_to_gpu(
     """
     device = destination_tensors[0].device
     device_module = torch.get_device_module(device)
-    current_stream = device_module.current_stream(device)
+    current_stream = torch.accelerator.current_stream(device)
     with record_function("## inplace_copy_to_gpu ##"):
         with device_module.stream(memcpy_stream):
             memcpy_stream.wait_stream(current_stream)
@@ -496,9 +496,7 @@ class _InputDataAwaitable(LazyAwaitable[List[T]]):
 
     def _wait_impl(self) -> List[T]:
         with record_function(f"## input_data_dist wait batch{self._batch_id} ##"):
-            current_stream = torch.get_device_module(self._device).current_stream(
-                self._device
-            )
+            current_stream = torch.accelerator.current_stream(self._device)
             current_stream.wait_event(self._data_done_event)
             # recv_slot[(k, i)] = slot k of the carrier received from rank i. Each
             # fused buffer is laid out source-major then slot-major, matching the
@@ -746,8 +744,7 @@ def input_data_dist(
     not recover it from CUDA tensors.
     """
     device = in_bufs[0].device
-    device_module = torch.get_device_module(device)
-    current_stream = device_module.current_stream(device)
+    current_stream = torch.accelerator.current_stream(device)
     world_size = len(recv_sizes)
     num_tensors = len(example_flat)
     trailing = [tuple(tensor.shape[1:]) for tensor in example_flat]
