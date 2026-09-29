@@ -631,6 +631,16 @@ class MaglevRail(MaglevPipelineBase):
         """
         return True
 
+    def _dense(self, state: MaglevRailPassState) -> None:
+        """Phase 2: the dense pipeline.
+
+        The one method a subclass has to replace to reorder the dense pass --
+        the sparse phases either side of it, the seams and the single gradient
+        reduction are the same whatever order phase 2 runs in. See
+        :class:`~torchrec.distributed.maglev.customized_pipeline.MaglevRailCustom`.
+        """
+        self._dense_zero_bubble(state)
+
     def _dense_zero_bubble(self, state: MaglevRailPassState) -> None:
         """The dense pipeline with the backward split into ``I`` and ``W``.
 
@@ -724,7 +734,7 @@ class MaglevRail(MaglevPipelineBase):
                         self.num_microbatches,
                     )
                 del global_inputs
-                self._dense_zero_bubble(state)
+                self._dense(state)
 
                 stage.sparse_backward_global(state)
                 # Freed before the reduction and the step, which is where the
