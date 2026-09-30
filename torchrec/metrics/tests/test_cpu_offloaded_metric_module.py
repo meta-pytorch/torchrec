@@ -61,8 +61,18 @@ from torchrec.metrics.throughput import ThroughputMetric
 from torchrec.test_utils import init_process_group_single_rank, skip_if_asan_class
 
 
+# Cross-thread handoffs are near-instant. The bound only turns a dead worker
+# into a named failure instead of a hung suite.
+_THREAD_SYNC_TIMEOUT_SEC: float = 5.0
+
+# Waiting on a resolved result also covers the metric computation itself.
+_COMPUTE_RESULT_TIMEOUT_SEC: float = 15.0
+
+
 def wait_until_true(
-    condition: Callable[[], bool], timeout: float = 15.0, interval: float = 0.1
+    condition: Callable[[], bool],
+    timeout: float = _COMPUTE_RESULT_TIMEOUT_SEC,
+    interval: float = 0.1,
 ) -> None:
     """Wait until a condition is true or timeout is reached."""
     start_time = time.time()
@@ -121,7 +131,7 @@ class CPUOffloadedRecMetricModuleEmptyMetricsTest(unittest.TestCase):
             result_event = threading.Event()
             deferrable.subscribe(callback=lambda _, e=result_event: e.set())
             self.assertTrue(
-                result_event.wait(timeout=15.0),
+                result_event.wait(timeout=_COMPUTE_RESULT_TIMEOUT_SEC),
                 "empty-metrics async_compute did not complete",
             )
             result = deferrable.resolve()
@@ -160,7 +170,7 @@ class CPUOffloadedRecMetricModuleEmptyMetricsTest(unittest.TestCase):
                 on_error=on_error,
             )
             self.assertTrue(
-                result_event.wait(timeout=15.0),
+                result_event.wait(timeout=_COMPUTE_RESULT_TIMEOUT_SEC),
                 "empty-metrics async_compute failure did not propagate",
             )
             self.assertEqual(len(errors), 1)
@@ -208,7 +218,9 @@ class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
                 "raw_weight": raw_weight,
             }
         )
-        wait_until_true(self.mock_metric.update_called, timeout=5.0)
+        wait_until_true(
+            self.mock_metric.update_called, timeout=_THREAD_SYNC_TIMEOUT_SEC
+        )
 
         predictions = cast(
             dict[str, torch.Tensor], self.mock_metric.predictions_update_calls[0]
@@ -249,7 +261,7 @@ class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
         user_embeddings = torch.tensor([0.25])
         try:
             module.update({"user_embeddings": user_embeddings})
-            wait_until_true(mock_metric.update_called, timeout=5.0)
+            wait_until_true(mock_metric.update_called, timeout=_THREAD_SYNC_TIMEOUT_SEC)
 
             predictions = cast(
                 dict[str, torch.Tensor], mock_metric.predictions_update_calls[0]
@@ -285,7 +297,9 @@ class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
 
         self.module.update(model_out)
         self.module.update(model_out)
-        wait_until_true(self.mock_metric.update_called, timeout=5.0)
+        wait_until_true(
+            self.mock_metric.update_called, timeout=_THREAD_SYNC_TIMEOUT_SEC
+        )
 
         predictions = cast(
             dict[str, torch.Tensor], self.mock_metric.predictions_update_calls[0]
@@ -372,6 +386,10 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.rec_metrics = RecMetricList([self.mock_metric])
 
         init_process_group_single_rank("gloo")
+        # Safety net for the rest of setUp raising, which skips tearDown. Guarded so
+        # it stays a no-op on the normal path, where tearDown destroys the group
+        # before shutting the module down.
+        self.addCleanup(self._destroy_process_group_if_live)
         self.cpu_module: CPUOffloadedRecMetricModule = self._make_module(
             throughput_metric=ThroughputMetric(
                 world_size=self.world_size,
@@ -401,9 +419,12 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         ):
             self._make_module()
 
-    def tearDown(self) -> None:
+    def _destroy_process_group_if_live(self) -> None:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+    def tearDown(self) -> None:
+        self._destroy_process_group_if_live()
         if hasattr(self, "cpu_module"):
             try:
                 self.cpu_module.shutdown()
@@ -728,16 +749,16 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         def _run() -> None:
             started.set()
-            release.wait(timeout=5.0)
+            release.wait(timeout=_THREAD_SYNC_TIMEOUT_SEC)
 
         live = threading.Thread(target=_run)
         live.start()
         try:
-            self.assertTrue(started.wait(timeout=5.0))
+            self.assertTrue(started.wait(timeout=_THREAD_SYNC_TIMEOUT_SEC))
             self.assertIn("File", _format_thread_stack(live))
         finally:
             release.set()
-            live.join(timeout=5.0)
+            live.join(timeout=_THREAD_SYNC_TIMEOUT_SEC)
 
         # Exited thread: ident is set but has no current frame.
         self.assertIn("already exited", _format_thread_stack(live))
@@ -758,7 +779,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 }
             )
             self.assertTrue(
-                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                self.cpu_module._captured_exception_event.wait(
+                    timeout=_THREAD_SYNC_TIMEOUT_SEC
+                ),
                 "update thread did not capture exception",
             )
 
@@ -782,7 +805,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 }
             )
             self.assertTrue(
-                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                self.cpu_module._captured_exception_event.wait(
+                    timeout=_THREAD_SYNC_TIMEOUT_SEC
+                ),
                 "update thread did not capture exception",
             )
 
@@ -901,7 +926,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.cpu_module.update(model_out)
 
             # Wait for exception to be captured
-            captured = self.cpu_module._captured_exception_event.wait(timeout=5.0)
+            captured = self.cpu_module._captured_exception_event.wait(
+                timeout=_THREAD_SYNC_TIMEOUT_SEC
+            )
 
             self.assertTrue(captured, "Exception event should be set")
             self.assertIsNotNone(self.cpu_module._captured_exception)
@@ -911,7 +938,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "Test exception from update thread",
             )
 
-            self.cpu_module.update_thread.join(timeout=5.0)
+            self.cpu_module.update_thread.join(timeout=_THREAD_SYNC_TIMEOUT_SEC)
             self.assertFalse(
                 self.cpu_module.update_thread.is_alive(),
                 "Update thread should have terminated after exception",
@@ -937,7 +964,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.cpu_module.async_compute()
 
             # Wait for exception to be captured
-            captured = self.cpu_module._captured_exception_event.wait(timeout=5.0)
+            captured = self.cpu_module._captured_exception_event.wait(
+                timeout=_THREAD_SYNC_TIMEOUT_SEC
+            )
 
             self.assertTrue(captured, "Exception event should be set")
             self.assertIsNotNone(self.cpu_module._captured_exception)
@@ -947,7 +976,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "Test exception from compute thread",
             )
 
-            self.cpu_module.compute_thread.join(timeout=5.0)
+            self.cpu_module.compute_thread.join(timeout=_THREAD_SYNC_TIMEOUT_SEC)
             self.assertFalse(
                 self.cpu_module.compute_thread.is_alive(),
                 "compute thread should have terminated after exception",
@@ -1369,7 +1398,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             result_event = threading.Event()
             deferrable.subscribe(callback=lambda _, e=result_event: e.set())
             self.assertTrue(
-                result_event.wait(timeout=15.0),
+                result_event.wait(timeout=_COMPUTE_RESULT_TIMEOUT_SEC),
                 f"async_compute #{expected_count} did not complete",
             )
             self.assertEqual(self.cpu_module.compute_count, expected_count)
@@ -1470,7 +1499,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 }
             )
 
-            self.cpu_module._captured_exception_event.wait(timeout=5.0)
+            self.cpu_module._captured_exception_event.wait(
+                timeout=_THREAD_SYNC_TIMEOUT_SEC
+            )
             self.assertEqual(self.cpu_module._update_errors, 1)
 
     def test_compute_error_counter_incremented_on_thread_exception(self) -> None:
@@ -1482,7 +1513,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         ):
             self.cpu_module.async_compute()
 
-            self.cpu_module._captured_exception_event.wait(timeout=5.0)
+            self.cpu_module._captured_exception_event.wait(
+                timeout=_THREAD_SYNC_TIMEOUT_SEC
+            )
             self.assertEqual(self.cpu_module._compute_errors, 1)
 
     def test_queue_join_does_not_deadlock_after_processing_failure(self) -> None:
@@ -1504,7 +1537,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.cpu_module._update_rec_metrics(model_out)
             # Wait for the update thread to die
             self.assertTrue(
-                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                self.cpu_module._captured_exception_event.wait(
+                    timeout=_THREAD_SYNC_TIMEOUT_SEC
+                ),
                 "update thread did not capture exception",
             )
 
@@ -1517,7 +1552,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         threading.Thread(target=join_queue, daemon=True).start()
         self.assertTrue(
-            join_completed.wait(timeout=5.0),
+            join_completed.wait(timeout=_THREAD_SYNC_TIMEOUT_SEC),
             "queue.join() deadlocked — task_done() was not called after processing failure",
         )
 
@@ -1532,7 +1567,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             deferrable = self.cpu_module.async_compute()
 
             self.assertTrue(
-                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                self.cpu_module._captured_exception_event.wait(
+                    timeout=_THREAD_SYNC_TIMEOUT_SEC
+                ),
                 "compute thread did not capture exception",
             )
 
@@ -1551,7 +1588,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             deferrable = self.cpu_module.async_compute()
 
             self.assertTrue(
-                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                self.cpu_module._captured_exception_event.wait(
+                    timeout=_THREAD_SYNC_TIMEOUT_SEC
+                ),
                 "update thread did not capture exception",
             )
 
@@ -1563,38 +1602,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         cpu_module = self._make_module(update_queue_size=1)
 
         block_event = threading.Event()
-
-        def controlled_process_job(_: MetricUpdateJob) -> None:
-            block_event.wait()
-
-        model_out = {
-            "task1-prediction": torch.tensor([0.5]),
-            "task1-label": torch.tensor([0.5]),
-            "task1-weight": torch.tensor([1.0]),
-        }
-
-        with patch.object(
-            cpu_module, "_process_metric_update_job", side_effect=controlled_process_job
-        ), patch.object(cpu_module, "_log_event") as mock_log_event:
-            cpu_module._update_rec_metrics(model_out)
-            cpu_module._update_rec_metrics(model_out)
-
-            with self.assertRaises(RecMetricException):
-                cpu_module._update_rec_metrics(model_out)
-
-            mock_log_event.assert_called_once()
-            args = mock_log_event.call_args
-            self.assertEqual(args[0][0], "enqueue_update")
-            self.assertEqual(args[0][1], EventType.FAILURE)
-
-            block_event.set()
-
-    def test_enqueue_compute_logs_failure_on_queue_full(self) -> None:
-        """Verify FAILURE event is logged when update queue is full during async_compute."""
-        cpu_module = self._make_module(update_queue_size=1)
-
-        block_event = threading.Event()
         processing_started = threading.Event()
+        # Releases the worker even if an assertion below fails.
+        self.addCleanup(block_event.set)
 
         def controlled_process_job(_: MetricUpdateJob) -> None:
             processing_started.set()
@@ -1613,7 +1623,52 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             cpu_module._update_rec_metrics(model_out)
             # Wait for the update thread to pick up the first item before
             # enqueueing the second, otherwise put_nowait races with get.
-            processing_started.wait(timeout=5.0)
+            self.assertTrue(
+                processing_started.wait(timeout=_THREAD_SYNC_TIMEOUT_SEC),
+                "update thread did not dequeue the first job",
+            )
+            cpu_module._update_rec_metrics(model_out)
+
+            with self.assertRaises(RecMetricException):
+                cpu_module._update_rec_metrics(model_out)
+
+            mock_log_event.assert_called_once()
+            args = mock_log_event.call_args
+            self.assertEqual(args[0][0], "enqueue_update")
+            self.assertEqual(args[0][1], EventType.FAILURE)
+
+            block_event.set()
+
+    def test_enqueue_compute_logs_failure_on_queue_full(self) -> None:
+        """Verify FAILURE event is logged when update queue is full during async_compute."""
+        cpu_module = self._make_module(update_queue_size=1)
+
+        block_event = threading.Event()
+        processing_started = threading.Event()
+        # Releases the worker even if an assertion below fails.
+        self.addCleanup(block_event.set)
+
+        def controlled_process_job(_: MetricUpdateJob) -> None:
+            processing_started.set()
+            block_event.wait()
+
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.5]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        with patch.object(
+            cpu_module, "_process_metric_update_job", side_effect=controlled_process_job
+        ), patch.object(cpu_module, "_log_event") as mock_log_event:
+            # Fill the queue: 1 item being processed + 1 in queue = full
+            cpu_module._update_rec_metrics(model_out)
+            # Wait for the update thread to pick up the first item before
+            # enqueueing the second, otherwise put_nowait races with get.
+            self.assertTrue(
+                processing_started.wait(timeout=_THREAD_SYNC_TIMEOUT_SEC),
+                "update thread did not dequeue the first job",
+            )
             cpu_module._update_rec_metrics(model_out)
 
             with self.assertRaises(RecMetricException):
@@ -2113,7 +2168,7 @@ class WorkerSideBatchingTest(unittest.TestCase):
 
         threading.Thread(target=call_sync, daemon=True).start()
         self.assertTrue(
-            sync_completed.wait(timeout=5.0),
+            sync_completed.wait(timeout=_THREAD_SYNC_TIMEOUT_SEC),
             "sync() deadlocked when called with a partial K-batch in flight",
         )
         self.assertEqual(cpu_module._total_updates_processed, 3)
