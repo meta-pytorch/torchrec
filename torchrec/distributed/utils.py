@@ -31,6 +31,7 @@ from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     KeyedJaggedTensor,
 )
+from torchrec.distributed.fused_params import FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER
 from torchrec.distributed.types import (
     DataType,
     EmbeddingEvent,
@@ -688,6 +689,12 @@ def add_params_from_parameter_sharding(
     """
     if fused_params is None:
         fused_params = {}
+
+    if parameter_sharding.compute_kernel not in {
+        EmbeddingComputeKernel.FUSED.value,
+        EmbeddingComputeKernel.FUSED_TRITON.value,
+    }:
+        fused_params.pop(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER, None)
 
     if parameter_sharding.compute_kernel not in {
         EmbeddingComputeKernel.FUSED_TRITON.value,

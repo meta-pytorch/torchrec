@@ -22,6 +22,9 @@ FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS: str = (
 )
 FUSED_PARAM_TBE_ROW_ALIGNMENT: str = "__register_tbe_row_alignment"
 FUSED_PARAM_BOUNDS_CHECK_MODE: str = "__register_tbe_bounds_check_mode"
+FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: str = (
+    "__register_enable_fs_2d_async_allgather"
+)
 
 # Force lengths to offsets conversion before TBE lookup. Helps with performance
 # with certain ways to split models.
@@ -74,6 +77,15 @@ def get_fused_param_tbe_row_alignment(
         return None
     else:
         return fused_params[FUSED_PARAM_TBE_ROW_ALIGNMENT]
+
+
+def fused_param_enable_fs_2d_async_allgather(
+    fused_params: Optional[Dict[str, Any]],
+) -> bool:
+    return (
+        fused_params is not None
+        and fused_params.get(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER) is True
+    )
 
 
 def fused_param_bounds_check_mode(
@@ -130,6 +142,8 @@ def tbe_fused_params(
         fused_params_for_tbe.pop(FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS)
     if FUSED_PARAM_TBE_ROW_ALIGNMENT in fused_params_for_tbe:
         fused_params_for_tbe.pop(FUSED_PARAM_TBE_ROW_ALIGNMENT)
+    if FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER in fused_params_for_tbe:
+        fused_params_for_tbe.pop(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER)
     if FUSED_PARAM_BOUNDS_CHECK_MODE in fused_params_for_tbe:
         fused_params_for_tbe.pop(FUSED_PARAM_BOUNDS_CHECK_MODE)
     if FUSED_PARAM_LENGTHS_TO_OFFSETS_LOOKUP in fused_params_for_tbe:
