@@ -83,6 +83,11 @@ W = TypeVar("W")
 GRADIENT_DIVISION: bool = True
 USE_SYNC_COLLECTIVES: bool = False
 USE_TRITON_PERMUTE_2D: bool = False
+# Kill switch for the fbgemm fast paths in `_recat_pooled_embedding_grad_out`. Set
+# `TORCHREC_USE_FBGEMM_RECAT=0` to fall back to the split/contiguous/cat reference.
+# Read once at import, so it has to be set before the process starts;
+# `set_use_fbgemm_recat` still overrides it in-process.
+USE_FBGEMM_RECAT: bool = os.environ.get("TORCHREC_USE_FBGEMM_RECAT", "0") == "1"
 
 
 def set_gradient_division(val: bool) -> None:
@@ -112,6 +117,15 @@ def set_use_triton_permute_2d(val: bool) -> None:
 
 def get_use_triton_permute_2d() -> bool:
     return USE_TRITON_PERMUTE_2D
+
+
+def set_use_fbgemm_recat(val: bool) -> None:
+    global USE_FBGEMM_RECAT
+    USE_FBGEMM_RECAT = val
+
+
+def get_use_fbgemm_recat() -> bool:
+    return USE_FBGEMM_RECAT
 
 
 @contextmanager
@@ -235,6 +249,13 @@ class All2AllPooledInfo:
             `dim_sum_per_rank`, this is only used by the fast kernel of
             `_recat_pooled_embedding_grad_out`.
         codecs (Optional[QuantizedCommCodecs]): quantized communication codecs.
+        recat_dim_sum_per_rank_tensor (Optional[Tensor]): int64 device tensor of
+            `dim_sum_per_rank`, consumed by the fbgemm recat kernel in
+            `_recat_pooled_embedding_grad_out`.
+        recat_cumsum_dim_sum_per_rank_tensor (Optional[Tensor]): int64 device tensor
+            holding the *exclusive* cumulative sum of `dim_sum_per_rank`
+            (`[0, d0, d0 + d1, ...]`), i.e. each rank's starting column. Note this
+            differs from `cumsum_dim_sum_per_rank_tensor`, which is inclusive.
     """
 
     batch_size_per_rank: List[int]
@@ -242,6 +263,8 @@ class All2AllPooledInfo:
     dim_sum_per_rank_tensor: Optional[Tensor]
     cumsum_dim_sum_per_rank_tensor: Optional[Tensor]
     codecs: Optional[QuantizedCommCodecs] = None
+    recat_dim_sum_per_rank_tensor: Optional[Tensor] = None
+    recat_cumsum_dim_sum_per_rank_tensor: Optional[Tensor] = None
 
 
 @dataclass
@@ -514,6 +537,8 @@ def alltoall_pooled(
     group: Optional[dist.ProcessGroup] = None,
     codecs: Optional[QuantizedCommCodecs] = None,
     all_to_all_single_comm: Optional[All2AllSingle] = None,
+    recat_dim_sum_per_rank_tensor: Optional[Tensor] = None,
+    recat_cumsum_dim_sum_per_rank_tensor: Optional[Tensor] = None,
 ) -> Awaitable[Tensor]:
     """
     Performs AlltoAll operation for a single pooled embedding tensor.
@@ -538,6 +563,11 @@ def alltoall_pooled(
         group (Optional[dist.ProcessGroup]): the process group to work on. If None, the
             default process group will be used.
         codecs (Optional[QuantizedCommCodecs]): quantized communication codecs.
+        recat_dim_sum_per_rank_tensor (Optional[Tensor]): int64 device tensor of
+            `dim_sum_per_rank`, consumed by the fbgemm recat kernel in
+            `_recat_pooled_embedding_grad_out`.
+        recat_cumsum_dim_sum_per_rank_tensor (Optional[Tensor]): int64 device tensor
+            holding the *exclusive* cumulative sum of `dim_sum_per_rank`.
 
     Returns:
         Awaitable[Tensor]: Async work handle which can be `wait()`-ed later to
@@ -570,6 +600,8 @@ def alltoall_pooled(
         dim_sum_per_rank_tensor=dim_sum_per_rank_tensor,
         cumsum_dim_sum_per_rank_tensor=cumsum_dim_sum_per_rank_tensor,
         codecs=codecs,
+        recat_dim_sum_per_rank_tensor=recat_dim_sum_per_rank_tensor,
+        recat_cumsum_dim_sum_per_rank_tensor=recat_cumsum_dim_sum_per_rank_tensor,
     )
 
     # Keep the experimental dependency out of non-TPU import and execution paths.
@@ -1418,10 +1450,45 @@ def reduce_scatter_v_per_feature_pooled(
     return myreq
 
 
+# The fbgemm kernels only have float and half dispatch arms.
+_FBGEMM_RECAT_DTYPES: Tuple[torch.dtype, ...] = (torch.float32, torch.float16)
+
+
 # TODO: improve performance of _recat_pooled_embedding_grad_out, see T87591139
 def _recat_pooled_embedding_grad_out(
-    grad_output: Tensor, num_features_per_rank: List[int]
+    grad_output: Tensor,
+    num_features_per_rank: List[int],
+    dim_sum_per_rank_tensor: Optional[Tensor] = None,
+    cumsum_dim_sum_per_rank_tensor: Optional[Tensor] = None,
 ) -> Tensor:
+    """
+    Regroups a ``[B_local, sum(num_features_per_rank)]`` gradient, whose columns are
+    ordered by rank, into the flat rank-major send buffer the backward all-to-all
+    expects: ``[rank0 block][rank1 block]...``, each block ``[B_local, D_rank]``
+    flattened row-major.
+
+    ``dim_sum_per_rank_tensor`` and ``cumsum_dim_sum_per_rank_tensor`` select the
+    single-kernel fbgemm path; both must be int64 and the cumsum must be
+    *exclusive* (``[0, d0, d0 + d1, ...]``), which is what the kernel indexes as
+    each rank's starting column. Passing an inclusive cumsum silently shifts every
+    rank's stripe by one slot.
+    """
+    if USE_FBGEMM_RECAT and grad_output.dtype in _FBGEMM_RECAT_DTYPES:
+        if (
+            grad_output.is_cuda
+            and dim_sum_per_rank_tensor is not None
+            and cumsum_dim_sum_per_rank_tensor is not None
+            and dim_sum_per_rank_tensor.dtype == torch.int64
+            and cumsum_dim_sum_per_rank_tensor.dtype == torch.int64
+        ):
+            return torch.ops.fbgemm.recat_embedding_grad_output_mixed_D_batch(
+                grad_output,
+                dim_sum_per_rank_tensor,
+                cumsum_dim_sum_per_rank_tensor,
+            )
+        return torch.ops.fbgemm.recat_embedding_grad_output_mixed_D(
+            grad_output, num_features_per_rank
+        )
     grad_outputs_by_rank = grad_output.split(num_features_per_rank, dim=1)
     return torch.cat(
         [
@@ -1669,6 +1736,8 @@ class All2All_Pooled_Wait(Function):
         sharded_grad_output = _recat_pooled_embedding_grad_out(
             grad_output.contiguous(),
             dim_sum_per_rank,
+            a2ai.recat_dim_sum_per_rank_tensor,
+            a2ai.recat_cumsum_dim_sum_per_rank_tensor,
         )
 
         if a2ai.codecs is not None:

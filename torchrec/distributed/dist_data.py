@@ -1420,6 +1420,22 @@ class PooledEmbeddingsAllToAll(nn.Module):
             "_cumsum_dim_sum_per_rank_tensor",
             torch.tensor(cumsum_dim_sum_per_rank, device=device, dtype=torch.int),
         )
+        # The fbgemm recat kernel indexes the cumsum as each rank's *starting*
+        # column, so it needs the exclusive scan, and reads both as int64. Kept
+        # separate from the two buffers above, which are persistent and whose
+        # inclusive/int32 values are baked into existing checkpoints.
+        self.register_buffer(
+            "_recat_dim_sum_per_rank_tensor",
+            torch.tensor(dim_sum_per_rank, device=device, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_recat_cumsum_dim_sum_per_rank_tensor",
+            torch.tensor(
+                [0] + cumsum_dim_sum_per_rank[:-1], device=device, dtype=torch.int64
+            ),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -1455,6 +1471,10 @@ class PooledEmbeddingsAllToAll(nn.Module):
             cumsum_dim_sum_per_rank_tensor=self._cumsum_dim_sum_per_rank_tensor,
             group=self._pg,
             codecs=self._codecs,
+            # pyrefly: ignore[bad-argument-type]
+            recat_dim_sum_per_rank_tensor=self._recat_dim_sum_per_rank_tensor,
+            # pyrefly: ignore[bad-argument-type]
+            recat_cumsum_dim_sum_per_rank_tensor=self._recat_cumsum_dim_sum_per_rank_tensor,
         )
 
         pooled_embedding_awaitable = PooledEmbeddingsAwaitable(
