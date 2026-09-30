@@ -33,6 +33,7 @@ from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.shard_estimators import (
     _calculate_shard_io_sizes,
     _calculate_storage_specific_sizes,
+    _maybe_charge_weights_to_ddr,
     _validate_io_sizes,
     _validate_perf,
     EmbeddingOffloadStats,
@@ -45,6 +46,7 @@ from torchrec.distributed.planner.types import (
     Shard,
     SharderData,
     ShardingOption,
+    Storage,
     Topology,
 )
 from torchrec.distributed.quant_embeddingbag import QuantEmbeddingBagCollectionSharder
@@ -1796,6 +1798,80 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
             constraint_key_value_params=KeyValueParams(max_l1_cache_size=8),
         )
         self.assertGreater(large, small)
+
+    def test_weight_init_on_cpu_moves_hbm_to_ddr(self) -> None:
+        topology = Topology(world_size=2, compute_device="cuda")
+        num_embeddings = 100
+        embedding_dim = 64
+        # FP32 weight tensor bytes for the full (table-wise) shard.
+        weight_bytes = num_embeddings * embedding_dim * 4
+
+        def _storage(weight_init_on_cpu: bool) -> Storage:
+            # The flag reaches the estimator the same way it reaches the kernel --
+            # through the sharder's `fused_params` -- so a plan can never disagree
+            # with where the weights actually get allocated.
+            enumerator = EmbeddingEnumerator(topology=topology, batch_size=BATCH_SIZE)
+            tables = [
+                EmbeddingBagConfig(
+                    num_embeddings=num_embeddings,
+                    embedding_dim=embedding_dim,
+                    name="table_0",
+                    feature_names=["feature_0"],
+                    data_type=DataType.FP32,
+                )
+            ]
+            model = TestSparseNN(tables=tables, weighted_tables=[])
+            sharding_options = enumerator.enumerate(
+                module=model,
+                sharders=[
+                    cast(
+                        ModuleSharder[torch.nn.Module],
+                        TestEBCSharder(
+                            sharding_type=ShardingType.TABLE_WISE.value,
+                            kernel_type=EmbeddingComputeKernel.FUSED.value,
+                            fused_params=(
+                                {"weight_init_on_cpu": True}
+                                if weight_init_on_cpu
+                                else {}
+                            ),
+                        ),
+                    )
+                ],
+            )
+            self.assertEqual(len(sharding_options), 1)
+            self.assertEqual(len(sharding_options[0].shards), 1)
+            storage = sharding_options[0].shards[0].storage
+            assert storage is not None
+            return storage
+
+        baseline = _storage(weight_init_on_cpu=False)
+        cpu_init = _storage(weight_init_on_cpu=True)
+
+        # The weight tensor bytes move out of HBM and into DDR; everything else
+        # (optimizer/cache/pipeline) stays put, so the deltas equal weight_bytes.
+        self.assertEqual(baseline.hbm - cpu_init.hbm, weight_bytes)
+        self.assertEqual(cpu_init.ddr - baseline.ddr, weight_bytes)
+
+    def test_weight_init_on_cpu_negative_hbm_asserts(self) -> None:
+        # HBM sizes smaller than the weight tensor would go negative after the
+        # move, which the planner would read as free HBM.
+        with self.assertRaises(AssertionError) as ctx:
+            _maybe_charge_weights_to_ddr(
+                hbm_specific_sizes=[100],
+                ddr_specific_sizes=[0],
+                hbm_storage=1000,
+                shape=torch.Size([10, 10]),
+                shard_sizes=[[10, 10]],
+                sharding_type=ShardingType.TABLE_WISE.value,
+                compute_device="cuda",
+                weight_init_on_cpu=True,
+                table_cached=False,
+                use_virtual_table=False,
+            )
+        self.assertIn(
+            "Negative HBM size detected in hbm_specific_sizes[0]=-900",
+            str(ctx.exception),
+        )
 
 
 class TestEmbeddingOffloadStats(unittest.TestCase):

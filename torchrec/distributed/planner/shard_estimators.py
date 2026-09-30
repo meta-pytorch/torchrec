@@ -234,6 +234,12 @@ class EmbeddingStorageEstimator(ShardEstimator):
             # TODO: remove after deprecating fused_params in sharder
             if mpp_conf is None:
                 mpp_conf = sharder_data.fused_params.get("multipass_prefetch_config")
+
+            # Read off the same `fused_params` the kernel will be built with, so
+            # the plan cannot disagree with where the weights actually land.
+            weight_init_on_cpu: bool = bool(
+                sharder_data.fused_params.get("weight_init_on_cpu", False)
+            )
             try:
                 shard_storages = calculate_shard_storages(
                     sharder_data=sharder_data,
@@ -260,6 +266,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     key_value_params=key_value_params,
                     kv_cache_load_factor=kv_cache_load_factor,
                     use_virtual_table=use_virtual_table,
+                    weight_init_on_cpu=weight_init_on_cpu,
                 )
             except ZeroDivisionError as e:
                 raise ValueError(
@@ -340,12 +347,19 @@ def calculate_shard_storages(
     key_value_params: Optional[KeyValueParams] = None,
     kv_cache_load_factor: float = KV_CACHING_RATIO,
     use_virtual_table: bool = False,
+    weight_init_on_cpu: bool = False,
 ) -> List[Storage]:
     """
     Calculates estimated storage sizes for each sharded tensor using SharderData.
 
     Like calculate_shard_storages but takes a SharderData snapshot instead of a live
     ModuleSharder, enabling picklability.
+
+    When ``weight_init_on_cpu`` is set, the embedding weight tensor is allocated on
+    host memory instead of the compute device, so its bytes are charged to DDR
+    rather than HBM. Only the weight tensor moves: optimizer state, cache auxiliary
+    state and pipeline IO stay on HBM. Cached and virtual-table kernels already keep
+    their weights off HBM, so they are left alone.
     """
     input_sizes, output_sizes = _calculate_shard_io_sizes(
         sharding_type=sharding_type,
@@ -390,6 +404,19 @@ def calculate_shard_storages(
         optimizer_class=optimizer_class,
         is_inference=is_inference,
     )
+    hbm_specific_sizes, ddr_specific_sizes = _maybe_charge_weights_to_ddr(
+        hbm_specific_sizes=hbm_specific_sizes,
+        ddr_specific_sizes=ddr_specific_sizes,
+        hbm_storage=hbm_storage,
+        shape=tensor.shape,
+        shard_sizes=shard_sizes,
+        sharding_type=sharding_type,
+        compute_device=compute_device,
+        weight_init_on_cpu=weight_init_on_cpu,
+        table_cached=table_cached,
+        use_virtual_table=use_virtual_table,
+    )
+
     ssd_specific_sizes: List[int] = [
         hbm_specific_size + ddr_specific_size
         for hbm_specific_size, ddr_specific_size in zip(
@@ -896,6 +923,71 @@ def _calculate_storage_specific_sizes(
             cache_aux_state_sizes, tensor_sizes, optimizer_sizes
         )
     ]
+
+
+def _maybe_charge_weights_to_ddr(
+    hbm_specific_sizes: List[int],
+    ddr_specific_sizes: List[int],
+    hbm_storage: int,
+    shape: torch.Size,
+    shard_sizes: List[List[int]],
+    sharding_type: str,
+    compute_device: str,
+    weight_init_on_cpu: bool,
+    table_cached: bool,
+    use_virtual_table: bool,
+) -> Tuple[List[int], List[int]]:
+    """Charge the embedding weight bytes to DDR instead of HBM, if applicable.
+
+    Under `weight_init_on_cpu` the weight buffer is allocated on the host and only
+    reaches HBM after quantization, so reserving HBM for it over-provisions the
+    plan. Only the weight tensor is reassigned. `hbm_specific_sizes` also covers
+    optimizer and cache-auxiliary state, which are left charged to HBM because
+    they do stay on the compute device.
+
+    Returns the sizes unchanged when the flag is off, or when the weights are
+    already off HBM anyway -- cached and virtual-table kernels keep them in host
+    memory by construction, and a non-accelerator compute device has no HBM to
+    free.
+    """
+    if (
+        not weight_init_on_cpu
+        or table_cached
+        or use_virtual_table
+        or compute_device not in {"cuda", "mtia"}
+    ):
+        return hbm_specific_sizes, ddr_specific_sizes
+
+    weight_tensor_sizes: List[int] = _calculate_tensor_sizes(
+        storage=hbm_storage,
+        shape=shape,
+        shard_sizes=shard_sizes,
+        sharding_type=sharding_type,
+    )
+    new_hbm_specific_sizes: List[int] = [
+        hbm_specific_size - weight_tensor_size
+        for hbm_specific_size, weight_tensor_size in zip(
+            hbm_specific_sizes, weight_tensor_sizes
+        )
+    ]
+    # A negative HBM size would read as free HBM and let the planner over-pack
+    # the device, so fail loudly instead.
+    for i, size in enumerate(new_hbm_specific_sizes):
+        assert size >= 0, (
+            f"[TorchRec Planner] Negative HBM size detected in hbm_specific_sizes[{i}]={size} "
+            f"after charging weights to DDR for sharding_type={sharding_type}. "
+            f"hbm_specific_sizes={hbm_specific_sizes}, "
+            f"weight_tensor_sizes={weight_tensor_sizes}"
+        )
+    return (
+        new_hbm_specific_sizes,
+        [
+            ddr_specific_size + weight_tensor_size
+            for ddr_specific_size, weight_tensor_size in zip(
+                ddr_specific_sizes, weight_tensor_sizes
+            )
+        ],
+    )
 
 
 def _calculate_tensor_sizes(
