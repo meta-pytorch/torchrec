@@ -3449,22 +3449,17 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 num_workers, len(keys)
             ).T.cpu()
 
+            # Kept on `stride_per_rank_per_key`'s device: it is only ever used to index
+            # `cumsum_lengths`, which lives there too. Moving it to CPU costs a
+            # device-to-host sync, and `index` then has to copy it straight back.
             strides_cumsum: torch.Tensor = (
                 torch.ops.fbgemm.asynchronous_complete_cumsum(stride_per_rank_per_key)
-            ).cpu()
+            )
 
             cumsum_lengths = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
 
-            n = strides_cumsum.size(0)
-            strides_cumsum_from_1 = torch.narrow(
-                strides_cumsum, dim=0, start=1, length=n - 1
-            )
-            strides_cumsum_to_minus_1 = torch.narrow(
-                strides_cumsum, dim=0, start=0, length=n - 1
-            )
             length_per_key_tensor = (
-                cumsum_lengths[strides_cumsum_from_1]
-                - cumsum_lengths[strides_cumsum_to_minus_1]
+                cumsum_lengths[strides_cumsum[1:]] - cumsum_lengths[strides_cumsum[:-1]]
             )
 
             with record_function("## dist_init:recat_values vb ##"):
