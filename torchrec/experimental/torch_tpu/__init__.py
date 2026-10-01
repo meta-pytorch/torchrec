@@ -28,6 +28,7 @@ if TYPE_CHECKING:
         SparseCoreSavePlanner,
     )
     from torchrec.experimental.torch_tpu.datasets.dataloader import (
+        PrefetchDataLoader,
         SparseCoreBatch,
         SparseCoreDataLoader,
     )
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     )
     from torchrec.experimental.torch_tpu.modules.embedding_configs import (
         SparseCoreEmbeddingConfig,
+        StackedSparseCoreEmbeddingConfig,
     )
     from torchrec.experimental.torch_tpu.modules.embedding_modules import (
         TPUEmbeddingUnfused,
@@ -46,10 +48,21 @@ if TYPE_CHECKING:
         SparseCoreFusedEmbeddingBagCollection,
         SparseCoreFusedEmbeddingCollection,
     )
+    from torchrec.experimental.torch_tpu.modules.table_stacking import (
+        auto_stack_tables,
+        prepare_tables_for_stacking,
+        stack_and_shard_tables,
+        stack_tables,
+        unshard_and_unstack_tables,
+    )
+    from torchrec.experimental.torch_tpu.pipelining.train_pipeline import (
+        SparseCoreTrainPipeline,
+    )
 
 
 _SYMBOL_TO_MODULE: dict[str, str] = {
     "KeyedSparseCorePreprocessedInput": "torchrec.experimental.torch_tpu.datasets.input_preprocessing",
+    "PrefetchDataLoader": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreBatch": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreDataLoader": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreEmbeddingConfig": "torchrec.experimental.torch_tpu.modules.embedding_configs",
@@ -59,7 +72,14 @@ _SYMBOL_TO_MODULE: dict[str, str] = {
     "SparseCoreLoadPlanner": "torchrec.experimental.torch_tpu.checkpoint.planners",
     "SparseCorePreprocessedInput": "torchrec.experimental.torch_tpu.datasets.input_preprocessing",
     "SparseCoreSavePlanner": "torchrec.experimental.torch_tpu.checkpoint.planners",
+    "SparseCoreTrainPipeline": "torchrec.experimental.torch_tpu.pipelining.train_pipeline",
+    "StackedSparseCoreEmbeddingConfig": "torchrec.experimental.torch_tpu.modules.embedding_configs",
     "TPUEmbeddingUnfused": "torchrec.experimental.torch_tpu.modules.embedding_modules",
+    "auto_stack_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "prepare_tables_for_stacking": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "stack_and_shard_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "stack_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
+    "unshard_and_unstack_tables": "torchrec.experimental.torch_tpu.modules.table_stacking",
 }
 
 
@@ -79,14 +99,22 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "SparseCoreEmbeddingConfig",
+    "StackedSparseCoreEmbeddingConfig",
     "SparseCoreFusedEmbeddingBagCollection",
     "SparseCoreFusedEmbeddingCollection",
     "TPUEmbeddingUnfused",
     "SparseCoreInputPreprocessor",
     "KeyedSparseCorePreprocessedInput",
     "SparseCorePreprocessedInput",
+    "PrefetchDataLoader",
     "SparseCoreBatch",
     "SparseCoreDataLoader",
     "SparseCoreSavePlanner",
     "SparseCoreLoadPlanner",
+    "SparseCoreTrainPipeline",
+    "stack_tables",
+    "auto_stack_tables",
+    "prepare_tables_for_stacking",
+    "stack_and_shard_tables",
+    "unshard_and_unstack_tables",
 ]
