@@ -8,6 +8,8 @@
 
 #include <torchrec/csrc/dynamic_embedding/details/bits_op.h>
 
+#include <bit>
+
 namespace torchrec::bits_impl {
 
 template <typename T>
@@ -36,42 +38,42 @@ struct ClzImpl {
 template <>
 struct ClzImpl<unsigned int> {
   int operator()(unsigned int v) const {
-    return __builtin_clz(v);
+    return std::countl_zero(v);
   }
 };
 
 template <>
 struct ClzImpl<int> {
   int operator()(int v) const {
-    return __builtin_clz(static_cast<unsigned int>(v));
+    return std::countl_zero(static_cast<unsigned int>(v));
   }
 };
 
 template <>
 struct ClzImpl<unsigned long> {
   int operator()(unsigned long v) const {
-    return __builtin_clzl(v);
+    return std::countl_zero(v);
   }
 };
 
 template <>
 struct ClzImpl<long> {
   int operator()(long v) const {
-    return __builtin_clzl(static_cast<unsigned long>(v));
+    return std::countl_zero(static_cast<unsigned long>(v));
   }
 };
 
 template <>
 struct ClzImpl<unsigned long long> {
   int operator()(unsigned long long v) const {
-    return __builtin_clzll(v);
+    return std::countl_zero(v);
   }
 };
 
 template <>
 struct ClzImpl<long long> {
   int operator()(long long v) const {
-    return __builtin_clzll(static_cast<unsigned long long>(v));
+    return std::countl_zero(static_cast<unsigned long long>(v));
   }
 };
 
