@@ -44,13 +44,9 @@ Check out the [Getting Started](https://pytorch.org/torchrec/setup-torchrec.html
 
    pip install torch --index-url https://download.pytorch.org/whl/nightly/cu126
 
-   CUDA 12.8
+   CUDA 13.0
 
-   pip install torch --index-url https://download.pytorch.org/whl/nightly/cu128
-
-   CUDA 12.9
-
-   pip install torch --index-url https://download.pytorch.org/whl/nightly/cu129
+   pip install torch --index-url https://download.pytorch.org/whl/nightly/cu130
 
    CPU
 
@@ -69,13 +65,9 @@ Check out the [Getting Started](https://pytorch.org/torchrec/setup-torchrec.html
 
    pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/nightly/cu126
 
-   CUDA 12.8
+   CUDA 13.0
 
-   pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/nightly/cu128
-
-   CUDA 12.9
-
-   pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/nightly/cu129
+   pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/nightly/cu130
 
    CPU
 
