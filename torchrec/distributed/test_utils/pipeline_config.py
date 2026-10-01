@@ -19,6 +19,7 @@ from torchrec.distributed.train_pipeline import (
 )
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
     EvalPipelineCPUSparse,
+    EvalPipelinePrefetchSparseDist,
     TrainEvalHybridPipelineBase,
     TrainPipelinePrefetchEMS,
     TrainPipelineSparseDistBwdOpt,
@@ -75,6 +76,11 @@ class PipelineConfig:
     # dense forward of batch i (pair with the FBGEMM_FORWARD_UVM_BLOCK_LIMIT env
     # var and emb_lookup_stream="new").
     enable_embedding_lookup_prefetch: bool = False
+    # eval-prefetch only: EvalPipelineStage value -> module FQN. Moves that stage
+    # out of its default slot in progress() and onto the module's forward hook,
+    # so it is issued partway through the dense forward instead of after it.
+    # e.g. {"wait_sparse_data_dist": "dense", "prefetch": "dense"}
+    stage_hooks: Dict[str, str] = field(default_factory=dict)
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def get_kwargs(self, **default_kwargs) -> Dict[str, Any]:
@@ -83,7 +89,14 @@ class PipelineConfig:
             kwargs["pipeline_postproc"] = True
         if "sharding_type" in kwargs:
             kwargs["sharding_type"] = ShardingType(kwargs["sharding_type"])
-        if self.pipeline in ("base", "sparse", "sparse_lite", "prefetch", "pec"):
+        if self.pipeline in (
+            "base",
+            "sparse",
+            "sparse_lite",
+            "prefetch",
+            "eval-prefetch",
+            "pec",
+        ):
             for key in ("site_fqn", "sharding_type"):
                 if key in kwargs:
                     kwargs.pop(key)
@@ -147,6 +160,7 @@ class PipelineConfig:
             "sparse-emb-stash": TrainPipelineSparseDistEmbStash,
             "prefetch-ems": TrainPipelinePrefetchEMS,
             "eval-cpu-sparse": EvalPipelineCPUSparse,
+            "eval-prefetch": EvalPipelinePrefetchSparseDist,
             "pec": TrainPipelinePEC,
         }
 
@@ -189,6 +203,18 @@ class PipelineConfig:
                     clear_data_dist_inputs=self.clear_data_dist_inputs,
                     enable_embedding_lookup_prefetch=self.enable_embedding_lookup_prefetch,
                     **self.get_kwargs(emb_lookup_stream=self.emb_lookup_stream),
+                )
+            case "eval-prefetch":
+                # eval-only, so there is no backward to hide a data-dist clear
+                # behind: it does not take the clear_data_dist_inputs knob.
+                return EvalPipelinePrefetchSparseDist(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    enable_inplace_copy_batch=self.enable_inplace_copy_batch,
+                    free_features_storage_early=self.free_features_storage_early,
+                    stage_hooks=self.stage_hooks,
+                    **self.get_kwargs(),
                 )
             case "pec":
                 # TrainPipelinePEC owns its full progress and does not accept the
