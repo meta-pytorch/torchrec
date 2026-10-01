@@ -33,7 +33,7 @@ jobs:
       matrix:
         cuda-tag: ["cu126", "cu130"]
         os:
-          - mt-l-x86aavx2-45-167-a10g-4
+          - mp-l-x86aavx2-45-167-a10g-4
         python:
           - version: "3.13"
             tag: "py313"
