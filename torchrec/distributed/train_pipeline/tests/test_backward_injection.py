@@ -224,6 +224,71 @@ class InjectionSiteTest(unittest.TestCase):
         self.assertEqual(grad_shapes[-1], torch.Size([4]))
         handle.remove()
 
+    def test_forward_marker_survives_parameter_swap(self) -> None:
+        """FORWARD_MARKER still fires after the parameter objects are replaced,
+        which is what SimpleFSDP's swap_dtensor_with_tensor does every forward
+        and what silently disables a PARAM_GRAD hook."""
+        model = SimpleModel()
+        grad_shapes: List[torch.Size] = []
+
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.FORWARD_MARKER,
+            hook_position=0.0,
+        )
+        handle = register_backward_hook(
+            site,
+            model,
+            lambda grad: grad_shapes.append(grad.shape),
+        )
+
+        for module in model.modules():
+            for name, param in list(module.named_parameters(recurse=False)):
+                module._parameters[name] = nn.Parameter(param.detach().clone())
+
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(grad_shapes, [torch.Size([2, 4])])
+
+        # Under compile the trigger must survive as a node in the backward
+        # graph; plain Python in a backward would run at trace time instead.
+        grad_shapes.clear()
+        torch.compile(model, backend="aot_eager")(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(grad_shapes, [torch.Size([2, 4])])
+
+        handle.remove()
+
+    def test_param_grad_does_not_survive_parameter_swap(self) -> None:
+        """Negative control for FORWARD_MARKER: PARAM_GRAD silently stops firing
+        once the parameter objects are replaced, because the hook lives on the
+        old object. This is the premise the marker path exists to work around."""
+        model = SimpleModel()
+        calls: List[torch.Size] = []
+
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=0.0,
+        )
+        handle = register_backward_hook(
+            site,
+            model,
+            lambda grad: calls.append(grad.shape),
+        )
+
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(len(calls), 1)
+
+        for module in model.modules():
+            for name, param in list(module.named_parameters(recurse=False)):
+                module._parameters[name] = nn.Parameter(param.detach().clone())
+
+        model.zero_grad()
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(len(calls), 1)  # did not fire again
+        handle.remove()
+
     def test_hook_position_no_trainable_params_raises(self) -> None:
         """PARAM_GRAD on a module with no params asserts."""
         model = SimpleModel()
