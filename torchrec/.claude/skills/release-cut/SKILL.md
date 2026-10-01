@@ -131,7 +131,7 @@ Beyond checking that the workflows succeed, the user should also inspect the **r
 
 1. **Release channel URL** — The `--index-url` should be a release channel, e.g.:
    - `https://download.pytorch.org/whl/cpu` (CPU)
-   - `https://download.pytorch.org/whl/cu129` (CUDA)
+   - `https://download.pytorch.org/whl/cu130` (CUDA)
    - There should be **no** `test` or `nightly` suffix (e.g., `whl/test/cpu` or `whl/nightly/cpu` means the wrong channel was used).
 
 2. **Dependency versions** — The installed versions of `torch` and `fbgemm-gpu` should match this release. Example log lines for v1.5.0:
