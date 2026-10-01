@@ -1086,3 +1086,32 @@ class TestRecatPooledEmbeddingGradOut(unittest.TestCase):
         torch.testing.assert_close(
             actual, _reference_recat(grad_output, dim_sum_per_rank), rtol=0, atol=0
         )
+
+    def test_fbgemm_path_reports_api_usage(self) -> None:
+        # torch dedupes the event itself; patching it out here only checks that
+        # the fbgemm path is the one attributed.
+        dim_sum_per_rank = [8, 16, 4, 32]
+        grad_output = self._make_case(16, dim_sum_per_rank, torch.float32)
+        dims, cumsum = self._recat_tensors(dim_sum_per_rank)
+
+        comm_ops.set_use_fbgemm_recat(True)
+        with patch.object(torch._C, "_log_api_usage_once") as log_api_usage_once:
+            comm_ops._recat_pooled_embedding_grad_out(
+                grad_output, dim_sum_per_rank, dims, cumsum
+            )
+        log_api_usage_once.assert_called_once_with(
+            "torchrec.distributed.comm_ops.recat_pooled_embedding_grad_out."
+            "recat_embedding_grad_output_mixed_D_batch"
+        )
+
+    def test_reference_path_reports_no_api_usage(self) -> None:
+        dim_sum_per_rank = [8, 16, 4, 32]
+        grad_output = self._make_case(16, dim_sum_per_rank, torch.float32)
+        dims, cumsum = self._recat_tensors(dim_sum_per_rank)
+
+        comm_ops.set_use_fbgemm_recat(False)
+        with patch.object(torch._C, "_log_api_usage_once") as log_api_usage_once:
+            comm_ops._recat_pooled_embedding_grad_out(
+                grad_output, dim_sum_per_rank, dims, cumsum
+            )
+        log_api_usage_once.assert_not_called()

@@ -1481,11 +1481,19 @@ def _recat_pooled_embedding_grad_out(
             and dim_sum_per_rank_tensor.dtype == torch.int64
             and cumsum_dim_sum_per_rank_tensor.dtype == torch.int64
         ):
+            torch._C._log_api_usage_once(
+                "torchrec.distributed.comm_ops.recat_pooled_embedding_grad_out."
+                "recat_embedding_grad_output_mixed_D_batch"
+            )
             return torch.ops.fbgemm.recat_embedding_grad_output_mixed_D_batch(
                 grad_output,
                 dim_sum_per_rank_tensor,
                 cumsum_dim_sum_per_rank_tensor,
             )
+        torch._C._log_api_usage_once(
+            "torchrec.distributed.comm_ops.recat_pooled_embedding_grad_out."
+            "recat_embedding_grad_output_mixed_D"
+        )
         return torch.ops.fbgemm.recat_embedding_grad_output_mixed_D(
             grad_output, num_features_per_rank
         )
