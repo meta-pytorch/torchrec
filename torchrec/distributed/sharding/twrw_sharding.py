@@ -61,6 +61,7 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
+from torchrec.distributed.utils import none_throws
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
 
@@ -70,6 +71,74 @@ T = TypeVar("T")
 W = TypeVar("W")
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _resolve_single_group_ranks(
+    table_name: str,
+    plan_ranks: List[int],
+    num_shards: int,
+    table_group: int,
+    local_size: int,
+    is_2D_parallel: bool,
+) -> List[int]:
+    if not is_2D_parallel and len(plan_ranks) > local_size:
+        raise ValueError(
+            f"'{table_name}': the plan places it on {len(plan_ranks)} ranks, "
+            f"more than the {local_size} in a TWRW group, but does not set "
+            "num_twrw_groups. The planner and runtime disagree on the group width."
+        )
+    if num_shards < local_size:
+        raise ValueError(
+            f"'{table_name}': a single-group table needs at least one shard per "
+            f"rank, but the plan has {num_shards} shards for a TWRW group of "
+            f"{local_size} ranks."
+        )
+    if not is_2D_parallel and num_shards > local_size:
+        raise ValueError(
+            f"'{table_name}': a single-group table needs exactly {local_size} "
+            f"shards outside 2D parallelism, but the plan has {num_shards}."
+        )
+    return list(range(table_group * local_size, (table_group + 1) * local_size))
+
+
+def _resolve_multi_group_ranks(
+    table_name: str,
+    num_twrw_groups: int,
+    plan_ranks: List[int],
+    num_shards: int,
+    local_size: int,
+    is_2D_parallel: bool,
+) -> List[int]:
+    if is_2D_parallel:
+        raise ValueError(
+            f"'{table_name}': TABLE_ROW_WISE "
+            f"num_twrw_groups={num_twrw_groups} is not supported under "
+            "2D parallelism."
+        )
+    if len(plan_ranks) != num_shards:
+        raise ValueError(
+            f"'{table_name}': a multi-group table has {len(plan_ranks)} placement "
+            f"ranks for {num_shards} shards."
+        )
+    expected_ranks = num_twrw_groups * local_size
+    if len(plan_ranks) != expected_ranks:
+        raise ValueError(
+            f"'{table_name}': num_twrw_groups={num_twrw_groups} needs "
+            f"{expected_ranks} ranks at a TWRW group width of {local_size}, but "
+            f"the plan places it on {len(plan_ranks)}."
+        )
+    if len(set(plan_ranks)) != len(plan_ranks):
+        raise ValueError(
+            f"'{table_name}': placement ranks {plan_ranks} repeat a rank; each "
+            "row shard needs its own."
+        )
+    groups = {rank // local_size for rank in plan_ranks}
+    if len(groups) != num_twrw_groups:
+        raise ValueError(
+            f"'{table_name}': num_twrw_groups={num_twrw_groups} but its "
+            f"{len(plan_ranks)} ranks span {len(groups)} groups."
+        )
+    return plan_ranks
 
 
 class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
@@ -168,6 +237,45 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             if group_config.has_feature_processor:
                 self._has_feature_processor = True
 
+    def _resolve_placement_ranks(
+        self,
+        table_name: str,
+        num_twrw_groups: int,
+        plan_ranks: List[int],
+        num_shards: int,
+        table_group: int,
+    ) -> List[int]:
+        """Resolve one rank per row shard.
+
+        Single-group plans preserve the legacy `ranks[0]` behavior. Multi-group
+        plans preserve `ranks[i]` to `shards[i]`; `num_twrw_groups` explicitly
+        selects the path.
+        """
+        local_size = self._local_size
+        if num_twrw_groups < 1:
+            raise ValueError(
+                f"'{table_name}': num_twrw_groups={num_twrw_groups} must be >= 1."
+            )
+
+        if num_twrw_groups == 1:
+            return _resolve_single_group_ranks(
+                table_name,
+                plan_ranks,
+                num_shards,
+                table_group,
+                local_size,
+                self._is_2D_parallel,
+            )
+
+        return _resolve_multi_group_ranks(
+            table_name,
+            num_twrw_groups,
+            plan_ranks,
+            num_shards,
+            local_size,
+            self._is_2D_parallel,
+        )
+
     def _shard(
         self,
         sharding_infos: List[EmbeddingShardingInfo],
@@ -180,8 +288,7 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         peer_group = get_process_group_ranks(self._pg) if self._is_2D_parallel else None
         for info in sharding_infos:
             # Under 2D parallelism we transform rank to the logical ordering in a regular parallelism scheme
-            # pyrefly: ignore[unsupported-operation]
-            planner_rank = info.param_sharding.ranks[0]
+            planner_rank = none_throws(info.param_sharding.ranks)[0]
             if peer_group is not None:
                 pg_members: List[int] = peer_group
                 try:
@@ -208,47 +315,47 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                     raise
             else:
                 rank = planner_rank
-            table_node = rank // local_size
+            table_group = rank // local_size
             # pyrefly: ignore[missing-attribute]
             shards = info.param_sharding.sharding_spec.shards
 
-            # The loop below places exactly local_size shards, one per rank of the
-            # node. A longer list is silently truncated while the global_metadata
-            # built here still advertises the whole tensor, so the model trains on a
-            # partial table and the gap only surfaces later as a checkpoint
-            # validation error; a shorter one indexes past the end. Both mean the
-            # producer and the runtime disagree on the node width, so fail here
-            # while both numbers are still in scope.
-            #
-            # Gated on the same knob as the pod_size factor: with the factor off the
-            # runtime group is deliberately narrower than the plan, so leaving this
-            # check on would turn the killswitch into a hard failure instead of a
-            # revert. Cheap comparison first so the knob is only read on a mismatch.
-            if len(shards) != local_size and is_2d_pod_size_enabled():
+            table_name = info.embedding_config.name
+            num_twrw_groups: int = info.param_sharding.num_twrw_groups or 1
+            placement_ranks = self._resolve_placement_ranks(
+                table_name=table_name,
+                num_twrw_groups=num_twrw_groups,
+                plan_ranks=list(none_throws(info.param_sharding.ranks)),
+                num_shards=len(shards),
+                table_group=table_group,
+            )
+            expected_shards = num_twrw_groups * local_size
+
+            # Keep the pod-size killswitch reversible: when disabled, the runtime
+            # group is deliberately narrower than the plan.
+            if len(shards) != expected_shards and is_2d_pod_size_enabled():
                 consequence = (
-                    f"placing only the first {local_size} and dropping "
-                    f"{len(shards) - local_size} while still reporting the full "
+                    f"placing only the first {expected_shards} and dropping "
+                    f"{len(shards) - expected_shards} while still reporting the full "
                     f"tensor"
-                    if len(shards) > local_size
-                    else f"leaving {local_size - len(shards)} of the node's ranks "
-                    f"with no shard to place"
+                    if len(shards) > expected_shards
+                    else f"leaving {expected_shards - len(shards)} placement ranks "
+                    "with no shard"
                 )
                 raise ValueError(
-                    f"TwRw node width mismatch for table "
+                    f"TWRW group span mismatch for table "
                     f"'{info.embedding_config.name}': the plan has {len(shards)} "
-                    f"row shards but the runtime intra-node group has {local_size} "
-                    f"ranks. is_2D={self._is_2D_parallel}, "
+                    f"row shards but {num_twrw_groups} TWRW groups at a runtime "
+                    f"group width of {local_size} need {expected_shards}. "
+                    f"is_2D={self._is_2D_parallel}, "
                     f"pod_size={get_resolved_pod_size()}, "
                     f"node_group_size={self._node_group_size}, "
                     f"local_world_size={get_local_size(self._global_world_size)}. "
-                    f"A TwRw plan must carry one shard per rank of the node; "
+                    f"A TWRW plan must carry one shard per placement rank; "
                     f"continuing would mean {consequence}. Check that the plan was "
                     f"built against Topology.intra_group_size rather than "
                     f"local_world_size."
                 )
 
-            table_name = info.embedding_config.name
-            num_twrw_groups: int = info.param_sharding.num_twrw_groups or 1
             if num_twrw_groups > 1:
                 raise NotImplementedError(
                     f"'{table_name}': TABLE_ROW_WISE "
@@ -281,11 +388,7 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                     stride=info.param.stride(),
                 )
 
-            for rank in range(
-                table_node * local_size,
-                (table_node + 1) * local_size,
-            ):
-                rank_idx = rank - (table_node * local_size)
+            for rank_idx, rank in enumerate(placement_ranks):
                 tables_per_rank[rank].append(
                     ShardedEmbeddingTable(
                         num_embeddings=info.embedding_config.num_embeddings,
