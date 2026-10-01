@@ -222,7 +222,15 @@ class DefaultPlannerProvider(PlannerProvider):
         if policy == StorageReservationPolicy.FIXED_PERCENTAGE:
             return FixedPercentageStorageReservation(percentage=percentage)
         if policy == StorageReservationPolicy.INFERENCE:
-            return InferenceStorageReservation(percentage=percentage)
+            # Forwarded for the same reason the heuristical branch above forwards
+            # it: this reservation assumes dense modules are GPU-resident and
+            # replicated, so a caller that keeps them on CPU has no way to say so
+            # except through this override. Dropping it silently re-reserves HBM
+            # the dense weights never occupy.
+            return InferenceStorageReservation(
+                percentage=percentage,
+                dense_tensor_estimate=cfg.dense_tensor_estimate,
+            )
         raise NotImplementedError(
             f"storage_reservation_policy {policy.value!r} ({policy.name}) is not "
             "buildable by DefaultPlannerProvider (SKU_AWARE is planned)."
