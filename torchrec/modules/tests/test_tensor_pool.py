@@ -59,6 +59,85 @@ class TensorPoolTest(unittest.TestCase):
 
         torch.testing.assert_close(dense_pool.pool_size, pool_size)
 
+    def test_update_unique(
+        self,
+    ) -> None:
+        device = (
+            torch.device("cpu")
+            if not torch.cuda.is_available()
+            else torch.device("cuda:0")
+        )
+        pool_size = 10
+        dim = 3
+        batch_size = 5
+        dense_pool = TensorPool(
+            pool_size=pool_size,
+            dim=dim,
+            dtype=torch.float,
+            device=device,
+        )
+        update_ids = [1, 9, 4, 2, 6]
+        ids = torch.tensor(update_ids, dtype=torch.int, device=device)
+        reference_values = torch.rand(
+            (batch_size, dim), dtype=torch.float, device=device
+        )
+        dense_pool.update_unique(ids=ids, values=reference_values)
+
+        torch.testing.assert_close(dense_pool.lookup(ids=ids), reference_values)
+
+        untouched_ids = torch.tensor(
+            [i for i in range(pool_size) if i not in update_ids],
+            dtype=torch.int,
+            device=device,
+        )
+        torch.testing.assert_close(
+            dense_pool.lookup(ids=untouched_ids),
+            torch.zeros((untouched_ids.numel(), dim), dtype=torch.float, device=device),
+        )
+
+    def test_update_validation_parity(
+        self,
+    ) -> None:
+        device = (
+            torch.device("cpu")
+            if not torch.cuda.is_available()
+            else torch.device("cuda:0")
+        )
+        pool_size = 10
+        dim = 3
+        batch_size = 5
+        dense_pool = TensorPool(
+            pool_size=pool_size,
+            dim=dim,
+            dtype=torch.float,
+            device=device,
+        )
+        ids = torch.tensor([1, 9, 4, 2, 6], dtype=torch.int, device=device)
+        values = torch.rand((batch_size, dim), dtype=torch.float, device=device)
+
+        invalid_args = [
+            ("values_not_2d", ids, values.flatten()),
+            ("values_wrong_dim", ids, values[:, :-1]),
+            ("values_wrong_dtype", ids, values.double()),
+            ("ids_wrong_dtype", ids.float(), values),
+            ("ids_out_of_bounds", ids + pool_size, values),
+        ]
+        if torch.cuda.is_available():
+            invalid_args += [
+                ("values_wrong_device", ids, values.cpu()),
+                ("ids_wrong_device", ids.cpu(), values),
+            ]
+
+        updates = {
+            "update": dense_pool.update,
+            "update_unique": dense_pool.update_unique,
+        }
+        for case, bad_ids, bad_values in invalid_args:
+            for method, update in updates.items():
+                with self.subTest(case=case, method=method):
+                    with self.assertRaises(AssertionError):
+                        update(ids=bad_ids, values=bad_values)
+
     def test_conflict(
         self,
     ) -> None:

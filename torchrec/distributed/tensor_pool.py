@@ -537,6 +537,18 @@ class ShardedInferenceTensorPool(
             # pyrefly: ignore[not-callable]
             shard.update(deduped_ids, values[dedup_permutation])
 
+    def _update_local_unique(
+        self,
+        dist_input: List[torch.Tensor],
+        dist_values: List[torch.Tensor],
+    ) -> None:
+        # LocalShardPool.update is a plain scatter-assign with no dedup of its own,
+        # so the only thing skipped here is the deterministic_dedup that
+        # _update_local applies inline.
+        for i, shard in enumerate(self._local_shard_pools):
+            # pyrefly: ignore[not-callable]
+            shard.update(dist_input[i], dist_values[i])
+
     # pyrefly: ignore[bad-return]
     def _update_preproc(self, values: torch.Tensor) -> torch.Tensor:
         pass
@@ -546,6 +558,19 @@ class ShardedInferenceTensorPool(
             ids, values
         )
         self._update_local(dist_input, dist_values)
+
+    def update_unique(self, ids: torch.Tensor, values: torch.Tensor) -> None:
+        """
+        Same as :meth:`update`, but skips the dedup pass because the caller
+        guarantees that ``ids`` contains no duplicates. Row-wise bucketization
+        sends each distinct id to exactly one shard, so global uniqueness implies
+        per-shard uniqueness. See :meth:`TensorPool.update_unique` for what
+        passing duplicates anyway does.
+        """
+        dist_input, dist_values, unbucketize_permute = self._update_ids_dist(
+            ids, values
+        )
+        self._update_local_unique(dist_input, dist_values)
 
 
 class TensorPoolSharder(ModuleSharder[TensorPool]):

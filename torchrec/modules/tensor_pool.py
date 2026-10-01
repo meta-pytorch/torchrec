@@ -121,7 +121,7 @@ class TensorPool(ObjectPool[torch.Tensor]):
         _fx_assert_pool_size(ids, self._pool_size)
         return self._pool[ids]
 
-    def update(self, ids: torch.Tensor, values: torch.Tensor) -> None:
+    def _assert_valid_update(self, ids: torch.Tensor, values: torch.Tensor) -> None:
         assert values.dim() == 2
         assert values.size(1) == self._dim
         assert values.dtype == self._dtype
@@ -129,9 +129,32 @@ class TensorPool(ObjectPool[torch.Tensor]):
         _fx_assert_device(ids, self._device)
         _fx_assert_pool_size(ids, self._pool_size)
 
+    def update(self, ids: torch.Tensor, values: torch.Tensor) -> None:
+        self._assert_valid_update(ids, values)
+
         # If duplicate ids are passed in for update, only the last one is kept
         deduped_ids, dedup_permutation = deterministic_dedup(ids)
         self._pool[deduped_ids] = values[dedup_permutation]
+
+    def update_unique(self, ids: torch.Tensor, values: torch.Tensor) -> None:
+        """
+        Same as :meth:`update`, but skips the dedup pass because the caller
+        guarantees that ``ids`` contains no duplicates.
+
+        Passing duplicate ids here is undefined behaviour, not the last-one-wins
+        of :meth:`update`. The write lowers to ``index_put_`` with
+        ``accumulate=False``; on CUDA the writes to a repeated row race per
+        element, so that row can come back an element-wise mix of two different
+        value rows. For data whose rows pack a per-row scale and bias, such a
+        mix decodes to a value matching neither input.
+
+        Args:
+            ids (torch.Tensor): 1D tensor of unique pool indices to write to
+            values (torch.Tensor): tensor of shape [ids.size(0), dim] to write
+        """
+        self._assert_valid_update(ids, values)
+
+        self._pool[ids] = values
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         return self.lookup(ids)
