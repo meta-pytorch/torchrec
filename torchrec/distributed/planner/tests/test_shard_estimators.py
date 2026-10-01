@@ -2085,7 +2085,7 @@ class TestCalculateShardIoSizesValidation(unittest.TestCase):
             self.assertGreaterEqual(size, 0)
             self.assertFalse(math.isnan(size))
 
-    def test_valid_twrw_sizes_are_non_negative(self) -> None:
+    def test_twrw_input_sizes_use_all_row_shards(self) -> None:
         input_sizes, output_sizes = _calculate_shard_io_sizes(
             sharding_type="table_row_wise",
             batch_sizes=[32],
@@ -2093,18 +2093,30 @@ class TestCalculateShardIoSizesValidation(unittest.TestCase):
             local_world_size=2,
             input_lengths=[10.0],
             emb_dim=64,
-            shard_sizes=[[50, 64], [50, 64]],
+            shard_sizes=[[25, 64]] * 4,
             input_data_type_size=4.0,
             output_data_type_size=4.0,
             num_poolings=[1.0],
             is_pooled=True,
         )
-        for size in input_sizes:
-            self.assertGreaterEqual(size, 0)
-            self.assertFalse(math.isnan(size))
-        for size in output_sizes:
-            self.assertGreaterEqual(size, 0)
-            self.assertFalse(math.isnan(size))
+        self.assertEqual(input_sizes, [1280] * 4)
+        self.assertEqual(output_sizes, [32768] * 4)
+
+    def test_grid_input_sizes_keep_local_world_size_divisor(self) -> None:
+        input_sizes, _ = _calculate_shard_io_sizes(
+            sharding_type="grid_shard",
+            batch_sizes=[32],
+            world_size=4,
+            local_world_size=2,
+            input_lengths=[10.0],
+            emb_dim=64,
+            shard_sizes=[[50, 32]] * 4,
+            input_data_type_size=4.0,
+            output_data_type_size=4.0,
+            num_poolings=[1.0],
+            is_pooled=True,
+        )
+        self.assertEqual(input_sizes, [2560] * 4)
 
     def test_zero_shard_sizes_produce_zero_io(self) -> None:
         input_sizes, output_sizes = _calculate_shard_io_sizes(
