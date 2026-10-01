@@ -23,20 +23,24 @@
 
 import dataclasses
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from etils import epath
 from torch import distributed as dist
 from torchrec.experimental.torch_tpu.datasets import pybind_input_preprocessing
-from torchrec.experimental.torch_tpu.datasets.fdo import csv_file_fdo_client
+from torchrec.experimental.torch_tpu.datasets.fdo import csv_file_fdo_client, fdo_client
 from torchrec.experimental.torch_tpu.datasets.fdo.fdo_client import (
-    FDOClient,
     KeyedSparseCoreInputStats,
     SparseCoreInputStats,
 )
 from torchrec.experimental.torch_tpu.modules.embedding_configs import (
     SparseCoreEmbeddingConfig,
+    StackedSparseCoreEmbeddingConfig,
+)
+from torchrec.experimental.torch_tpu.modules.table_stacking import (
+    auto_stack_tables,
+    prepare_tables_for_stacking,
 )
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
@@ -183,8 +187,10 @@ class SparseCoreInputPreprocessor:
         global_device_count: int = 1,
         num_sc_per_device: int = 2,
         allow_id_dropping: bool = False,
-        fdo_client: Optional[FDOClient] = None,
+        fdo_client: Optional[fdo_client.FDOClient] = None,
         fdo_dir: Optional[epath.PathLike] = None,
+        auto_stack: bool = False,
+        activation_mem_bytes_limit: int = 6 * 1024 * 1024,
     ) -> None:
         """Initializes the CPU input preprocessor and its stateful PyBind11 C++ backend.
 
@@ -200,6 +206,9 @@ class SparseCoreInputPreprocessor:
           fdo_client: Optional pre-constructed FDO client to record statistics.
           fdo_dir: Optional directory path to automatically create a
             CSVFileFDOClient seeded with initial table configurations.
+          auto_stack: Whether to automatically group compatible tables for stacking.
+          activation_mem_bytes_limit: Memory limit in bytes for activation buffers
+            per SparseCore partition.
         """
         self._batch_size = batch_size
         self._local_device_count = 1  # Always 1 for PyTorch TPU.
@@ -213,7 +222,20 @@ class SparseCoreInputPreprocessor:
                     "max_seq_len must be provided for EmbeddingConfig table"
                     f" {table.name}"
                 )
+        if auto_stack:
+            auto_stack_tables(
+                tables,
+                global_device_count=global_device_count,
+                num_sc_per_device=num_sc_per_device,
+                batch_size=batch_size,
+                activation_mem_bytes_limit=activation_mem_bytes_limit,
+            )
         self._tables = tables
+        self._stacked_configs = prepare_tables_for_stacking(
+            tables,
+            global_device_count=global_device_count,
+            num_sc_per_device=num_sc_per_device,
+        )
 
         if fdo_client is None and fdo_dir is not None:
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -242,7 +264,7 @@ class SparseCoreInputPreprocessor:
     def _rebuild_backend(self) -> None:
         """Rebuilds metadata and re-instantiates C++ preprocessor backend."""
         self._tables_metadata = self._build_tables_metadata(
-            self._tables,
+            self._stacked_configs,
             self._batch_size,
             self._global_device_count,
         )
@@ -256,7 +278,7 @@ class SparseCoreInputPreprocessor:
         )
 
     @property
-    def fdo_client(self) -> Optional[FDOClient]:
+    def fdo_client(self) -> Optional[fdo_client.FDOClient]:
         """Returns the attached FDO client if present."""
         return self._fdo_client
 
@@ -308,6 +330,34 @@ class SparseCoreInputPreprocessor:
                     updated_max_ids > table.max_ids_per_partition
                     or updated_max_unique_ids > table.max_unique_ids_per_partition
                 ):
+                    if table.suggested_coo_buffer_size_per_device is not None:
+                        num_scs = self._global_device_count * self._num_sc_per_device
+                        max_ids_rounded_up = ((updated_max_ids + 7) // 8) * 8
+                        theoretical_max = (
+                            max_ids_rounded_up * self._num_sc_per_device * num_scs
+                        )
+                        alignment = 8 * self._num_sc_per_device
+                        old_rounded = max(
+                            8, ((table.max_ids_per_partition + 7) // 8) * 8
+                        )
+                        scaled_buf = int(
+                            math.ceil(
+                                table.suggested_coo_buffer_size_per_device
+                                * (max_ids_rounded_up / old_rounded)
+                            )
+                        )
+                        scaled_buf = (
+                            (scaled_buf + alignment - 1) // alignment
+                        ) * alignment
+                        min_device_buf = max_ids_rounded_up * self._num_sc_per_device
+                        table.suggested_coo_buffer_size_per_device = min(
+                            theoretical_max,
+                            max(
+                                table.suggested_coo_buffer_size_per_device,
+                                scaled_buf,
+                                min_device_buf,
+                            ),
+                        )
                     table.max_ids_per_partition = updated_max_ids
                     table.max_unique_ids_per_partition = updated_max_unique_ids
                     changed = True
@@ -318,61 +368,58 @@ class SparseCoreInputPreprocessor:
 
     def _build_tables_metadata(
         self,
-        tables: List[SparseCoreEmbeddingConfig],
+        stacked_configs: List[StackedSparseCoreEmbeddingConfig],
         batch_size: int,
         global_device_count: int = 1,
     ) -> List[Dict[str, Any]]:
-        """Builds lightweight table and feature metadata dictionaries for C++ backend initialization.
-
-        Args:
-          tables: List of embedding table configurations.
-          batch_size: Process-local batch size.
-          global_device_count: Total number of TPU chips globally.
-
-        Returns:
-          A list of dictionaries containing table names, partition ID capacities,
-          and feature sharding offsets.
-        """
+        """Builds lightweight table and feature metadata dictionaries for C++ backend initialization."""
         tables_metadata = []
-        for table in tables:
+        num_sparsecores = global_device_count * self._num_sc_per_device
+
+        for stack_config in stacked_configs:
             features = []
             row_offset = 0
-            for feature_name in table.feature_names:
-                if isinstance(table.config, EmbeddingConfig):
-                    max_seq_len_table = table.max_seq_len
-                    assert max_seq_len_table is not None
-                    # For EC, fictional batch size is max_ids = batch_size * max_seq_len
-                    seq_batch_size = batch_size * max_seq_len_table
-                    batch_size_global = seq_batch_size * global_device_count
-                    feat_batch_size = seq_batch_size
-                    combiner = "sum"
-                elif isinstance(table.config, EmbeddingBagConfig):
-                    batch_size_global = batch_size * global_device_count
-                    feat_batch_size = batch_size
-                    combiner = "sum" if table.pooling == PoolingType.SUM else "mean"
-                else:
-                    raise TypeError(f"Unsupported table type: {type(table.config)}")
+            for table in stack_config.tables:
+                col_offset = stack_config.get_col_offset(table.name, num_sparsecores)
+                col_shift = stack_config.get_shard_rotation(table.name)
 
-                features.append(
-                    {
-                        "name": feature_name,
-                        "row_offset": row_offset,
-                        "col_offset": 0,
-                        "col_shift": 0,
-                        "batch_size": feat_batch_size,
-                        "combiner": combiner,
-                        "max_col_id": table.config.num_embeddings,
-                    }
-                )
-                row_offset += batch_size_global
+                for feature_name in table.feature_names:
+                    if isinstance(table.config, EmbeddingConfig):
+                        max_seq_len_table = table.max_seq_len
+                        assert max_seq_len_table is not None
+                        seq_batch_size = batch_size * max_seq_len_table
+                        batch_size_global = seq_batch_size * global_device_count
+                        feat_batch_size = seq_batch_size
+                        combiner = "sum"
+                    elif isinstance(table.config, EmbeddingBagConfig):
+                        batch_size_global = batch_size * global_device_count
+                        feat_batch_size = batch_size
+                        combiner = "sum" if table.pooling == PoolingType.SUM else "mean"
+                    else:
+                        raise TypeError(f"Unsupported table type: {type(table.config)}")
+
+                    features.append(
+                        {
+                            "name": feature_name,
+                            "row_offset": row_offset,
+                            "col_offset": col_offset,
+                            "col_shift": col_shift,
+                            "batch_size": feat_batch_size,
+                            "combiner": combiner,
+                            "max_col_id": table.config.num_embeddings,
+                        }
+                    )
+                    row_offset += batch_size_global
 
             tables_metadata.append(
                 {
-                    "name": table.name,
-                    "max_ids_per_partition": table.max_ids_per_partition,
-                    "max_unique_ids_per_partition": table.max_unique_ids_per_partition,
+                    "name": stack_config.stack_name,
+                    "max_ids_per_partition": stack_config.max_ids_per_partition,
+                    "max_unique_ids_per_partition": (
+                        stack_config.max_unique_ids_per_partition
+                    ),
                     "suggested_coo_buffer_size_per_device": (
-                        table.suggested_coo_buffer_size_per_device
+                        stack_config.suggested_coo_buffer_size_per_device or 0
                     ),
                     "features": features,
                 }
@@ -399,39 +446,42 @@ class SparseCoreInputPreprocessor:
             table_lengths_dict = {}
             table_actual_num_ids_dict = {}
 
-            for table in self._tables:
-                input_indices[table.name] = []
-                input_offsets[table.name] = []
-                max_seq_len_table = table.max_seq_len
-                assert max_seq_len_table is not None
-                seq_batch_size = self._batch_size * max_seq_len_table
+            for stack_config in self._stacked_configs:
+                input_indices[stack_config.stack_name] = []
+                input_offsets[stack_config.stack_name] = []
                 lengths_dict = {}
                 actual_num_ids_dict = {}
-                for feature_name in table.feature_names:
-                    f = feature_dict[feature_name]
-                    indices = f.values().to("cpu", torch.int32)
-                    lengths = f.lengths().to("cpu")
-                    lengths_dict[feature_name] = lengths
+                for table in stack_config.tables:
+                    max_seq_len_table = table.max_seq_len
+                    assert max_seq_len_table is not None
+                    seq_batch_size = self._batch_size * max_seq_len_table
+                    for feature_name in table.feature_names:
+                        f = feature_dict[feature_name]
+                        indices = f.values().to("cpu", torch.int32)
+                        lengths = f.lengths().to("cpu")
+                        lengths_dict[feature_name] = lengths
 
-                    actual_num_ids = indices.numel()
-                    actual_num_ids_dict[feature_name] = actual_num_ids
+                        actual_num_ids = indices.numel()
+                        actual_num_ids_dict[feature_name] = actual_num_ids
 
-                    # Pad indices to max_ids
-                    padded_indices = torch.zeros(seq_batch_size, dtype=torch.int32)
-                    padded_indices[:actual_num_ids] = indices
+                        # Pad indices to max_ids
+                        padded_indices = torch.zeros(seq_batch_size, dtype=torch.int32)
+                        padded_indices[:actual_num_ids] = indices
 
-                    # Build offsets: [0, 1, 2, ..., N, N, N, ..., N] of length max_ids + 1
-                    padded_offsets = torch.empty(seq_batch_size + 1, dtype=torch.int32)
-                    padded_offsets[: actual_num_ids + 1] = torch.arange(
-                        0, actual_num_ids + 1, dtype=torch.int32
-                    )
-                    padded_offsets[actual_num_ids + 1 :] = actual_num_ids
+                        # Build offsets: [0, 1, 2, ..., N, N, N, ..., N] of length max_ids + 1
+                        padded_offsets = torch.empty(
+                            seq_batch_size + 1, dtype=torch.int32
+                        )
+                        padded_offsets[: actual_num_ids + 1] = torch.arange(
+                            0, actual_num_ids + 1, dtype=torch.int32
+                        )
+                        padded_offsets[actual_num_ids + 1 :] = actual_num_ids
 
-                    input_indices[table.name].append(padded_indices)
-                    input_offsets[table.name].append(padded_offsets)
+                        input_indices[stack_config.stack_name].append(padded_indices)
+                        input_offsets[stack_config.stack_name].append(padded_offsets)
 
-                table_lengths_dict[table.name] = lengths_dict
-                table_actual_num_ids_dict[table.name] = actual_num_ids_dict
+                table_lengths_dict[stack_config.stack_name] = lengths_dict
+                table_actual_num_ids_dict[stack_config.stack_name] = actual_num_ids_dict
 
             # Call official TPU preprocess op (CPU) via PyBind
             res = self._backend.preprocess(
@@ -464,13 +514,18 @@ class SparseCoreInputPreprocessor:
             return KeyedSparseCorePreprocessedInput(table_tensors, stats=stats)
 
         else:  # EBC mode
-            for table in self._tables:
-                input_indices[table.name] = []
-                input_offsets[table.name] = []
-                for feature_name in table.feature_names:
-                    f = feature_dict[feature_name]
-                    input_indices[table.name].append(f.values().to("cpu", torch.int32))
-                    input_offsets[table.name].append(f.offsets().to("cpu", torch.int32))
+            for stack_config in self._stacked_configs:
+                input_indices[stack_config.stack_name] = []
+                input_offsets[stack_config.stack_name] = []
+                for table in stack_config.tables:
+                    for feature_name in table.feature_names:
+                        f = feature_dict[feature_name]
+                        input_indices[stack_config.stack_name].append(
+                            f.values().to("cpu", torch.int32)
+                        )
+                        input_offsets[stack_config.stack_name].append(
+                            f.offsets().to("cpu", torch.int32)
+                        )
 
             res = self._backend.preprocess(
                 input_indices,
