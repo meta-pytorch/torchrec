@@ -24,7 +24,7 @@ on:
       - '.github/scripts/run_benchmarks.sh'
   pull_request:
     paths:
-      - '.github/workflows/benchmark-nightly.yml'
+      - '.github/workflows/benchmark-osdc.yml'
       - '.github/scripts/run_benchmarks.sh'
 jobs:
   pipeline_benchmark:
@@ -33,7 +33,7 @@ jobs:
       matrix:
         cuda-tag: ["cu126", "cu130"]
         os:
-          - linux.g5.12xlarge.nvidia.gpu
+          - mt-l-x86aavx2-45-167-a10g-4
         python:
           - version: "3.13"
             tag: "py313"
@@ -42,14 +42,18 @@ jobs:
         exclude:
           - is_pr: true
             cuda-tag: "cu126"
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    runs-on: ${{ matrix.os }}
+    container: pytorch/almalinux-builder:cpu
+    timeout-minutes: 60
     permissions:
       id-token: write
       contents: read
-    with:
-      runner: ${{ matrix.os }}
-      timeout: 60
-      script: |
+    steps:
+    - uses: actions/checkout@v4
+    - shell: bash
+      run: |
+        set -x
+        eval "$(conda shell.bash hook)"
         ldd --version
         conda create -y --name benchmark python=${{ matrix.python.version }}
         conda info
@@ -90,7 +94,10 @@ jobs:
         mkdir -p artifacts-to-be-uploaded
         mv trace-*.json.gz memory-*.pickle artifacts-to-be-uploaded
         ls -l artifacts-to-be-uploaded
-      upload-artifact: ${{ matrix.os }}-${{ matrix.python.tag }}-${{ matrix.cuda-tag }}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.os }}-${{ matrix.python.tag }}-${{ matrix.cuda-tag }}
+        path: artifacts-to-be-uploaded/
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.repository }}-${{ github.event_name == 'workflow_dispatch' }}
