@@ -397,6 +397,7 @@ class ShardPerfContextTest(unittest.TestCase):
         self.assertEqual(ctx.emb_dim, 0)
         self.assertEqual(ctx.world_size, 1)
         self.assertEqual(ctx.local_world_size, 1)
+        self.assertEqual(ctx.table_num_twrw_groups, 1)
         self.assertFalse(ctx.is_inference)
         self.assertFalse(ctx.is_weighted)
         self.assertTrue(ctx.is_pooled)
