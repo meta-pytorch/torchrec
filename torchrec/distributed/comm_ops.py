@@ -140,6 +140,39 @@ def _is_fp8_rowwise_padding_enabled() -> bool:
     return bool(int(os.environ.get("TORCHREC_ENABLE_FP8_ROWWISE_PADDING", 0)))
 
 
+def _fp8_rowwise_padded_splits(
+    codec: Any, qcomm_ctx: Any, splits: List[int]
+) -> Optional[List[int]]:
+    """
+    Rounds each split up to a multiple of `row_dim` for FP8 rowwise qcomms.
+    Returns None if padding is disabled, the codec is not FP8 rowwise, or every
+    split is already aligned, in which case the comm is unchanged.
+    """
+    if (
+        not _is_fp8_rowwise_padding_enabled()
+        or qcomm_ctx is None
+        or getattr(qcomm_ctx, "row_dim", -1) <= 0
+        or getattr(codec, "_comm_precision", None) != SparseType.FP8
+    ):
+        return None
+    row_dim = qcomm_ctx.row_dim
+    padded = [split + (row_dim - split % row_dim) % row_dim for split in splits]
+    return padded if padded != splits else None
+
+
+def _pad_splits(tensor: Tensor, splits: List[int], padded: List[int]) -> Tensor:
+    return torch.cat(
+        [
+            torch.nn.functional.pad(chunk, (0, p - s))
+            for chunk, s, p in zip(tensor.split(splits), splits, padded)
+        ]
+    )
+
+
+def _strip_splits(tensor: Tensor, padded: List[int], splits: List[int]) -> Tensor:
+    return torch.cat([chunk[:s] for chunk, s in zip(tensor.split(padded), splits)])
+
+
 """
 Some commonly used notations for comm ops:
     B - batch size
@@ -1653,6 +1686,12 @@ class All2All_Pooled_Req(Function):
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
             grad_input = codecs.backward.decode(grad_output, myreq.qcomm_ctx)
+            splits = [D_local_sum * B_rank for B_rank in batch_size_per_rank]
+            padded_splits = _fp8_rowwise_padded_splits(
+                codecs.backward, myreq.qcomm_ctx, splits
+            )
+            if padded_splits is not None:
+                grad_input = _strip_splits(grad_input, padded_splits, splits)
             grad_input = grad_input.view(B_global, D_local_sum)
         else:
             grad_input = grad_output.view(B_global, D_local_sum)
@@ -1751,23 +1790,36 @@ class All2All_Pooled_Wait(Function):
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
             qcomm_ctx = codecs.backward.create_context()
+            input_split_sizes = [
+                B_local * D_rank_sum for D_rank_sum in dim_sum_per_rank
+            ]
+            output_split_sizes = [
+                D_local_sum * B_rank for B_rank in batch_size_per_rank
+            ]
+            padded_input_split_sizes = _fp8_rowwise_padded_splits(
+                codecs.backward, qcomm_ctx, input_split_sizes
+            )
+            if padded_input_split_sizes is not None:
+                sharded_grad_output = _pad_splits(
+                    sharded_grad_output, input_split_sizes, padded_input_split_sizes
+                )
+                input_split_sizes = padded_input_split_sizes
+            padded_output_split_sizes = _fp8_rowwise_padded_splits(
+                codecs.backward, qcomm_ctx, output_split_sizes
+            )
+            if padded_output_split_sizes is not None:
+                output_split_sizes = padded_output_split_sizes
             sharded_grad_output = codecs.backward.encode(
                 sharded_grad_output,
                 qcomm_ctx,
             )
             input_split_sizes = [
-                codecs.backward.calc_quantized_size(
-                    B_local * D_rank_sum,
-                    qcomm_ctx,
-                )
-                for D_rank_sum in dim_sum_per_rank
+                codecs.backward.calc_quantized_size(split, qcomm_ctx)
+                for split in input_split_sizes
             ]
             output_split_sizes = [
-                codecs.backward.calc_quantized_size(
-                    D_local_sum * B_rank,
-                    qcomm_ctx,
-                )
-                for B_rank in batch_size_per_rank
+                codecs.backward.calc_quantized_size(split, qcomm_ctx)
+                for split in output_split_sizes
             ]
         else:
             qcomm_ctx = None
@@ -1946,6 +1998,12 @@ class Variable_Batch_All2All_Pooled_Req(Function):
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
             grad_input = codecs.backward.decode(grad_output, myreq.qcomm_ctx)
+            splits = none_throws(a2ai.input_splits)
+            padded_splits = _fp8_rowwise_padded_splits(
+                codecs.backward, myreq.qcomm_ctx, splits
+            )
+            if padded_splits is not None:
+                grad_input = _strip_splits(grad_input, padded_splits, splits)
         else:
             grad_input = grad_output
         if GRADIENT_DIVISION:
@@ -2026,6 +2084,19 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
             qcomm_ctx = codecs.backward.create_context()
+            padded_input_split_sizes = _fp8_rowwise_padded_splits(
+                codecs.backward, qcomm_ctx, input_split_sizes
+            )
+            if padded_input_split_sizes is not None:
+                sharded_grad_output = _pad_splits(
+                    sharded_grad_output, input_split_sizes, padded_input_split_sizes
+                )
+                input_split_sizes = padded_input_split_sizes
+            padded_output_split_sizes = _fp8_rowwise_padded_splits(
+                codecs.backward, qcomm_ctx, output_split_sizes
+            )
+            if padded_output_split_sizes is not None:
+                output_split_sizes = padded_output_split_sizes
             sharded_grad_output = codecs.backward.encode(
                 sharded_grad_output,
                 qcomm_ctx,
