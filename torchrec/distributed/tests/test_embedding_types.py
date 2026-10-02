@@ -11,9 +11,13 @@ import unittest
 from typing import Dict, List
 
 import torch
-from torchrec.distributed.embedding_types import KJTList, ShardedEmbeddingModule
+from torchrec.distributed.embedding_types import (
+    DPLookupAwaitable,
+    KJTList,
+    ShardedEmbeddingModule,
+)
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionContext
-from torchrec.distributed.types import Awaitable, LazyAwaitable
+from torchrec.distributed.types import Awaitable, LazyAwaitable, NoWait
 
 Out = Dict[str, torch.Tensor]
 CompIn = KJTList
@@ -64,3 +68,20 @@ class TestShardedEmbeddingModule(unittest.TestCase):
                 self.assertEqual(embedding_module.training, mode)
                 for lookup in embedding_module._lookups:
                     self.assertEqual(lookup.training, mode)
+
+
+class DPLookupAwaitableTest(unittest.TestCase):
+    def test_lookup_is_deferred_and_started_once(self) -> None:
+        calls = 0
+
+        def lookup() -> Awaitable[int]:
+            nonlocal calls
+            calls += 1
+            return NoWait(1)
+
+        awaitable = DPLookupAwaitable(lookup)
+
+        self.assertEqual(calls, 0)
+        self.assertEqual(awaitable.wait(), 1)
+        self.assertEqual(awaitable.wait(), 1)
+        self.assertEqual(calls, 1)

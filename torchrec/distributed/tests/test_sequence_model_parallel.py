@@ -10,31 +10,152 @@
 
 import sys
 import unittest
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, cast, Dict, List, Optional, Tuple, Type
 
 import hypothesis.strategies as st
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from hypothesis import assume, given, settings, Verbosity
-from torchrec.distributed.embedding import EmbeddingCollectionContext
+from torchrec.distributed.embedding import (
+    EmbeddingCollectionContext,
+    EmbeddingCollectionSharder,
+    ShardedEmbeddingCollection,
+)
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
 from torchrec.distributed.planner import ParameterConstraints
-from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
+from torchrec.distributed.sharding_plan import (
+    construct_module_sharding_plan,
+    data_parallel,
+    row_wise,
+)
+from torchrec.distributed.test_utils.multi_process import (
+    MultiProcessContext,
+    MultiProcessTestBase,
+)
 from torchrec.distributed.test_utils.test_model import TestSparseNNBase
 from torchrec.distributed.test_utils.test_sharding import sharding_single_rank_test
 from torchrec.distributed.tests.test_sequence_model import (
     TestEmbeddingCollectionSharder,
     TestSequenceSparseNN,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 
 
+_ROW_WISE_FEATURE = "row_wise_feature"
+_DATA_PARALLEL_FEATURE = "data_parallel_feature"
+
+
+def _create_mixed_sharded_ec(ctx: MultiProcessContext) -> ShardedEmbeddingCollection:
+    assert ctx.pg is not None
+    module = EmbeddingCollection(
+        tables=[
+            EmbeddingConfig(
+                name="row_wise_table",
+                embedding_dim=4,
+                num_embeddings=8,
+                feature_names=[_ROW_WISE_FEATURE],
+            ),
+            EmbeddingConfig(
+                name="data_parallel_table",
+                embedding_dim=4,
+                num_embeddings=8,
+                feature_names=[_DATA_PARALLEL_FEATURE],
+            ),
+        ],
+        device=ctx.device,
+    )
+    sharder = EmbeddingCollectionSharder()
+    plan = construct_module_sharding_plan(
+        module,
+        per_param_sharding={
+            "row_wise_table": row_wise(
+                compute_kernel=EmbeddingComputeKernel.FUSED.value
+            ),
+            "data_parallel_table": data_parallel(),
+        },
+        local_size=ctx.local_size,
+        world_size=ctx.world_size,
+        device_type=ctx.device.type,
+        sharder=cast(ModuleSharder[torch.nn.Module], sharder),
+    )
+    return sharder.shard(
+        module=module,
+        params=plan,
+        env=ShardingEnv.from_process_group(ctx.pg),
+        device=ctx.device,
+    )
+
+
+def _run_dp_lookup_defer_flag_test(rank: int, world_size: int) -> None:
+    with MultiProcessContext(rank, world_size, "nccl") as ctx:
+        module = _create_mixed_sharded_ec(ctx)
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=[_ROW_WISE_FEATURE, _DATA_PARALLEL_FEATURE],
+            values=torch.tensor([rank, rank + 1], device=ctx.device),
+            lengths=torch.tensor([1, 1], device=ctx.device),
+        )
+
+        lookup_features: list[str] = []
+
+        def record_lookup(
+            features: KeyedJaggedTensor,
+            _embeddings: torch.Tensor,
+            _module: torch.nn.Module | None,
+            _optimizer_state: torch.Tensor | None,
+        ) -> None:
+            lookup_features.extend(features.keys())
+
+        module.register_post_lookup_tracker_fn(record_lookup)
+
+        eager_context = module.create_context()
+        assert not eager_context.defer_dp_lookup
+        eager_input = module.input_dist(eager_context, features).wait().wait()
+        eager_request = module.compute_and_output_dist(eager_context, eager_input)
+
+        assert lookup_features == [_ROW_WISE_FEATURE, _DATA_PARALLEL_FEATURE]
+
+        eager_output = eager_request.wait()
+        lookup_features.clear()
+
+        deferred_context = module.create_context()
+        deferred_context.defer_dp_lookup = True
+        deferred_input = module.input_dist(deferred_context, features).wait().wait()
+        deferred_request = module.compute_and_output_dist(
+            deferred_context, deferred_input
+        )
+
+        assert lookup_features == [_ROW_WISE_FEATURE]
+
+        deferred_output = deferred_request.wait()
+
+        assert lookup_features == [_ROW_WISE_FEATURE, _DATA_PARALLEL_FEATURE]
+        assert eager_output.keys() == deferred_output.keys()
+        for name in eager_output:
+            torch.testing.assert_close(
+                eager_output[name].values(), deferred_output[name].values()
+            )
+            torch.testing.assert_close(
+                eager_output[name].lengths(), deferred_output[name].lengths()
+            )
+
+
 @skip_if_asan_class
 class SequenceModelParallelTest(MultiProcessTestBase):
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_dp_lookup_respects_defer_flag(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_dp_lookup_defer_flag_test,
+            world_size=2,
+        )
+
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
