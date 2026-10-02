@@ -818,11 +818,14 @@ class ParameterSharding:
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE or PS.
         bag_size_hints (Optional[List[int]]): expected bag size for each feature,
             used only by FUSED_TRITON and TRITON_UVM.
+        num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span.
 
     NOTE:
       ShardingType.TABLE_WISE - rank where this embedding is placed
       ShardingType.COLUMN_WISE - rank where the embedding shards are placed, seen as individual tables
-      ShardingType.TABLE_ROW_WISE  - first rank when this embedding is placed
+      ShardingType.TABLE_ROW_WISE  - first rank when this embedding is placed;
+        with num_twrw_groups > 1, one rank per row block, positionally paired with
+        sharding_spec.shards
       ShardingType.ROW_WISE, ShardingType.DATA_PARALLEL - unused
 
     """
@@ -838,6 +841,7 @@ class ParameterSharding:
     output_dtype: Optional[DataType] = None
     key_value_params: Optional[KeyValueParams] = None
     bag_size_hints: Optional[List[int]] = None
+    num_twrw_groups: Optional[int] = None
 
 
 class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterSharding]):
@@ -890,6 +894,10 @@ class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterShardin
                 "compute_kernel": param_sharding.compute_kernel,
                 "ranks": param_sharding.ranks,
             }
+            if param_sharding.num_twrw_groups is not None:
+                sharding_plan_dict[param_name][
+                    "num_twrw_groups"
+                ] = param_sharding.num_twrw_groups
             if isinstance(param_sharding.sharding_spec, EnumerableShardingSpec):
                 shards = param_sharding.sharding_spec.shards
                 if shards is not None:

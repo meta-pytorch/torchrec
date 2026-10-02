@@ -531,10 +531,24 @@ class GreedyPerfPartitioner(Partitioner):
         if remainder > 0:
             raise PlannerError(
                 error_type=PlannerErrorType.PARTITION,
-                message=f"Grid Sharding is unable to place shards equally over hosts without overlapping. {num_shards=} % {local_world_size=} != 0",
+                message=f"Multi-host sharding is unable to place shards equally over hosts without overlapping. {num_shards=} % {local_world_size=} != 0",
             )
 
         sorted_host_level_devices = _sort_devices_by_perf(_host_level_devices)
+        sharding_option = sharding_option_group.sharding_options[0]
+        if (
+            sharding_option.sharding_type == ShardingType.TABLE_ROW_WISE.value
+            and num_host_to_allocate > len(sorted_host_level_devices)
+        ):
+            raise PlannerError(
+                error_type=PlannerErrorType.PARTITION,
+                message=(
+                    f"'{sharding_option.name}': TABLE_ROW_WISE needs "
+                    f"{num_host_to_allocate} TWRW groups, but only "
+                    f"{len(sorted_host_level_devices)} are available."
+                ),
+            )
+
         host_index = 0
         all_hosts_used = False
         while True:
@@ -556,11 +570,30 @@ class GreedyPerfPartitioner(Partitioner):
                     )
                 )
             host_index += 1  # shift to next host
+            # TWRW persists this positional shard-to-rank mapping.
+            if sharding_option.sharding_type == ShardingType.TABLE_ROW_WISE.value:
+                devices = sorted(devices, key=lambda d: d.rank)
+
             host_devices = copy.deepcopy(devices)
             success = True
-            sharding_option = sharding_option_group.sharding_options[0]
+
+            if (
+                sharding_option.sharding_type == ShardingType.TABLE_ROW_WISE.value
+                and len({d.rank for d in host_devices}) != len(host_devices)
+            ):
+                raise PlannerError(
+                    error_type=PlannerErrorType.PARTITION,
+                    message=(
+                        f"'{sharding_option.name}': TABLE_ROW_WISE requires "
+                        "a distinct rank for each row shard."
+                    ),
+                )
             try:
-                if sharding_option.sharding_type == ShardingType.GRID_SHARD.value:
+                if sharding_option.sharding_type in (
+                    ShardingType.GRID_SHARD.value,
+                    # Same uniform placement as GRID_SHARD.
+                    ShardingType.TABLE_ROW_WISE.value,
+                ):
                     GreedyPerfPartitioner._uniform_partition(
                         [sharding_option], host_devices
                     )

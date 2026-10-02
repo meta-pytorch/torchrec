@@ -247,6 +247,15 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                     f"local_world_size."
                 )
 
+            table_name = info.embedding_config.name
+            num_twrw_groups: int = info.param_sharding.num_twrw_groups or 1
+            if num_twrw_groups > 1:
+                raise NotImplementedError(
+                    f"'{table_name}': TABLE_ROW_WISE "
+                    f"num_twrw_groups={num_twrw_groups} is not supported by "
+                    "the runtime yet."
+                )
+
             # construct the global sharded_tensor_metadata
             global_metadata = ShardedTensorMetadata(
                 shards_metadata=shards,
