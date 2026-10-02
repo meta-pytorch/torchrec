@@ -17,8 +17,8 @@ handshake and injects a live ``SingleProcessContext`` (``ctx``) plus this rank's
 ``rank`` and ``world_size``. The runner must therefore use ``ctx.device`` /
 ``ctx.pg`` directly rather than creating its own context.
 
-Multiple primitive benchmarks live in this file. ``benchmark_runner`` selects which one(s)
-to run via the ``name`` flag (see ``_BENCHMARKS``); each benchmark measures latency
+Multiple primitive benchmarks live in this file. ``benchmark_runner`` runs the one
+named by ``name`` (see ``_BENCHMARKS``); each benchmark measures latency
 only -- outputs are not checked for correctness. The first is ``kjt_a2a``, the All-to-All
 performance of ``KJTAllToAll`` (the ``KeyedJaggedTensor`` A2A collective from
 ``dist_data.py``). The second is ``kt_a2a``, the All-to-All performance of
@@ -40,7 +40,7 @@ MAST or locally.
 
 import logging
 import socket
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torchrec.distributed.benchmark.base import benchmark_func, BenchmarkResult
@@ -676,101 +676,41 @@ _BENCHMARKS: Dict[str, Callable[..., BenchmarkResult]] = {
     "all_gather": _benchmark_all_gather,
 }
 
-# Special ``--name`` token that expands to every benchmark in ``_BENCHMARKS`` (in
-# registry order). Intentionally NOT a key in ``_BENCHMARKS`` -- expanded by
-# :func:`parse_benchmark_names`.
-RUN_ALL: str = "all"
-
 
 def available_primitives() -> List[str]:
     """Return the sorted names of the registered primitive benchmarks.
 
-    These (plus the special ``"all"`` token, :data:`RUN_ALL`) are the values accepted
-    by the ``--name`` flag; see :func:`parse_benchmark_names`.
+    These are the values accepted by ``name`` for the primitive benchmark.
     """
     return sorted(_BENCHMARKS)
-
-
-def parse_benchmark_names(value: Union[str, Sequence[str]]) -> List[str]:
-    """Resolve the ``--name`` selector into a concrete list of benchmark names.
-
-    Accepts a comma-separated string (e.g. ``"kjt_a2a,kt_a2a"``) or a sequence of
-    names. The special token ``"all"`` (:data:`RUN_ALL`) expands to every registered
-    benchmark in registry order. Duplicates are dropped while preserving first-seen
-    order. Suitable as an argparse ``type`` -- an unknown name raises ``ValueError``.
-
-    Returns:
-        The ordered, de-duplicated list of benchmark names to run (never empty).
-    """
-    if isinstance(value, str):
-        tokens = [t.strip() for t in value.split(",") if t.strip()]
-    else:
-        tokens = [str(t).strip() for t in value if str(t).strip()]
-
-    resolved: List[str] = []
-    for tok in tokens:
-        if tok == RUN_ALL:
-            resolved.extend(_BENCHMARKS)
-        elif tok in _BENCHMARKS:
-            resolved.append(tok)
-        else:
-            raise ValueError(
-                f"unknown primitive benchmark {tok!r}; available: "
-                f"{sorted(_BENCHMARKS)} (or {RUN_ALL!r} to run all of them)"
-            )
-    if not resolved:
-        raise ValueError("--name must select at least one benchmark")
-
-    seen: set[str] = set()
-    deduped: List[str] = []
-    for benchmark_name in resolved:
-        if benchmark_name not in seen:
-            seen.add(benchmark_name)
-            deduped.append(benchmark_name)
-    return deduped
 
 
 def benchmark_runner(
     ctx: SingleProcessContext,
     rank: int,
     world_size: int,
+    name: str,
     **kwargs: Any,
-) -> List[BenchmarkResult]:
-    """Per-rank primitive benchmark entry point.
-
-    Runs one or more primitive benchmarks, selected via the ``name`` flag, and returns
-    this rank's per-benchmark results. ``name`` is resolved by
-    :func:`parse_benchmark_names`, so it may be a single name, a comma-separated list
-    (e.g. ``"kjt_a2a,kt_a2a"``), or ``"all"`` to run every registered benchmark. The
-    selected benchmarks run sequentially in this one process, reusing the injected
-    ``ctx`` (device + process group), ``rank`` and ``world_size``; the remaining
-    ``kwargs`` are forwarded to each. Each benchmark is dispatched under its own name,
-    so their result files (keyed by name + rank) do not collide.
+) -> BenchmarkResult:
+    """Per-rank primitive benchmark entry point: runs the benchmark ``name``.
 
     Args:
         ctx: live single-process context (device + process group) injected by the
             process runner; use ``ctx.device`` / ``ctx.pg`` directly.
         rank: this process' global rank.
         world_size: total number of ranks.
-        **kwargs: ``name`` (str | list) selects the benchmark(s) (default
-            ``"kjt_a2a"``); the rest are forwarded to each selected benchmark (see its
-            docstring). Keys a benchmark does not use are ignored by its own lookups.
+        name: the primitive benchmark to run; one of :func:`available_primitives`.
+        **kwargs: forwarded to the benchmark (see its docstring). Keys it does not
+            use are ignored by its own lookups.
 
     Returns:
-        This rank's per-benchmark ``BenchmarkResult`` list, in resolved ``name`` order.
+        This rank's ``BenchmarkResult``.
     """
-    names = parse_benchmark_names(kwargs.pop("name", "kjt_a2a"))
-
     logger.info(
-        "rank=%d local_rank=%d host=%s running primitive benchmarks: %s",
+        "rank=%d local_rank=%d host=%s running primitive benchmark: %s",
         rank,
         ctx.local_rank,
         socket.gethostname(),
-        names,
+        name,
     )
-    return [
-        _BENCHMARKS[benchmark_name](
-            ctx, rank, world_size, name=benchmark_name, **kwargs
-        )
-        for benchmark_name in names
-    ]
+    return _BENCHMARKS[name](ctx, rank, world_size, name=name, **kwargs)
