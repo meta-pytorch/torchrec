@@ -478,6 +478,9 @@ def log_pipeline_module_info(
     pipelined_module_fqns: List[str],
     non_pipelined_module_fqns: List[str],
     pipeline_forward_type: str = "",
+    non_pipelined_reasons: Optional[Dict[str, str]] = None,
+    postproc_fx_blockers: Optional[Dict[str, str]] = None,
+    pipeline_postproc: Optional[bool] = None,
 ) -> None:
     """No-op OSS stub."""
     pass
