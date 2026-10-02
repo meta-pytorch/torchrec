@@ -52,6 +52,7 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
+    DPLookupAwaitable,
     EmbeddingComputeKernel,
     KJTList,
     ShardedEmbeddingModule,
@@ -489,6 +490,7 @@ class EmbeddingBagCollectionContext(Multistreamable):
     variable_batch_per_feature: bool = False
     divisor: Optional[torch.Tensor] = None
     early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
+    defer_dp_lookup: bool = False
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -739,6 +741,7 @@ class ShardedEmbeddingBagCollection(
                 ordered_sharding_items.append((sharding_type, sharding_infos))
 
         self._sharding_types: List[str] = [item[0] for item in ordered_sharding_items]
+        self._dp_index = self._find_dp_index()
 
         self._embedding_shardings: List[
             EmbeddingSharding[
@@ -829,6 +832,18 @@ class ShardedEmbeddingBagCollection(
             "cpu",
         ]:
             self.load_state_dict(module.state_dict(), strict=False)
+
+    def _find_dp_index(self) -> Optional[int]:
+        # Shardings are keyed by sharding type, so data-parallel is one entry at
+        # most. Position, not identity: everything downstream indexes per sharding.
+        return next(
+            (
+                index
+                for index, sharding_type in enumerate(self._sharding_types)
+                if sharding_type == ShardingType.DATA_PARALLEL.value
+            ),
+            None,
+        )
 
     def init_data_parallel(self) -> None:
         """
@@ -1997,60 +2012,95 @@ class ShardedEmbeddingBagCollection(
 
         return awaitable
 
+    def _compute_and_output_dist_per_sharding(
+        self,
+        index: int,
+        features: KeyedJaggedTensor,
+        sharding_context: Optional[EmbeddingShardingContext],
+        resize_awaitables: List[Awaitable[torch.Tensor]],
+    ) -> Awaitable[torch.Tensor]:
+        lookup = self._lookups[index]
+        dist = self._output_dists[index]
+        sharding_type = self._sharding_types[index]
+
+        with maybe_annotate_embedding_event(
+            EmbeddingEvent.LOOKUP,
+            self._module_fqn,
+            sharding_type,
+        ):
+            # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
+            embs = lookup(features)
+            # Ensure Triton kernels complete before NCCL collectives.
+            # This is needed because Triton kernels run asynchronously and NCCL may
+            # use a separate stream. The wait_for_forward() method synchronizes via
+            # CUDA events recorded after the Triton kernel completes.
+            if hasattr(lookup, "wait_for_forward"):
+                # pyrefly: ignore[not-callable]: `wait_for_forward` is dynamically checked
+                lookup.wait_for_forward()
+            if MemoryStashingManager.is_enabled():
+                stash_result = MemoryStashingManager.stash_embedding_weights(
+                    lookup, caller=self.__class__.__name__
+                )
+                if stash_result is not None:
+                    await_restore, _, _execute_stash = stash_result
+                    embs.register_hook(await_restore)
+            if hasattr(lookup, "get_resize_awaitables"):
+                # pyrefly: ignore [not-callable]
+                resize_awaitables.extend(lookup.get_resize_awaitables())
+            if self.post_lookup_tracker_fn is not None:
+                self.post_lookup_tracker_fn(features, embs, self, None)
+
+        with maybe_annotate_embedding_event(
+            EmbeddingEvent.OUTPUT_DIST,
+            self._module_fqn,
+            sharding_type,
+        ):
+            awaitable = dist(embs, sharding_context)
+            if self.post_odist_tracker_fn is not None:
+                self.post_odist_tracker_fn()
+
+        return awaitable
+
     def compute_and_output_dist(
         self, ctx: EmbeddingBagCollectionContext, input: KJTList
     ) -> LazyAwaitable[KeyedTensor]:
+        """Run lookup and output distribution for every sharding.
+
+        When `ctx.defer_dp_lookup` is set, the returned lazy awaitable holds the
+        data-parallel lookup until it is consumed. All other sharding lookups and
+        output distributions start immediately.
         """
-        the main API called in PipelineForward, where the shardedEBC's forward is swapped
-        see _rewrite_model in train_pipeline for details
-        """
-        batch_size_per_feature_pre_a2a = []
-        awaitables = []
-        resize_awaitables = []
+        defer_dp = ctx.defer_dp_lookup and self._dp_index is not None
+        batch_size_per_feature_pre_a2a: List[int] = []
+        awaitables: List[Awaitable[torch.Tensor]] = []
+        resize_awaitables: List[Awaitable[torch.Tensor]] = []
 
         # No usage of zip for dynamo
-        for i in range(len(self._lookups)):
-            lookup = self._lookups[i]
-            dist = self._output_dists[i]
-            sharding_context = ctx.sharding_contexts[i]
-            features = input[i]
-            sharding_type = self._sharding_types[i]
+        for index in range(len(self._lookups)):
+            sharding_context = ctx.sharding_contexts[index]
+            features = input[index]
 
-            with maybe_annotate_embedding_event(
-                EmbeddingEvent.LOOKUP,
-                self._module_fqn,
-                sharding_type,
-            ):
-                # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
-                embs = lookup(features)
-                # Ensure Triton kernels complete before NCCL collectives.
-                # This is needed because Triton kernels run asynchronously and NCCL may
-                # use a separate stream. The wait_for_forward() method synchronizes via
-                # CUDA events recorded after the Triton kernel completes.
-                if hasattr(lookup, "wait_for_forward"):
-                    # pyrefly: ignore[not-callable]: `wait_for_forward` is dynamically checked
-                    lookup.wait_for_forward()
-                if MemoryStashingManager.is_enabled():
-                    stash_result = MemoryStashingManager.stash_embedding_weights(
-                        lookup, caller=self.__class__.__name__
+            if defer_dp and index == self._dp_index:
+                awaitables.append(
+                    DPLookupAwaitable(
+                        partial(
+                            self._compute_and_output_dist_per_sharding,
+                            index,
+                            features,
+                            sharding_context,
+                            resize_awaitables,
+                        )
                     )
-                    if stash_result is not None:
-                        await_restore, _, _execute_stash = stash_result
-                        embs.register_hook(await_restore)
-                if hasattr(lookup, "get_resize_awaitables"):
-                    # pyrefly: ignore [not-callable]
-                    resize_awaitables.extend(lookup.get_resize_awaitables())
-                if self.post_lookup_tracker_fn is not None:
-                    self.post_lookup_tracker_fn(features, embs, self, None)
-
-            with maybe_annotate_embedding_event(
-                EmbeddingEvent.OUTPUT_DIST,
-                self._module_fqn,
-                sharding_type,
-            ):
-                awaitables.append(dist(embs, sharding_context))
-                if self.post_odist_tracker_fn is not None:
-                    self.post_odist_tracker_fn()
+                )
+            else:
+                awaitables.append(
+                    self._compute_and_output_dist_per_sharding(
+                        index,
+                        features,
+                        sharding_context,
+                        resize_awaitables,
+                    )
+                )
 
             if sharding_context:
                 batch_size_per_feature_pre_a2a.extend(
@@ -2150,6 +2200,7 @@ class ShardedEmbeddingBagCollection(
         self._sharding_types: List[str] = list(
             self.sharding_type_to_sharding_infos.keys()
         )
+        self._dp_index = self._find_dp_index()
         # TODO: Optimize to update only the changed embedding shardings
 
         # Recreate embedding sharding modules based on the new sharding infos.

@@ -7,17 +7,25 @@
 
 # pyre-strict
 
-from typing import Dict, Tuple
+from typing import cast, Dict, Tuple
 from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+from torch import distributed as dist
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.sharding_plan import (
+    construct_module_sharding_plan,
+    data_parallel,
+    row_wise,
+)
 from torchrec.distributed.test_utils.test_model_parallel_base import (
     ModelParallelSparseOnlyBase,
     ModelParallelStateDictBase,
 )
-from torchrec.distributed.types import ShardedModule
+from torchrec.distributed.types import ModuleSharder, ShardedModule, ShardingEnv
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -69,6 +77,93 @@ class TwoSparseArchModel(nn.Module):
 
 class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
     backend = "nccl"
+
+    def test_dp_lookup_respects_defer_flag(self) -> None:
+        module = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name="row_wise_table",
+                    embedding_dim=4,
+                    num_embeddings=8,
+                    feature_names=["row_wise_feature"],
+                ),
+                EmbeddingBagConfig(
+                    name="data_parallel_table",
+                    embedding_dim=4,
+                    num_embeddings=8,
+                    feature_names=["data_parallel_feature"],
+                ),
+            ],
+            device=self.device,
+        )
+        sharder = EmbeddingBagCollectionSharder()
+        plan = construct_module_sharding_plan(
+            module,
+            per_param_sharding={
+                "row_wise_table": row_wise(
+                    compute_kernel=EmbeddingComputeKernel.FUSED.value
+                ),
+                "data_parallel_table": data_parallel(),
+            },
+            local_size=1,
+            world_size=1,
+            device_type=self.device.type,
+            sharder=cast(ModuleSharder[torch.nn.Module], sharder),
+        )
+        process_group = dist.GroupMember.WORLD
+        assert process_group is not None
+        sharded_module = sharder.shard(
+            module=module,
+            params=plan,
+            env=ShardingEnv.from_process_group(process_group),
+            device=self.device,
+        )
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["row_wise_feature", "data_parallel_feature"],
+            values=torch.tensor([0, 1], device=self.device),
+            lengths=torch.tensor([1, 1], device=self.device),
+        )
+
+        lookup_features: list[str] = []
+
+        def record_lookup(
+            lookup_input: KeyedJaggedTensor,
+            _embeddings: torch.Tensor,
+            _module: torch.nn.Module | None,
+            _optimizer_state: torch.Tensor | None,
+        ) -> None:
+            lookup_features.extend(lookup_input.keys())
+
+        sharded_module.register_post_lookup_tracker_fn(record_lookup)
+
+        eager_context = sharded_module.create_context()
+        self.assertFalse(eager_context.defer_dp_lookup)
+        eager_input = sharded_module.input_dist(eager_context, features).wait().wait()
+        eager_request = sharded_module.compute_and_output_dist(
+            eager_context, eager_input
+        )
+
+        self.assertEqual(["row_wise_feature", "data_parallel_feature"], lookup_features)
+
+        eager_output = eager_request.wait()
+        lookup_features.clear()
+
+        deferred_context = sharded_module.create_context()
+        deferred_context.defer_dp_lookup = True
+        deferred_input = (
+            sharded_module.input_dist(deferred_context, features).wait().wait()
+        )
+        deferred_output = sharded_module.compute_and_output_dist(
+            deferred_context, deferred_input
+        )
+
+        self.assertEqual(["row_wise_feature"], lookup_features)
+
+        resolved_output = deferred_output.wait()
+
+        self.assertEqual(["row_wise_feature", "data_parallel_feature"], lookup_features)
+        self.assertEqual(eager_output.keys(), resolved_output.keys())
+        torch.testing.assert_close(eager_output.values(), resolved_output.values())
 
     def test_shared_sparse_module_in_multiple_parents(self) -> None:
         """
