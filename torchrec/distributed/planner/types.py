@@ -1348,6 +1348,7 @@ class ShardingOption:
             table's weights GPU->CPU during the dense forward/backward. Set on the
             table config before planning; the planner reflects the HBM that stashing
             frees in its storage estimates.
+        num_twrw_groups (Optional[int]): TWRW groups spanned by this table.
     """
 
     def __init__(
@@ -1372,6 +1373,7 @@ class ShardingOption:
         key_value_params: Optional[KeyValueParams] = None,
         num_poolings: Optional[List[float]] = None,
         stash_weights: bool = False,
+        num_twrw_groups: Optional[int] = None,
     ) -> None:
         self.name = name
         self._tensor = tensor
@@ -1400,6 +1402,7 @@ class ShardingOption:
         self.key_value_params: Optional[KeyValueParams] = key_value_params
         self.num_poolings: Optional[List[float]] = num_poolings
         self.stash_weights: bool = stash_weights
+        self.num_twrw_groups: Optional[int] = num_twrw_groups
 
         child_module = module[1]
         self._module_type_key: str = (
@@ -1671,6 +1674,8 @@ class ParameterConstraints:
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE, either for
             SSD or PS.
         use_virtual_table (bool): is virtual table enabled for this table.
+        num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span. `None` and
+            1 preserve the single-group placement.
     """
 
     sharding_types: Optional[List[str]] = None
@@ -1691,11 +1696,12 @@ class ParameterConstraints:
     device_group: Optional[str] = None
     key_value_params: Optional[KeyValueParams] = None
     use_virtual_table: bool = False
+    num_twrw_groups: Optional[int] = None
 
     def _hashable_values(
         self, cache_params: object, key_value_params: object
     ) -> Tuple[Any, ...]:
-        return (
+        hashable_values = (
             tuple(self.sharding_types) if self.sharding_types else None,
             tuple(self.compute_kernels) if self.compute_kernels else None,
             self.min_partition,
@@ -1712,7 +1718,9 @@ class ParameterConstraints:
             self.device_group,
             key_value_params,
             self.use_virtual_table,
+            self.num_twrw_groups,
         )
+        return hashable_values
 
     def _persistent_hash(
         self,

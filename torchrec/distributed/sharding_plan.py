@@ -99,6 +99,7 @@ def calculate_shard_sizes_and_offsets(
     col_wise_shard_dim: Optional[int] = None,
     device_memory_sizes: Optional[List[int]] = None,
     num_buckets: Optional[int] = None,
+    num_twrw_groups: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
     Calculates sizes and offsets for tensor sharded according to provided sharding type.
@@ -109,6 +110,7 @@ def calculate_shard_sizes_and_offsets(
         local_world_size (int): total number of devices in host group topology.
         sharding_type (str): provided ShardingType value.
         col_wise_shard_dim (Optional[int]): dimension for column wise sharding split.
+        num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span. Defaults to 1.
 
     Returns:
         Tuple[List[List[int]], List[List[int]]]: shard sizes, represented as a list of the dimensions of the sharded tensor on each device, and shard offsets, represented as a list of coordinates of placement on each device.
@@ -140,7 +142,9 @@ def calculate_shard_sizes_and_offsets(
             )
         )
     elif sharding_type == ShardingType.TABLE_ROW_WISE.value:
-        return _calculate_rw_shard_sizes_and_offsets(rows, local_world_size, columns)
+        return _calculate_rw_shard_sizes_and_offsets(
+            rows, (num_twrw_groups or 1) * local_world_size, columns
+        )
     elif (
         sharding_type == ShardingType.COLUMN_WISE.value
         or sharding_type == ShardingType.TABLE_COLUMN_WISE.value
@@ -333,6 +337,7 @@ def _get_parameter_size_offsets(
     world_size: int,
     col_wise_shard_dim: Optional[int] = None,
     num_buckets: Optional[int] = None,
+    num_twrw_groups: Optional[int] = None,
 ) -> List[Tuple[List[int], List[int]]]:
     (
         shard_sizes,
@@ -344,6 +349,7 @@ def _get_parameter_size_offsets(
         sharding_type=sharding_type.value,
         col_wise_shard_dim=col_wise_shard_dim,
         num_buckets=num_buckets,
+        num_twrw_groups=num_twrw_groups,
     )
     return list(zip(shard_sizes, shard_offsets))
 
@@ -396,6 +402,7 @@ def _get_parameter_sharding(
     sharder: ModuleSharder[nn.Module],
     placements: Optional[List[str]] = None,
     compute_kernel: Optional[str] = None,
+    num_twrw_groups: Optional[int] = None,
 ) -> ParameterSharding:
     return ParameterSharding(
         sharding_spec=(
@@ -430,6 +437,7 @@ def _get_parameter_sharding(
             else _get_compute_kernel(sharder, param, sharding_type, device_type)
         ),
         ranks=[rank for (_, _, rank) in size_offset_ranks],
+        num_twrw_groups=num_twrw_groups,
     )
 
 

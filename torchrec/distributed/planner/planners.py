@@ -216,6 +216,7 @@ def to_sharding_plan(
                 }
                 else None
             ),
+            num_twrw_groups=sharding_option.num_twrw_groups,
         )
         plan[sharding_option.path] = module_plan
     # pyrefly: ignore[bad-argument-type]
@@ -493,6 +494,7 @@ def extract_plan(
                     feature_names=so.feature_names,
                     output_dtype=so.output_dtype,
                     key_value_params=so.key_value_params,
+                    num_twrw_groups=so.num_twrw_groups,
                 )
             )
 

@@ -19,6 +19,14 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.constants import BATCH_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
+from torchrec.distributed.planner.estimator.types import (
+    HardwarePerfConfig,
+    ShardPerfContext,
+)
+from torchrec.distributed.planner.partitioners import (
+    GreedyPerfPartitioner,
+    ShardingOptionGroup,
+)
 from torchrec.distributed.planner.perf_models import NoopPerfModel
 from torchrec.distributed.planner.planners import (
     EmbeddingShardingPlanner,
@@ -35,12 +43,16 @@ from torchrec.distributed.planner.storage_reservations import (
     SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
+    DeviceHardware,
     ParameterConstraints,
+    PartitionByType,
+    Perf,
     PlanLoader,
     PlannerContextFingerprintError,
     PlannerError,
     PlannerErrorType,
     Shard,
+    SharderData,
     ShardingOption,
     Storage,
     Topology,
@@ -53,10 +65,12 @@ from torchrec.distributed.types import (
     CacheParams,
     DataType,
     EmbeddingModuleShardingPlan,
+    EnumerableShardingSpec,
     KeyValueParams,
     ModuleSharder,
     ShardingPlan,
     ShardingType,
+    StorageUsageType,
 )
 from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -386,6 +400,300 @@ class TestEmbeddingShardingPlannerWithConstraints(unittest.TestCase):
                 constraint.bounds_check_mode, sharding_option.bounds_check_mode
             )
             self.assertEqual(constraint.is_weighted, sharding_option.is_weighted)
+
+
+class TWRWSharder(EmbeddingBagCollectionSharder):
+    def sharding_types(self, compute_device_type: str) -> List[str]:
+        return [ShardingType.TABLE_ROW_WISE.value]
+
+    def compute_kernels(
+        self, sharding_type: str, compute_device_type: str
+    ) -> List[str]:
+        return [EmbeddingComputeKernel.FUSED.value]
+
+
+def _multi_group_devices(
+    num_groups: int, group_load: Optional[List[float]] = None
+) -> List[List[DeviceHardware]]:
+    """TWRW groups of two ranks, optionally preloaded to set perf order."""
+    return [
+        [
+            DeviceHardware(
+                rank=group * 2 + local,
+                storage=Storage(hbm=1024 * 1024, ddr=0),
+                perf=Perf(
+                    fwd_compute=group_load[group] if group_load else 0.0,
+                    fwd_comms=0,
+                    bwd_compute=0,
+                    bwd_comms=0,
+                ),
+            )
+            for local in range(2)
+        ]
+        for group in range(num_groups)
+    ]
+
+
+def _multi_group_option(
+    sharding_type: str, num_twrw_groups: int, rows: int
+) -> ShardingOptionGroup:
+    """One table split across two-rank TWRW groups."""
+    num_shards = num_twrw_groups * 2
+    block = rows // num_shards
+    return ShardingOptionGroup(
+        sharding_options=[
+            ShardingOption(
+                name="table_0",
+                tensor=torch.empty((rows, 64), device="meta"),
+                module=("sparse.ebc", nn.Module()),
+                input_lengths=[1.0],
+                batch_size=BATCH_SIZE,
+                sharding_type=sharding_type,
+                partition_by=PartitionByType.MULTI_HOST.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                # The bare test module has no pooling metadata.
+                is_pooled=True,
+                shards=[
+                    Shard(
+                        size=[block, 64],
+                        offset=[block * i, 0],
+                        storage=Storage(hbm=1024, ddr=0),
+                        perf=Perf(
+                            fwd_compute=0, fwd_comms=0, bwd_compute=0, bwd_comms=0
+                        ),
+                    )
+                    for i in range(num_shards)
+                ],
+                num_twrw_groups=num_twrw_groups,
+            )
+        ],
+        storage_sum=Storage(hbm=num_shards * 1024, ddr=0),
+        perf_sum=0.0,
+        param_count=1,
+    )
+
+
+class TableRowWiseNumTwrwGroupsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        gate = patch(
+            "torchrec.distributed.utils.is_twrw_multi_group_enabled",
+            return_value=True,
+        )
+        gate.start()
+        self.addCleanup(gate.stop)
+        self.topology = Topology(
+            world_size=4,
+            local_world_size=2,
+            hbm_cap=1024 * 1024 * 8,
+            compute_device="cuda",
+        )
+        self.tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=64,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(2)
+        ]
+
+    def _plan(
+        self,
+        constraints: Dict[str, ParameterConstraints],
+        topology: Optional[Topology] = None,
+    ) -> EmbeddingModuleShardingPlan:
+        planner = EmbeddingShardingPlanner(
+            topology=topology or self.topology, constraints=constraints
+        )
+        model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        plan = planner.plan(
+            module=model,
+            sharders=[cast(ModuleSharder[nn.Module], TWRWSharder())],
+        )
+        return cast(EmbeddingModuleShardingPlan, plan.plan["sparse.ebc"])
+
+    def test_num_twrw_groups_reaches_parameter_sharding(self) -> None:
+        """The constraint controls row cuts; an unset table stays unchanged."""
+        ebc_plan = self._plan(
+            {
+                "table_0": ParameterConstraints(num_twrw_groups=2),
+                "table_1": ParameterConstraints(),
+            }
+        )
+
+        split = ebc_plan["table_0"]
+        self.assertEqual(split.num_twrw_groups, 2)
+        # An exact list catches duplicate-rank placement.
+        self.assertEqual(none_throws(split.ranks), [0, 1, 2, 3])
+        # Rows are partitioned, not replicated across groups.
+        shards = none_throws(
+            cast(EnumerableShardingSpec, none_throws(split.sharding_spec)).shards
+        )
+        self.assertEqual([tuple(s.shard_sizes) for s in shards], [(250, 64)] * 4)
+        self.assertEqual(
+            [tuple(s.shard_offsets) for s in shards],
+            [(0, 0), (250, 0), (500, 0), (750, 0)],
+        )
+
+        # Unset preserves the stock single-group plan.
+        stock = ebc_plan["table_1"]
+        self.assertIsNone(stock.num_twrw_groups)
+        self.assertIn(none_throws(stock.ranks), ([0, 1], [2, 3]))
+        stock_shards = none_throws(
+            cast(EnumerableShardingSpec, none_throws(stock.sharding_spec)).shards
+        )
+        self.assertEqual([tuple(s.shard_sizes) for s in stock_shards], [(500, 64)] * 2)
+
+    def test_one_group_preserves_single_group_plan(self) -> None:
+        sharding = self._plan({"table_0": ParameterConstraints(num_twrw_groups=1)})[
+            "table_0"
+        ]
+        self.assertIsNone(sharding.num_twrw_groups)
+        self.assertEqual(len(none_throws(sharding.ranks)), 2)
+
+    def test_killswitch_preserves_validation_and_disables_multi_group(self) -> None:
+        with patch(
+            "torchrec.distributed.utils.is_twrw_multi_group_enabled",
+            return_value=False,
+        ):
+            sharding = self._plan({"table_0": ParameterConstraints(num_twrw_groups=2)})[
+                "table_0"
+            ]
+            self.assertIsNone(sharding.num_twrw_groups)
+            self.assertEqual(len(none_throws(sharding.ranks)), 2)
+
+            with self.assertRaisesRegex(PlannerError, "must be >= 1"):
+                self._plan({"table_0": ParameterConstraints(num_twrw_groups=0)})
+
+    def test_pod_aware_group_width(self) -> None:
+        sharding = self._plan(
+            {"table_0": ParameterConstraints(num_twrw_groups=2)},
+            topology=Topology(
+                world_size=8,
+                local_world_size=2,
+                pod_size=2,
+                hbm_cap=1024 * 1024 * 8,
+                compute_device="cuda",
+            ),
+        )["table_0"]
+        self.assertEqual(none_throws(sharding.ranks), list(range(8)))
+        shards = none_throws(
+            cast(EnumerableShardingSpec, none_throws(sharding.sharding_spec)).shards
+        )
+        self.assertEqual([tuple(s.shard_sizes) for s in shards], [(125, 64)] * 8)
+
+    def test_estimator_context_uses_group_count_and_validates_shards(self) -> None:
+        option = _multi_group_option(
+            ShardingType.TABLE_ROW_WISE.value, num_twrw_groups=2, rows=1000
+        ).sharding_options[0]
+        sharder_data = SharderData(
+            fused_params={},
+            qcomm_dtype_sizes={},
+            storage_usage_type=StorageUsageType.DEFAULT,
+        )
+
+        def build_contexts(shard_sizes: List[List[int]]) -> List[ShardPerfContext]:
+            return ShardPerfContext.build_shard_perf_contexts(
+                config=HardwarePerfConfig(),
+                shard_sizes=shard_sizes,
+                sharding_option=option,
+                topology=self.topology,
+                constraints=None,
+                sharder_data=sharder_data,
+            )
+
+        contexts = build_contexts([[250, 64]] * 4)
+        self.assertEqual([ctx.table_num_twrw_groups for ctx in contexts], [2] * 4)
+
+        with self.assertRaisesRegex(ValueError, "needs 4 shards.*got 3"):
+            build_contexts([[250, 64]] * 3)
+
+    def test_num_twrw_groups_is_always_hashed(self) -> None:
+        """Every declared value contributes to the stored-plan digest."""
+        hashes = {
+            hash(ParameterConstraints()),
+            hash(ParameterConstraints(num_twrw_groups=1)),
+            hash(ParameterConstraints(num_twrw_groups=2)),
+        }
+        self.assertEqual(len(hashes), 3)
+
+    def test_unusable_num_twrw_groups_is_rejected(self) -> None:
+        """Reject non-positive and unavailable group counts."""
+        for num_twrw_groups, message in (
+            (3, "exceeds the 2 TWRW group"),
+            (0, "must be >= 1"),
+            (-1, "must be >= 1"),
+        ):
+            with self.subTest(num_twrw_groups=num_twrw_groups):
+                with self.assertRaisesRegex(PlannerError, message):
+                    self._plan(
+                        {
+                            "table_0": ParameterConstraints(
+                                num_twrw_groups=num_twrw_groups
+                            )
+                        }
+                    )
+
+    def test_unusable_num_twrw_groups_is_rejected_for_another_sharding_type(
+        self,
+    ) -> None:
+        """Validate values that still affect another sharding type's hash."""
+        planner = EmbeddingShardingPlanner(
+            topology=self.topology,
+            constraints={"table_0": ParameterConstraints(num_twrw_groups=3)},
+        )
+        model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        with self.assertRaisesRegex(PlannerError, "exceeds the 2 TWRW group"):
+            planner.plan(
+                module=model,
+                sharders=[cast(ModuleSharder[nn.Module], TWvsRWSharder())],
+            )
+
+    def test_multi_group_partition_places_row_blocks_in_rank_order(self) -> None:
+        """TWRW placement order must remain stable across plan reloads."""
+        row_wise = _multi_group_option(ShardingType.TABLE_ROW_WISE.value, 2, 1000)
+        GreedyPerfPartitioner._multi_hosts_partition(
+            row_wise, _multi_group_devices(2, group_load=[100.0, 0.0])
+        )
+        self.assertEqual(
+            [shard.rank for shard in row_wise.sharding_options[0].shards], [0, 1, 2, 3]
+        )
+
+        # GRID_SHARD retains performance order.
+        grid = _multi_group_option(ShardingType.GRID_SHARD.value, 2, 1000)
+        GreedyPerfPartitioner._multi_hosts_partition(
+            grid, _multi_group_devices(2, group_load=[100.0, 0.0])
+        )
+        self.assertEqual(
+            [shard.rank for shard in grid.sharding_options[0].shards], [2, 3, 0, 1]
+        )
+
+    def test_multi_group_partition_rejects_insufficient_groups(self) -> None:
+        """TWRW requires one available topology group per requested group."""
+        with self.assertRaisesRegex(
+            PlannerError, "needs 3 TWRW groups, but only 2 are available"
+        ):
+            GreedyPerfPartitioner._multi_hosts_partition(
+                _multi_group_option(ShardingType.TABLE_ROW_WISE.value, 3, 1002),
+                _multi_group_devices(2),
+            )
+
+        group = _multi_group_option(ShardingType.TABLE_ROW_WISE.value, 3, 1002)
+        GreedyPerfPartitioner._multi_hosts_partition(group, _multi_group_devices(3))
+        self.assertEqual(
+            [shard.rank for shard in group.sharding_options[0].shards],
+            [0, 1, 2, 3, 4, 5],
+        )
+
+    def test_multi_group_partition_rejects_duplicate_ranks(self) -> None:
+        devices = _multi_group_devices(2)
+        devices[1][0].rank = devices[0][0].rank
+
+        with self.assertRaisesRegex(PlannerError, "requires a distinct rank"):
+            GreedyPerfPartitioner._multi_hosts_partition(
+                _multi_group_option(ShardingType.TABLE_ROW_WISE.value, 2, 1000),
+                devices,
+            )
 
 
 class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
