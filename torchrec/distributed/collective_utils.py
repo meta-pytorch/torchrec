@@ -242,15 +242,27 @@ def _resolve_enablement_on_leader() -> bool:
 
 
 def init_collective_validation(pg: dist.ProcessGroup) -> None:
-    """Broadcast collective validation flag from rank 0 to all ranks in pg.
+    """Make all ranks in pg agree on whether collective validation is enabled.
 
     Call once on the world PG during DistributedModelParallel.__init__
-    so all ranks participate. Uses both JK and env var to determine if validation
-    is enabled.
+    so all ranks participate. If TORCHREC_VALIDATE_COLLECTIVES is "0" or "1",
+    each rank uses that value and no collective runs. Otherwise rank 0 checks
+    the JK and broadcasts the result to the other ranks.
     """
     global _USE_COLLECTIVE_VALIDATION, _INITIALIZED
     if _INITIALIZED:
         return  # prevents double-DMP / JK initialization
+    # Each rank reads its own environment here, so the variable must be set the
+    # same way on every rank. A rank without it would wait in the broadcast
+    # below for peers that never join.
+    enable_via_env = os.environ.get("TORCHREC_VALIDATE_COLLECTIVES", "")
+    if enable_via_env in ("0", "1"):
+        _USE_COLLECTIVE_VALIDATION = enable_via_env == "1"
+        _INITIALIZED = True
+        logger.info(
+            f"Collective validation initialized from env: {_USE_COLLECTIVE_VALIDATION}"
+        )
+        return
     _USE_COLLECTIVE_VALIDATION = invoke_on_rank_and_broadcast_result(
         pg=pg,
         func=_resolve_enablement_on_leader,
