@@ -13,6 +13,7 @@ from typing import Any, cast, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 from torch import nn
+from torchrec.distributed import utils as distributed_utils
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     DEFAULT_PERF_ESTIMATOR,
@@ -31,6 +32,8 @@ from torchrec.distributed.planner.types import (
     Enumerator,
     ParameterConstraints,
     PartitionByType,
+    PlannerError,
+    PlannerErrorType,
     Shard,
     SharderDataMap,
     ShardEstimator,
@@ -59,6 +62,7 @@ from torchrec.modules.mc_embedding_modules import (
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
 
 # compute kernels that should only be used if users specified them
 GUARDED_COMPUTE_KERNELS: Set[EmbeddingComputeKernel] = {
@@ -229,6 +233,7 @@ class EmbeddingEnumerator(Enumerator):
                 for sharding_type in self._filter_sharding_types(
                     name, sharder.sharding_types(self._compute_device), sharder_key
                 ):
+                    num_twrw_groups = self._extract_num_twrw_groups(name, sharding_type)
                     for compute_kernel in self._filter_compute_kernels(
                         name,
                         sharder.compute_kernels(sharding_type, self._compute_device),
@@ -246,6 +251,7 @@ class EmbeddingEnumerator(Enumerator):
                                 col_wise_shard_dim=col_wise_shard_dim,
                                 device_memory_sizes=self._device_memory_sizes,
                                 num_buckets=num_buckets,
+                                num_twrw_groups=num_twrw_groups,
                             )
                         except ZeroDivisionError as e:
                             # Re-raise with additional context about the table and module
@@ -275,7 +281,9 @@ class EmbeddingEnumerator(Enumerator):
                                 batch_size=self._batch_size,
                                 compute_kernel=compute_kernel,
                                 sharding_type=sharding_type,
-                                partition_by=get_partition_by_type(sharding_type),
+                                partition_by=get_partition_by_type(
+                                    sharding_type, num_twrw_groups
+                                ),
                                 shards=[
                                     Shard(size=size, offset=offset)
                                     for size, offset in zip(shard_sizes, shard_offsets)
@@ -292,6 +300,7 @@ class EmbeddingEnumerator(Enumerator):
                                 stash_weights=self._get_stash_weights(
                                     name, child_module
                                 ),
+                                num_twrw_groups=num_twrw_groups,
                             )
                         )
                 if not sharding_options_per_table:
@@ -312,6 +321,48 @@ class EmbeddingEnumerator(Enumerator):
         # Caching the search space with a copy of sharding options, to avoid unexpected modifications to list
         self._last_stored_search_space = copy.deepcopy(sharding_options)
         return sharding_options
+
+    def _extract_num_twrw_groups(
+        self, parameter: str, sharding_type: str
+    ) -> Optional[int]:
+        """
+        Return the validated TABLE_ROW_WISE group span.
+
+        `None` and 1 keep the legacy plan. Validate every sharding type because
+        the constraint always contributes to the stored-plan fingerprint.
+        """
+        num_twrw_groups = (
+            self._constraints[parameter].num_twrw_groups
+            if self._constraints and self._constraints.get(parameter)
+            else None
+        )
+        if num_twrw_groups is None:
+            return None
+        if num_twrw_groups < 1:
+            raise PlannerError(
+                error_type=PlannerErrorType.STRICT_CONSTRAINTS,
+                message=(
+                    f"'{parameter}': num_twrw_groups must be >= 1, "
+                    f"got {num_twrw_groups}."
+                ),
+            )
+        max_twrw_groups = self._world_size // self._local_world_size
+        if num_twrw_groups > max_twrw_groups:
+            raise PlannerError(
+                error_type=PlannerErrorType.STRICT_CONSTRAINTS,
+                message=(
+                    f"'{parameter}': num_twrw_groups={num_twrw_groups} exceeds "
+                    f"the {max_twrw_groups} TWRW group(s) available "
+                    f"(world_size={self._world_size}, "
+                    f"intra_group_size={self._local_world_size}). Each group can "
+                    "hold at most one row block of a table."
+                ),
+            )
+        if sharding_type != ShardingType.TABLE_ROW_WISE.value:
+            return None
+        if num_twrw_groups <= 1 or not distributed_utils.is_twrw_multi_group_enabled():
+            return None
+        return num_twrw_groups
 
     def _get_num_buckets(self, parameter: str, module: nn.Module) -> Optional[int]:
         """
@@ -591,12 +642,16 @@ def _extract_constraints_for_param(
     )
 
 
-def get_partition_by_type(sharding_type: str) -> str:
+def get_partition_by_type(
+    sharding_type: str, num_twrw_groups: Optional[int] = None
+) -> str:
     """
     Gets corresponding partition by type for provided sharding type.
 
     Args:
         sharding_type (str): sharding type string.
+        num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span; > 1 selects
+            MULTI_HOST.
 
     Returns:
         str: the corresponding `PartitionByType` value.
@@ -619,6 +674,13 @@ def get_partition_by_type(sharding_type: str) -> str:
     if sharding_type in device_sharding_types:
         return PartitionByType.DEVICE.value
     elif sharding_type in host_sharding_types:
+        # MULTI_HOST already places uniformly across topology groups.
+        if (
+            sharding_type == ShardingType.TABLE_ROW_WISE.value
+            and num_twrw_groups is not None
+            and num_twrw_groups > 1
+        ):
+            return PartitionByType.MULTI_HOST.value
         return PartitionByType.HOST.value
     elif sharding_type in uniform_sharding_types:
         return PartitionByType.UNIFORM.value
