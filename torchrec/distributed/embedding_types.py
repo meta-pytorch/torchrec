@@ -45,7 +45,9 @@ from torch.distributed._tensor.placement_types import Placement
 from torch.nn.modules.module import _addindent
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.types import (
+    Awaitable,
     compute_storage_usage,
+    LazyAwaitable,
     ModuleSharder,
     QuantizedCommCodecs,
     ShardedModule,
@@ -388,6 +390,21 @@ Out = TypeVar("Out")
 CompIn = TypeVar("CompIn", KJTList, ListOfKJTList, KeyedJaggedTensor)
 DistOut = TypeVar("DistOut")
 ShrdCtx = TypeVar("ShrdCtx", bound=Multistreamable)
+DPLookupResult = TypeVar("DPLookupResult")
+
+
+class DPLookupAwaitable(LazyAwaitable[DPLookupResult]):
+    """Defers data-parallel lookup and output distribution until needed."""
+
+    def __init__(self, lookup: Callable[[], Awaitable[DPLookupResult]]) -> None:
+        super().__init__()
+        self._lookup = lookup
+        self._awaitable: Optional[Awaitable[DPLookupResult]] = None
+
+    def _wait_impl(self) -> DPLookupResult:
+        if self._awaitable is None:
+            self._awaitable = self._lookup()
+        return self._awaitable.wait()
 
 
 class ShardedEmbeddingModule(

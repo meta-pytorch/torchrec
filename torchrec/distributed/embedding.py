@@ -12,6 +12,7 @@ import logging
 import warnings
 from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import accumulate
 from typing import (
     Any,
@@ -45,6 +46,7 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
+    DPLookupAwaitable,
     EmbeddingComputeKernel,
     KJTList,
     ShardedEmbeddingModule,
@@ -341,6 +343,9 @@ class EmbeddingCollectionContext(Multistreamable):
     seq_vbe_ctx: List[SequenceVBEContext] = field(default_factory=list)
     table_name_to_unpruned_hash_sizes: Dict[str, int] = field(default_factory=dict)
     early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
+    # Set per batch by a pipeline to defer the DP lookup until output consumption.
+    # Left False by `ShardedModule.forward`, so eager use never defers.
+    defer_dp_lookup: bool = False
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -612,6 +617,7 @@ class ShardedEmbeddingCollection(
         # pyrefly: ignore[bad-argument-type]
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
         self._embedding_dim: int = module.embedding_dim()
+        self._dp_index = self._find_dp_index()
         self._embedding_names_per_sharding: List[List[str]] = []
         for sharding in self._sharding_type_to_sharding.values():
             self._embedding_names_per_sharding.append(sharding.embedding_names())
@@ -641,6 +647,18 @@ class ShardedEmbeddingCollection(
 
         if module.device != torch.device("meta"):
             self.load_state_dict(module.state_dict())
+
+    def _find_dp_index(self) -> Optional[int]:
+        # Shardings are keyed by sharding type, so data-parallel is one entry at
+        # most. Position, not identity: everything downstream indexes per sharding.
+        return next(
+            (
+                index
+                for index, sharding_type in enumerate(self._sharding_types)
+                if sharding_type == ShardingType.DATA_PARALLEL.value
+            ),
+            None,
+        )
 
     def init_data_parallel(self) -> None:
         """
@@ -1727,56 +1745,96 @@ class ShardedEmbeddingCollection(
             use_packed_jagged_tensor=self._use_packed_jagged_tensor,
         )
 
+    def _compute_and_output_dist_per_sharding(
+        self,
+        index: int,
+        features: KeyedJaggedTensor,
+        sharding_ctx: SequenceShardingContext,
+        resize_awaitables: List[Awaitable[torch.Tensor]],
+    ) -> Awaitable[torch.Tensor]:
+        """Local lookup plus output dist for a single sharding."""
+        lookup = self._lookups[index]
+        odist = self._output_dists[index]
+        sharding_type = self._sharding_types[index]
+
+        embedding_dim = self._embedding_dim_for_sharding_type(sharding_type)
+
+        with maybe_annotate_embedding_event(
+            EmbeddingEvent.LOOKUP, self._module_fqn, sharding_type
+        ):
+            embs = lookup(features)
+
+            if MemoryStashingManager.is_enabled():
+                stash_result = MemoryStashingManager.stash_embedding_weights(
+                    lookup, caller=self.__class__.__name__
+                )
+                if stash_result is not None:
+                    await_restore, *_ = stash_result
+                    embs.register_hook(await_restore)
+
+            if hasattr(lookup, "get_resize_awaitables"):
+                # pyrefly: ignore[not-callable]
+                resize_awaitables.extend(lookup.get_resize_awaitables())
+
+            if self.post_lookup_tracker_fn is not None:
+                self.post_lookup_tracker_fn(features, embs, self, None)
+
+        with maybe_annotate_embedding_event(
+            EmbeddingEvent.OUTPUT_DIST, self._module_fqn, sharding_type
+        ):
+            awaitable = odist(embs.view(-1, embedding_dim), sharding_ctx)
+
+            if self.post_odist_tracker_fn is not None:
+                self.post_odist_tracker_fn()
+
+        return awaitable
+
     def compute_and_output_dist(
         self, ctx: EmbeddingCollectionContext, input: KJTList
     ) -> LazyAwaitable[Dict[str, JaggedTensor]]:
+        """Lookup + output dist for every sharding.
+
+        When `ctx.defer_dp_lookup` is set, the returned lazy awaitable holds the
+        data-parallel lookup until it is consumed. All other sharding lookups and
+        output distributions start immediately.
+        """
+        defer_dp = ctx.defer_dp_lookup and self._dp_index is not None
         awaitables_per_sharding: List[Awaitable[torch.Tensor]] = []
         features_before_all2all_per_sharding: List[KeyedJaggedTensor] = []
-        resize_awaitables = []
+        resize_awaitables: List[Awaitable[torch.Tensor]] = []
 
-        for lookup, odist, features, sharding_ctx, sharding_type in zip(
-            self._lookups,
-            self._output_dists,
-            input,
-            ctx.sharding_contexts,
-            self._sharding_type_to_sharding,
+        for index, (features, sharding_ctx) in enumerate(
+            zip(input, ctx.sharding_contexts)
         ):
             sharding_ctx.lengths_after_input_dist = features.lengths().view(
                 -1, features.stride()
             )
-            embedding_dim = self._embedding_dim_for_sharding_type(sharding_type)
-
-            with maybe_annotate_embedding_event(
-                EmbeddingEvent.LOOKUP, self._module_fqn, sharding_type
-            ):
-                embs = lookup(features)
-                if MemoryStashingManager.is_enabled():
-                    stash_result = MemoryStashingManager.stash_embedding_weights(
-                        lookup, caller=self.__class__.__name__
-                    )
-                    if stash_result is not None:
-                        await_restore, *_ = stash_result
-                        embs.register_hook(await_restore)
-                if hasattr(lookup, "get_resize_awaitables"):
-                    # pyrefly: ignore[not-callable]
-                    resize_awaitables.extend(lookup.get_resize_awaitables())
-                if self.post_lookup_tracker_fn is not None:
-                    self.post_lookup_tracker_fn(features, embs, self, None)
-
-            with maybe_annotate_embedding_event(
-                EmbeddingEvent.OUTPUT_DIST, self._module_fqn, sharding_type
-            ):
+            if defer_dp and index == self._dp_index:
                 awaitables_per_sharding.append(
-                    odist(embs.view(-1, embedding_dim), sharding_ctx)
+                    DPLookupAwaitable(
+                        partial(
+                            self._compute_and_output_dist_per_sharding,
+                            index,
+                            features,
+                            sharding_ctx,
+                            # This accumulator is shared with the result awaitable,
+                            # which waits for resize work after all shard outputs.
+                            resize_awaitables,
+                        )
+                    )
                 )
-                if self.post_odist_tracker_fn is not None:
-                    self.post_odist_tracker_fn()
+            else:
+                awaitables_per_sharding.append(
+                    self._compute_and_output_dist_per_sharding(
+                        index, features, sharding_ctx, resize_awaitables
+                    )
+                )
 
             features_before_all2all_per_sharding.append(
-                #  got `Optional[KeyedJaggedTensor]`.
                 # pyrefly: ignore[bad-argument-type]
                 sharding_ctx.features_before_input_dist
             )
+
         return EmbeddingCollectionAwaitable(
             awaitables_per_sharding=awaitables_per_sharding,
             features_per_sharding=features_before_all2all_per_sharding,
