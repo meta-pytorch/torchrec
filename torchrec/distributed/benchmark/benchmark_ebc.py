@@ -22,9 +22,10 @@ whole sharded ``EmbeddingBagCollection`` training iteration: the forward covers
 ``input_dist`` (the KJT A2A), the local TBE lookup, and ``output_dist`` (the pooled
 embedding collective) together, and by default the backward and optimizer step follow
 (``--backward=false`` measures the forward alone). ``name`` picks how the tables are
-sharded (see ``_SHARDING_GENERATORS``); with the table and input configuration otherwise
-held fixed, the resulting latencies are directly comparable across sharding types. Only
-latency is measured -- outputs are not checked for correctness.
+sharded (see ``_SHARDING_GENERATORS``). Each sharding type defaults to the table and input
+shape it is chosen for in practice (see ``_DEFAULT_SHAPES``); pass the shape explicitly
+to compare sharding types on one workload. Only latency is measured -- outputs are not
+checked for correctness.
 
 Three sharding types are supported, and ``name`` selects one of them:
 
@@ -137,6 +138,44 @@ _SHARDING_GENERATORS: Dict[
             ranks=list(range(world_size)), compute_kernel=compute_kernel
         )
     ),
+}
+
+
+# Default table and input shape per sharding type. A single shared shape cannot be
+# representative: 256 identical tables are the table-wise case, and they make row-wise
+# reduce-scatter partial sums for every table (8x table-wise's output_dist bytes on 8
+# ranks) and column-wise ship every index to every rank in 32-dim slices. Row-wise and
+# column-wise keep fewer tables than ranks, as they are used in practice, and make up
+# the load with batch, pooling and width: every shape looks up the same embedding bytes
+# per iteration per rank (batch_size * num_tables * pooling_factor * embedding_dim * 4 B
+# = 21.5 GB), so latencies compare directly. Explicit kwargs override these.
+_DEFAULT_SHAPES: Dict[str, Dict[str, int]] = {
+    # Many medium tables, spread whole and round-robin over the ranks.
+    ShardingType.TABLE_WISE.value: {
+        "num_tables": 256,
+        "num_embeddings": 1_000_000,
+        "embedding_dim": 256,
+        "pooling_factor": 20,
+        "batch_size": 4096,
+    },
+    # Few large, lookup-heavy tables (long-sequence features): row shards spread both
+    # the memory and the lookups.
+    ShardingType.ROW_WISE.value: {
+        "num_tables": 4,
+        "num_embeddings": 50_000_000,
+        "embedding_dim": 256,
+        "pooling_factor": 320,
+        "batch_size": 16384,
+    },
+    # Few wide tables: 4096 columns keep each shard at or above MIN_CW_DIM (128) on up
+    # to 32 ranks.
+    ShardingType.COLUMN_WISE.value: {
+        "num_tables": 4,
+        "num_embeddings": 2_500_000,
+        "embedding_dim": 4096,
+        "pooling_factor": 20,
+        "batch_size": 16384,
+    },
 }
 
 
@@ -464,24 +503,27 @@ def _benchmark_sharding_type(
                 ``pipeline``. Default 10.
             num_tables (int): number of embedding tables, one feature each. For
                 table-wise they are assigned to ranks round-robin, so a multiple of
-                ``world_size`` keeps the assignment balanced. Default 256.
-            num_embeddings (int): rows per table. Default 1_000_000.
-            embedding_dim (int): embedding width per table. Default 256.
-            batch_size (int): this rank's local batch size. Default 4096.
-            pooling_factor (int): indices looked up per feature per sample -- with
-                the defaults each iteration looks up
-                ``4096 * 256 * 20 ~= 21M`` embedding rows per rank. Default 20.
+                ``world_size`` keeps the assignment balanced. Default per sharding
+                type (see ``_DEFAULT_SHAPES``).
+            num_embeddings (int): rows per table. Default per sharding type.
+            embedding_dim (int): embedding width per table. Default per sharding
+                type.
+            batch_size (int): this rank's local batch size. Default per sharding
+                type.
+            pooling_factor (int): indices looked up per feature per sample. Default
+                per sharding type.
             values_dtype (torch.dtype): dtype of the KJT ``values`` tensor.
                 Default int64.
-            num_benchmarks (int): number of measured iterations. Default 100.
+            num_benchmarks (int): number of measured iterations. Default 200, or
+                100 with ``pipeline``, where each iteration already drives
+                ``num_batches`` batches.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
             memory_snapshot (bool): capture a CUDA memory snapshot alongside the
                 profile (requires profile_dir). Default True.
-        The benchmark name (which keys the result files) is always
-        ``"ebc_<sharding_type>"``: the launcher's ``name`` is the primitive-benchmark
-        selector, so it is forwarded here as a list and deliberately not consumed.
+        The benchmark name (which keys the result files) is
+        ``"ebc_<sharding_type>"``, with a ``_pipelined`` suffix when ``pipeline``.
 
     Returns:
         This rank's ``BenchmarkResult``.
@@ -494,16 +536,17 @@ def _benchmark_sharding_type(
     compute_kernel: str = str(
         kwargs.get("compute_kernel", EmbeddingComputeKernel.FUSED.value)
     )
-    num_tables: int = int(kwargs.get("num_tables", 256))
-    num_embeddings: int = int(kwargs.get("num_embeddings", 1_000_000))
-    embedding_dim: int = int(kwargs.get("embedding_dim", 256))
-    batch_size: int = int(kwargs.get("batch_size", 4096))
-    pooling_factor: int = int(kwargs.get("pooling_factor", 20))
+    shape = _DEFAULT_SHAPES[sharding_type]
+    num_tables: int = int(kwargs.get("num_tables", shape["num_tables"]))
+    num_embeddings: int = int(kwargs.get("num_embeddings", shape["num_embeddings"]))
+    embedding_dim: int = int(kwargs.get("embedding_dim", shape["embedding_dim"]))
+    batch_size: int = int(kwargs.get("batch_size", shape["batch_size"]))
+    pooling_factor: int = int(kwargs.get("pooling_factor", shape["pooling_factor"]))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.int64)
     backward: bool = as_bool(kwargs.get("backward"), True)
     pipeline: bool = as_bool(kwargs.get("pipeline"), False)
     num_batches: int = int(kwargs.get("num_batches", 10))
-    num_benchmarks: int = int(kwargs.get("num_benchmarks", 100))
+    num_benchmarks: int = int(kwargs.get("num_benchmarks", 100 if pipeline else 200))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
     memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
