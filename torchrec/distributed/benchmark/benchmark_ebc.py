@@ -21,13 +21,12 @@ Where ``benchmark_primitive`` times the bare collectives in isolation, this file
 whole sharded ``EmbeddingBagCollection`` training iteration: the forward covers
 ``input_dist`` (the KJT A2A), the local TBE lookup, and ``output_dist`` (the pooled
 embedding collective) together, and by default the backward and optimizer step follow
-(``--backward=false`` measures the forward alone). The ``sharding_type`` flag picks how the tables are
+(``--backward=false`` measures the forward alone). ``name`` picks how the tables are
 sharded (see ``_SHARDING_GENERATORS``); with the table and input configuration otherwise
 held fixed, the resulting latencies are directly comparable across sharding types. Only
 latency is measured -- outputs are not checked for correctness.
 
-Three sharding types are supported, and ``sharding_type`` may name one, several
-(comma-separated) or ``"all"`` to run every one of them in sequence within the same job:
+Three sharding types are supported, and ``name`` selects one of them:
 
 - ``table_wise``: each table lives whole on one rank (assigned round-robin), so
   ``output_dist`` is a ``PooledEmbeddingsAllToAll``.
@@ -41,7 +40,6 @@ A follow-up launcher binary will call ``runner`` explicitly with options to run 
 MAST or locally.
 """
 
-import gc
 import itertools
 import logging
 import socket
@@ -52,7 +50,6 @@ from typing import (
     Dict,
     List,
     Optional,
-    Sequence,
     Tuple,
     TYPE_CHECKING,
     Union,
@@ -142,62 +139,10 @@ _SHARDING_GENERATORS: Dict[
     ),
 }
 
-# Special ``sharding_type`` token that expands to every entry in
-# ``_SHARDING_GENERATORS`` (in registry order). Intentionally NOT a key in that dict
-# -- it is expanded by :func:`parse_sharding_types`.
-RUN_ALL: str = "all"
-
 
 def available_sharding_types() -> List[str]:
-    """Return the sorted sharding types accepted by the ``sharding_type`` flag.
-
-    These (plus the special ``"all"`` token, :data:`RUN_ALL`) are the values
-    :func:`parse_sharding_types` accepts.
-    """
+    """Return the sorted sharding types the module benchmark accepts as ``name``."""
     return sorted(_SHARDING_GENERATORS)
-
-
-def parse_sharding_types(value: Union[str, Sequence[str]]) -> List[str]:
-    """Resolve the ``sharding_type`` selector into a concrete list of sharding types.
-
-    Accepts a comma-separated string (e.g. ``"table_wise,row_wise"``) or a sequence of
-    names. The special token ``"all"`` (:data:`RUN_ALL`) expands to every registered
-    sharding type in registry order. Duplicates are dropped while preserving first-seen
-    order.
-
-    Returns:
-        The ordered, de-duplicated list of sharding types to run (never empty).
-
-    Raises:
-        ValueError: if a token is neither a registered sharding type nor ``"all"``, or
-            if the selector resolves to nothing.
-    """
-    if isinstance(value, str):
-        tokens = [t.strip() for t in value.split(",") if t.strip()]
-    else:
-        tokens = [str(t).strip() for t in value if str(t).strip()]
-
-    resolved: List[str] = []
-    for tok in tokens:
-        if tok == RUN_ALL:
-            resolved.extend(_SHARDING_GENERATORS)
-        elif tok in _SHARDING_GENERATORS:
-            resolved.append(tok)
-        else:
-            raise ValueError(
-                f"unknown sharding type {tok!r}; available: "
-                f"{available_sharding_types()} (or {RUN_ALL!r} to run all of them)"
-            )
-    if not resolved:
-        raise ValueError("sharding_type must select at least one sharding type")
-
-    seen: set[str] = set()
-    deduped: List[str] = []
-    for sharding_type in resolved:
-        if sharding_type not in seen:
-            seen.add(sharding_type)
-            deduped.append(sharding_type)
-    return deduped
 
 
 def _make_tables(
@@ -492,10 +437,10 @@ def _benchmark_sharding_type(
     backward and optimizer step as well. Correctness of the pooled output is
     intentionally not verified.
 
-    Called once per selected sharding type by :func:`benchmark_runner`. The sharded
-    module, its optimizer and the input batch are all local to this call, so they
-    become collectable as soon as it returns -- which is what keeps a multi-sharding
-    run from holding every module alive at once.
+    Called by :func:`benchmark_runner`. The sharded module, its optimizer and the
+    input batch are all local to this call, so they become collectable as soon as it
+    returns -- which is what keeps a multi-run job from holding every module alive at
+    once.
 
     Args:
         ctx: live single-process context (device + process group) injected by the
@@ -711,58 +656,27 @@ def benchmark_runner(
     ctx: SingleProcessContext,
     rank: int,
     world_size: int,
+    name: str,
     **kwargs: Any,
-) -> List[BenchmarkResult]:
-    """Per-rank module benchmark entry point.
-
-    Runs the sharded-``EmbeddingBagCollection`` benchmark once per selected sharding
-    type and returns this rank's per-sharding-type results. ``sharding_type`` is
-    resolved by :func:`parse_sharding_types`, so it may be a single name, a
-    comma-separated list (e.g. ``"table_wise,row_wise"``), or ``"all"`` to run every
-    registered sharding type. The selected runs happen sequentially in this one
-    process, reusing the injected ``ctx`` (device + process group), ``rank`` and
-    ``world_size``; the remaining ``kwargs`` are forwarded to each (see
-    :func:`_benchmark_sharding_type`). Each run is dispatched under its own name
-    (``ebc_<sharding_type>``), so their result files do not collide.
+) -> BenchmarkResult:
+    """Per-rank module benchmark entry point: runs the sharding type ``name``.
 
     Args:
         ctx: live single-process context (device + process group) injected by the
             process runner; use ``ctx.device`` / ``ctx.pg`` directly.
         rank: this process' global rank.
         world_size: total number of ranks.
-        **kwargs: ``sharding_type`` (str | list) selects the run(s) (default
-            ``"table_wise"``); the rest are forwarded to each selected run.
+        name: the sharding type to run; one of :func:`available_sharding_types`.
+        **kwargs: forwarded to :func:`_benchmark_sharding_type` (e.g. ``pipeline``).
 
     Returns:
-        This rank's per-sharding-type ``BenchmarkResult`` list, in resolved
-        ``sharding_type`` order.
+        This rank's ``BenchmarkResult``.
     """
-    sharding_types = parse_sharding_types(
-        kwargs.pop("sharding_type", ShardingType.TABLE_WISE.value)
-    )
-
     logger.info(
-        "rank=%d local_rank=%d host=%s running module benchmarks: %s",
+        "rank=%d local_rank=%d host=%s running module benchmark: %s",
         rank,
         ctx.local_rank,
         socket.gethostname(),
-        sharding_types,
+        name,
     )
-
-    results: List[BenchmarkResult] = []
-    for sharding_type in sharding_types:
-        results.append(
-            _benchmark_sharding_type(ctx, rank, world_size, sharding_type, **kwargs)
-        )
-        # Reclaim this run's shards before the next sharding type builds its own.
-        # Both steps are needed: the sharded module sits in reference cycles (module
-        # <-> autograd/state hooks), so dropping the last name does not free it until
-        # a collection runs, and ``empty_cache`` only returns blocks that are already
-        # unreferenced. Skipping either leaves the previous runs' tables resident and
-        # inflates every later sharding type's peak memory -- which silently makes
-        # the memory column of a multi-sharding run cumulative rather than per-run.
-        gc.collect()
-        if ctx.device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    return results
+    return _benchmark_sharding_type(ctx, rank, world_size, name, **kwargs)

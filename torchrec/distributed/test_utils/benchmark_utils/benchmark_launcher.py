@@ -26,32 +26,38 @@ Both paths create + handshake the process group and inject a live
 ``SingleProcessContext`` (``ctx``), plus this rank's ``rank`` / ``world_size``,
 into the selected benchmark's ``benchmark_runner``.
 
+``--benchmark=all`` runs every benchmark back to back in one dispatch, reusing the
+same hosts and process group.
+
 Examples:
     # local: spawn 2 ranks on this host and run the KJT (sparse index) A2A benchmark
-    buck2 run @fbcode//mode/opt \\
-        fbcode//torchrec/distributed/test_utils/benchmark_utils:benchmark_launcher -- \\
+    python -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \\
         --mode=local --benchmark=primitive --name=kjt_a2a --world-size=2
 
-    # local: run the KT (dense pooled-embedding / output_dist) A2A benchmark
-    buck2 run @fbcode//mode/opt \\
-        fbcode//torchrec/distributed/test_utils/benchmark_utils:benchmark_launcher -- \\
-        --mode=local --benchmark=primitive --name=kt_a2a --world-size=2
+    # local: run the row-wise sharded EBC benchmark through the train pipeline
+    python -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \\
+        --mode=local --benchmark=module --name=row_wise --pipeline=true --world-size=2
+
+    # local: run every benchmark
+    python -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \\
+        --mode=local --benchmark=all --world-size=2
 
     # remote: invoked per-rank by torchrun/MAST (rendezvous env preset)
-    buck2 run @fbcode//mode/opt \\
-        fbcode//torchrec/distributed/test_utils/benchmark_utils:benchmark_launcher -- \\
-        --mode=remote --benchmark=module
+    python -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \\
+        --mode=remote --benchmark=all
 """
 
 import argparse
+import gc
 import logging
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torchrec.distributed.benchmark import benchmark_ebc, benchmark_primitive
 from torchrec.distributed.test_utils.process_runner import (
     run_local_multi_process_func,
     run_single_process_func,
+    SingleProcessContext,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -65,6 +71,15 @@ _BENCHMARKS: Dict[str, Callable[..., Any]] = {
     "primitive": benchmark_primitive.benchmark_runner,
     "module": benchmark_ebc.benchmark_runner,
 }
+
+# Valid ``--name`` values for each entry in ``_BENCHMARKS``.
+_AVAILABLE_NAMES: Dict[str, Callable[[], List[str]]] = {
+    "primitive": benchmark_primitive.available_primitives,
+    "module": benchmark_ebc.available_sharding_types,
+}
+
+# Special ``--benchmark`` token; selects :func:`_run_all_benchmarks`.
+RUN_ALL: str = "all"
 
 # torchrun/torchelastic inject args like ``--local-rank`` into the worker argv;
 # LOCAL_RANK is read from the environment instead, so these must not be forwarded
@@ -115,17 +130,94 @@ def parse_forwarded_kwargs(unknown: List[str]) -> Dict[str, Any]:
     return kwargs
 
 
-def _name_arg(value: str) -> List[str]:
-    """argparse ``type`` for ``--name``: resolve the selector, report errors inline.
-
-    Delegates to :func:`benchmark_primitive.parse_benchmark_names` (which expands
-    ``"all"`` and validates), converting its ``ValueError`` into an
-    ``ArgumentTypeError`` so argparse surfaces the specific message.
-    """
+def _run_and_reclaim(
+    runner: Callable[..., Any],
+    ctx: SingleProcessContext,
+    rank: int,
+    world_size: int,
+    results: List[Any],
+    **kwargs: Any,
+) -> None:
+    """Run one benchmark into ``results``, then free its memory for the next run."""
     try:
-        return benchmark_primitive.parse_benchmark_names(value)
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(str(e)) from e
+        results.append(runner(ctx, rank, world_size, **kwargs))
+    except Exception:
+        logger.exception(
+            "rank=%d %s name=%s pipeline=%s failed",
+            rank,
+            runner.__module__,
+            kwargs.get("name"),
+            kwargs.get("pipeline"),
+        )
+        raise
+    # Modules and buffers sit in reference cycles, so without an explicit collection
+    # a finished run stays resident and inflates every later run's peak memory.
+    gc.collect()
+    if ctx.device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _run_all_benchmarks(
+    ctx: SingleProcessContext,
+    rank: int,
+    world_size: int,
+    **kwargs: Any,
+) -> List[Any]:
+    """Per-rank runner for ``--benchmark=all``: every primitive, then every sharding
+    type both unpipelined and pipelined.
+
+    The remaining ``kwargs`` go to every run, so a shared name such as ``batch_size``
+    (which means different things to each benchmark) applies to all of them.
+    """
+    kwargs.pop("pipeline", None)
+    results: List[Any] = []
+
+    for name in benchmark_primitive.available_primitives():
+        _run_and_reclaim(
+            benchmark_primitive.benchmark_runner,
+            ctx,
+            rank,
+            world_size,
+            results,
+            name=name,
+            **kwargs,
+        )
+
+    for name in benchmark_ebc.available_sharding_types():
+        for pipeline in (False, True):
+            _run_and_reclaim(
+                benchmark_ebc.benchmark_runner,
+                ctx,
+                rank,
+                world_size,
+                results,
+                name=name,
+                pipeline=pipeline,
+                **kwargs,
+            )
+
+    return results
+
+
+def _resolve_runner(benchmark: str) -> Callable[..., Any]:
+    """Return the per-rank runner for a ``--benchmark`` selection."""
+    if benchmark == RUN_ALL:
+        return _run_all_benchmarks
+    return _BENCHMARKS[benchmark]
+
+
+def _check_name(benchmark: str, name: Optional[str]) -> None:
+    """Validate that ``name`` picks exactly one run of ``benchmark``."""
+    if benchmark == RUN_ALL:
+        if name is not None:
+            raise ValueError(f"--name must be omitted with --benchmark={RUN_ALL}")
+        return
+    available = _AVAILABLE_NAMES[benchmark]()
+    if name not in available:
+        raise ValueError(
+            f"--benchmark={benchmark} requires --name to be one of {available}, "
+            f"got {name!r}"
+        )
 
 
 def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
@@ -145,20 +237,21 @@ def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--benchmark",
-        choices=sorted(_BENCHMARKS),
+        choices=sorted([*_BENCHMARKS, RUN_ALL]),
         required=True,
-        help="which benchmark runner to launch.",
+        help="which benchmark runner to launch, or 'all' to run every one of them "
+        "back to back in this one job (sharing its hosts and process group).",
     )
     parser.add_argument(
         "--name",
-        type=_name_arg,
-        default="kjt_a2a",
+        type=str,
+        default=None,
         help=(
-            "comma-separated primitive op(s) to benchmark when --benchmark=primitive "
-            "(e.g. 'kjt_a2a' or 'kjt_a2a,kt_a2a'), or 'all' to run every primitive in "
-            "sequence. Available: "
+            "which benchmark of --benchmark to run. primitive: "
             + ", ".join(benchmark_primitive.available_primitives())
-            + ". Ignored by other benchmarks. Default: kjt_a2a."
+            + ". module: "
+            + ", ".join(benchmark_ebc.available_sharding_types())
+            + ". Required unless --benchmark=all, which runs every one of them."
         ),
     )
     parser.add_argument(
@@ -211,8 +304,18 @@ def run_benchmark(args: argparse.Namespace, extra_kwargs: Dict[str, Any]) -> Non
     (``mode`` / ``benchmark`` / ``name`` / ``world_size`` / ``backend`` /
     ``profile_dir``); ``extra_kwargs`` are benchmark-specific options forwarded
     verbatim to the runner.
+
+    Raises:
+        ValueError: if ``name`` does not pick exactly one run of ``benchmark`` (see
+            :func:`_check_name`).
     """
-    runner: Callable[..., Any] = _BENCHMARKS[args.benchmark]
+    _check_name(args.benchmark, args.name)
+    runner: Callable[..., Any] = _resolve_runner(args.benchmark)
+
+    runner_kwargs: Dict[str, Any] = dict(extra_kwargs)
+    runner_kwargs["profile_dir"] = args.profile_dir
+    if args.name is not None:
+        runner_kwargs["name"] = args.name
 
     if args.mode == "local":
         # Validate we have enough GPUs for the requested world_size before
@@ -236,9 +339,7 @@ def run_benchmark(args: argparse.Namespace, extra_kwargs: Dict[str, Any]) -> Non
             runner,
             world_size=args.world_size,
             backend=args.backend,
-            name=args.name,
-            profile_dir=args.profile_dir,
-            **extra_kwargs,
+            **runner_kwargs,
         )
     else:  # remote
         logger.info(
@@ -247,9 +348,7 @@ def run_benchmark(args: argparse.Namespace, extra_kwargs: Dict[str, Any]) -> Non
         run_single_process_func(
             runner,
             backend=args.backend,
-            name=args.name,
-            profile_dir=args.profile_dir,
-            **extra_kwargs,
+            **runner_kwargs,
         )
 
 
