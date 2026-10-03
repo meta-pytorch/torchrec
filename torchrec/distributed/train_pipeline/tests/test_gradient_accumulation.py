@@ -15,7 +15,7 @@
 
 import contextlib
 import unittest
-from typing import Any, cast, Iterator, List
+from typing import Any, cast, Iterator, List, Optional
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -1415,6 +1415,32 @@ class FullTrainingLoopTest(unittest.TestCase):
         ga.reset()
         self.assertEqual(ga.current_step, 0)
 
+    def test_set_step_refuses_an_open_partial_window(self) -> None:
+        """set_step re-anchors, so an open window would let the next step exceed K."""
+        model = _MockModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        ga = GradientAccumulationWrapper(
+            _MockPipeline(num_batches=8), optimizer, model, config
+        )
+
+        dummy_iter: Iterator[Any] = iter([])
+        for _ in range(3):
+            ga.progress(dummy_iter)
+        self.assertTrue(ga._pending_uncommitted)
+
+        with self.assertRaises(RuntimeError):
+            ga.set_step(0)
+
+        # The opt-out discards the window and re-arms the window-start zero, so the
+        # abandoned gradients are cleared by the next zero_grad rather than carried.
+        ga.set_step(0, drop_partial=True)
+        self.assertFalse(ga._pending_uncommitted)
+        self.assertTrue(ga._optimizer_wrapper._needs_zero_grad)
+        self.assertEqual(ga.current_step, 0)
+
     def test_gradient_values_accumulated(self) -> None:
         """Gradients are accumulated across micro-batches (not replaced)."""
         model = nn.Linear(10, 5, bias=False)
@@ -2260,11 +2286,174 @@ class UnsupportedPipelineTest(unittest.TestCase):
         self.assertIs(pipeline._optimizer, first_wrapper)
 
 
+class OptimizerStepReportingTest(unittest.TestCase):
+    """The three properties a caller needs to report per-reader-batch completion.
+
+    ``optimizer_step_completed`` answers "did the call that just returned step?",
+    ``will_complete_optimizer_step`` answers the same question about the NEXT call, and
+    ``has_uncommitted_gradients`` says whether accumulated gradients are still open. A
+    caller that has to re-derive any of these from ``current_step`` is re-implementing the
+    boundary arithmetic, which is what drifts.
+    """
+
+    K: int = 4
+
+    def _make(
+        self, k: Optional[int] = None, is_enabled: bool = True
+    ) -> tuple[GradientAccumulationWrapper[Any, int], _MockModel]:
+        model = _MockModel()
+        pipeline = _IteratorDrivenStepPipeline()
+        config = GradientAccumulationConfig(
+            is_enabled=is_enabled, num_steps=k if k is not None else self.K
+        )
+        wrapper: GradientAccumulationWrapper[Any, int] = GradientAccumulationWrapper(
+            pipeline, MagicMock(spec=torch.optim.Optimizer), model, config
+        )
+        model.train()
+        return wrapper, model
+
+    def test_completion_is_reported_only_on_the_boundary_micro(self) -> None:
+        wrapper, _model = self._make()
+        it: Iterator[int] = iter(range(2 * self.K))
+        completed = []
+        for _ in range(2 * self.K):
+            wrapper.progress(it)
+            completed.append(wrapper.optimizer_step_completed)
+        self.assertEqual(
+            [False, False, False, True, False, False, False, True], completed
+        )
+
+    def test_prediction_matches_the_outcome_it_predicts(self) -> None:
+        wrapper, _model = self._make()
+        it: Iterator[int] = iter(range(2 * self.K))
+        for i in range(2 * self.K):
+            predicted = wrapper.will_complete_optimizer_step
+            wrapper.progress(it)
+            self.assertEqual(
+                predicted,
+                wrapper.optimizer_step_completed,
+                f"prediction disagreed with the outcome at micro {i}",
+            )
+
+    def test_uncommitted_gradients_track_the_open_window(self) -> None:
+        wrapper, _model = self._make()
+        it: Iterator[int] = iter(range(self.K))
+        open_after = []
+        for _ in range(self.K):
+            wrapper.progress(it)
+            open_after.append(wrapper.has_uncommitted_gradients)
+        self.assertEqual([True, True, True, False], open_after)
+
+    def test_disabled_ga_reports_every_batch_as_a_completed_step(self) -> None:
+        # num_steps must be 1: __post_init__ auto-enables GA for any K > 1, so a
+        # K > 1 config cannot express the disabled pass-through.
+        wrapper, _model = self._make(k=1, is_enabled=False)
+        it: Iterator[int] = iter(range(3))
+        for _ in range(3):
+            wrapper.progress(it)
+            self.assertTrue(wrapper.optimizer_step_completed)
+
+    def test_eval_never_reports_a_completed_step(self) -> None:
+        wrapper, model = self._make()
+        it: Iterator[int] = iter(range(self.K))
+        for _ in range(self.K - 1):
+            wrapper.progress(it)
+        model.eval()
+        wrapper.progress(it)
+        self.assertFalse(wrapper.optimizer_step_completed)
+
+
+class CountedWindowValidationTest(unittest.TestCase):
+    """A completed window must hold the K in force, counted rather than derived.
+
+    The derived span cannot detect an under-filled window: ``set_step()`` moves the anchor,
+    so the arithmetic closes on schedule while fewer than K micro-batches actually
+    contributed gradients. Severity is graded -- a window that began on a boundary raises,
+    one entered off-residue via ``set_step`` warns, because ``set_step`` off-residue is
+    legitimate public API.
+    """
+
+    K: int = 4
+
+    def _make(self) -> tuple[GradientAccumulationWrapper[Any, int], _MockModel]:
+        model = _MockModel()
+        pipeline = _IteratorDrivenStepPipeline()
+        config = GradientAccumulationConfig(is_enabled=True, num_steps=self.K)
+        wrapper: GradientAccumulationWrapper[Any, int] = GradientAccumulationWrapper(
+            pipeline, MagicMock(spec=torch.optim.Optimizer), model, config
+        )
+        model.train()
+        return wrapper, model
+
+    def test_a_full_window_is_silent(self) -> None:
+        wrapper, _model = self._make()
+        it: Iterator[int] = iter(range(2 * self.K))
+        with self.assertNoLogs(
+            "torchrec.distributed.train_pipeline.gradient_accumulation", level="WARNING"
+        ):
+            for _ in range(2 * self.K):
+                wrapper.progress(it)
+
+    def test_set_step_off_residue_warns_and_names_both_numbers(self) -> None:
+        wrapper, _model = self._make()
+        wrapper.set_step(2)
+        it: Iterator[int] = iter(range(2))
+        with self.assertLogs(
+            "torchrec.distributed.train_pipeline.gradient_accumulation", level="WARNING"
+        ) as logs:
+            wrapper.progress(it)
+            wrapper.progress(it)
+        message = "\n".join(logs.output)
+        self.assertIn("2 micro-batch(es)", message)
+        self.assertIn(f"K={self.K}", message)
+
+    def test_realignment_starts_a_fresh_full_window(self) -> None:
+        """An exhaustion re-anchor resets the count with the anchor, so the window that
+        follows is full and silent -- this is the reset obligation the counter creates.
+        """
+        wrapper, _model = self._make()
+        first: Iterator[int] = iter(range(2))
+        wrapper.progress(first)
+        wrapper.progress(first)
+        with self.assertRaises(StopIteration):
+            wrapper.progress(first)
+        second: Iterator[int] = iter(range(self.K))
+        with self.assertNoLogs(
+            "torchrec.distributed.train_pipeline.gradient_accumulation", level="WARNING"
+        ):
+            for _ in range(self.K):
+                wrapper.progress(second)
+
+    def test_forced_last_batch_partial_window_is_not_held_to_k(self) -> None:
+        wrapper, _model = self._make()
+        it: Iterator[int] = iter(range(2))
+        wrapper.progress(it)
+        with self.assertNoLogs(
+            "torchrec.distributed.train_pipeline.gradient_accumulation", level="WARNING"
+        ):
+            wrapper.progress(it, is_last_batch=True)
+
+    def test_a_missed_anchor_reset_raises(self) -> None:
+        """White-box mutation guard. Every re-anchor path resets the count, so an aligned
+        short window is unreachable through the public API -- it can only be produced by a
+        future re-anchor that forgets the reset, which is exactly what this detects."""
+        wrapper, _model = self._make()
+        it: Iterator[int] = iter(range(2))
+        wrapper.progress(it)
+        wrapper.optimizer_wrapper._window_base -= 2
+        with self.assertRaises(RuntimeError) as caught:
+            wrapper.progress(it)
+        self.assertIn("2 micro-batch(es)", str(caught.exception))
+        self.assertIn(f"K={self.K}", str(caught.exception))
+
+
 class LiveKSingleSourceTest(unittest.TestCase):
     """K in force is wrapper-private state seeded from the config, not a live config read.
 
     Every boundary computation and every diagnostic must agree on one value, so that
-    changing K is one write rather than a hunt through the config reads in this file.
+    changing K is one write rather than a hunt through the config reads in this file. The
+    wrapper also owns its config copy, so a caller holding the object it passed in cannot
+    move a boundary mid-window.
     """
 
     K: int = 4
@@ -2280,3 +2469,234 @@ class LiveKSingleSourceTest(unittest.TestCase):
 
         config.num_steps = 2
         self.assertEqual(self.K, wrapper.num_micro_batches_per_step)
+
+        it: Iterator[int] = iter(range(self.K))
+        completed = []
+        for _ in range(self.K):
+            wrapper.progress(it)
+            completed.append(wrapper.optimizer_step_completed)
+        self.assertEqual([False, False, False, True], completed)
+
+
+class GAFinalPartialWindowVisibilityTest(unittest.TestCase):
+    """A final partial window committed under ``STEP`` really does update the weights,
+    and no caller can observe that it did: the commit happens on the ``StopIteration``
+    path, which re-raises before ``progress()`` can return or set
+    ``optimizer_step_completed``.
+    """
+
+    def _make(
+        self, policy: PartialWindowPolicy
+    ) -> tuple[GradientAccumulationWrapper[Any, torch.Tensor], nn.Linear]:
+        torch.manual_seed(0)
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.1)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        pipeline = _EvalAwareForwardPipeline(model, optimizer)
+        wrapper = GradientAccumulationWrapper(
+            pipeline, optimizer, model, config, partial_window_policy=policy
+        )
+        return wrapper, model
+
+    @staticmethod
+    def _two_training_micros(
+        wrapper: GradientAccumulationWrapper[Any, torch.Tensor], model: nn.Linear
+    ) -> torch.Tensor:
+        batch = torch.randn(4, 10)
+        model.train()
+        wrapper.progress(iter([batch]))
+        wrapper.progress(iter([batch]))
+        return model.weight.detach().clone()
+
+    def test_exhausted_partial_window_under_step_moves_the_weights(self) -> None:
+        wrapper, model = self._make(PartialWindowPolicy.STEP)
+        before = self._two_training_micros(wrapper, model)
+
+        with self.assertRaises(StopIteration):
+            wrapper.progress(iter([]))
+
+        self.assertFalse(
+            torch.equal(before, model.weight.detach()),
+            "the partial final window was not committed",
+        )
+
+    def test_the_committed_partial_window_is_not_reported(self) -> None:
+        wrapper, model = self._make(PartialWindowPolicy.STEP)
+        self._two_training_micros(wrapper, model)
+
+        with self.assertRaises(StopIteration):
+            wrapper.progress(iter([]))
+
+        self.assertFalse(wrapper.optimizer_step_completed)
+
+    def test_exhausted_partial_window_under_discard_leaves_the_weights_alone(
+        self,
+    ) -> None:
+        wrapper, model = self._make(PartialWindowPolicy.DISCARD)
+        before = self._two_training_micros(wrapper, model)
+
+        with self.assertRaises(StopIteration):
+            wrapper.progress(iter([]))
+
+        self.assertTrue(
+            torch.equal(before, model.weight.detach()),
+            "DISCARD took an optimizer step on the partial window",
+        )
+
+    def test_exhaustion_during_eval_does_not_commit_the_open_window(self) -> None:
+        wrapper, model = self._make(PartialWindowPolicy.STEP)
+        before = self._two_training_micros(wrapper, model)
+
+        model.eval()
+        with self.assertRaises(StopIteration):
+            wrapper.progress(iter([]))
+
+        self.assertTrue(
+            torch.equal(before, model.weight.detach()),
+            "an eval exhaustion flushed the open training window",
+        )
+
+
+class SetNumMicroBatchesPerStepTest(unittest.TestCase):
+    """Pins the runtime K setter used by the PT2 warmup K=1 phase.
+
+    The setter must move the boundary and re-anchor the window WITHOUT breaking the
+    monotonic ``current_step`` contract -- that last point is what rejects a
+    ``reset()``-based implementation, which would pass every other assertion here.
+    """
+
+    def _make_wrapper(
+        self, num_steps: int = 4, is_enabled: bool = True
+    ) -> GradientAccumulationWrapper[Any, Any]:
+        model = _MockModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        pipeline = _MockPipeline(num_batches=1000)
+        config = GradientAccumulationConfig(
+            is_enabled=is_enabled, num_steps=num_steps, num_warmup_steps=1
+        )
+        return GradientAccumulationWrapper(pipeline, optimizer, model, config)
+
+    def test_setter_moves_the_boundary_and_reanchors(self) -> None:
+        ga = self._make_wrapper(num_steps=4)
+        ga.set_num_micro_batches_per_step(1)
+
+        self.assertEqual(ga.num_micro_batches_per_step, 1)
+        # Re-anchored: the window restarts here, so nothing is carried into the new K.
+        self.assertEqual(ga.micro_batches_into_window, 0)
+
+    def test_rejects_k_below_one(self) -> None:
+        ga = self._make_wrapper(num_steps=4)
+        with self.assertRaises(ValueError):
+            ga.set_num_micro_batches_per_step(0)
+        with self.assertRaises(ValueError):
+            ga.set_num_micro_batches_per_step(-1)
+        self.assertEqual(ga.num_micro_batches_per_step, 4)
+
+    def test_rejects_when_gradient_accumulation_is_disabled(self) -> None:
+        """A disabled wrapper is a pass-through, so a K stored here is never consulted."""
+        ga = self._make_wrapper(num_steps=1, is_enabled=False)
+        with self.assertRaises(RuntimeError):
+            ga.set_num_micro_batches_per_step(1)
+
+    def test_rejects_with_uncommitted_gradients(self) -> None:
+        """Changing K mid-window would reinterpret gradients taken under the old K."""
+        ga = self._make_wrapper(num_steps=4)
+        ga.progress(iter([1]))  # one micro of a four-micro window
+        self.assertTrue(ga.has_uncommitted_gradients)
+
+        with self.assertRaises(RuntimeError):
+            ga.set_num_micro_batches_per_step(1)
+        self.assertEqual(ga.num_micro_batches_per_step, 4)
+
+    def test_allow_open_window_waives_the_refusal(self) -> None:
+        """The waiver is the ONLY way to change K over a dirty window, and it exists for
+        exactly one caller: the unwind of an already-failed phase. Untested, the unwind
+        path would be the first place it ever ran.
+
+        Waiving DISCARDS the window rather than carrying it: those gradients were taken
+        under the old K (and, for the one caller, the old loss scale), so summing them into
+        the next window would mix two scales in one update. Asserting only that K changed
+        is what let a log line claim a discard the code never performed.
+        """
+        ga = self._make_wrapper(num_steps=4)
+        ga.progress(iter([1]))
+        self.assertTrue(ga.has_uncommitted_gradients)
+        param = next(iter(ga._model.parameters()))
+        param.grad = torch.ones_like(param)
+
+        ga.set_num_micro_batches_per_step(2, allow_open_window=True)
+
+        self.assertEqual(ga.num_micro_batches_per_step, 2)
+        # Abandoned, not merely re-anchored.
+        self.assertFalse(ga.has_uncommitted_gradients)
+        # Re-armed, so the next window start clears instead of early-returning.
+        self.assertTrue(ga.optimizer_wrapper._needs_zero_grad)
+
+        ga.optimizer_wrapper.zero_grad()
+
+        self.assertTrue(
+            param.grad is None
+            or bool(torch.equal(param.grad, torch.zeros_like(param))),
+            "the abandoned window's gradients survived into the next window",
+        )
+
+    def test_every_progress_completes_a_step_at_k_one(self) -> None:
+        ga = self._make_wrapper(num_steps=4)
+        ga.set_num_micro_batches_per_step(1)
+
+        for _ in range(3):
+            ga.progress(iter([1]))
+            self.assertTrue(ga.optimizer_step_completed)
+            self.assertFalse(ga.has_uncommitted_gradients)
+
+    def test_round_trip_closes_the_next_window_holding_exactly_k(self) -> None:
+        """K -> 1 -> K, then a full window, with no _validate_completed_window raise.
+
+        The raise is the failure this guards: a window that began on a boundary must hold
+        K at close, so a re-anchor that got the arithmetic wrong surfaces right here.
+        """
+        ga = self._make_wrapper(num_steps=4)
+        ga.set_num_micro_batches_per_step(1)
+        for _ in range(3):  # a non-multiple of 4, deliberately
+            ga.progress(iter([1]))
+        ga.set_num_micro_batches_per_step(4)
+
+        for i in range(4):
+            ga.progress(iter([1]))
+            expected_step = i == 3
+            self.assertEqual(ga.optimizer_step_completed, expected_step)
+        self.assertFalse(ga.has_uncommitted_gradients)
+
+    def test_current_step_stays_monotonic_across_the_round_trip(self) -> None:
+        """Rejects a reset()-based implementation, which zeroes the counter.
+
+        The K changes happen on CLOSED windows. That is not the test being polite: the
+        setter refuses an open partial window outright (covered above), so a legal round
+        trip is the only round trip there is."""
+        ga = self._make_wrapper(num_steps=4)
+        observed = [ga.current_step]
+
+        for _ in range(4):  # one complete K=4 window, so nothing is left pending
+            ga.progress(iter([1]))
+        observed.append(ga.current_step)
+        self.assertFalse(ga.has_uncommitted_gradients)
+
+        ga.set_num_micro_batches_per_step(1)
+        observed.append(ga.current_step)
+        ga.progress(iter([1]))  # at K=1 this window closes immediately
+        observed.append(ga.current_step)
+        ga.set_num_micro_batches_per_step(4)
+        observed.append(ga.current_step)
+        ga.progress(iter([1]))
+        observed.append(ga.current_step)
+
+        self.assertEqual(
+            observed,
+            sorted(observed),
+            f"current_step went backwards across a K round trip: {observed}",
+        )
+        self.assertEqual(
+            observed[-1], 6, f"micros were lost or double-counted: {observed}"
+        )
