@@ -107,6 +107,49 @@ _DEFAULT_WINDOW_SIZE = 10_000_000
 _DEFAULT_THROUGHPUT_WINDOW_SECONDS = 100
 _DEFAULT_THROUGHPUT_WARMUP_STEPS = 100
 
+# Suffix of the companion `named_tensors` entry carrying a loss key's denominator.
+# `"{loss_key}{LOSS_DENOM_SUFFIX}"` — e.g. `"2:ctr:loss:loss_denom"`. Reserved: producers
+# must not emit an unrelated tensor under this suffix, and consumers that iterate
+# `named_tensors` blindly (e.g. a `named_tensors.update()` merge) must not collide with it.
+LOSS_DENOM_SUFFIX = ":loss_denom"
+
+
+class LossAggregation(StrValueMixin, Enum):
+    """Override for how a `:loss` key combines across the K micro-batches of a step.
+
+    Under gradient accumulation the metrics module sees K separate scalar values for the
+    same loss key. Whether they can be recombined into the value the un-split batch would
+    have produced is a property of the loss module's reduction semantics.
+
+    **The normal path needs no configuration.** The producer self-declares by emitting
+    `named_tensors["{key}" + LOSS_DENOM_SUFFIX]` alongside its loss: a denominator PRESENT
+    means the key is a mergeable ratio, recombined as `sum(l_i * d_i) / sum(d_i)`; ABSENT
+    means the legacy path, byte-identical to pre-existing behaviour. This map exists only
+    for the exceptions that signal cannot express:
+
+    SUM:
+        The emitted value is a raw sum with no denominator; micro-batch values simply add.
+    NON_MERGEABLE:
+        Pin the key to the legacy path even if a denominator is emitted, to defend against
+        a mis-annotated producer. Values are known-approximate at K > 1.
+    MERGEABLE_RATIO:
+        Assert the producer MUST emit a denominator -- a micro-batch without one raises
+        rather than silently falling back to a wrong divisor. The behaviour is automatic;
+        only the assertion is opt-in. No producer declares it, so the assertion is inert
+        and the member is here for a producer that wants to opt in.
+
+    ⚠️ Classify from the loss's SEMANTICS, never from the shape of its final reduction, and
+    key it on the EMITTED loss key: one key carrying several internal terms takes the
+    weakest kind among them. A loss returning `torch.sum(...)` can still be NON_MERGEABLE if
+    it centers per-batch (`z - z.mean(...)`) and divides by `(N-1)` before summing. In
+    practice only ratio-style losses -- a weighted mean over examples -- are mergeable;
+    anything computing a cross-example statistic defaults to NON_MERGEABLE.
+    """
+
+    MERGEABLE_RATIO = "mergeable_ratio"
+    SUM = "sum"
+    NON_MERGEABLE = "non_mergeable"
+
 
 @dataclass
 class RecMetricDef:
@@ -181,6 +224,13 @@ class MetricsConfig:
         enable_pt2_compile (bool): whether to enable PT2 compilation for metrics.
         should_clone_update_inputs (bool): whether to clone the inputs of update(). This
             prevents CUDAGraph error on overwritting tensor outputs by subsequent runs.
+        loss_aggregation (Dict[str, LossAggregation]): OVERRIDE for how an emitted
+            `:loss` key combines across the micro-batches of one optimizer step. The
+            normal path needs no entry: a producer self-declares a mergeable ratio by
+            emitting `"{key}" + LOSS_DENOM_SUFFIX`, and a key with no denominator takes
+            the legacy path. Keyed by the emitted loss key rather than by ``RecTaskInfo``,
+            so auxiliary losses with no owning task are expressible. See
+            ``LossAggregation``.
     """
 
     rec_tasks: List[RecTaskInfo] = field(default_factory=list)
@@ -197,8 +247,28 @@ class MetricsConfig:
     enable_pt2_compile: bool = False
     should_clone_update_inputs: bool = False
     use_cpu_offloaded_rec_metric_module: Optional[bool] = None
+    loss_aggregation: Dict[str, LossAggregation] = field(default_factory=dict)
+    # Number of micro-batches per optimizer step. Drives the metrics module's
+    # micro-batching gate (``RecMetricModule.set_under_micro_batching``) from CONFIG
+    # rather than from having been called, so the published key set is a function of the
+    # job's configuration and not of its history. Defaults to 1, so every pre-existing
+    # config is inert and no MetricsConfig subclass breaks.
+    num_micro_batches_per_step: int = 1
 
     def __post_init__(self) -> None:
+        if self.num_micro_batches_per_step < 1:
+            raise ValueError(
+                "num_micro_batches_per_step must be at least 1, got "
+                f"{self.num_micro_batches_per_step}."
+            )
+        for key, aggregation in self.loss_aggregation.items():
+            # Rejected, not coerced: the consumers select on ``is``, so a look-alike that
+            # merely compares equal is silently ignored rather than applied.
+            if not isinstance(aggregation, LossAggregation):
+                raise ValueError(
+                    f"loss_aggregation[{key!r}] must be a LossAggregation member, got "
+                    f"{aggregation!r} of type {type(aggregation).__name__}."
+                )
         for metric_enum, metric_def in self.rec_metrics.items():
             if metric_def.rec_task_indices:
                 if self.rec_tasks is None:
