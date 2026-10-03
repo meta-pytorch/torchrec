@@ -22,6 +22,7 @@ from hypothesis import given, settings, strategies as st, Verbosity
 from torchrec.distributed.embedding_sharding import bucketize_kjt_before_all2all
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.fused_params import FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import (
@@ -899,6 +900,44 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
         self.assertTrue(fused_params["fused_bounds_check"])
         self.assertTrue(fused_params["enable_triton_tbe_optimizations"])
         self.assertEqual(fused_params["tbe_chunk_size_limit"], 1024**3)
+
+    def test_fs_2d_allgather_param_is_only_forwarded_to_supported_kernels(
+        self,
+    ) -> None:
+        for compute_kernel in (
+            EmbeddingComputeKernel.FUSED,
+            EmbeddingComputeKernel.FUSED_TRITON,
+        ):
+            with self.subTest(compute_kernel=compute_kernel):
+                parameter_sharding = ParameterSharding(
+                    sharding_type=ShardingType.TABLE_WISE.value,
+                    compute_kernel=compute_kernel.value,
+                    ranks=[0],
+                )
+                fused_params = add_params_from_parameter_sharding(
+                    {FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: True},
+                    parameter_sharding,
+                )
+                self.assertIs(
+                    fused_params[FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER],
+                    True,
+                )
+
+        for compute_kernel in (
+            EmbeddingComputeKernel.DENSE,
+            EmbeddingComputeKernel.TRITON_UVM,
+        ):
+            with self.subTest(compute_kernel=compute_kernel):
+                parameter_sharding = ParameterSharding(
+                    sharding_type=ShardingType.TABLE_WISE.value,
+                    compute_kernel=compute_kernel.value,
+                    ranks=[0],
+                )
+                fused_params = add_params_from_parameter_sharding(
+                    {FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: True},
+                    parameter_sharding,
+                )
+                self.assertNotIn(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER, fused_params)
 
 
 class ConvertFusedParamsTest(unittest.TestCase):

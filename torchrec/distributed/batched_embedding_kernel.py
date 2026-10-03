@@ -97,6 +97,8 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.fused_params import (
+    FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER,
+    fused_param_enable_fs_2d_async_allgather,
     get_embedding_table_index_type,
     get_embedding_table_offset_type,
 )
@@ -247,6 +249,37 @@ class ChunkedReduceScatterResizeAwaitable(ReduceScatterResizeAwaitable):
         self._resize_callback()
         self._completed = True
         return self._shard_bufs[0]
+
+
+class AllGatherResizeAwaitable(LazyAwaitable[torch.Tensor]):
+    """Waits for asynchronous all-gathers before restoring full weights."""
+
+    def __init__(
+        self,
+        async_works: List[dist.Work],
+        output_tensors: List[torch.Tensor],
+        result_tensor: torch.Tensor,
+        resize_callback: Callable[[], None],
+    ) -> None:
+        super().__init__()
+        assert async_works
+        assert output_tensors
+        self._async_works = async_works
+        # Output aliases must outlive their in-flight NCCL work.
+        self._output_tensors = output_tensors
+        self._result_tensor = result_tensor
+        self._resize_callback = resize_callback
+        self._completed = False
+
+    def _wait_impl(self) -> torch.Tensor:
+        if self._completed:
+            return self._result_tensor
+
+        for async_work in self._async_works:
+            async_work.wait()
+        self._resize_callback()
+        self._completed = True
+        return self._result_tensor
 
 
 def _decode_res_enabled_tables(encoded: Optional[str]) -> Optional[List[str]]:
@@ -2722,11 +2755,14 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
 
         weights_precision = data_type_to_sparse_type(config.data_type)
 
+        enable_res, res_params = _populate_res_params(config)
         fused_params = config.fused_params or {}
+        if FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER in fused_params:
+            fused_params = dict(fused_params)
+            fused_params.pop(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER)
         if "cache_precision" not in fused_params:
             fused_params["cache_precision"] = weights_precision
 
-        enable_res, res_params = _populate_res_params(config)
         fused_params[ENABLE_RAW_EMBEDDING_STREAMING_STR] = enable_res
         logger.info(
             f"BatchedFusedEmbedding: uvm_host_mapped={fused_params.get('uvm_host_mapped', False)}"
@@ -3906,7 +3942,11 @@ class BatchedFusedEmbeddingBag(
         sharding_type: Optional[ShardingType] = None,
         env: Optional[ShardingEnv] = None,
     ) -> None:
+        enable_fs_2d_async_allgather = fused_param_enable_fs_2d_async_allgather(
+            config.fused_params
+        )
         super().__init__(config, pg, device, sharding_type)
+        self._enable_fs_2d_async_allgather = enable_fs_2d_async_allgather
 
         managed: List[EmbeddingLocation] = []
         compute_devices: List[ComputeDevice] = []
@@ -3927,13 +3967,16 @@ class BatchedFusedEmbeddingBag(
                 managed.append(EmbeddingLocation.HOST)
 
         weights_precision = data_type_to_sparse_type(config.data_type)
+        enable_res, res_params = _populate_res_params(config)
         fused_params = config.fused_params or {}
+        if FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER in fused_params:
+            fused_params = dict(fused_params)
+            fused_params.pop(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER)
         if "cache_precision" not in fused_params:
             fused_params["cache_precision"] = weights_precision
             if weights_precision == SparseType.NFP8:
                 fused_params["cache_precision"] = SparseType.FP16
 
-        enable_res, res_params = _populate_res_params(config)
         fused_params[ENABLE_RAW_EMBEDDING_STREAMING_STR] = enable_res
         logger.info(
             f"BatchedFusedEmbeddingBag: uvm_host_mapped={fused_params.get('uvm_host_mapped', False)}"
@@ -4782,6 +4825,9 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
         _assert_local_cols_divisible_by_4(config)
         weights_precision = data_type_to_sparse_type(config.data_type)
         fused_params = config.fused_params or {}
+        self._enable_fs_2d_async_allgather = fused_param_enable_fs_2d_async_allgather(
+            fused_params
+        )
         optimizer = fused_params.get("optimizer", OptimType.EXACT_SGD)
         learning_rate = fused_params.get("learning_rate", 0.01)
         eps = fused_params.get("eps", 0.1)
@@ -4875,6 +4921,7 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
         self._shard_buf_nbytes: List[int] = [0 for _ in weight_chunk_sizes]
         self._async_stream = torch.cuda.Stream(device=device)
         self._rs_awaitable: Optional[ChunkedReduceScatterResizeAwaitable] = None
+        self._ag_awaitable: Optional[AllGatherResizeAwaitable] = None
         self._training_forward_outstanding = False
         self.register_full_backward_pre_hook(
             # pyrefly: ignore [bad-argument-type]
@@ -4888,6 +4935,15 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
     @property
     def weight_chunks(self) -> Tuple[torch.Tensor, ...]:
         return self._full_weight_chunks
+
+    @property
+    def enable_fs_2d_async_allgather(self) -> bool:
+        return self._enable_fs_2d_async_allgather
+
+    def initiate_all_gather(self) -> None:
+        if not self._enable_fs_2d_async_allgather:
+            raise RuntimeError("Asynchronous all-gather is not enabled")
+        self._all_gather_table_weights()
 
     def get_sync_weight_tensors(self) -> List[torch.Tensor]:
         return list(self._full_weight_chunks)
@@ -4966,6 +5022,7 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
 
     def split_embedding_weights(self) -> List[torch.Tensor]:
         self._all_gather_table_weights()
+        self._wait_for_all_gather()
         return cast(List[torch.Tensor], self._table_weight_wrappers)
 
     def named_split_embedding_weights(
@@ -5101,6 +5158,9 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
     def _all_gather_table_weights(self) -> None:
         if not self.weights_sharded:
             return
+        if self._enable_fs_2d_async_allgather:
+            self._start_all_gather_async()
+            return
         self.ensure_reduce_scatter_complete()
         num_groups = self._env.num_sharding_groups()
         with torch.no_grad():
@@ -5139,12 +5199,87 @@ class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBa
                     shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
+    def _start_all_gather_async(self) -> None:
+        if self._ag_awaitable is not None:
+            return
+
+        self.ensure_reduce_scatter_complete()
+        num_groups = self._env.num_sharding_groups()
+        async_works: List[dist.Work] = []
+        output_aliases: List[torch.Tensor] = []
+        shard_bufs: List[torch.Tensor] = []
+        with torch.no_grad():
+            for chunk_index, (full_chunk, shard_buf) in enumerate(
+                zip(self._full_weight_chunks, self._shard_bufs)
+            ):
+                assert shard_buf is not None
+                padded_total_size = shard_buf.numel() * num_groups
+                full_chunk.untyped_storage().resize_(
+                    padded_total_size * self._element_size
+                )
+                output_alias = torch.empty(
+                    0,
+                    dtype=full_chunk.dtype,
+                    device=full_chunk.device,
+                )
+                output_alias.set_(
+                    full_chunk.untyped_storage(),
+                    0,
+                    (padded_total_size,),
+                    (1,),
+                )
+                with record_function(
+                    "## 2d_allgather_fully_sharded_chunk ##",
+                    f"chunk={chunk_index}, logical={full_chunk.numel()}, padded={padded_total_size}",
+                ):
+                    async_work = dist.all_gather_into_tensor(
+                        output_tensor=output_alias,
+                        input_tensor=shard_buf,
+                        group=self._env.replica_pg,
+                        async_op=True,
+                    )
+                assert async_work is not None
+                async_works.append(async_work)
+                output_aliases.append(output_alias)
+                shard_bufs.append(shard_buf)
+
+        full_weight_chunks = self._full_weight_chunks
+
+        def resize_callback() -> None:
+            for full_chunk, shard_buf in zip(full_weight_chunks, shard_bufs):
+                full_chunk.untyped_storage().resize_(
+                    full_chunk.numel() * self._element_size
+                )
+                shard_buf.untyped_storage().resize_(0)
+            self.weights_sharded = False
+
+        self._ag_awaitable = AllGatherResizeAwaitable(
+            async_works=async_works,
+            output_tensors=output_aliases,
+            result_tensor=full_weight_chunks[0],
+            resize_callback=resize_callback,
+        )
+
+    def _wait_for_all_gather(self) -> None:
+        if self._ag_awaitable is None:
+            if self.weights_sharded:
+                raise RuntimeError(
+                    "Asynchronous all-gather was not initiated before TBE backward"
+                )
+            return
+        with record_function("## wait_fs_2d_allgather ##"):
+            self._ag_awaitable.wait()
+        self._ag_awaitable = None
+
     def _chunked_sharded_backward_hook(
         self,
         module: nn.Module,
         grad_input: List[torch.Tensor],
     ) -> None:
-        self._all_gather_table_weights()
+        if not self._enable_fs_2d_async_allgather:
+            self._all_gather_table_weights()
+        else:
+            self._wait_for_all_gather()
 
     def _chunked_sharded_backward_complete_hook(
         self,
@@ -5209,23 +5344,36 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._async_work: Optional[dist.Work] = None
         self._async_event: Optional[torch.cuda.Event] = None
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
+        self._ag_awaitable: Optional[AllGatherResizeAwaitable] = None
 
         self.register_full_backward_pre_hook(
             # pyrefly: ignore [bad-argument-type]
             self._hybird_sharded_backward_hook,
         )
 
+    @property
+    def enable_fs_2d_async_allgather(self) -> bool:
+        return self._enable_fs_2d_async_allgather
+
+    def initiate_all_gather(self) -> None:
+        if not self._enable_fs_2d_async_allgather:
+            raise RuntimeError("Asynchronous all-gather is not enabled")
+        self._all_gather_table_weights()
+
     def _all_gather_table_weights(self) -> None:
         """
         All-gather embedding weights from sharded state back to full weights.
 
         Collective Communication:
-            - all_gather_into_tensor on replica_pg (synchronous)
+            - all_gather_into_tensor on replica_pg
 
         This is called during the backward pass (via backward hook) to restore
         full embedding weights before gradient computation.
         """
         if not self.weights_sharded:
+            return
+        if self._enable_fs_2d_async_allgather:
+            self._start_all_gather_async()
             return
         self.ensure_reduce_scatter_complete()
 
@@ -5268,10 +5416,71 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
+    def _start_all_gather_async(self) -> None:
+        if self._ag_awaitable is not None:
+            return
+
+        self.ensure_reduce_scatter_complete()
+        shard_buf = none_throws(self._shard_buf)
+        padded_total_size = shard_buf.numel() * self._env.num_sharding_groups()
+        self._unsharded_param.untyped_storage().resize_(
+            padded_total_size * self._element_size
+        )
+        output_tensor = self._unsharded_param
+        if padded_total_size != self._unsharded_param.numel():
+            output_tensor = torch.empty(
+                0,
+                dtype=self._unsharded_param.dtype,
+                device=self._unsharded_param.device,
+            )
+            # pyrefly: ignore [no-matching-overload]
+            output_tensor.set_(
+                self._unsharded_param.untyped_storage(),
+                0,
+                (padded_total_size,),
+            )
+
+        with record_function("## 2d_allgather_fully_sharded ##"):
+            async_work = dist.all_gather_into_tensor(
+                output_tensor=output_tensor,
+                input_tensor=shard_buf,
+                group=self._env.replica_pg,
+                async_op=True,
+            )
+        assert async_work is not None
+
+        def resize_callback() -> None:
+            self._emb_module.weights_dev = self._unsharded_param[
+                : self._original_shape.numel()
+            ]
+            shard_buf.untyped_storage().resize_(0)
+            self.weights_sharded = False
+
+        self._ag_awaitable = AllGatherResizeAwaitable(
+            async_works=[async_work],
+            output_tensors=[output_tensor],
+            result_tensor=self._unsharded_param,
+            resize_callback=resize_callback,
+        )
+
+    def _wait_for_all_gather(self) -> None:
+        if self._ag_awaitable is None:
+            if self.weights_sharded:
+                raise RuntimeError(
+                    "Asynchronous all-gather was not initiated before TBE backward"
+                )
+            return
+        with record_function("## wait_fs_2d_allgather ##"):
+            self._ag_awaitable.wait()
+        self._ag_awaitable = None
+
     def _hybird_sharded_backward_hook(
         self, module: nn.Module, grad_input: List[torch.Tensor]
     ) -> None:
-        self._all_gather_table_weights()
+        if not self._enable_fs_2d_async_allgather:
+            self._all_gather_table_weights()
+        else:
+            self._wait_for_all_gather()
 
     def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
         """
