@@ -272,6 +272,8 @@ def convert_optimizer_type_and_kwargs(
         return (EmbOptimType.EXACT_ROWWISE_ADAGRAD, optimizer_kwargs)
     elif optimizer_type == torch.optim.Adam:
         return (EmbOptimType.ADAM, optimizer_kwargs)
+    elif optimizer_type == trec_optim.FTRL and hasattr(EmbOptimType, "FTRL"):
+        return (EmbOptimType.FTRL, optimizer_kwargs)
 
     return None
 
