@@ -332,20 +332,22 @@ def _propagate_ems_stash_selection(
     ``MemoryStashingManager.resolve_stash_weights``), silently measuring something
     other than the plan. Trainer integrations do the equivalent after planning.
 
-    ``_stashed_tables`` is populated on rank 0 only -- ``collective_plan`` solves
+    ``selected_stashed_tables()`` is populated on rank 0 only -- ``collective_plan`` solves
     there and broadcasts the plan -- so the subset is broadcast over the same pg.
     Only the budget path sets it; the no-budget default leaves it None and the
     runtime falls back to the per-table flag, which is the intended behavior there.
     """
-    if getattr(planner, "_ems_stash_hbm_budget_gb", None) is None:
+    if getattr(planner, "ems_stash_hbm_budget_gb", None) is None:
         # No budget (or a planner without the knob at all): nothing was selected, so
         # the runtime uses the per-table flag. Reset and skip the broadcast -- the
         # gate is the planner's config, which is identical on every rank, rather than
-        # _stashed_tables, which only rank 0 populates and so cannot gate a collective.
+        # the selection, which only rank 0 populates and so cannot gate a collective.
         MemoryStashingManager.set_stashed_tables(None)
         return
 
-    stashed_tables: Optional[Set[str]] = getattr(planner, "_stashed_tables", None)
+    getter = getattr(planner, "selected_stashed_tables", None)
+    selected = getter() if callable(getter) else None
+    stashed_tables: Optional[Set[str]] = selected if isinstance(selected, set) else None
     if pg is not None and dist.get_world_size(pg) > 1:
         broadcast_list: List[Optional[Set[str]]] = [stashed_tables]
         dist.broadcast_object_list(broadcast_list, src=0, group=pg)
