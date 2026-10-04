@@ -343,8 +343,8 @@ class EmbeddingCollectionContext(Multistreamable):
     seq_vbe_ctx: List[SequenceVBEContext] = field(default_factory=list)
     table_name_to_unpruned_hash_sizes: Dict[str, int] = field(default_factory=dict)
     early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
-    # Set per batch by a pipeline to defer the DP lookup until output consumption.
-    # Left False by `ShardedModule.forward`, so eager use never defers.
+    # A pipeline sets this per batch to defer DP lookup until output consumption.
+    # `ShardedModule.forward` leaves it false, so eager execution never defers.
     defer_dp_lookup: bool = False
 
     def record_stream(self, stream: torch.Stream) -> None:

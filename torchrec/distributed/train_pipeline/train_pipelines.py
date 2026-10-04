@@ -126,6 +126,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _wait_for_events,
     AsyncInplaceCopyMixin,
     DataLoadingThread,
+    is_deferred_dp_supported,
     prefetch_embeddings,
     use_context_for_postprocs,
 )
@@ -1538,10 +1539,12 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             ``optimizer.step()``. On the current stream the top-of-``progress()``
             position lands after the previous optimizer step and buys nothing.
 
-            Only correct for tables updated in the fused backward. Tables owned
-            by the dense optimizer (``DATA_PARALLEL`` shards, and any table on a
-            non-fused compute kernel) are read one iteration stale -- silently,
-            since this trains and converges. Check the sharding plan first.
+            Safe only for tables updated by backward-fused optimizers. Tables
+            updated by the dense optimizer, such as ``DATA_PARALLEL`` shards,
+            would otherwise read weights one iteration stale.
+        defer_dp_lookup (bool): holds each sharded embedding collection's
+            data-parallel lookup until the swapped runtime forward consumes the
+            embedding result. This is independent of lookup placement.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -1567,6 +1570,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
         embedding_lookup_before_optimizer: bool = False,
+        defer_dp_lookup: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1588,6 +1592,9 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             embedding_lookup_before_optimizer,
         )
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
+
+        self._defer_dp_lookup = defer_dp_lookup
+        self._deferred_dp_module_context_names: Optional[List[str]] = None
 
         if emb_lookup_stream == "new":
             self._emb_lookup_stream: Optional[torch.Stream] = (
@@ -1642,6 +1649,23 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         current_stream = torch.get_device_module(self._device).current_stream()
         current_stream.wait_stream(self._emb_lookup_stream)
 
+    def _mark_dp_lookups_deferred(self, context: EmbeddingTrainPipelineContext) -> None:
+        """Marks supported module contexts for deferred DP lookup.
+
+        The pipeline caches supported context names after the first batch.
+        """
+        if self._deferred_dp_module_context_names is None:
+            self._deferred_dp_module_context_names = [
+                name
+                for name, module_context in context.module_contexts.items()
+                if is_deferred_dp_supported(module_context)
+            ]
+
+        for name in self._deferred_dp_module_context_names:
+            module_context = context.module_contexts[name]
+            assert is_deferred_dp_supported(module_context)
+            module_context.defer_dp_lookup = True
+
     def start_embedding_lookup(
         self,
         batch: Optional[In],
@@ -1649,9 +1673,14 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
     ) -> None:
         """
         Waits for batch to finish getting copied to GPU, then starts the input dist. This Event based vesrion.
+
+        Defers supported data-parallel lookups until runtime forward when enabled.
         """
         if batch is None:
             return
+
+        if self._defer_dp_lookup:
+            self._mark_dp_lookups_deferred(context)
 
         with record_function(f"## start_embedding_lookup {context.index} ##"):
             current_stream = torch.get_device_module(self._device).current_stream()
