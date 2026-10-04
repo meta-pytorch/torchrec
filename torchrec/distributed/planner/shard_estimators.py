@@ -30,6 +30,7 @@ from torchrec.distributed.planner.estimator.estimator import (
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Perf,
+    Shard,
     SharderData,
     SharderDataMap,
     ShardEstimator,
@@ -270,8 +271,37 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     f"sharding_type='{sharding_option.sharding_type}', "
                     f"compute_kernel='{sharding_option.compute_kernel}'"
                 ) from e
-            for shard, storage in zip(sharding_option.shards, shard_storages):
+            cache_weight_sizes = [0] * len(sharding_option.shards)
+            if (
+                sharding_option.compute_kernel
+                == EmbeddingComputeKernel.FUSED_UVM_CACHING.value
+                and not sharding_option.enforce_hbm
+            ):
+                tensor_storage = compute_storage_usage(
+                    sharding_option.tensor,
+                    self._topology.compute_device,
+                    sharding_option.compute_kernel,
+                    sharder_data.storage_usage_type,
+                )
+                cached_storage = round(
+                    tensor_storage.get("ddr", 0)
+                    * (caching_ratio if caching_ratio else UVM_CACHING_RATIO)
+                )
+                cache_weight_sizes = _calculate_tensor_sizes(
+                    storage=cached_storage,
+                    shape=sharding_option.tensor.shape,
+                    shard_sizes=[shard.size for shard in sharding_option.shards],
+                    sharding_type=sharding_option.sharding_type,
+                )
+
+            for shard, storage, cache_weight_size in zip(
+                sharding_option.shards,
+                shard_storages,
+                cache_weight_sizes,
+            ):
                 shard.storage = storage
+                shard.cache_weight_bytes = cache_weight_size
+                shard.cache_dimension_padding_bytes = 0
 
 
 def calculate_pipeline_io_cost(

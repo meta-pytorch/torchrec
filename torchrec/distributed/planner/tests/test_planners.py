@@ -82,6 +82,16 @@ class TWSharder(EmbeddingBagCollectionSharder):
         return [EmbeddingComputeKernel.FUSED.value]
 
 
+class TWUVMCachingSharder(EmbeddingBagCollectionSharder):
+    def sharding_types(self, compute_device_type: str) -> List[str]:
+        return [ShardingType.TABLE_WISE.value]
+
+    def compute_kernels(
+        self, sharding_type: str, compute_device_type: str
+    ) -> List[str]:
+        return [EmbeddingComputeKernel.FUSED_UVM_CACHING.value]
+
+
 class TestEmbeddingShardingPlanner(unittest.TestCase):
     def setUp(self) -> None:
         compute_device = "cuda"
@@ -1770,6 +1780,214 @@ class TestStorageEstimation(unittest.TestCase):
                             f"{so_default.name} ({so_default.compute_kernel}, "
                             f"{so_default.sharding_type})",
                         )
+
+    def test_uvm_cache_accounts_for_dominant_dimension_padding(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=8,
+                name="table_small",
+                feature_names=["feature_small"],
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=160,
+                name="table_large",
+                feature_names=["feature_large"],
+            ),
+        ]
+        constraints = {
+            table.name: ParameterConstraints(
+                sharding_types=[ShardingType.TABLE_WISE.value],
+                compute_kernels=[EmbeddingComputeKernel.FUSED_UVM_CACHING.value],
+                cache_params=CacheParams(load_factor=0.5),
+            )
+            for table in tables
+        }
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        sharder = TWUVMCachingSharder(fused_params={"cache_load_factor": 0.5})
+        topology = Topology(
+            world_size=1,
+            hbm_cap=1024**3,
+            ddr_cap=1024**3,
+            compute_device="cuda",
+        )
+        planner = EmbeddingShardingPlanner(
+            topology=topology,
+            constraints=constraints,
+            storage_reservation=FixedAbsoluteStorageReservation(0),
+        )
+
+        planner.plan(
+            module=model,
+            sharders=[cast(ModuleSharder[torch.nn.Module], sharder)],
+        )
+        selected_options = {
+            option.name: option for option in planner.get_selected_options()
+        }
+        small_shard = selected_options["table_small"].shards[0]
+        large_shard = selected_options["table_large"].shards[0]
+
+        expected_small_padding = small_shard.cache_weight_bytes * (160 // 8 - 1)
+        self.assertEqual(
+            expected_small_padding,
+            small_shard.cache_dimension_padding_bytes,
+        )
+        self.assertEqual(0, large_shard.cache_dimension_padding_bytes)
+
+        padded_hbm = sum(
+            shard.storage.hbm
+            for option in selected_options.values()
+            for shard in option.shards
+            if shard.storage is not None
+        )
+        unpadded_hbm = padded_hbm - expected_small_padding
+        self.assertGreater(padded_hbm, unpadded_hbm)
+
+        constrained_planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=1,
+                hbm_cap=padded_hbm - 1,
+                ddr_cap=1024**3,
+                compute_device="cuda",
+            ),
+            constraints=constraints,
+            storage_reservation=FixedAbsoluteStorageReservation(0),
+        )
+        with self.assertRaisesRegex(
+            PlannerError,
+            r"UVM cache dimension padding causes per-rank HBM to exceed capacity: "
+            r"rank \d+: required \d+ bytes after UVM cache dimension padding, "
+            r"available \d+ bytes",
+        ):
+            constrained_planner.plan(
+                module=model,
+                sharders=[cast(ModuleSharder[torch.nn.Module], sharder)],
+            )
+
+    def test_table_prefetch_true_overrides_global_prefetch_for_grouping(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=8,
+                name="table_small",
+                feature_names=["feature_small"],
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=160,
+                name="table_large",
+                feature_names=["feature_large"],
+            ),
+        ]
+        constraints = {
+            table.name: ParameterConstraints(
+                sharding_types=[ShardingType.TABLE_WISE.value],
+                compute_kernels=[EmbeddingComputeKernel.FUSED_UVM_CACHING.value],
+                cache_params=CacheParams(
+                    load_factor=0.5,
+                    prefetch_pipeline=True,
+                ),
+            )
+            for table in tables
+        }
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=1,
+                hbm_cap=1024**3,
+                ddr_cap=1024**3,
+                compute_device="cuda",
+            ),
+            constraints=constraints,
+            storage_reservation=FixedAbsoluteStorageReservation(0),
+        )
+        sharder = TWUVMCachingSharder(
+            fused_params={
+                "cache_load_factor": 0.5,
+                "prefetch_pipeline": False,
+            }
+        )
+
+        planner.plan(
+            module=model,
+            sharders=[cast(ModuleSharder[torch.nn.Module], sharder)],
+        )
+
+        self.assertTrue(
+            all(
+                shard.cache_dimension_padding_bytes == 0
+                for option in planner.get_selected_options()
+                for shard in option.shards
+            )
+        )
+
+    def test_table_prefetch_false_overrides_global_prefetch_for_padding(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=8,
+                name="table_small",
+                feature_names=["feature_small"],
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=160,
+                name="table_large",
+                feature_names=["feature_large"],
+            ),
+        ]
+        constraints = {
+            table.name: ParameterConstraints(
+                sharding_types=[ShardingType.TABLE_WISE.value],
+                compute_kernels=[EmbeddingComputeKernel.FUSED_UVM_CACHING.value],
+                cache_params=CacheParams(
+                    load_factor=0.5,
+                    prefetch_pipeline=False,
+                ),
+            )
+            for table in tables
+        }
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=1,
+                hbm_cap=1024**3,
+                ddr_cap=1024**3,
+                compute_device="cuda",
+            ),
+            constraints=constraints,
+            storage_reservation=FixedAbsoluteStorageReservation(0),
+        )
+        sharder = TWUVMCachingSharder(
+            fused_params={
+                "cache_load_factor": 0.5,
+                "prefetch_pipeline": True,
+            }
+        )
+
+        planner.plan(
+            module=model,
+            sharders=[cast(ModuleSharder[torch.nn.Module], sharder)],
+        )
+
+        selected_options = {
+            option.name: option for option in planner.get_selected_options()
+        }
+        small_option = selected_options["table_small"]
+        small_shard = small_option.shards[0]
+        large_shard = selected_options["table_large"].shards[0]
+        expected_small_padding = small_shard.cache_weight_bytes * (160 // 8 - 1)
+
+        self.assertEqual(
+            False,
+            none_throws(small_option.cache_params).prefetch_pipeline,
+        )
+        self.assertEqual(
+            expected_small_padding,
+            small_shard.cache_dimension_padding_bytes,
+        )
+        self.assertEqual(0, large_shard.cache_dimension_padding_bytes)
 
 
 class TestValidateModulesInclusionInShardingPlan(unittest.TestCase):
