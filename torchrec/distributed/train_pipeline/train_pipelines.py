@@ -12,6 +12,7 @@ import contextlib
 import logging
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum, unique
 from typing import (
     Any,
     Callable,
@@ -1457,6 +1458,38 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         return output
 
 
+@unique
+class EmbeddingLookupPhase(Enum):
+    PROGRESS_START = "progress_start"
+    AFTER_DATA_DIST = "after_data_dist"
+    BEFORE_OPTIMIZER = "before_optimizer"
+
+
+def _resolve_embedding_lookup_phase(
+    embedding_lookup_after_data_dist: bool,
+    embedding_lookup_before_optimizer: bool,
+) -> EmbeddingLookupPhase:
+    """Resolves the embedding lookup placement for the fused SDD pipeline."""
+    match (
+        embedding_lookup_after_data_dist,
+        embedding_lookup_before_optimizer,
+    ):
+        case True, True:
+            raise ValueError(
+                "embedding_lookup_after_data_dist and "
+                "embedding_lookup_before_optimizer are alternative placements "
+                "for the same lookup; set at most one."
+            )
+        case True, False:
+            return EmbeddingLookupPhase.AFTER_DATA_DIST
+        case False, True:
+            return EmbeddingLookupPhase.BEFORE_OPTIMIZER
+        case False, False:
+            return EmbeddingLookupPhase.PROGRESS_START
+        case _:
+            raise AssertionError("unreachable embedding lookup placement")
+
+
 class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
     """
     This pipeline modifies TrainPipelineSparseDist by running embedding lookup in a
@@ -1495,6 +1528,20 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         TODO: pipeline_postproc, custom_model_fwd, strict
         use_emb_lookuo_stream (bool): if true invoke the compute_and_output_dist
             (for batch i+1) using a new stream, else re-using the data_dist stream
+        embedding_lookup_before_optimizer (bool): if true, issue batch i+1's
+            embedding lookup between the backward and the dense optimizer step,
+            instead of batch i's at the top of ``progress()``. The lookup for
+            batch 0 is primed in ``fill_pipeline``. Use with
+            ``emb_lookup_stream="current"``: the lookup then serializes on the
+            default stream as before, but its ``output_dist`` all-to-all escapes
+            onto ProcessGroupNCCL's internal stream where it overlaps
+            ``optimizer.step()``. On the current stream the top-of-``progress()``
+            position lands after the previous optimizer step and buys nothing.
+
+            Only correct for tables updated in the fused backward. Tables owned
+            by the dense optimizer (``DATA_PARALLEL`` shards, and any table on a
+            non-fused compute kernel) are read one iteration stale -- silently,
+            since this trains and converges. Check the sharding plan first.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -1519,6 +1566,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         enqueue_batch_after_forward: bool = False,
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
+        embedding_lookup_before_optimizer: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1533,6 +1581,11 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             free_features_storage_early=free_features_storage_early,
             clear_data_dist_inputs=clear_data_dist_inputs,
+        )
+
+        self._embedding_lookup_phase = _resolve_embedding_lookup_phase(
+            embedding_lookup_after_data_dist,
+            embedding_lookup_before_optimizer,
         )
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
 
@@ -1552,6 +1605,35 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             self._emb_lookup_stream = self._data_dist_stream
         else:
             raise RuntimeError(f"Unknown emb_lookup_stream {emb_lookup_stream}")
+
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
+        super().fill_pipeline(dataloader_iter)
+        if (
+            self._embedding_lookup_phase is EmbeddingLookupPhase.BEFORE_OPTIMIZER
+            and self.batches
+        ):
+            # Every other batch's lookup is issued by the previous progress() call,
+            # just before its optimizer step. Batch 0 has no previous call, and
+            # InSyncEmbeddingPipelinedForward raises on an empty
+            # embedding_a2a_requests.
+            context = cast(EmbeddingTrainPipelineContext, self.contexts[0])
+            if not context.embedding_a2a_requests:
+                # pyrefly: ignore [bad-argument-type]
+                self.start_embedding_lookup(self.batches[0], context)
+
+    def _maybe_start_embedding_lookup_at(
+        self,
+        phase: EmbeddingLookupPhase,
+    ) -> None:
+        if self._embedding_lookup_phase is not phase:
+            return
+
+        batch_index = 1 if phase is EmbeddingLookupPhase.BEFORE_OPTIMIZER else 0
+        if len(self.batches) <= batch_index:
+            return
+
+        context = cast(EmbeddingTrainPipelineContext, self.contexts[batch_index])
+        self.start_embedding_lookup(self.batches[batch_index], context)
 
     def wait_embedding_lookup(self) -> None:
         """
@@ -1614,9 +1696,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         self._set_module_context(self.contexts[0])
 
         # start embedding_lookup so it can overlap with previous optimizer
-        if not self._embedding_lookup_after_data_dist:
-            # pyrefly: ignore [bad-argument-type]
-            self.start_embedding_lookup(self.batches[0], self.contexts[0])
+        self._maybe_start_embedding_lookup_at(EmbeddingLookupPhase.PROGRESS_START)
 
         if self._model.training:
             with record_function("## zero_grad ##"):
@@ -1638,9 +1718,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             # first exhaust here.
             self.enqueue_batch(dataloader_iter)
 
-        if self._embedding_lookup_after_data_dist:
-            # pyrefly: ignore [bad-argument-type]
-            self.start_embedding_lookup(self.batches[0], self.contexts[0])
+        self._maybe_start_embedding_lookup_at(EmbeddingLookupPhase.AFTER_DATA_DIST)
 
         # forward
         with record_function(f"## forward {self.contexts[0].index} ##"):
@@ -1662,6 +1740,9 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             # backward
             self._backward(losses)
 
+        self._maybe_start_embedding_lookup_at(EmbeddingLookupPhase.BEFORE_OPTIMIZER)
+
+        if self._model.training:
             # update
             with record_function("## optimizer ##"):
                 self._optimizer.step()
@@ -3055,8 +3136,10 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
         if self._model.training:
             # backward
             ctx = self.get_compiled_autograd_ctx()
-            with ctx, torchrec_use_sync_collectives(), record_function(
-                "## backward ##"
+            with (
+                ctx,
+                torchrec_use_sync_collectives(),
+                record_function("## backward ##"),
             ):
                 torch.sum(losses, dim=0).backward()
 
