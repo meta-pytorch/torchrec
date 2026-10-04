@@ -5,6 +5,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 # pyre-strict
 
 import unittest
@@ -14,7 +16,21 @@ from unittest.mock import MagicMock, patch
 import torch
 from hypothesis import given, settings, strategies as st
 from torch.optim import Optimizer
+from torchrec.distributed.embedding import (
+    EmbeddingCollectionContext,
+    EmbeddingCollectionSharder,
+    ShardedEmbeddingCollection,
+)
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embeddingbag import (
+    EmbeddingBagCollectionContext,
+    EmbeddingBagCollectionSharder,
+    ShardedEmbeddingBagCollection,
+)
+from torchrec.distributed.sharding_plan import (
+    construct_module_sharding_plan,
+    data_parallel,
+)
 from torchrec.distributed.test_utils.test_sharding import copy_state_dict
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -25,14 +41,143 @@ from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import 
 from torchrec.distributed.train_pipeline.train_pipelines import (
     TrainPipelineFusedSparseDist,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 _FUSED_PARAMS: dict[str, bool] = {"stochastic_rounding": False}
 _NUM_BATCHES = 12
 _BATCH_SIZE = 32
+_DATA_PARALLEL_FEATURE = "data_parallel_feature"
+
+
+class _DPShardedEmbeddingTrainModel(torch.nn.Module):
+    def __init__(
+        self,
+        sequence: ShardedEmbeddingCollection,
+        pooled: ShardedEmbeddingBagCollection,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        self.sequence = sequence
+        self.pooled = pooled
+        self.dense_weight = torch.nn.Parameter(torch.ones(4, device=device))
+
+    def forward(self, features: KeyedJaggedTensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sequence_embeddings = self.sequence(features)[_DATA_PARALLEL_FEATURE].values()
+        pooled_embeddings = self.pooled(features)[_DATA_PARALLEL_FEATURE]
+        prediction = torch.sum(
+            (sequence_embeddings + pooled_embeddings) * self.dense_weight
+        )
+        return prediction.square(), prediction
 
 
 class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
+    def _create_dp_sharded_ec(self) -> ShardedEmbeddingCollection:
+        module = EmbeddingCollection(
+            tables=[
+                EmbeddingConfig(
+                    name="data_parallel_table",
+                    embedding_dim=4,
+                    num_embeddings=8,
+                    feature_names=[_DATA_PARALLEL_FEATURE],
+                )
+            ],
+            device=self.device,
+        )
+        sharder = EmbeddingCollectionSharder()
+        plan = construct_module_sharding_plan(
+            module,
+            per_param_sharding={"data_parallel_table": data_parallel()},
+            local_size=1,
+            world_size=1,
+            device_type=self.device.type,
+            sharder=cast(ModuleSharder[torch.nn.Module], sharder),
+        )
+        return sharder.shard(
+            module=module,
+            params=plan,
+            env=ShardingEnv.from_process_group(self.pg),
+            device=self.device,
+        )
+
+    def _create_dp_sharded_ebc(self) -> ShardedEmbeddingBagCollection:
+        module = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name="data_parallel_table",
+                    embedding_dim=4,
+                    num_embeddings=8,
+                    feature_names=[_DATA_PARALLEL_FEATURE],
+                )
+            ],
+            device=self.device,
+        )
+        sharder = EmbeddingBagCollectionSharder()
+        plan = construct_module_sharding_plan(
+            module,
+            per_param_sharding={"data_parallel_table": data_parallel()},
+            local_size=1,
+            world_size=1,
+            device_type=self.device.type,
+            sharder=cast(ModuleSharder[torch.nn.Module], sharder),
+        )
+        return sharder.shard(
+            module=module,
+            params=plan,
+            env=ShardingEnv.from_process_group(self.pg),
+            device=self.device,
+        )
+
+    def _run_deferred_dp_lookup_parity(
+        self,
+        reference_model: _DPShardedEmbeddingTrainModel,
+        pipeline_model: _DPShardedEmbeddingTrainModel,
+    ) -> TrainPipelineFusedSparseDist[KeyedJaggedTensor, torch.Tensor]:
+        copy_state_dict(reference_model.state_dict(), pipeline_model.state_dict())
+
+        # Citrine C2: use foreach updates for multi-tensor optimizers.
+        reference_optimizer = torch.optim.SGD(
+            reference_model.parameters(), lr=0.1, foreach=True
+        )
+        pipeline_optimizer = torch.optim.SGD(
+            pipeline_model.parameters(), lr=0.1, foreach=True
+        )
+        batches = [
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=[_DATA_PARALLEL_FEATURE],
+                values=torch.tensor([0, 1], device=self.device),
+                lengths=torch.tensor([1, 1], device=self.device),
+            )
+            for _ in range(4)
+        ]
+        pipeline = TrainPipelineFusedSparseDist(
+            model=pipeline_model,
+            optimizer=pipeline_optimizer,
+            device=self.device,
+            execute_all_batches=True,
+            emb_lookup_stream="current",
+            embedding_lookup_before_optimizer=True,
+            defer_dp_lookup=True,
+        )
+        dataloader = iter(batches)
+
+        for batch in batches[:2]:
+            reference_optimizer.zero_grad()
+            loss, expected = reference_model(batch)
+            loss.backward()
+            reference_optimizer.step()
+
+            actual = pipeline.progress(dataloader)
+
+            torch.testing.assert_close(expected, actual)
+
+        return pipeline
+
     def _assert_equal_to_non_pipelined(
         self,
         sharding_type: str,
@@ -174,6 +319,46 @@ class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
                 embedding_lookup_after_data_dist=True,
                 embedding_lookup_before_optimizer=True,
             )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_deferred_dp_lookup_matches_non_pipelined(self) -> None:
+        """Deferred EC and EBC lookups observe the current optimizer update."""
+        reference_model = _DPShardedEmbeddingTrainModel(
+            self._create_dp_sharded_ec(),
+            self._create_dp_sharded_ebc(),
+            self.device,
+        )
+        pipeline_model = _DPShardedEmbeddingTrainModel(
+            self._create_dp_sharded_ec(),
+            self._create_dp_sharded_ebc(),
+            self.device,
+        )
+        # Verifies numerical parity after each optimizer update.
+        pipeline = self._run_deferred_dp_lookup_parity(reference_model, pipeline_model)
+
+        # Verifies deferred DP state for both embedding context types.
+        context = cast(EmbeddingTrainPipelineContext, pipeline.contexts[0])
+        ec_contexts = {
+            name: module_context
+            for name, module_context in context.module_contexts.items()
+            if isinstance(module_context, EmbeddingCollectionContext)
+        }
+        self.assertEqual(1, len(ec_contexts))
+        self.assertTrue(all(ctx.defer_dp_lookup for ctx in ec_contexts.values()))
+        ebc_contexts = {
+            name: module_context
+            for name, module_context in context.module_contexts.items()
+            if isinstance(module_context, EmbeddingBagCollectionContext)
+        }
+        self.assertEqual(1, len(ebc_contexts))
+        self.assertTrue(all(ctx.defer_dp_lookup for ctx in ebc_contexts.values()))
+        self.assertCountEqual(
+            [*ec_contexts, *ebc_contexts],
+            pipeline._deferred_dp_module_context_names or [],
+        )
 
     @unittest.skipIf(
         not torch.cuda.is_available(),

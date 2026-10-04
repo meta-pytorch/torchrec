@@ -28,6 +28,8 @@ from typing import (
     Set,
     Tuple,
     Type,
+    TypeGuard,
+    Union,
 )
 
 import torch
@@ -35,6 +37,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
+from torchrec.distributed.embedding import EmbeddingCollectionContext
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,
     KJTListAwaitable,
@@ -42,6 +45,7 @@ from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.embedding_types import KJTList
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionContext
 
 try:
     from torchrec.distributed.logging_handlers import (
@@ -108,6 +112,16 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def is_deferred_dp_supported(
+    context: Multistreamable,
+) -> TypeGuard[Union[EmbeddingCollectionContext, EmbeddingBagCollectionContext]]:
+    """Returns whether the module context supports deferred DP lookup."""
+    return isinstance(
+        context,
+        (EmbeddingCollectionContext, EmbeddingBagCollectionContext),
+    )
 
 
 def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
