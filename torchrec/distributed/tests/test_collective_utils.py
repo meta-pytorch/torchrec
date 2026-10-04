@@ -475,6 +475,11 @@ class CollectiveUtilsTest(unittest.TestCase):
         )
 
 
+def _collective_count(pg: dist.ProcessGroup) -> int:
+    # The c10d type stub doesn't declare this binding.
+    return pg._get_sequence_number_for_group()  # pyrefly: ignore[missing-attribute]
+
+
 class TestEnableCollectiveValidation(MultiProcessTestBase):
     def tearDown(self) -> None:
         cu._USE_COLLECTIVE_VALIDATION = False
@@ -488,11 +493,14 @@ class TestEnableCollectiveValidation(MultiProcessTestBase):
     ) -> None:
         with MultiProcessContext(rank, world_size, backend) as ctx:
             assert ctx.pg is not None
+            seq_before = _collective_count(ctx.pg)
 
             with mock.patch(
                 "torch._utils_internal.justknobs_check", return_value=jk_enabled
             ) as mock_jk:
                 init_collective_validation(ctx.pg)
+
+            assert _collective_count(ctx.pg) > seq_before
 
             if ctx.rank == 0:
                 # Only rank 0 because of invoke_on_rank_and_broadcast_result
@@ -518,6 +526,30 @@ class TestEnableCollectiveValidation(MultiProcessTestBase):
             jk_enabled=jk_enabled,
             callable=TestEnableCollectiveValidation._test_init_collective_validation,
         )
+
+    @staticmethod
+    def _test_env_var_skips_broadcast(
+        rank: int, world_size: int, backend: str, env_val: str
+    ) -> None:
+        os.environ["TORCHREC_VALIDATE_COLLECTIVES"] = env_val
+        with MultiProcessContext(rank, world_size, backend) as ctx:
+            assert ctx.pg is not None
+            seq_before = _collective_count(ctx.pg)
+
+            init_collective_validation(ctx.pg)
+
+            assert _collective_count(ctx.pg) == seq_before
+            assert cu._INITIALIZED is True
+            assert validate_collectives_enabled() is (env_val == "1")
+
+    def test_env_var_skips_broadcast(self) -> None:
+        for env_val in ("0", "1"):
+            self._run_multi_process_test(
+                world_size=2,
+                backend="gloo",
+                env_val=env_val,
+                callable=TestEnableCollectiveValidation._test_env_var_skips_broadcast,
+            )
 
     def test_set_env_var_overrides(self) -> None:
         # Test setting env variable to false overrides jk
