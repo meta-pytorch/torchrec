@@ -151,7 +151,7 @@ def _benchmark_kjt_a2a(
             batch_size (int): stride; the lengths tensor has ``num_features * batch_size``
                 entries. Default 32 * 1024.
             values_dtype (torch.dtype): dtype of the ``values`` tensor. Default int64.
-            num_benchmarks (int): number of measured iterations. Default 20.
+            num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
@@ -166,7 +166,7 @@ def _benchmark_kjt_a2a(
     num_values: int = int(kwargs.get("num_values", 50_000_000))
     batch_size: int = int(kwargs.get("batch_size", 32 * 1024))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.int64)
-    num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
+    num_benchmarks: int = int(kwargs.get("num_benchmarks", 100))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
     memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
@@ -305,7 +305,7 @@ def _benchmark_kt_a2a(
                 of float32 per rank, comparable to ``kjt_a2a``). Default 3072.
             values_dtype (torch.dtype): dtype of the embedding tensor; must be a floating
                 dtype. Default float32.
-            num_benchmarks (int): number of measured iterations. Default 20.
+            num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
@@ -319,7 +319,7 @@ def _benchmark_kt_a2a(
     batch_size: int = int(kwargs.get("batch_size", 32 * 1024))
     dim: int = int(kwargs.get("dim", 3072))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.float32)
-    num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
+    num_benchmarks: int = int(kwargs.get("num_benchmarks", 100))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
     memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
@@ -453,7 +453,7 @@ def _benchmark_reduce_scatter(
                 comparable to ``kt_a2a``). Default 3072.
             values_dtype (torch.dtype): dtype of the embedding tensor; must be a floating
                 dtype. Default float32.
-            num_benchmarks (int): number of measured iterations. Default 20.
+            num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
@@ -467,7 +467,7 @@ def _benchmark_reduce_scatter(
     batch_size: int = int(kwargs.get("batch_size", 32 * 1024))
     dim: int = int(kwargs.get("dim", 3072))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.float32)
-    num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
+    num_benchmarks: int = int(kwargs.get("num_benchmarks", 100))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
     memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
@@ -597,7 +597,7 @@ def _benchmark_all_gather(
                 comparable to ``kt_a2a`` / ``reduce_scatter``). Default 3072.
             values_dtype (torch.dtype): dtype of the embedding tensor; must be a floating
                 dtype. Default float32.
-            num_benchmarks (int): number of measured iterations. Default 20.
+            num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
@@ -611,7 +611,7 @@ def _benchmark_all_gather(
     batch_size: int = int(kwargs.get("batch_size", 32 * 1024))
     dim: int = int(kwargs.get("dim", 3072))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.float32)
-    num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
+    num_benchmarks: int = int(kwargs.get("num_benchmarks", 100))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
     memory_snapshot: bool = as_bool(kwargs.get("memory_snapshot"), True)
