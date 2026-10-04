@@ -654,7 +654,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         ]
         if self._use_custom_embedding_formatting and out.device.type == "tpu":
             per_feature_batch_sizes = [feature_batch_size] * len(table_feature_list)
-            unstacked_tensors = torch.ops.tpu.sparse_dense_matmul_activation_unstack(
+            unstacked_tensors = torch.tpu.ops.sparse_dense_matmul_activation_unstack(
                 out,
                 per_feature_batch_sizes,
                 per_feature_dims,
@@ -951,7 +951,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             max_unique_ids = stack_config.max_unique_ids_per_partition
 
             if self._optimizer_type == torch.optim.SGD:
-                new_table = torch.ops.tpu.sparse_dense_matmul_grad_with_sgd(
+                new_table = torch.tpu.ops.sparse_dense_matmul_grad_with_sgd(
                     table_inputs.row_pointers,
                     table_inputs.embedding_ids,
                     table_inputs.sample_ids,
@@ -971,7 +971,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                     )
                 eps = self._optimizer_kwargs.get("eps", 1e-10)
                 new_table, new_accumulator = (
-                    torch.ops.tpu.sparse_dense_matmul_grad_with_adagrad(
+                    torch.tpu.ops.sparse_dense_matmul_grad_with_adagrad(
                         table_inputs.row_pointers,
                         table_inputs.embedding_ids,
                         table_inputs.sample_ids,
@@ -1000,7 +1000,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                 b1 = self._optimizer_kwargs.get("beta1", 0.9)
                 b2 = self._optimizer_kwargs.get("beta2", 0.999)
                 new_table, new_momentum, new_velocity = (
-                    torch.ops.tpu.sparse_dense_matmul_grad_with_adam(
+                    torch.tpu.ops.sparse_dense_matmul_grad_with_adam(
                         table_inputs.row_pointers,
                         table_inputs.embedding_ids,
                         table_inputs.sample_ids,

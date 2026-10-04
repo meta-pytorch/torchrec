@@ -41,7 +41,7 @@ def sparse_dense_matmul_sgd_fwd(
     table_name: str = "table",
 ) -> torch.Tensor:
     """Executes the forward pass of sparse-dense matrix multiplication for SGD."""
-    return torch.ops.tpu.sparse_dense_matmul(
+    return torch.tpu.ops.sparse_dense_matmul(
         row_pointers,
         embedding_ids,
         sample_ids,
@@ -71,7 +71,7 @@ def sparse_dense_matmul_sgd_bwd(
     table_name: str = "table",
 ) -> None:
     """Executes the backward pass and inplace SGD weight update."""
-    updated_table = torch.ops.tpu.sparse_dense_matmul_grad_with_sgd(
+    updated_table = torch.tpu.ops.sparse_dense_matmul_grad_with_sgd(
         row_pointers,
         embedding_ids,
         sample_ids,
@@ -206,7 +206,7 @@ def sparse_dense_matmul_adagrad_fwd(
     table_name: str = "table",
 ) -> torch.Tensor:
     """Executes the forward pass of sparse-dense matrix multiplication for Adagrad."""
-    return torch.ops.tpu.sparse_dense_matmul(
+    return torch.tpu.ops.sparse_dense_matmul(
         row_pointers,
         embedding_ids,
         sample_ids,
@@ -239,7 +239,7 @@ def sparse_dense_matmul_adagrad_bwd(
 ) -> None:
     """Executes the backward pass and inplace Adagrad weight and accumulator update."""
     updated_table, updated_accumulator = (
-        torch.ops.tpu.sparse_dense_matmul_grad_with_adagrad(
+        torch.tpu.ops.sparse_dense_matmul_grad_with_adagrad(
             row_pointers,
             embedding_ids,
             sample_ids,
@@ -393,7 +393,7 @@ def sparse_dense_matmul_adam_fwd(
     table_name: str = "table",
 ) -> torch.Tensor:
     """Executes the forward pass of sparse-dense matrix multiplication for Adam."""
-    return torch.ops.tpu.sparse_dense_matmul(
+    return torch.tpu.ops.sparse_dense_matmul(
         row_pointers,
         embedding_ids,
         sample_ids,
@@ -429,7 +429,7 @@ def sparse_dense_matmul_adam_bwd(
 ) -> None:
     """Executes the backward pass and inplace Adam weight, momentum, and velocity update."""
     updated_table, updated_momentum, updated_velocity = (
-        torch.ops.tpu.sparse_dense_matmul_grad_with_adam(
+        torch.tpu.ops.sparse_dense_matmul_grad_with_adam(
             row_pointers,
             embedding_ids,
             sample_ids,
