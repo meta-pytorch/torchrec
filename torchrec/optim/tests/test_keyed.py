@@ -76,6 +76,9 @@ class TestKeyedOptimizer(unittest.TestCase):
 
     def test_load_state_dict(self) -> None:
         init_process_group_single_rank("gloo")
+        # Registered here, not at the end of the test, so a failed assertion below
+        # does not leak the group into later tests.
+        self.addCleanup(dist.destroy_process_group)
 
         # Set up example KeyedOptimizer.
         param_1_t, param_2_t = torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])
@@ -175,7 +178,6 @@ class TestKeyedOptimizer(unittest.TestCase):
         self._assert_state_dict_equals(
             expected_state_dict, keyed_optimizer.state_dict()
         )
-        dist.destroy_process_group()
 
     def test_non_param_state_key(self) -> None:
         with self.assertRaisesRegex(ValueError, "All state keys must be params."):
