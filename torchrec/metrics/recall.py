@@ -49,7 +49,9 @@ def compute_false_neg_sum(
     threshold: float = 0.5,
 ) -> torch.Tensor:
     predictions = predictions.double()
-    return torch.sum(weights * ((predictions <= threshold) * labels), dim=-1)
+    # Strictly below the threshold. Equality is a predicted positive, matching
+    # compute_true_pos_sum, so a tie is not also a false negative.
+    return torch.sum(weights * ((predictions < threshold) * labels), dim=-1)
 
 
 def get_recall_states(
