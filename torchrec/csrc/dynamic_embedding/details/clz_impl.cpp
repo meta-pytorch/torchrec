@@ -8,77 +8,15 @@
 
 #include <torchrec/csrc/dynamic_embedding/details/bits_op.h>
 
+#include <bit>
+#include <type_traits>
+
 namespace torchrec::bits_impl {
 
 template <typename T>
-inline static bool get_bit(T n, int k) {
-  int mask = 1 << k;
-  return static_cast<bool>(n & mask);
-}
-
-template <typename T>
-struct ClzImpl {
-  /**
-   * Naive implementation for no __builtin_clz
-   */
-  int operator()(T v) const {
-    int result = 0;
-    for (uint16_t num_bits = sizeof(T) * 8; num_bits != 0;
-         --num_bits, ++result) {
-      if (get_bit(v, num_bits - 1)) {
-        break;
-      }
-    }
-    return result;
-  }
-};
-
-template <>
-struct ClzImpl<unsigned int> {
-  int operator()(unsigned int v) const {
-    return __builtin_clz(v);
-  }
-};
-
-template <>
-struct ClzImpl<int> {
-  int operator()(int v) const {
-    return __builtin_clz(static_cast<unsigned int>(v));
-  }
-};
-
-template <>
-struct ClzImpl<unsigned long> {
-  int operator()(unsigned long v) const {
-    return __builtin_clzl(v);
-  }
-};
-
-template <>
-struct ClzImpl<long> {
-  int operator()(long v) const {
-    return __builtin_clzl(static_cast<unsigned long>(v));
-  }
-};
-
-template <>
-struct ClzImpl<unsigned long long> {
-  int operator()(unsigned long long v) const {
-    return __builtin_clzll(v);
-  }
-};
-
-template <>
-struct ClzImpl<long long> {
-  int operator()(long long v) const {
-    return __builtin_clzll(static_cast<unsigned long long>(v));
-  }
-};
-
-template <typename T>
 int Clz<T>::operator()(T v) const {
-  ClzImpl<T> clz;
-  return clz(v);
+  using UT = std::make_unsigned_t<T>;
+  return std::countl_zero(static_cast<UT>(v));
 }
 
 template struct Clz<int>;
