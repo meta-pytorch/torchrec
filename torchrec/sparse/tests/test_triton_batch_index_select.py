@@ -243,3 +243,84 @@ class TritonBatchIndexSelectTest(unittest.TestCase):
                     atol=max(16, 2 * batch_size // min(input_rows))
                     * torch.finfo(inputs.dtype).eps,
                 )
+
+    def test_empty_features(self) -> None:
+        inputs = torch.empty(0, device="cuda")
+        indices = torch.empty(0, device="cuda", dtype=torch.int64)
+
+        output = triton_batch_index_select_dim0(inputs, indices, 4, [], [])
+
+        self.assertEqual(output.numel(), 0)
+        self.assertEqual(output.device, inputs.device)
+        self.assertEqual(output.dtype, inputs.dtype)
+
+    def test_invalid_inputs(self) -> None:
+        batch_size = 2
+        input_rows = [2, 3]
+        input_columns = [4, 4]
+        inputs = torch.randn(20, device="cuda")
+        indices = torch.zeros(4, device="cuda", dtype=torch.int64)
+        cases = (
+            (
+                "mismatched_rows_and_columns",
+                inputs,
+                indices,
+                input_rows,
+                [4],
+                "must have equal length",
+            ),
+            (
+                "cpu_inputs",
+                torch.randn(20, device="cpu"),
+                indices,
+                input_rows,
+                input_columns,
+                "must be CUDA tensors on the same device",
+            ),
+            (
+                "non_contiguous_inputs",
+                torch.randn(40, device="cuda")[::2],
+                indices,
+                input_rows,
+                input_columns,
+                "must be contiguous",
+            ),
+            (
+                "inputs_size_mismatch",
+                torch.randn(19, device="cuda"),
+                indices,
+                input_rows,
+                input_columns,
+                "inputs size does not match",
+            ),
+            (
+                "indices_size_mismatch",
+                inputs,
+                torch.zeros(3, device="cuda", dtype=torch.int64),
+                input_rows,
+                input_columns,
+                "indices size does not match",
+            ),
+            (
+                "non_positive_rows",
+                torch.randn(12, device="cuda"),
+                indices,
+                [0, 3],
+                input_columns,
+                "row counts must be positive",
+            ),
+            (
+                "non_positive_columns",
+                torch.randn(12, device="cuda"),
+                indices,
+                input_rows,
+                [0, 4],
+                "column counts must be positive",
+            ),
+        )
+        for name, case_inputs, case_indices, rows, columns, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    triton_batch_index_select_dim0(
+                        case_inputs, case_indices, batch_size, rows, columns
+                    )
