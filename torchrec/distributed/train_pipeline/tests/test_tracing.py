@@ -114,6 +114,34 @@ class TestNodeArg(unittest.TestCase):
         # Weights is call_module node, so we should only find 2 args unmodified
         self.assertEqual(num_found, len(kjt_args) - 1)
 
+    def test_reasons_do_not_leak_between_modules(self) -> None:
+        graph = torch.fx.Graph()
+        # `call_method` with a target other than `get` is unhandled.
+        unhandled = torch.fx.Node(graph, "unhandled", "call_method", "size", (), {})
+        failing_node = torch.fx.Node(
+            graph, "ebc_a", "call_module", "ebc_a", (unhandled,), {}
+        )
+        features = torch.fx.Node(
+            graph, "features", "placeholder", "torch.Tensor", (), {}
+        )
+        succeeding_node = torch.fx.Node(
+            graph, "ebc_b", "call_module", "ebc_b", (features,), {}
+        )
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), False)
+
+        _, num_found = node_args_helper.get_node_args(failing_node)
+        self.assertEqual(num_found, 0)
+        self.assertEqual(
+            node_args_helper.take_unresolved_arg_reasons(), ["postproc_fx_untraceable"]
+        )
+        self.assertEqual(node_args_helper.take_postproc_fx_blockers(), ["unhandled"])
+
+        _, num_found = node_args_helper.get_node_args(succeeding_node)
+        self.assertEqual(num_found, 1)
+        self.assertEqual(node_args_helper.take_unresolved_arg_reasons(), [])
+        self.assertEqual(node_args_helper.take_postproc_fx_blockers(), [])
+
 
 class DummyShardedModule(
     ShardedModule[torch.Tensor, torch.Tensor, torch.Tensor, NullShardedModuleContext]

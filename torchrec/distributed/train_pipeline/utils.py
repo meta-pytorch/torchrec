@@ -630,6 +630,8 @@ def _rewrite_model(  # noqa C901
     pipelined_sharded_modules = []
 
     non_pipelined_sharded_modules = []
+    non_pipelined_reasons: Dict[str, str] = {}
+    fx_blockers_per_module: Dict[str, str] = {}
 
     args_helper = NodeArgsHelper(
         model, context, pipeline_postproc, default_stream, dist_stream
@@ -647,10 +649,14 @@ def _rewrite_model(  # noqa C901
         # only work on node with input(s), we don't expect zero input count for sharded module
         if total_num_args == 0:
             logger.warning(f"Module '{node.target}' is a ShardedModule with zero input")
+            non_pipelined_reasons[str(node.target)] = "zero_input"
             continue
 
         # List[ArgInfo]: for rebuilding the input arguments, while the num verifies if missing any
         arg_info_list, num_found = args_helper.get_node_args(node)
+        # Drained on both branches so nothing carries over to the next module.
+        module_reasons = args_helper.take_unresolved_arg_reasons()
+        module_fx_blockers = args_helper.take_postproc_fx_blockers()
 
         if num_found == total_num_args:
             logger.info(f"Module '{node.target}' will be pipelined")
@@ -676,6 +682,11 @@ def _rewrite_model(  # noqa C901
                 f"Module '{node.target}' will NOT be pipelined, due to input modifications"
             )
             non_pipelined_sharded_modules.append(node.target)
+            non_pipelined_reasons[str(node.target)] = (
+                module_reasons[0] if module_reasons else "unknown"
+            )
+            if module_fx_blockers:
+                fx_blockers_per_module[str(node.target)] = "|".join(module_fx_blockers)
 
     # JIT script unsharded modules if applicable.
     if apply_jit:
@@ -695,6 +706,9 @@ def _rewrite_model(  # noqa C901
         pipelined_module_fqns=pipelined_sharded_modules,
         non_pipelined_module_fqns=non_pipelined_sharded_modules,
         pipeline_forward_type=pipelined_forward.__name__,
+        non_pipelined_reasons=non_pipelined_reasons,
+        postproc_fx_blockers=fx_blockers_per_module,
+        pipeline_postproc=pipeline_postproc,
     )
 
     return (
