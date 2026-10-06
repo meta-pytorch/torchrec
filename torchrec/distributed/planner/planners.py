@@ -55,6 +55,8 @@ from torchrec.distributed.planner.types import (
     PlannerError,
     PlannerErrorType,
     Proposer,
+    Shard,
+    SharderDataMap,
     ShardingOption,
     Stats,
     Storage,
@@ -62,7 +64,9 @@ from torchrec.distributed.planner.types import (
     Topology,
 )
 from torchrec.distributed.planner.utils import (
+    build_sharder_data_map,
     bytes_to_gb,
+    is_prefetch_pipelined,
     reset_shard_rank,
     sharder_name,
     storage_repr_in_gb,
@@ -162,6 +166,164 @@ except Exception:
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_ENABLE_UVM_CACHE_PADDING_JK = (
+    "pytorch/torchrec:enable_sharding_plan_uvm_cache_dimension_padding"
+)
+
+
+def _is_uvm_cache_padding_enabled() -> bool:
+    try:
+        return torch._utils_internal.justknobs_check(
+            _ENABLE_UVM_CACHE_PADDING_JK,
+            default=True,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to resolve UVM cache padding JK; defaulting to enabled"
+        )
+        return True
+
+
+def _calculate_uvm_cache_dimension_padding(
+    sharding_options: List[ShardingOption],
+    sharder_data_map: SharderDataMap,
+) -> List[Tuple[Shard, int]]:
+    """Calculate post-placement FBGEMM cache padding for each shard.
+
+    FBGEMM allocates one cache tensor per grouped TBE. Every cache row in that
+    tensor has ``max_D_cache`` columns, including rows belonging to narrower
+    tables. The table-local storage estimator cannot know this dominant
+    dimension because grouping is rank-dependent, so account for it after the
+    partitioner assigns ranks.
+
+    The grouping key intentionally merges some runtime groups (for example SUM
+    and MEAN pooling) when the planner lacks the corresponding metadata. Merging
+    can only increase the dominant dimension, making this estimate conservative
+    instead of underestimating HBM.
+    """
+    grouped_shards: Dict[Tuple[object, ...], List[Shard]] = {}
+
+    for sharding_option in sharding_options:
+        if (
+            sharding_option.compute_kernel
+            != EmbeddingComputeKernel.FUSED_UVM_CACHING.value
+        ):
+            continue
+
+        sharder_data = sharder_data_map[sharding_option.module_type_key]
+        fused_params = sharder_data.fused_params
+        bucket_by_dimension = is_prefetch_pipelined(sharding_option, sharder_data)
+        one_tbe_per_table = bool(fused_params.get("use_one_tbe_per_table", False))
+
+        for shard in sharding_option.shards:
+            if (
+                shard.rank is None
+                or shard.cache_weight_bytes <= 0
+                or len(shard.size) < 2
+                or shard.size[1] <= 0
+            ):
+                continue
+
+            grouping_key = (
+                shard.rank,
+                sharding_option.path,
+                sharding_option.sharding_type,
+                sharding_option.tensor.dtype,
+                sharding_option.is_pooled,
+                sharding_option.is_weighted,
+                sharding_option.has_feature_processor,
+                sharding_option.enforce_hbm,
+                shard.size[1] if bucket_by_dimension else None,
+                sharding_option.name if one_tbe_per_table else None,
+            )
+            grouped_shards.setdefault(grouping_key, []).append(shard)
+
+    padding: List[Tuple[Shard, int]] = []
+    for shards in grouped_shards.values():
+        dominant_dimension = max(shard.size[1] for shard in shards)
+        for shard in shards:
+            padded_cache_bytes = (
+                shard.cache_weight_bytes * dominant_dimension + shard.size[1] - 1
+            ) // shard.size[1]
+            padding_bytes = padded_cache_bytes - shard.cache_weight_bytes
+            if padding_bytes > 0:
+                padding.append((shard, padding_bytes))
+
+    return padding
+
+
+def _validate_uvm_cache_dimension_padding_fits(
+    plan: List[ShardingOption],
+    storage_constraint: Topology,
+    sharder_data_map: SharderDataMap,
+) -> List[Tuple[Shard, int]]:
+    """Validate per-rank HBM after accounting for UVM cache row padding.
+
+    With the no-prefetch grouping implemented in
+    https://github.com/meta-pytorch/torchrec/pull/1859, UVM-cached tables with
+    different embedding dimensions can share a TBE. FBGEMM allocates every
+    cache row at that group's maximum dimension, so cached rows from narrower
+    tables require padding. After rank assignment, this function adds that
+    padding to each shard's base HBM estimate without mutating the proposal and
+    checks the total against each rank's reserved capacity. It returns padding
+    for a valid plan or raises a PARTITION PlannerError.
+    """
+    padding = _calculate_uvm_cache_dimension_padding(plan, sharder_data_map)
+    padding_by_shard_id = {id(shard): padding_bytes for shard, padding_bytes in padding}
+    hbm_by_rank = {device.rank: 0 for device in storage_constraint.devices}
+
+    for sharding_option in plan:
+        for shard in sharding_option.shards:
+            if shard.rank is None or shard.storage is None:
+                continue
+            hbm_by_rank[shard.rank] += shard.storage.hbm + padding_by_shard_id.get(
+                id(shard), 0
+            )
+
+    capacity_by_rank = {
+        device.rank: device.storage.hbm for device in storage_constraint.devices
+    }
+    exceeded = {
+        rank: (hbm, capacity_by_rank[rank])
+        for rank, hbm in hbm_by_rank.items()
+        if hbm > capacity_by_rank[rank]
+    }
+    if exceeded:
+        details = ", ".join(
+            f"rank {rank}: required {required} bytes after UVM cache dimension "
+            f"padding, available {available} bytes"
+            for rank, (required, available) in sorted(exceeded.items())
+        )
+        raise PlannerError(
+            error_type=PlannerErrorType.PARTITION,
+            message=(
+                "UVM cache dimension padding causes per-rank HBM to exceed "
+                "capacity: "
+                f"{details}"
+            ),
+        )
+
+    return padding
+
+
+def _apply_uvm_cache_dimension_padding(padding: List[Tuple[Shard, int]]) -> None:
+    """Apply validated UVM cache padding to the selected plan.
+
+    With the no-prefetch grouping implemented in
+    https://github.com/meta-pytorch/torchrec/pull/1859, mixed-dimension
+    UVM-cached tables can share a TBE whose cache rows use the group's maximum
+    dimension. Narrower tables therefore require extra HBM for cache-row
+    padding. This mutates only the final plan so its HBM calculation includes
+    that padding and records the added bytes separately for diagnostics.
+    Candidate proposals remain unchanged so repeated validation cannot
+    accumulate bytes.
+    """
+    for shard, padding_bytes in padding:
+        if shard.storage is None:
+            continue
+        shard.storage.hbm += padding_bytes
+        shard.cache_dimension_padding_bytes = padding_bytes
 
 
 def to_sharding_plan(
@@ -833,6 +995,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         """
         self._num_proposals = 0
         self._num_plans = 0
+        uvm_cache_padding_enabled = _is_uvm_cache_padding_enabled()
 
         start_time = perf_counter()
         best_plan = None
@@ -887,6 +1050,9 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 "num_table_constraints": (
                     str(len(self._constraints)) if self._constraints else "0"
                 ),
+                "uvm_cache_dimension_padding_enabled": str(
+                    uvm_cache_padding_enabled
+                ).lower(),
             },
             technique=_technique,
         )
@@ -906,6 +1072,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         if not search_space:
             # No shardable parameters
             return ShardingPlan({})
+
+        sharder_data_map = build_sharder_data_map(
+            {sharder_name(sharder.module_type): sharder for sharder in sharders}
+        )
 
         log_search_space_summary(search_space, self.__class__.__name__)
 
@@ -995,6 +1165,12 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                             proposal=proposal,
                             storage_constraint=storage_constraint,
                         )
+                        if uvm_cache_padding_enabled:
+                            _validate_uvm_cache_dimension_padding_fits(
+                                plan,
+                                storage_constraint,
+                                sharder_data_map,
+                            )
                         self._num_plans += 1
                         proposer_num_plans += 1
                         perf_rating = self._perf_model.rate(plan=plan)
@@ -1063,6 +1239,28 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         if best_plan:
             for callback in self._callbacks:
                 best_plan = callback(best_plan)
+
+            if uvm_cache_padding_enabled:
+                # Callbacks may mutate a plan that was validated during proposal
+                # search, while loaded plans bypass proposal validation entirely.
+                cache_dimension_padding = _validate_uvm_cache_dimension_padding_fits(
+                    best_plan,
+                    storage_constraint,
+                    sharder_data_map,
+                )
+                _apply_uvm_cache_dimension_padding(cache_dimension_padding)
+                if cache_dimension_padding:
+                    padding_by_rank: Dict[int, int] = {}
+                    for shard, padding_bytes in cache_dimension_padding:
+                        if shard.rank is not None:
+                            padding_by_rank[shard.rank] = (
+                                padding_by_rank.get(shard.rank, 0) + padding_bytes
+                            )
+                    logger.info(
+                        "Accounted for dominant-dimension UVM cache padding: "
+                        f"total={sum(padding_by_rank.values())} bytes, "
+                        f"max_per_rank={max(padding_by_rank.values())} bytes"
+                    )
 
             self._best_plan = best_plan
             sharding_plan = to_sharding_plan(best_plan, self._topology)
