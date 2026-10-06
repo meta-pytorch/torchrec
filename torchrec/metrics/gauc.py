@@ -103,10 +103,35 @@ def get_auc_states(
     predictions: torch.Tensor,
     weights: torch.Tensor,
     num_candidates: torch.Tensor,
+    max_num_candidates: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
+    """Compute GAUC states with optional sync-free static candidate padding.
+
+    max_num_candidates must bound every num_candidates value in the batch.
+    The checks below run asynchronously on CUDA, so malformed lengths are
+    reported at a later synchronization rather than at this call boundary.
+    They are not a synchronous preflight for untrusted input.
+    """
 
     # predictions, labels: [n_task, n_sample]
-    max_length = int(num_candidates.max().item())
+    if max_num_candidates is None:
+        max_length = int(num_candidates.max().item())
+    else:
+        if max_num_candidates < 0:
+            raise ValueError("max_num_candidates must be nonnegative")
+        max_length = max_num_candidates
+        # Citrine C6: validate static padding on device without syncing lengths.
+        torch._assert_async(
+            (num_candidates >= 0).all(), "num_candidates must be nonnegative"
+        )
+        torch._assert_async(
+            (num_candidates <= max_length).all(),
+            "num_candidates must not exceed max_num_candidates",
+        )
+        torch._assert_async(
+            num_candidates.sum() == predictions.shape[-1],
+            "sum(num_candidates) must match predictions.shape[-1]",
+        )
     predictions_perm = predictions.permute(1, 0)
     labels_perm = labels.permute(1, 0)
     weights_perm = weights.permute(1, 0)
@@ -173,6 +198,7 @@ class GAUCMetricComputation(RecMetricComputation):
         labels: torch.Tensor,
         weights: Optional[torch.Tensor],
         num_candidates: torch.Tensor,
+        max_num_candidates: Optional[int] = None,
         **kwargs: Dict[str, Any],
     ) -> None:
         if predictions is None or weights is None:
@@ -180,7 +206,13 @@ class GAUCMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for GAUCMetricComputation update"
             )
 
-        states = get_auc_states(labels, predictions, weights, num_candidates)
+        states = get_auc_states(
+            labels,
+            predictions,
+            weights,
+            num_candidates,
+            max_num_candidates=max_num_candidates,
+        )
         num_samples = predictions.shape[-1]
 
         for state_name, state_value in states.items():
