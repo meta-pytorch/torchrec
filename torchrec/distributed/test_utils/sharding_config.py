@@ -58,7 +58,11 @@ from torchrec.distributed.types import (
     ShardingPlanner,
     ShardingType,
 )
-from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+from torchrec.modules.embedding_configs import (
+    DataType,
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+)
 
 try:
     from torchrec.fb.distributed.planner.lp_planner import LinearProgrammingPlanner
@@ -94,6 +98,9 @@ class PlannerConfig:
     compute_kernel: EmbeddingComputeKernel = EmbeddingComputeKernel.FUSED
     sharding_type: ShardingType = ShardingType.TABLE_WISE
     additional_constraints: Dict[str, Any] = field(default_factory=dict)
+    # Dtype the embedding weights are quantized to before reaching the device.
+    # Only takes effect with the sharder's `weight_init_on_cpu` fused param.
+    quantized_weight_dtype: Optional[DataType] = None
     # Storage reservation percentage (0.0 to 1.0) for planner memory estimation
     storage_reservation_percentage: float = 0.15
     storage_reservation_type: StorageReservationType = (
@@ -211,6 +218,7 @@ class PlannerConfig:
             "pooling_factors": self.pooling_factors,
             "num_poolings": self.num_poolings,
             "batch_sizes": self.batch_sizes,
+            "quantized_weight_dtype": self.quantized_weight_dtype,
         }
         if kwargs is None:
             kwargs = default_kwargs
