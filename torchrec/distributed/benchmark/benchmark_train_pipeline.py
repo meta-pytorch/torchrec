@@ -41,6 +41,7 @@ from torchrec.distributed.benchmark.base import (
     CPUMemoryStats,
     GPUMemoryStats,
 )
+from torchrec.distributed.planner.planners import EmbeddingShardingPlanner
 from torchrec.distributed.test_utils.input_config import ModelInputConfig
 from torchrec.distributed.test_utils.metric_config import RecMetricConfig
 from torchrec.distributed.test_utils.model_config import (
@@ -122,7 +123,7 @@ class RunOptions(BenchFuncConfig):
             profiling iteration. Requires profiling-only mode.
         expected_cache_size_bytes (Optional[int]): Expected total FBGEMM cache
             allocation for each enforce_hbm setting. When set, the benchmark validates
-            the instantiated FBGEMM allocation before timing.
+            both planner and FBGEMM allocations before timing.
     """
 
     world_size: int = 2
@@ -145,6 +146,7 @@ class RunOptions(BenchFuncConfig):
 
 
 def _validate_cache_sizes(
+    planner: EmbeddingShardingPlanner,
     sharded_model: nn.Module,
     expected_cache_size_bytes: int,
 ) -> None:
@@ -152,6 +154,13 @@ def _validate_cache_sizes(
         False: expected_cache_size_bytes,
         True: expected_cache_size_bytes,
     }
+    planned_bytes = {False: 0, True: 0}
+    for option in planner.get_selected_options():
+        planned_bytes[bool(option.enforce_hbm)] += sum(
+            shard.cache_weight_bytes + shard.cache_dimension_padding_bytes
+            for shard in option.shards
+        )
+
     actual_bytes = {False: 0, True: 0}
     tbe_counts = {False: 0, True: 0}
     for module in _group_sharded_modules(sharded_model):
@@ -166,18 +175,24 @@ def _validate_cache_sizes(
         )
         tbe_counts[enforce_hbm] += 1
 
+    if planned_bytes != expected_bytes:
+        raise RuntimeError(
+            f"Planner cache sizes {planned_bytes} did not match expected sizes "
+            f"{expected_bytes}"
+        )
     if actual_bytes != expected_bytes:
         raise RuntimeError(
             f"FBGEMM cache sizes {actual_bytes} did not match expected sizes "
             f"{expected_bytes}; TBE counts by enforce_hbm: {tbe_counts}"
         )
     logger.info(
-        "Validated FBGEMM cache sizes by enforce_hbm: %s",
+        "Validated planner and FBGEMM cache sizes by enforce_hbm: %s",
         expected_bytes,
     )
 
 
 def _maybe_validate_cache_sizes(
+    planner: object,
     sharded_model: nn.Module,
     run_option: RunOptions,
 ) -> None:
@@ -186,7 +201,10 @@ def _maybe_validate_cache_sizes(
         return
     if run_option.world_size != 1:
         raise ValueError("Cache-size validation currently requires world_size=1")
+    if not isinstance(planner, EmbeddingShardingPlanner):
+        raise TypeError("Cache-size validation requires EmbeddingShardingPlanner")
     _validate_cache_sizes(
+        planner,
         sharded_model,
         expected_cache_size_bytes,
     )
@@ -231,7 +249,7 @@ class _InitializedModel:
             device=ctx.device,
             planner=planner,
         )
-        _maybe_validate_cache_sizes(sharded_model, run_option)
+        _maybe_validate_cache_sizes(planner, sharded_model, run_option)
         metric_module = metric_config.generate_metric_module(
             batch_size=run_option.batch_size,
             world_size=run_option.world_size,

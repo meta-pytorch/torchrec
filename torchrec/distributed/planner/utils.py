@@ -83,14 +83,12 @@ def is_prefetch_pipelined(
     sharding_option: ShardingOption,
     sharder_data: SharderData,
 ) -> bool:
-    prefetch_pipeline = (
-        sharding_option.cache_params.prefetch_pipeline
-        if sharding_option.cache_params
-        else None
-    )
-    if not prefetch_pipeline:
-        prefetch_pipeline = sharder_data.fused_params.get("prefetch_pipeline", False)
-    return prefetch_pipeline
+    if (
+        sharding_option.cache_params is not None
+        and sharding_option.cache_params.prefetch_pipeline is not None
+    ):
+        return sharding_option.cache_params.prefetch_pipeline
+    return bool(sharder_data.fused_params.get("prefetch_pipeline", False))
 
 
 def extract_comm_data_type_size(
