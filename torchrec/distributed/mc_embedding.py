@@ -66,6 +66,7 @@ class ShardedManagedCollisionEmbeddingCollection(
         # TODO - maybe we need this to manage unsharded/sharded consistency/state consistency
         env: ShardingEnv,
         device: torch.device,
+        module_fqn: Optional[str] = None,
     ) -> None:
         super().__init__(
             module,
@@ -74,6 +75,7 @@ class ShardedManagedCollisionEmbeddingCollection(
             mc_sharder,
             env,
             device,
+            module_fqn,
         )
 
     # For consistency with embeddingbag
@@ -128,6 +130,7 @@ class ManagedCollisionEmbeddingCollectionSharder(
             mc_sharder=self._mc_sharder,
             env=env,
             device=device,
+            module_fqn=module_fqn,
         )
 
     @property

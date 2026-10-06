@@ -186,10 +186,33 @@ class NodeArgsHelper:
         self._default_stream = default_stream
         self._dist_stream = dist_stream
         self._pipelined_postprocs: Set[PipelinedPostproc] = set()
+        self._unresolved_arg_reasons: List[str] = []
+        # Ordered set of fx node names that could not be handled.
+        self._postproc_fx_blockers: Dict[str, None] = {}
 
     @property
     def pipelined_postprocs(self) -> Set[PipelinedPostproc]:
         return self._pipelined_postprocs
+
+    def take_unresolved_arg_reasons(self) -> List[str]:
+        """Returns reasons recorded since the last call and empties the buffer.
+
+        Must be drained per top-level module, including on success, so a reason
+        never carries over to the next module.
+        """
+        reasons = self._unresolved_arg_reasons
+        self._unresolved_arg_reasons = []
+        return reasons
+
+    def take_postproc_fx_blockers(self) -> List[str]:
+        """Returns fx nodes that could not be handled since the last call, deduped
+        in insertion order, and empties the buffer.
+
+        Drained per top-level module so each blocker stays attributable to one.
+        """
+        blockers = list(self._postproc_fx_blockers)
+        self._postproc_fx_blockers = {}
+        return blockers
 
     def _swap_postproc_module_recursive(
         self,
@@ -317,6 +340,7 @@ class NodeArgsHelper:
 
         # check if module is safe to pipeline i.e.no trainable param
         if not _check_postproc_pipelineable(postproc_module):
+            self._unresolved_arg_reasons.append("postproc_trainable_params")
             return None
 
         # For module calls, `self` isn't counted
@@ -440,6 +464,8 @@ class NodeArgsHelper:
                     f"fx node {child_node.name, child_node.op, child_node.target} "
                     "can't be handled correctly for postproc module"
                 )
+                self._unresolved_arg_reasons.append("postproc_fx_untraceable")
+                self._postproc_fx_blockers[child_node.name] = None
                 break
 
         # if we couldn't hit one of the "decisive" outcomes (constant, placeholder or module), return "not found"

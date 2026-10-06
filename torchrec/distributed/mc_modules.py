@@ -315,12 +315,18 @@ class ShardedManagedCollisionCollection(
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         use_index_dedup: bool = False,
         restore_dedup_feature_boundary: bool = True,
+        module_fqn: Optional[str] = None,
+        sharding_types: Optional[List[str]] = None,
     ) -> None:
         # pyrefly: ignore[missing-attribute]
         super().__init__()
         self.need_preprocess: bool = module.need_preprocess
         self._device = device
         self._env = env
+        # Input dist for an MC-wrapped module runs here rather than on the inner
+        # embedding module, so this is where its profiler annotation comes from.
+        self._module_fqn = module_fqn
+        self._sharding_types = sharding_types
         self._table_name_to_parameter_sharding: Dict[str, ParameterSharding] = (
             copy.deepcopy(table_name_to_parameter_sharding)
         )
@@ -949,7 +955,9 @@ class ShardedManagedCollisionCollection(
                     )
                 )
 
-        return KJTListSplitsAwaitable(awaitables, ctx)
+        return KJTListSplitsAwaitable(
+            awaitables, ctx, self._module_fqn, self._sharding_types
+        )
 
     def _kjt_list_to_tensor_list(
         self,
@@ -1265,6 +1273,8 @@ class ManagedCollisionCollectionSharder(
         ],
         device: Optional[torch.device] = None,
         use_index_dedup: bool = False,
+        module_fqn: Optional[str] = None,
+        sharding_types: Optional[List[str]] = None,
     ) -> ShardedManagedCollisionCollection:
 
         if device is None:
@@ -1278,6 +1288,8 @@ class ManagedCollisionCollectionSharder(
             embedding_shardings=embedding_shardings,
             use_index_dedup=use_index_dedup,
             restore_dedup_feature_boundary=self._restore_dedup_feature_boundary,
+            module_fqn=module_fqn,
+            sharding_types=sharding_types,
         )
 
     def shardable_parameters(

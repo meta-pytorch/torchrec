@@ -155,6 +155,7 @@ class TestEBCSharderMCH(
             mc_sharder=self._mc_sharder,
             env=env,
             device=device,
+            module_fqn=module_fqn,
         )
 
 
