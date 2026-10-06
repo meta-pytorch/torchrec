@@ -60,8 +60,12 @@ def build_groups(
             if len(group) > 1:
                 group.pop(random.randint(0, len(group) - 1))
     if duplicates:
+        # Duplicate a key that is already in a group. Drawing from `all_keys`
+        # can re-add exactly the keys `skips` dropped, leaving every key used
+        # once again, which is the property callers set `duplicates` to break.
+        present = [key for group in groups for key in group]
         for group in groups:
-            group.append(random.choice(all_keys))
+            group.append(random.choice(present or all_keys))
     return groups
 
 
