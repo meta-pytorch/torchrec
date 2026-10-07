@@ -10,6 +10,8 @@
 import logging
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from enum import Enum, unique
 from typing import (
     Any,
     Callable,
@@ -17,6 +19,7 @@ from typing import (
     Deque,
     Dict,
     Iterator,
+    List,
     Optional,
     Tuple,
     Type,
@@ -38,11 +41,13 @@ from torchrec.distributed.train_pipeline.pipeline_context import (
     CPUEmbeddingTrainPipelineContext,
     In,
     Out,
+    PrefetchTrainPipelineContext,
     TrainPipelineContext,
 )
 from torchrec.distributed.train_pipeline.runtime_forwards import (
     CPUEmbeddingPipelinedForward,
     PipelinedForward,
+    PrefetchPipelinedForward,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.train_pipeline.types import PipelineState
@@ -52,7 +57,9 @@ from torchrec.distributed.train_pipeline.utils import (
     _rewrite_model,
     _start_data_dist,
     _to_device,
+    _wait_for_batch,
     FutureDeque,
+    prefetch_embeddings,
     use_context_for_postprocs,
 )
 from torchrec.distributed.types import LazyNoWait, ShardingType
@@ -1418,3 +1425,598 @@ class TrainPipelinePrefetchEMS(TrainPipelineSparseDistEmbStash[In, Out]):
 
         self.dequeue_batch()
         return output
+
+
+@unique
+class EvalPipelineStage(Enum):
+    """
+    Relocatable stages of ``EvalPipelinePrefetchSparseDist``.
+
+    Each names work done for a batch *behind* the one being evaluated, so it can
+    be moved off its default slot in ``progress()`` and onto a module forward
+    hook. See ``EvalPipelinePrefetchSparseDist.hook_stage``.
+    """
+
+    # H2D copy of the newest batch (i+3)
+    ENQUEUE_BATCH = "enqueue_batch"
+    # splits all2all for batch i+2
+    START_SPARSE_DATA_DIST = "start_sparse_data_dist"
+    # tensor all2all for batch i+1
+    WAIT_SPARSE_DATA_DIST = "wait_sparse_data_dist"
+    # embedding cache prefetch for batch i+1
+    PREFETCH = "prefetch"
+
+    @classmethod
+    def from_name(cls, name: str) -> "EvalPipelineStage":
+        """Resolve a stage from its config string, listing the valid names on typo."""
+        try:
+            return cls(name)
+        except ValueError:
+            valid = ", ".join(stage.value for stage in cls)
+            raise ValueError(
+                f"Unknown pipeline stage {name!r}. Valid stages: {valid}"
+            ) from None
+
+
+@dataclass
+class _StageHookSpec:
+    """Where a relocated stage should run."""
+
+    fqn: str
+    prepend: bool = False
+
+
+# Within one step a stage may only run once its producer has. START_SPARSE_DATA_DIST
+# maps to ENQUEUE_BATCH rather than to a consumer of its all2all: the batch it
+# distributes has to exist first, while the a2a it starts is awaited by the *next*
+# step's WAIT_SPARSE_DATA_DIST, not this one's.
+_STAGE_PREREQUISITE: Dict[EvalPipelineStage, EvalPipelineStage] = {
+    EvalPipelineStage.START_SPARSE_DATA_DIST: EvalPipelineStage.ENQUEUE_BATCH,
+    EvalPipelineStage.PREFETCH: EvalPipelineStage.WAIT_SPARSE_DATA_DIST,
+}
+
+# Install order for hooks landing on the same module. PyTorch fires forward hooks
+# in registration order, so without a canonical order the caller's dict ordering
+# (i.e. yaml key order) would silently decide whether the dependency chain holds.
+_STAGE_ORDER: List[EvalPipelineStage] = [
+    EvalPipelineStage.ENQUEUE_BATCH,
+    EvalPipelineStage.START_SPARSE_DATA_DIST,
+    EvalPipelineStage.WAIT_SPARSE_DATA_DIST,
+    EvalPipelineStage.PREFETCH,
+]
+
+
+class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
+    """
+    Eval-only 4-stage pipeline with embedding cache prefetching.
+
+    This is the eval counterpart of ``PrefetchTrainPipelineSparseDist``: it keeps
+    the dedicated prefetch stage that hides UVM/UVM_CACHING lookup latency, but
+    drops everything that only exists to serve training. It is **not** usable for training — no
+    gradients are ever produced.
+
+    Pipeline stages (3 batches in flight)::
+
+        batch i     forward                       default stream
+        batch i+1   wait input_dist + prefetch    data_dist / prefetch streams
+        batch i+2   H2D device transfer           memcpy stream
+        batch i+2   start input_dist (splits a2a) data_dist stream
+
+    Eval-specific tuning versus the training pipeline:
+
+    - The forward runs under ``torch.no_grad()``, so no autograd graph is built.
+    - Eval can be far more aggressive than training about *what* it hides behind
+      the forward. Weights are frozen, so batch i+1's sparse work is ordered
+      against nothing: both input_dist and the cache prefetch are pushed into the
+      window of batch i's forward.
+    - That is also why the forward for batch i is issued **before** the
+      CPU-blocking ``wait_sparse_data_dist``/``prefetch`` for batch i+1. Those two
+      calls stall the CPU thread on a collective, and the GPU only runs what the
+      CPU already enqueued. Training absorbs the stall with the previous step's
+      backward and optimizer kernels; eval has no such backlog, so the forward has
+      to be launched first or the GPU idles through the stall.
+    - ``execute_all_batches`` is forced to ``True``: eval metrics are wrong if the
+      tail batches left in the pipeline are dropped when the dataloader ends.
+    - 2D DMP sync is disabled — there are no weight updates to sync.
+
+    Entry invariant of ``progress()``: ``batches[0]`` has been prefetched and
+    ``batches[1]``'s input_dist has been started, either by ``fill_pipeline`` or
+    by the tail of the previous iteration.
+
+    Relocating stages:
+        The default slots above put every sparse stage *after* the dense forward
+        returns, which is the right choice when the forward is one long opaque
+        block. When it is not -- e.g. a dense arch with a natural gap partway
+        through -- ``hook_stage`` moves an individual stage onto a module's
+        forward hook so it is issued mid-forward instead::
+
+            pipeline.hook_stage(EvalPipelineStage.WAIT_SPARSE_DATA_DIST, "dense")
+            pipeline.hook_stage(EvalPipelineStage.PREFETCH, "dense")
+
+        This mirrors the ``SDDStepsOrder`` mechanism in
+        ``TrainPipelineCustomizedOrderSparseDist``, narrowed to the stages this
+        pipeline owns. Stages left unhooked keep their default slots, so mixing
+        the two can invert the dependency order -- see ``hook_stage``.
+
+    NOTE: prefetching keeps two batches' embedding lookups alive at once, on top
+    of 3 in-flight batches. Peak HBM is higher than ``EvalPipelineSparseDist``;
+    size the eval batch accordingly.
+
+    Args:
+        stage_hooks (Optional[Dict[str, str]]): stage name -> module FQN, applied
+            as if ``hook_stage`` had been called for each entry. Exists so a
+            config/yaml can place stages without building the pipeline in Python;
+            equivalent to the programmatic API but without the ``prepend`` knob.
+            Stage names are the ``EvalPipelineStage`` values, e.g.
+            ``{"wait_sparse_data_dist": "dense", "prefetch": "dense"}``.
+            Default: None.
+
+    Example:
+        >>> model.eval()
+        >>> pipeline = EvalPipelinePrefetchSparseDist(
+        ...     model=model,
+        ...     optimizer=optimizer,
+        ...     device=torch.device("cuda:0"),
+        ... )
+        >>> while True:
+        ...     try:
+        ...         output = pipeline.progress(dataloader_iter)
+        ...     except StopIteration:
+        ...         break
+    """
+
+    # The PipelinedForward class that is used in _rewrite_model
+    # pyrefly: ignore [bad-override]
+    _pipelined_forward_type = PrefetchPipelinedForward
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        apply_jit: bool = False,
+        pipeline_postproc: bool = True,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
+        enqueue_batch_after_forward: bool = False,
+        stage_hooks: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            execute_all_batches=True,
+            apply_jit=apply_jit,
+            context_type=PrefetchTrainPipelineContext,
+            pipeline_postproc=pipeline_postproc,
+            custom_model_fwd=custom_model_fwd,
+            dmp_collection_sync_interval_batches=None,
+            enqueue_batch_after_forward=enqueue_batch_after_forward,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
+        )
+        self._prefetch_stream: Optional[torch.Stream] = (
+            (torch.get_device_module(device).Stream())
+            if self._device.type in ["cuda", "mtia"]
+            else None
+        )
+        self._default_stream: Optional[torch.Stream] = (
+            (torch.get_device_module(self._device).Stream())
+            if self._device.type in ["cuda", "mtia"]
+            else None
+        )
+        stage_hooks = stage_hooks or {}
+
+        # Stages relocated out of their default slot in progress() and into a
+        # module forward hook. See hook_stage().
+        self._stage_hooks: Dict[EvalPipelineStage, _StageHookSpec] = {}
+        self._stage_hook_handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._stage_ran: Dict[EvalPipelineStage, bool] = {}
+        self._stage_hook_missed_warned: bool = False
+        # progress() stashes the live iterator so a hooked ENQUEUE_BATCH, which
+        # fires from inside the model forward, can still pull the next batch.
+        self._active_dataloader_iter: Optional[Iterator[In]] = None
+
+        # Config-driven equivalent of calling hook_stage() for each entry, so a
+        # benchmark yaml can place stages without constructing the pipeline in
+        # Python. Bad stage names raise here rather than silently doing nothing.
+        for stage_name, module_fqn in stage_hooks.items():
+            self.hook_stage(EvalPipelineStage.from_name(stage_name), module_fqn)
+
+    def hook_stage(
+        self,
+        stage: "EvalPipelineStage",
+        module_fqn: str,
+        prepend: bool = False,
+    ) -> None:
+        """
+        Relocate a pipeline stage into a module's forward hook.
+
+        By default every stage runs at a fixed point in ``progress()`` (see the
+        class docstring). Hooking a stage removes it from that slot and runs it
+        instead when ``module_fqn``'s forward completes, i.e. partway through the
+        dense forward of batch i. That lets callers place the sparse work of
+        batch i+1 wherever the dense timeline has a gap, without subclassing.
+
+        Ordering is the caller's responsibility. The stages form a dependency
+        chain per batch::
+
+            ENQUEUE_BATCH -> START_SPARSE_DATA_DIST -> WAIT_SPARSE_DATA_DIST
+                          -> PREFETCH
+
+        A stage left unhooked keeps its default slot, so mixing hooked and
+        unhooked stages can invert that order. ``_run_stage`` raises if a stage
+        runs before its prerequisite has run in the same step.
+
+        Args:
+            stage: which stage to relocate.
+            module_fqn: dotted path of the module to hook, relative to the
+                unwrapped model (e.g. ``"sparse_arch"``, ``"over.overarch"``).
+                Resolved when the pipeline is first attached; an unknown path
+                raises then, not here.
+            prepend: run this hook before other forward hooks on that module.
+
+        Raises:
+            RuntimeError: if called after the pipeline has already run, since
+                hooks are installed during the one-time model surgery.
+
+        Example:
+            >>> pipeline.hook_stage(
+            ...     EvalPipelineStage.PREFETCH, "sparse_arch"
+            ... )
+        """
+        if self._pipelined_modules:
+            raise RuntimeError(
+                "hook_stage() must be called before the first progress(); "
+                "stage hooks are installed during model surgery."
+            )
+        self._stage_hooks[stage] = _StageHookSpec(fqn=module_fqn, prepend=prepend)
+
+    def _stage_is_hooked(self, stage: "EvalPipelineStage") -> bool:
+        return stage in self._stage_hooks
+
+    def _run_stage(self, stage: "EvalPipelineStage") -> None:
+        """
+        Execute one pipeline stage against the batches currently in flight.
+
+        Reads ``self.batches``/``self.contexts`` at call time rather than taking
+        them as arguments, so the same body works from the default slot in
+        ``progress()`` and from a forward hook firing mid-forward.
+        """
+        self._check_stage_preconditions(stage)
+        # Marked before the body: a stage whose guard finds too few batches in
+        # flight has still had its turn, and its consumers may run this step.
+        self._stage_ran[stage] = True
+        self._dispatch_stage(stage)
+
+    def _check_stage_preconditions(self, stage: "EvalPipelineStage") -> None:
+        """
+        Reject a hooked ``stage`` that is about to run at an illegal point.
+
+        Only hooked stages are checked. Unhooked ones run from the fixed sequence
+        in ``progress()``, which already follows the dependency chain.
+        """
+        if not self._stage_is_hooked(stage):
+            return
+
+        prerequisite = _STAGE_PREREQUISITE.get(stage)
+        if prerequisite is not None and not self._stage_ran.get(prerequisite, False):
+            raise RuntimeError(
+                f"{stage.value} ran before its prerequisite {prerequisite.value} "
+                "in the same step. Re-order the stage hooks: a hooked stage runs "
+                "at its module's forward, which may precede an unhooked stage's "
+                "default slot."
+            )
+        self._check_hook_site_not_too_early(stage)
+
+    def _dispatch_stage(self, stage: "EvalPipelineStage") -> None:
+        """Run ``stage``'s body, if enough batches are in flight for it to have work."""
+        if stage is EvalPipelineStage.ENQUEUE_BATCH:
+            dataloader_iter = self._active_dataloader_iter
+            if dataloader_iter is not None:
+                self.enqueue_batch(dataloader_iter)
+        elif stage is EvalPipelineStage.START_SPARSE_DATA_DIST:
+            if len(self.batches) >= 3:
+                self.start_sparse_data_dist(self.batches[2], self.contexts[2])
+        elif len(self.batches) >= 2:
+            self._dispatch_next_batch_stage(stage)
+
+    def _dispatch_next_batch_stage(self, stage: "EvalPipelineStage") -> None:
+        """Run the body of a stage that acts on batch i+1's context."""
+        context = cast(PrefetchTrainPipelineContext, self.contexts[1])
+        if stage is EvalPipelineStage.WAIT_SPARSE_DATA_DIST:
+            self.wait_sparse_data_dist(context)
+        elif stage is EvalPipelineStage.PREFETCH:
+            self._prefetch(context)
+
+    def _check_hook_site_not_too_early(self, stage: "EvalPipelineStage") -> None:
+        """
+        Reject a hook site that fires before batch i's sparse modules have run.
+
+        ``get_submodule`` only proves an FQN exists, not that it is a sane place
+        to hook. A module that runs *before* a pipelined sparse module is not:
+        ``_prefetch`` would evict cache lines batch i's own lookup has yet to
+        read.
+
+        ``module_input_post_prefetch`` is the signal -- ``_prefetch`` fills one
+        entry per pipelined module and each module's forward pops its own, so a
+        non-empty dict means some sparse module has not run yet.
+        """
+        if stage is not EvalPipelineStage.PREFETCH:
+            return
+        if not self.contexts:
+            return
+        context_0 = cast(PrefetchTrainPipelineContext, self.contexts[0])
+        pending = sorted(context_0.module_input_post_prefetch)
+        if pending:
+            spec = self._stage_hooks[stage]
+            raise RuntimeError(
+                f"Stage {stage.value} is hooked on {spec.fqn!r}, which runs before "
+                f"the sparse modules {pending} of the current batch. Running it "
+                "there would disturb the embedding cache and module contexts that "
+                "batch's own lookup still needs. Hook a module that runs after the "
+                "sparse arch."
+            )
+
+    def _maybe_run_stage(self, stage: "EvalPipelineStage") -> None:
+        """Run ``stage`` in its default slot unless it has been hooked away."""
+        if not self._stage_is_hooked(stage):
+            self._run_stage(stage)
+
+    def _try_hook_stages(self) -> None:
+        """
+        Install the forward hooks requested via ``hook_stage``.
+
+        Called once after model surgery. FQNs resolve against the unwrapped
+        model so callers write user-facing paths like ``"sparse_arch"`` rather
+        than the DMP-prefixed ones.
+        """
+        if not self._stage_hooks or self._stage_hook_handles:
+            return
+
+        model = self._model
+        if isinstance(model, DistributedModelParallel):
+            model = model.module
+
+        pipelined = {id(module) for module in self._pipelined_modules}
+
+        for stage in _STAGE_ORDER:
+            spec = self._stage_hooks.get(stage)
+            if spec is None:
+                continue
+            # Unknown FQN raises AttributeError here rather than silently never
+            # firing.
+            target = model.get_submodule(spec.fqn)
+
+            if id(target) in pipelined:
+                raise ValueError(
+                    f"Cannot hook stage {stage.value} on {spec.fqn!r}: that is a "
+                    "pipelined sparse module. Its forward is rewritten to return "
+                    "an awaitable, and running batch i+1's sparse work from "
+                    "inside it would mutate the embedding cache and module "
+                    "context that batch i's own lookup is still using. Hook a "
+                    "dense module that runs after it instead."
+                )
+
+            def _hook(
+                module: torch.nn.Module,
+                args: Any,
+                output: Any,
+                stage: "EvalPipelineStage" = stage,
+            ) -> None:
+                # Guard against a module invoked more than once per forward:
+                # the stage's work is only valid once per step.
+                if self._stage_ran.get(stage, False):
+                    return
+                with record_function(f"## stage_hook {stage.value} ##"):
+                    self._run_stage(stage)
+
+            self._stage_hook_handles.append(
+                target.register_forward_hook(_hook, prepend=spec.prepend)
+            )
+            logger.info(f"Hooked pipeline stage {stage.value} on {spec.fqn}")
+
+    def _remove_stage_hooks(self) -> None:
+        """Uninstall the stage hooks, so ``_try_hook_stages`` can install again."""
+        for handle in self._stage_hook_handles:
+            handle.remove()
+        self._stage_hook_handles.clear()
+
+    def detach(self) -> torch.nn.Module:
+        """
+        Detach the model, taking the stage hooks off with the model surgery.
+
+        Left installed they would keep firing on the returned model: a standalone
+        forward would run batch i+1's sparse work against whatever contexts the
+        pipeline still holds. They also close over ``self``, so the model would
+        pin this pipeline -- and the in-flight batches ``detach`` deliberately
+        keeps -- for as long as the caller holds the model.
+
+        Returns the original model.
+        """
+        self._remove_stage_hooks()
+        return super().detach()
+
+    def attach(
+        self, model: Optional[torch.nn.Module] = None, sparse_dist: bool = True
+    ) -> None:
+        """
+        Re-attach the model and reinstall the stage hooks ``detach`` removed.
+
+        ``fill_pipeline`` is the usual install site, but it returns early while
+        batches are still in flight -- exactly the state ``detach`` preserves so
+        ``progress`` can resume -- so the hooks are reinstalled here instead.
+        """
+        super().attach(model, sparse_dist)
+        # An empty context deque means super() deferred model surgery to the next
+        # fill_pipeline, which installs the hooks itself once the FQNs resolve.
+        if self._pipelined_modules:
+            self._try_hook_stages()
+
+    def _warn_on_missed_stage_hooks(self) -> None:
+        """
+        Warn once if a hooked stage never fired during a step.
+
+        A stage silently skipped means its module was not reached in the
+        forward, which usually points at a wrong FQN and would otherwise show up
+        only as a much later correctness or hang symptom.
+        """
+        if self._stage_hook_missed_warned:
+            return
+        missed = [
+            stage.value
+            for stage in self._stage_hooks
+            if not self._stage_ran.get(stage, False)
+        ]
+        if missed:
+            self._stage_hook_missed_warned = True
+            logger.warning(
+                f"Stage hooks {missed} did not fire this step; their modules were "
+                "not reached during forward. Check the FQNs passed to hook_stage()."
+            )
+
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
+        """
+        Cold start: prime 2 batches so ``progress`` meets its entry invariant.
+
+        ``batches[0]`` gets model surgery, a completed input_dist and a prefetch;
+        ``batches[1]`` gets its input_dist started.
+        """
+        # pipeline is already filled: fill_pipeline primes 2 batches, and progress
+        # holds 2 at its start (it enqueues a 3rd, then dequeues one at the end).
+        if len(self.batches) >= 2:
+            return
+
+        # draining the tail after the dataloader is exhausted, nothing to prime
+        if self.batches:
+            return
+
+        with torch.no_grad():
+            # batch i
+            if not self.enqueue_batch(dataloader_iter):
+                logger.info("fill_pipeline: failed to load batch i")
+                return
+
+            self._init_pipelined_modules(
+                cast(In, self.batches[0]),
+                self.contexts[0],
+                # pyrefly: ignore [bad-argument-type]
+                self._pipelined_forward_type,
+            )
+            # Model surgery is done, so hook FQNs can now be resolved.
+            self._try_hook_stages()
+            self.wait_sparse_data_dist(self.contexts[0])
+            self._prefetch(cast(PrefetchTrainPipelineContext, self.contexts[0]))
+
+            # batch i+1
+            if not self.enqueue_batch(dataloader_iter):
+                logger.info("fill_pipeline: failed to load batch i+1")
+                return
+
+            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        """
+        Runs the eval forward for batch i while prefetching batch i+1.
+
+        Args:
+            dataloader_iter: iterator producing eval batches.
+
+        Returns:
+            Model output for batch i.
+
+        Raises:
+            StopIteration: once the dataloader is exhausted and every batch left
+                in the pipeline has been evaluated.
+        """
+        self._state = PipelineState.IDLE
+        # attach the model just in case the user forgets to call it, especially when the
+        # user pauses the pipeline.progress and detaches the model for other purposes.
+        if not self._model_attached:
+            self.attach(self._model)
+
+        with torch.no_grad():
+            self.fill_pipeline(dataloader_iter)
+
+            # expected stop after every batch has been evaluated
+            if not self.batches:
+                one_time_rank0_logger.info(
+                    f"eval stopped at {self._batch_count} batches"
+                )
+                raise StopIteration
+
+            self._set_module_context(self.contexts[0])
+
+            # Hooked stages fire from inside the forward below and read these.
+            self._stage_ran = {}
+            self._active_dataloader_iter = dataloader_iter
+
+            # batch i's prefetch was issued on the prefetch stream; the forward
+            # below reads its output on the current stream.
+            with record_function(f"## wait_for_batch {self.contexts[0].index} ##"):
+                _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+
+            if not self._enqueue_batch_after_forward:
+                # batch i+3: load data and copy to gpu, the dataloader iter will
+                # first exhaust here
+                self._maybe_run_stage(EvalPipelineStage.ENQUEUE_BATCH)
+
+            # Forward batch i FIRST. It only depends on prefetch(i), which is
+            # already done, so launching it before the CPU-blocking waits below
+            # keeps the GPU busy while the CPU drains the input_dist awaitables.
+            with record_function(f"## eval {self.contexts[0].index} ##"):
+                self._state = PipelineState.CALL_FWD
+                _, output = self._model_fwd(self.batches[0])
+
+            if self._enqueue_batch_after_forward:
+                # Deferring the H2D copy until after the forward keeps it off the
+                # PCIe path used by the embedding prefetch below.
+                self._maybe_run_stage(EvalPipelineStage.ENQUEUE_BATCH)
+
+            # Free batch i's prefetched embeddings (already consumed by the
+            # forward) so the caching allocator can reuse them for batch i+1.
+            context_0 = cast(PrefetchTrainPipelineContext, self.contexts[0])
+            context_0.module_input_post_prefetch.clear()
+            context_0.module_contexts_post_prefetch.clear()
+
+            # complete input_dist (tensor a2a) for i+1, then prefetch its
+            # embeddings on the prefetch stream, overlapping the forward above.
+            self._maybe_run_stage(EvalPipelineStage.WAIT_SPARSE_DATA_DIST)
+            self._maybe_run_stage(EvalPipelineStage.PREFETCH)
+
+            # start input_dist for i+2 last, so its splits a2a overlaps with
+            # the next iteration's early phases
+            self._maybe_run_stage(EvalPipelineStage.START_SPARSE_DATA_DIST)
+
+            self._warn_on_missed_stage_hooks()
+            self._active_dataloader_iter = None
+
+            self.dequeue_batch()
+            return output
+
+    def _prefetch(self, context: PrefetchTrainPipelineContext) -> None:
+        """
+        Prefetches embeddings for ``context``'s batch on the prefetch stream.
+
+        Args:
+            context: prefetch context holding the completed input dist requests
+                and module contexts for the batch to prefetch.
+        """
+        context.module_input_post_prefetch.clear()
+        context.module_contexts_post_prefetch.clear()
+
+        with record_function(f"## sharded_module_prefetch {context.index} ##"):
+            # pyrefly: ignore [bad-argument-type]
+            with self._stream_context(self._prefetch_stream):
+                prefetch_embeddings(
+                    context,
+                    self._pipelined_modules,
+                    self._device,
+                    # pyrefly: ignore [bad-argument-type]
+                    self._stream_context,
+                    self._data_dist_stream,
+                    self._default_stream,
+                )
