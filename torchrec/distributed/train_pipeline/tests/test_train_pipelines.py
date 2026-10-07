@@ -685,6 +685,139 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    @given(
+        sharding_type=st.sampled_from([ShardingType.TABLE_WISE.value]),
+        kernel_type=st.sampled_from([EmbeddingComputeKernel.FUSED.value]),
+        execute_all_batches=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
+    def test_async_next_batch_equal_to_non_pipelined(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+        execute_all_batches: bool,
+    ) -> None:
+        """Numerics-parity gate for ``async_next_batch`` on every copy path:
+        regular copy, sync in-place copy, and async in-place copy. ``next()`` runs off
+        the main thread, so this pins that the iterator is still consumed exactly once
+        and in order, and that results match non-pipelined training."""
+        copy_modes = [
+            # (enable_inplace_copy_batch, async_inplace_copy)
+            (False, False),
+            (True, False),
+            (True, True),
+        ]
+        for enable_inplace_copy_batch, async_inplace_copy in copy_modes:
+            with self.subTest(
+                enable_inplace_copy_batch=enable_inplace_copy_batch,
+                async_inplace_copy=async_inplace_copy,
+            ):
+                data = self._generate_data(num_batches=12, batch_size=32)
+                dataloader = iter(data)
+
+                model = self._setup_model()
+                sharded_model, optim = self._generate_sharded_model_and_optimizer(
+                    model, sharding_type, kernel_type, {}
+                )
+                (
+                    sharded_model_pipelined,
+                    optim_pipelined,
+                ) = self._generate_sharded_model_and_optimizer(
+                    model, sharding_type, kernel_type, {}
+                )
+                copy_state_dict(
+                    sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+                )
+
+                pipeline = self.pipeline_class(
+                    model=sharded_model_pipelined,
+                    optimizer=optim_pipelined,
+                    device=self.device,
+                    execute_all_batches=execute_all_batches,
+                    enable_inplace_copy_batch=enable_inplace_copy_batch,
+                    async_inplace_copy=async_inplace_copy,
+                    async_next_batch=True,
+                )
+                self.assertTrue(pipeline._async_next_batch)
+
+                if not execute_all_batches:
+                    data = data[:-2]
+
+                for batch in data:
+                    batch = batch.to(self.device)
+                    optim.zero_grad()
+                    loss, pred = sharded_model(batch)
+                    loss.backward()
+                    optim.step()
+
+                    pred_pipeline = pipeline.progress(dataloader)
+                    torch.testing.assert_close(pred, pred_pipeline)
+
+                self.assertRaises(StopIteration, pipeline.progress, dataloader)
+                pipeline._shutdown_async_inplace_copy()
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_next_batch_setup_and_exhaustion(self) -> None:
+        """async_next_batch works without async_inplace_copy, keeps exactly one
+        fetch in flight, and never calls next() again once the iterator is exhausted,
+        even though execute_all_batches keeps enqueueing past the end."""
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            {},
+        )
+
+        pipeline = self.pipeline_class(
+            model=sharded_model,
+            optimizer=optim,
+            device=self.device,
+            enable_inplace_copy_batch=True,
+            async_inplace_copy=False,
+            async_next_batch=True,
+        )
+        self.assertTrue(pipeline._async_next_batch)
+        self.assertIsNotNone(pipeline._next_batch_fetch_executor)
+        self.assertIsNone(pipeline._inplace_copy_executor)
+        self.assertIsNone(pipeline._pending_next_batch)
+
+        data = self._generate_data(num_batches=2, batch_size=32)
+        next_calls = 0
+
+        def counting_iter() -> Generator[ModelInput, None, None]:
+            nonlocal next_calls
+            for batch in data:
+                next_calls += 1
+                yield batch
+            next_calls += 1
+
+        it = counting_iter()
+
+        first = pipeline._next_batch(it)
+        self.assertIs(first, data[0])
+        # One fetch runs ahead while the caller works on the batch just handed back.
+        self.assertIsNotNone(pipeline._pending_next_batch)
+
+        self.assertIs(pipeline._next_batch(it), data[1])
+        self.assertIsNone(pipeline._next_batch(it))
+        self.assertTrue(pipeline._dataloader_exhausted)
+        self.assertIsNone(pipeline._pending_next_batch)
+        calls_at_exhaustion = next_calls
+
+        for _ in range(3):
+            self.assertIsNone(pipeline._next_batch(it))
+        self.assertEqual(next_calls, calls_at_exhaustion)
+
+        pipeline._shutdown_async_inplace_copy()
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     @given(execute_all_batches=st.booleans())
     @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
     def test_pipelining_fsdp_pre_trace(self, execute_all_batches: bool) -> None:
@@ -2620,3 +2753,20 @@ class TrainPipelineSparseDistCompAutogradTest(TrainPipelineSparseDistTest):
     )
     def test_async_inplace_copy_setup_and_lifecycle(self) -> None:
         super().test_async_inplace_copy_setup_and_lifecycle()
+
+    @unittest.skip(
+        "async_next_batch is a base TrainPipelineSparseDist feature; the compiled-autograd variant uses a different pipeline class and hits the same hypothesis multi-executor HealthCheck as test_equal_to_non_pipelined. Threading x compiled autograd is validated separately."
+    )
+    def test_async_next_batch_equal_to_non_pipelined(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+        execute_all_batches: bool,
+    ) -> None:
+        super().test_async_next_batch_equal_to_non_pipelined()
+
+    @unittest.skip(
+        "Construction-only test; the compiled-autograd variant's tearDown asserts compiled-autograd captures that this test does not trigger. async_next_batch is a base TrainPipelineSparseDist feature validated in the eager variant."
+    )
+    def test_async_next_batch_setup_and_exhaustion(self) -> None:
+        super().test_async_next_batch_setup_and_exhaustion()

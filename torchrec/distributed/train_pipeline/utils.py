@@ -1064,6 +1064,10 @@ class AsyncInplaceCopyMixin(Generic[In]):
     Gated by ``async_inplace_copy`` (default off). When off, ``_setup_async_inplace_copy``
     is a no-op and the host pipeline behaves byte-for-byte as before.
 
+    ``async_next_batch`` (default off) is independent: it keeps one
+    ``next(dataloader_iter)`` in flight on its own thread and works with or without
+    ``async_inplace_copy``.
+
     Correctness: in-place copy allocates the destination on the *caller's current
     stream* (so no ``record_stream`` is needed). A worker thread has its own current
     stream, so we capture the main thread's current stream at submit time and re-enter
@@ -1078,8 +1082,14 @@ class AsyncInplaceCopyMixin(Generic[In]):
     batches: Deque[Optional[In]]
     _async_inplace_copy: bool = False
     _inplace_copy_executor: Optional[ThreadPoolExecutor] = None
+    _async_next_batch: bool = False
+    _next_batch_fetch_executor: Optional[ThreadPoolExecutor] = None
+    _pending_next_batch: "Optional[Future[Optional[In]]]" = None
+    _async_next_batch_iter: Optional[Iterator[In]] = None
 
-    def _setup_async_inplace_copy(self, enabled: bool, device: torch.device) -> None:
+    def _setup_async_inplace_copy(
+        self, enabled: bool, device: torch.device, async_next_batch: bool = False
+    ) -> None:
         requested = enabled
         if enabled and device.type not in ("cuda", "mtia"):
             logger.warning(
@@ -1089,6 +1099,15 @@ class AsyncInplaceCopyMixin(Generic[In]):
             enabled = False
         self._async_inplace_copy = enabled
         self._inplace_copy_executor = None
+        self._async_next_batch = async_next_batch
+        self._next_batch_fetch_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="async_next_batch")
+            if async_next_batch
+            else None
+        )
+        self._pending_next_batch = None
+        self._async_next_batch_iter = None
+        one_time_rank0_logger.info("async_next_batch: %s", async_next_batch)
         if not enabled:
             # Logged unconditionally (both branches) so a trace/log search can
             # confirm what value actually reached the pipeline, not just the on-case.
@@ -1130,8 +1149,54 @@ class AsyncInplaceCopyMixin(Generic[In]):
         assert self._inplace_copy_executor is not None
         return self._inplace_copy_executor.submit(_work)
 
+    def _submit_next_batch_fetch(
+        self, dataloader_iter: Iterator[In]
+    ) -> "Future[Optional[In]]":
+        def _work() -> Optional[In]:
+            with record_function("## next_batch (async) ##"):
+                return next(dataloader_iter, None)
+
+        assert self._next_batch_fetch_executor is not None
+        return self._next_batch_fetch_executor.submit(_work)
+
+    def _take_async_next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
+        """Return the host batch the fetch worker already pulled, then queue the next.
+
+        Only ``next()`` runs ahead; the H2D copy is still dispatched by the caller,
+        so no extra device batch is held. Fetch runs on its own thread so the copy
+        worker never queues behind a slow ``next()``.
+        """
+        # A new iterator invalidates anything queued against the old one. The
+        # in-flight batch is dropped, matching DataLoadingThread's one-iterator
+        # lifetime.
+        if self._async_next_batch_iter is not dataloader_iter:
+            pending = self._pending_next_batch
+            if pending is not None:
+                pending.cancel()
+            self._pending_next_batch = None
+            self._async_next_batch_iter = dataloader_iter
+
+        pending = self._pending_next_batch
+        if pending is None:
+            pending = self._submit_next_batch_fetch(dataloader_iter)
+        batch = pending.result()
+        # Stop resubmitting once exhausted so the worker does not call next() on a
+        # dead iterator.
+        self._pending_next_batch = (
+            self._submit_next_batch_fetch(dataloader_iter)
+            if batch is not None
+            else None
+        )
+        return batch
+
     def _shutdown_async_inplace_copy(self) -> None:
-        executor = self._inplace_copy_executor
-        if executor is not None:
-            executor.shutdown(wait=False)
-            self._inplace_copy_executor = None
+        pending = self._pending_next_batch
+        if pending is not None:
+            pending.cancel()
+            self._pending_next_batch = None
+        self._async_next_batch_iter = None
+        for executor in (self._next_batch_fetch_executor, self._inplace_copy_executor):
+            if executor is not None:
+                executor.shutdown(wait=False)
+        self._next_batch_fetch_executor = None
+        self._inplace_copy_executor = None
