@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import json
 import math
 import os
 import unittest
@@ -511,6 +512,150 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertTrue(MemoryStashingManager.is_enabled())
         MemoryStashingManager.reset()
         self.assertFalse(MemoryStashingManager.is_enabled())
+
+
+class TestStashCycleSummary(unittest.TestCase):
+    """Tests for the per-rank ``ems_stash_cycle_summary`` event."""
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+        MemoryStashingManager._logged_event_keys.clear()
+        MemoryStashingManager._last_cycle_signatures.clear()
+        MemoryStashingManager._cycle_summary_log_counts.clear()
+        patcher = patch("torchrec.distributed.memory_stashing.log_ems_event")
+        self.log_ems_event: Mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def _lookup(self, weights: torch.Tensor) -> Mock:
+        inner = Mock()
+        inner.weights_dev = weights
+        emb_module = Mock()
+        emb_module._emb_module = inner
+        lookup = Mock(spec=["_emb_modules"])
+        lookup._emb_modules = [emb_module]
+        return lookup
+
+    def _logged(self, event_name: str) -> List[Dict[str, str]]:
+        return [
+            c.args[1]
+            for c in self.log_ems_event.call_args_list
+            if c.args[0] == event_name
+        ]
+
+    def test_summary_sums_every_lookup(self) -> None:
+        MemoryStashingManager.stash_embedding_weights(
+            self._lookup(torch.ones((100, 64), device=self.device)), caller="EBC"
+        )
+        MemoryStashingManager.stash_embedding_weights(
+            self._lookup(torch.ones((50, 32), device=self.device)), caller="VLE"
+        )
+        MemoryStashingManager.restore_embedding_weights()
+
+        summaries = self._logged("ems_stash_cycle_summary")
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["use_case"], "embedding")
+        self.assertEqual(summaries[0]["stashed_bytes"], str((100 * 64 + 50 * 32) * 4))
+        self.assertEqual(summaries[0]["num_stashes"], "2")
+        self.assertEqual(
+            json.loads(summaries[0]["by_caller"]),
+            {
+                "EBC": {
+                    "stashed_bytes": 100 * 64 * 4,
+                    "num_tensors": 1,
+                    "num_stashes": 1,
+                },
+                "VLE": {
+                    "stashed_bytes": 50 * 32 * 4,
+                    "num_tensors": 1,
+                    "num_stashes": 1,
+                },
+            },
+        )
+
+    def test_summary_relogged_only_when_value_changes(self) -> None:
+        weights = torch.ones((100, 64), device=self.device)
+        for _ in range(2):
+            MemoryStashingManager.stash_embedding_weights(self._lookup(weights))
+            MemoryStashingManager.restore_embedding_weights()
+        self.assertEqual(len(self._logged("ems_stash_cycle_summary")), 1)
+
+        MemoryStashingManager.stash_embedding_weights(
+            self._lookup(torch.ones((10, 64), device=self.device))
+        )
+        MemoryStashingManager.restore_embedding_weights()
+        summaries = self._logged("ems_stash_cycle_summary")
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual(summaries[1]["stashed_bytes"], str(10 * 64 * 4))
+
+    def test_delayed_stash_is_tallied_when_executed(self) -> None:
+        MemoryStashingManager.set_delay_stash(True)
+        MemoryStashingManager.stash_embedding_weights(
+            self._lookup(torch.ones((100, 64), device=self.device))
+        )
+        MemoryStashingManager.stash_embedding_weights(
+            self._lookup(torch.ones((50, 32), device=self.device))
+        )
+        self.assertEqual(MemoryStashingManager._cycle_tallies, {})
+
+        MemoryStashingManager.execute_pending_stashes()
+        MemoryStashingManager.restore_embedding_weights()
+        summaries = self._logged("ems_stash_cycle_summary")
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["stashed_bytes"], str((100 * 64 + 50 * 32) * 4))
+
+    def _adam_with_state(self) -> torch.optim.Optimizer:
+        # The 1 MB weight gives two stashable Adam moments; the bias state is
+        # under the 1 MB stash threshold.
+        model = nn.Linear(512, 512).to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
+        model(torch.randn(32, 512, device=self.device)).sum().backward()
+        optimizer.step()
+        return optimizer
+
+    def test_optimizer_summary_covers_every_slice(self) -> None:
+        MemoryStashingManager.stash_optimizer_state(
+            self._adam_with_state(), num_slices=2
+        )
+        self.assertEqual(self._logged("ems_stash_cycle_summary"), [])
+
+        MemoryStashingManager.restore_optimizer_state_next()
+        MemoryStashingManager.restore_optimizer_state_next()
+
+        summaries = self._logged("ems_stash_cycle_summary")
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["use_case"], "optimizer_state")
+        self.assertEqual(summaries[0]["stashed_bytes"], str(2 * 512 * 512 * 4))
+        self.assertEqual(summaries[0]["num_stashes"], "2")
+
+    def test_optimizer_summary_sums_every_optimizer(self) -> None:
+        MemoryStashingManager.stash_optimizer_state(self._adam_with_state())
+        MemoryStashingManager.stash_optimizer_state(self._adam_with_state())
+        MemoryStashingManager.restore_optimizer_state()
+
+        summaries = self._logged("ems_stash_cycle_summary")
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["stashed_bytes"], str(2 * 2 * 512 * 512 * 4))
+        self.assertEqual(
+            json.loads(summaries[0]["by_caller"])["Adam"]["num_stashes"], 2
+        )
+
+    def test_collected_event_skips_lookups_with_nothing_to_stash(self) -> None:
+        MemoryStashingManager.stash_embedding_weights(
+            self._lookup(torch.ones((10, 8))), caller="NoStash"
+        )
+        MemoryStashingManager.stash_embedding_weights(
+            self._lookup(torch.ones((10, 8), device=self.device)), caller="Stash"
+        )
+        collected = self._logged("ems_stash_embedding_weights_collected")
+        self.assertEqual(len(collected), 1)
+        self.assertEqual(collected[0]["caller"], "Stash")
+        self.assertEqual(collected[0]["num_tensors"], "1")
 
 
 class ScratchBufferOptimizer(torch.optim.SGD):
