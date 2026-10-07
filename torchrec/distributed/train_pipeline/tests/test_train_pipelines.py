@@ -638,6 +638,73 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    def test_fence_batch_copy_stream_equal_to_non_pipelined(self) -> None:
+        """
+        ``fence_batch_copy_stream`` drops the record_stream registrations that keep
+        a freed batch block from being reused while the default stream still reads
+        it. Stalling the default stream before every step, and comparing only after
+        the loop, lets the CPU run steps ahead so the next batch copy lands in the
+        freed blocks; a missing fence shows up as a numerics mismatch.
+        """
+        data = self._generate_data(
+            num_batches=12,
+            batch_size=32,
+        )
+        dataloader = iter(data)
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            {},
+        )
+        (
+            sharded_model_pipelined,
+            optim_pipelined,
+        ) = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            {},
+        )
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        pipeline = self.pipeline_class(
+            model=sharded_model_pipelined,
+            optimizer=optim_pipelined,
+            device=self.device,
+            execute_all_batches=True,
+            fence_batch_copy_stream=True,
+        )
+        self.assertTrue(pipeline._fence_batch_copy_stream)
+
+        # The non-pipelined reference syncs the host on the default stream every
+        # step, so it runs to completion before the pipelined loop starts.
+        preds = []
+        for batch in data:
+            batch = batch.to(self.device)
+            optim.zero_grad()
+            loss, pred = sharded_model(batch)
+            loss.backward()
+            optim.step()
+            preds.append(pred)
+
+        preds_pipeline = []
+        for _ in data:
+            torch.cuda._sleep(50_000_000)
+            preds_pipeline.append(pipeline.progress(dataloader))
+
+        self.assertRaises(StopIteration, pipeline.progress, dataloader)
+        for pred, pred_pipeline in zip(preds, preds_pipeline):
+            torch.testing.assert_close(pred, pred_pipeline)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     def test_async_inplace_copy_setup_and_lifecycle(self) -> None:
         """async_inplace_copy: flag-off is a no-op (plain deque, no worker);
         flag-on swaps in a FutureDeque + a worker that shuts down cleanly and
@@ -1281,6 +1348,55 @@ class TrainPipelineRecordStreamGateTest(unittest.TestCase):
                     mock_wait_for_batch.call_args.kwargs["record_stream"],
                     expected_record_stream,
                 )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_fence_replaces_record_stream(self) -> None:
+        """With fence_batch_copy_stream, the default-stream registration is skipped
+        only because every regular batch copy is preceded by the memcpy fence; the
+        flag is dropped under in-place copy, which never needed the fence."""
+        dmp = MagicMock(spec=DMPCollection)
+        dmp.training = True
+        inplace_pipeline = TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cuda"),
+            enable_inplace_copy_batch=True,
+            fence_batch_copy_stream=True,
+        )
+        self.assertFalse(inplace_pipeline._fence_batch_copy_stream)
+
+        pipeline = TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cuda"),
+            fence_batch_copy_stream=True,
+        )
+        self.assertTrue(pipeline._fence_batch_copy_stream)
+        context = TrainPipelineContext()
+        context.index = 0
+        pipeline.batches.append(MagicMock(spec=Pipelineable))
+        pipeline.contexts.append(context)
+        with patch(
+            "torchrec.distributed.train_pipeline.train_pipelines._wait_for_batch"
+        ) as mock_wait_for_batch:
+            pipeline._wait_for_batch()
+        self.assertFalse(mock_wait_for_batch.call_args.kwargs["record_stream"])
+
+        calls = []
+        with patch.object(
+            pipeline,
+            "_fence_memcpy_stream",
+            side_effect=lambda: calls.append("fence"),
+        ), patch.object(
+            pipeline,
+            "copy_batch_to_gpu",
+            side_effect=lambda _: calls.append("copy") or (None, None),
+        ):
+            pipeline.enqueue_batch(iter([]))
+        self.assertEqual(calls, ["fence", "copy"])
 
 
 class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
@@ -2620,3 +2736,9 @@ class TrainPipelineSparseDistCompAutogradTest(TrainPipelineSparseDistTest):
     )
     def test_async_inplace_copy_setup_and_lifecycle(self) -> None:
         super().test_async_inplace_copy_setup_and_lifecycle()
+
+    @unittest.skip(
+        "fence_batch_copy_stream is a base TrainPipelineSparseDist option that the compiled-autograd pipeline does not accept."
+    )
+    def test_fence_batch_copy_stream_equal_to_non_pipelined(self) -> None:
+        super().test_fence_batch_copy_stream_equal_to_non_pipelined()
