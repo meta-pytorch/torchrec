@@ -7,8 +7,11 @@
 
 # pyre-strict
 
+import json
 import logging
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -44,6 +47,20 @@ logger: logging.Logger = logging.getLogger(__name__)
 # restore) overrides this independently -- see ``set_embedding_trunk_size`` /
 # ``set_optimizer_trunk_size``, driven from ``MemoryBouncerConfig``.
 _DEFAULT_CHUNK_SIZE_BYTES: int = 32 * 1024**2
+
+# Upper bound on how many distinct values a single stash cycle summary may log
+# per process, so a summary whose value keeps changing cannot flood the event
+# logger.
+_CYCLE_SUMMARY_LOG_LIMIT: int = 8
+
+
+@dataclass
+class _StashTally:
+    """Bytes and tensor counts stashed by one caller during one stash cycle."""
+
+    stashed_bytes: int = 0
+    num_tensors: int = 0
+    num_stashes: int = 0
 
 
 @runtime_checkable
@@ -182,6 +199,18 @@ class MemoryStashingManager:
     # sites run on every batch; without this guard they would flood the event
     # logger. Intentionally NOT cleared in reset() to avoid re-flooding.
     _logged_event_keys: set[str] = set()
+    # HBM freed by every stash since the use case's last cycle summary, keyed by
+    # use case then caller. A rank stashes once per lookup (and once per
+    # optimizer slice), so only the sum across all of them is the per-rank
+    # stashed volume. Guarded by ``_cycle_lock`` because optimizer stashing can
+    # run on the background stash thread.
+    _cycle_tallies: Dict[str, Dict[str, _StashTally]] = {}
+    _cycle_lock: threading.Lock = threading.Lock()
+    # Last tally logged per use case and how many times it was logged, so a
+    # summary is re-logged only when its value changes. Runs on every restore,
+    # so the unchanged case must stay a tuple comparison.
+    _last_cycle_signatures: Dict[str, Tuple[Tuple[str, int, int, int], ...]] = {}
+    _cycle_summary_log_counts: Dict[str, int] = {}
     # Trunk sizes (bytes) for the bulk copies, used as ``chunked_copy_``'s
     # ``chunk_size_bytes``. Embedding and optimizer stashing each get their own
     # pair, and within a use case the D2H stash and H2D restore are independent:
@@ -209,6 +238,68 @@ class MemoryStashingManager:
             return
         cls._logged_event_keys.add(event_name)
         log_ems_event(event_name, metadata)
+
+    @classmethod
+    def _tally_stash(
+        cls, use_case: str, caller: str, stashed_bytes: int, num_tensors: int
+    ) -> None:
+        """Add one stash's freed HBM to the current cycle's tally."""
+        with cls._cycle_lock:
+            tally = cls._cycle_tallies.setdefault(use_case, {}).setdefault(
+                caller, _StashTally()
+            )
+            tally.stashed_bytes += stashed_bytes
+            tally.num_tensors += num_tensors
+            tally.num_stashes += 1
+
+    @classmethod
+    def _log_cycle_summary(cls, use_case: str) -> None:
+        """Log this rank's total stashed volume for ``use_case`` and reset it.
+
+        Emits ``ems_stash_cycle_summary``: the sum over every stash in the cycle
+        (all lookups, or all optimizer slices) plus a per-caller breakdown.
+        Logged again only when the value changes, up to
+        ``_CYCLE_SUMMARY_LOG_LIMIT`` times per process.
+        """
+        with cls._cycle_lock:
+            tallies = cls._cycle_tallies.pop(use_case, None)
+            if not tallies:
+                return
+            signature = tuple(
+                sorted(
+                    (caller, t.stashed_bytes, t.num_tensors, t.num_stashes)
+                    for caller, t in tallies.items()
+                )
+            )
+            if cls._last_cycle_signatures.get(use_case) == signature:
+                return
+            log_count = cls._cycle_summary_log_counts.get(use_case, 0)
+            if log_count >= _CYCLE_SUMMARY_LOG_LIMIT:
+                return
+            # Recorded before emitting so that an emit that fails is not
+            # retried on every restore.
+            cls._last_cycle_signatures[use_case] = signature
+            cls._cycle_summary_log_counts[use_case] = log_count + 1
+        total_bytes = sum(t.stashed_bytes for t in tallies.values())
+        metadata = {
+            "use_case": use_case,
+            "stashed_bytes": str(total_bytes),
+            "stashed_gib": f"{total_bytes / 1024**3:.3f}",
+            "num_tensors": str(sum(t.num_tensors for t in tallies.values())),
+            "num_stashes": str(sum(t.num_stashes for t in tallies.values())),
+            "by_caller": json.dumps(
+                {
+                    caller: {
+                        "stashed_bytes": t.stashed_bytes,
+                        "num_tensors": t.num_tensors,
+                        "num_stashes": t.num_stashes,
+                    }
+                    for caller, t in tallies.items()
+                },
+                sort_keys=True,
+            ),
+        }
+        log_ems_event("ems_stash_cycle_summary", metadata)
 
     # DCP staging-boundary redirect map (criterion 1: no CUDA invalid-argument).
     # Maps a *freed* GPU StorageImpl identity (``untyped_storage()._cdata``) to
@@ -388,6 +479,8 @@ class MemoryStashingManager:
         cls._optimizer_stash_chunk_size_bytes = _DEFAULT_CHUNK_SIZE_BYTES
         cls._optimizer_restore_chunk_size_bytes = _DEFAULT_CHUNK_SIZE_BYTES
         cls._pending_stash_callbacks.clear()
+        with cls._cycle_lock:
+            cls._cycle_tallies.clear()
         cls._staged_storage_buffers.clear()
         cls._stashed_tables = None
         if cls._stash_executor is not None:
@@ -446,6 +539,9 @@ class MemoryStashingManager:
         sync_event: Optional[torch.cuda.Event] = None,
     ) -> None:
         """Pop and call all embedding weight restore callbacks in reverse order."""
+        # Every lookup has stashed by the time the first restore runs, so the
+        # embedding tally now holds this rank's whole stashed volume.
+        cls._log_cycle_summary("embedding")
         cls._log_ems_once(
             "ems_restore_embedding_weights_callbacks",
             {"num_callbacks": str(len(cls._embedding_weight_restore_callbacks))},
@@ -461,6 +557,9 @@ class MemoryStashingManager:
         restore_scratch_buffer: bool = True,
     ) -> None:
         """Restore copied optimizer state and, optionally, disposable scratch buffer."""
+        # A rank may stash several optimizers (and slices) before one restore, so
+        # the per-rank total is only known here.
+        cls._log_cycle_summary("optimizer_state")
         cls._log_ems_once(
             "ems_restore_optimizer_state_callbacks",
             {
@@ -491,6 +590,7 @@ class MemoryStashingManager:
         ``_step_optimizer`` pop-all guard, or hooks fired more times than there
         are slices).
         """
+        cls._log_cycle_summary("optimizer_state")
         if cls._optimizer_state_restore_callbacks:
             logger.info(
                 "restore_optimizer_state_next: restoring one slice "
@@ -519,6 +619,8 @@ class MemoryStashingManager:
         delay: bool = False,
         stash_chunk_size_bytes: Optional[int] = None,
         restore_chunk_size_bytes: Optional[int] = None,
+        use_case: Optional[str] = None,
+        caller: str = "",
     ) -> Tuple[
         Callable[[Optional[torch.Tensor]], None],
         Callable[..., None],
@@ -554,6 +656,10 @@ class MemoryStashingManager:
                 points always pass their use case's configured value.
             restore_chunk_size_bytes: Trunk size for the H2D copy in the
                 returned ``restore`` callback.  Same fallback as above.
+            use_case: If set, the HBM this stash frees is added to that use
+                case's cycle tally (see ``_log_cycle_summary``).
+            caller: Attributes the tallied bytes in the cycle summary's
+                per-caller breakdown.
 
         Returns:
             A tuple of three callback functions:
@@ -605,6 +711,7 @@ class MemoryStashingManager:
         def execute_stash(_grad: Optional[torch.Tensor] = None) -> None:
             """Perform the D2H copy and free HBM."""
             d2h_stream = cls.d2h_stream()
+            freed_bytes = 0
 
             # Ensure all operations on the caller's stream complete before we
             # start copying — prevents reading while still being written.
@@ -692,10 +799,13 @@ class MemoryStashingManager:
                         storage_ptr = tensor.untyped_storage().data_ptr()
                         if storage_ptr not in seen_storage_ptrs:
                             seen_storage_ptrs.add(storage_ptr)
+                            freed_bytes += tensor.untyped_storage().nbytes()
                             tensor.untyped_storage().resize_(0)
 
                 for tensor, cpu_buffer, _ in stash_data:
                     tensor.data = cpu_buffer
+            if use_case is not None and stash_data:
+                cls._tally_stash(use_case, caller, freed_bytes, len(stash_data))
             # Record completion of the D2H copies so ``restore`` can wait for
             # them before re-allocating, letting the allocator reuse the bytes
             # this stash just freed instead of double-buffering the state.
@@ -903,7 +1013,9 @@ class MemoryStashingManager:
                 continue
             tensors.append(weights_dev)
 
-        tensor_size = _tensor_size_text(tensors) if tensors else "0.00 Bytes"
+        if not tensors:
+            return None
+
         cls._log_ems_once(
             "ems_stash_embedding_weights_collected",
             {
@@ -911,12 +1023,9 @@ class MemoryStashingManager:
                 "lookup": type(lookup).__name__,
                 "module": type(module).__name__,
                 "num_tensors": str(len(tensors)),
-                "tensor_size": tensor_size,
+                "tensor_size": _tensor_size_text(tensors),
             },
         )
-
-        if not tensors:
-            return None
 
         if cls._delay_stash:
             await_restore, restore, execute_stash = cls._stash_tensors(
@@ -925,6 +1034,8 @@ class MemoryStashingManager:
                 delay=True,
                 stash_chunk_size_bytes=cls._embedding_stash_chunk_size_bytes,
                 restore_chunk_size_bytes=cls._embedding_restore_chunk_size_bytes,
+                use_case="embedding",
+                caller=caller,
             )
 
             # Wrap execute_stash to also register the restore callback,
@@ -941,6 +1052,8 @@ class MemoryStashingManager:
             label="embedding",
             stash_chunk_size_bytes=cls._embedding_stash_chunk_size_bytes,
             restore_chunk_size_bytes=cls._embedding_restore_chunk_size_bytes,
+            use_case="embedding",
+            caller=caller,
         )
         cls._embedding_weight_restore_callbacks.append(restore)
         return await_restore, restore, execute_stash
@@ -1265,6 +1378,8 @@ class MemoryStashingManager:
                 sync_event=sync_event,
                 stash_chunk_size_bytes=cls._optimizer_stash_chunk_size_bytes,
                 restore_chunk_size_bytes=cls._optimizer_restore_chunk_size_bytes,
+                use_case="optimizer_state",
+                caller=type(optimizer).__name__,
             )
             cls._optimizer_state_restore_callbacks.append(tensor_restore)
             scratch_buffer_restore = cls._release_optimizer_scratch_buffers(
@@ -1309,6 +1424,8 @@ class MemoryStashingManager:
                 sync_event=sync_event,
                 stash_chunk_size_bytes=cls._optimizer_stash_chunk_size_bytes,
                 restore_chunk_size_bytes=cls._optimizer_restore_chunk_size_bytes,
+                use_case="optimizer_state",
+                caller=type(optimizer).__name__,
             )
             slice_awaits.append(await_restore_k)
             slice_restores.append(restore_k)
