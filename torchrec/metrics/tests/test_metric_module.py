@@ -2853,3 +2853,93 @@ class LossAggregationContractTest(unittest.TestCase):
         )
         self.assertAlmostEqual(float(result["a:loss"]), 2.0, places=6)
         self.assertAlmostEqual(float(result["b:loss"]), 4.0, places=6)
+
+    # Atomicity: a rejected micro-batch must not leave half of itself behind
+
+    def _accumulator_state(self, module: RecMetricModule) -> Dict[str, Any]:
+        """A detached copy of every accumulator the loss chain writes."""
+        return {
+            "sums": {k: v.clone() for k, v in module._loss_acc.sums.items()},
+            "key_counts": dict(module._loss_acc.key_counts),
+            "denom_sums": {
+                k: v.clone() for k, v in module._loss_acc.denom_sums.items()
+            },
+            "ratio_keys": set(module._loss_acc.ratio_keys),
+            "count": module._loss_acc.count,
+        }
+
+    def _assert_accumulators_equal(
+        self, module: RecMetricModule, expected: Dict[str, Any]
+    ) -> None:
+        actual = self._accumulator_state(module)
+        self.assertEqual(set(actual["sums"]), set(expected["sums"]), "sums keys")
+        for key, value in expected["sums"].items():
+            self.assertTrue(
+                torch.equal(actual["sums"][key], value),
+                f"sums[{key!r}] moved: {value} -> {actual['sums'][key]}",
+            )
+        self.assertEqual(actual["key_counts"], expected["key_counts"])
+        self.assertEqual(set(actual["denom_sums"]), set(expected["denom_sums"]))
+        for key, value in expected["denom_sums"].items():
+            self.assertTrue(
+                torch.equal(actual["denom_sums"][key], value),
+                f"denom_sums[{key!r}] moved",
+            )
+        self.assertEqual(actual["ratio_keys"], expected["ratio_keys"])
+        self.assertEqual(actual["count"], expected["count"])
+
+    def test_rejected_micro_batch_does_not_fold_in_its_earlier_keys(self) -> None:
+        """A contract violation must be all-or-nothing across the WHOLE model_out.
+
+        The validation walk is per key, so a bad key raises only after earlier keys were
+        folded in; the staging/commit split is what makes that atomic. ``ok:loss`` is
+        emitted BEFORE the offending ``bad:loss`` in the same dict, so a non-atomic
+        implementation leaves ``ok:loss`` in the accumulators and double-counts it.
+        """
+        module = self._make_module({"bad:loss": LossAggregation.MERGEABLE_RATIO})
+        module.reset_loss_metrics()
+        before = self._accumulator_state(module)
+
+        with self.assertRaisesRegex(RecMetricException, "MERGEABLE_RATIO"):
+            module.update_micro_batch(
+                {
+                    "ok:loss": torch.tensor(1.0),
+                    "bad:loss": torch.tensor(2.0),  # declared ratio, no denominator
+                }
+            )
+
+        self._assert_accumulators_equal(module, before)
+
+    def test_rejected_micro_batch_leaves_the_previous_micro_intact(self) -> None:
+        """The rejection must not corrupt micro-batches that already committed.
+
+        Falsifier for the test above, which starts from empty accumulators and so
+        would also pass if a raise *cleared* everything instead of rolling back.
+        Here a good micro-batch commits first; the step must still be able to
+        publish it after the bad one is rejected.
+        """
+        module = self._make_module()
+        module.reset_loss_metrics()
+        module.update_micro_batch(
+            {
+                "ctr:loss": torch.tensor(1.0),
+                f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(4.0),
+            }
+        )
+        after_good = self._accumulator_state(module)
+
+        # Denominator present on the first micro but absent here: no correct divisor.
+        with self.assertRaisesRegex(RecMetricException, "on some"):
+            module.update_micro_batch({"ctr:loss": torch.tensor(2.0)})
+
+        self._assert_accumulators_equal(module, after_good)
+
+        # And the step still publishes the surviving micro-batch: 4.0 / 4.0.
+        module.update(
+            {
+                "ctr:loss": torch.tensor(3.0),
+                f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(4.0),
+            }
+        )
+        result = module.compute()
+        self.assertAlmostEqual(float(result["ctr:loss"]), 2.0, places=6)

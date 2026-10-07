@@ -41,6 +41,8 @@ from torchrec.metrics.metric_module import (
 )
 from torchrec.metrics.metrics_config import (
     DefaultMetricsConfig,
+    LOSS_DENOM_SUFFIX,
+    LossAggregation,
     MetricsConfig,
     RecComputeMode,
     RecMetricDef,
@@ -412,7 +414,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def test_construct_without_process_group(self) -> None:
         """Constructs with no initialized PG (e.g. single-process model validation);
-        the gloo group is deferred to first compute."""
+        the gloo group is created lazily, at first compute."""
         with patch(
             "torchrec.metrics.cpu_offloaded_metric_module.dist.is_initialized",
             return_value=False,
@@ -821,7 +823,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
 
     def test_early_stop_resolves_outstanding_compute_on_shutdown(self) -> None:
-        """APS metric-based early stop: the trainer issues async_compute() to
+        """Metric-based early stop: the trainer issues async_compute() to
         read a metric for the threshold check, the threshold trips, and the job
         tears down while updates are still queued and that compute is still in
         flight. shutdown() must drain the pending updates and resolve the
@@ -1125,16 +1127,12 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         "Not enough GPUs, this test requires at least 2 GPUs",
     )
     def test_transfer_tensors_to_cpu_event_on_source_device_stream(self) -> None:
-        """
-        Regression test for ZORM metric corruption on non-rank-0 processes.
+        """Regression test for offloaded metric corruption on non-rank-0 processes.
 
-        Bug: transfer_tensors_to_cpu recorded the CUDA event on cuda:0 (default)
-        instead of the source tensor's device (cuda:N), making event.synchronize()
-        a no-op on non-rank-0 processes.
-
-        Verifies the event tracks cuda:1's stream via event.query(): with the bug,
-        the event on idle cuda:0 completes immediately; with the fix, it stays
-        pending behind cuda:1's queued work.
+        transfer_tensors_to_cpu recorded the CUDA event on cuda:0 rather than the source
+        tensor's device, making event.synchronize() a no-op off rank 0. Verified via
+        event.query(): an event on idle cuda:0 completes immediately, one correctly on
+        cuda:1 stays pending behind that device's queued work.
         """
         with torch.cuda.device(0):
             source_tensors = {
@@ -2629,7 +2627,7 @@ class ForeachCloneTest(unittest.TestCase):
         self.assertFalse(out["scale"].requires_grad)
 
     def test_dict_clone_independent_of_caller_mutation(self) -> None:
-        """Reproduces the Pyper metric_update_reorder staleness bug at the helper
+        """Reproduces a caller-side metric_update_reorder staleness bug at the helper
         level: caller mutates the source tensor in place after we clone, and the
         clone must still hold the pre-mutation value. Without _foreach_clone the
         snapshot would be a reference and silently observe the new value."""
@@ -2638,7 +2636,7 @@ class ForeachCloneTest(unittest.TestCase):
             "labels": torch.tensor([0, 1, 0], dtype=torch.int64),
         }
         snapshot = _foreach_clone_dict(src)
-        # Caller overwrites the underlying storage (like Pyper's pre-allocated
+        # Caller overwrites the underlying storage (a pre-allocated
         # model_out buffer being reused for the next iteration).
         src["predictions"].zero_()
         src["labels"].fill_(7)
@@ -2797,7 +2795,7 @@ _MERGE_TEST_METRICS: list[tuple[str, RecMetricEnum]] = [
 
 
 class WindowOverEvictionMergeTest(unittest.TestCase):
-    """Repro + generalization + fix-verification for the ZORM window-metric NaN.
+    """Repro + generalization + fix-verification for the offloaded window-metric NaN.
 
     Root cause: CPUOffloadedRecMetricModule micro-batches K MetricUpdateJobs into
     ONE rec_metrics.update() call (``_merge_update_jobs`` -> ``_safe_merge_tensors``,
@@ -2957,13 +2955,12 @@ class WindowOverEvictionMergeTest(unittest.TestCase):
         )
         return "VALID" if all_close else "WRONG"
 
-    # ---- STEP 1: focused NE repro through the real ZORM worker ----
     def test_step1_ne_window_nan_repro(self) -> None:
         # Guard is evaluated against the UNMERGED batch; it must not trip.
         self.assertGreaterEqual(self.WINDOW_SIZE, self.BATCH_SIZE)
         reference = self._run_offloaded(RecMetricEnum.NE, update_batch_size=1)
         merged = self._run_offloaded(RecMetricEnum.NE, update_batch_size=self.K)
-        print("\n===== STEP 1 NE OVER-EVICTION REPRO (real ZORM worker) =====")
+        print("\n===== STEP 1 NE OVER-EVICTION REPRO (real offloaded worker) =====")
         for k in sorted(set(reference) & set(merged)):
             print(
                 f"  {k}: K=1={reference[k].tolist()} "
@@ -2979,9 +2976,8 @@ class WindowOverEvictionMergeTest(unittest.TestCase):
             "code the merged entry over-evicts the WindowBuffer -> window_ne=NaN.",
         )
 
-    # ---- STEP 2 + 3: generalized over ALL RecMetric types ----
     def test_all_metrics_window_valid_under_kmerge(self) -> None:
-        print("\n===== STEP 2/3 OVER-EVICTION TABLE (real ZORM worker) =====")
+        print("\n===== STEP 2/3 OVER-EVICTION TABLE (real offloaded worker) =====")
         print(
             f"  K={self.K} BATCH_SIZE={self.BATCH_SIZE} "
             f"WINDOW_SIZE(per-rank)={self.WINDOW_SIZE} "
@@ -3089,6 +3085,762 @@ class CapUpdateBatchSizeTest(unittest.TestCase):
             ),
             4,
         )
+
+
+class CPUOffloadedGradientAccumulationTest(unittest.TestCase):
+    """CPUOffloadedRecMetricModule under gradient accumulation (K > 1).
+
+    Every test here ARMS GA explicitly (`set_under_micro_batching(True)`) and builds
+    its own module: the shared fixtures in this file run `update_batch_size=1` with
+    the gate off, so reusing them would silently test the non-GA path. Worker-side
+    merge B is deliberately > K so that merging and accumulation are independent
+    axes rather than accidentally aligned.
+    """
+
+    def setUp(self) -> None:
+        self.world_size = 1
+        self.batch_size = 1
+        self.tasks = gen_test_tasks(["task1"])
+        self.initial_states = create_tensor_states(["cross_entropy_sum"])
+
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+
+        self.mock_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=0,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states=self.initial_states,
+        )
+        self.rec_metrics = RecMetricList([self.mock_metric])
+        init_process_group_single_rank("gloo")
+        self._modules: list[CPUOffloadedRecMetricModule] = []
+
+    def tearDown(self) -> None:
+        for module in self._modules:
+            try:
+                module.shutdown()
+            except Exception:
+                pass
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    def _make_module(
+        self,
+        *,
+        update_batch_size: int = 10,
+        under_micro_batching: bool = True,
+        **overrides: Any,
+    ) -> CPUOffloadedRecMetricModule:
+        defaults: dict[str, Any] = {
+            "model_out_device": torch.device("cpu"),
+            "batch_size": self.batch_size,
+            "world_size": self.world_size,
+            "rec_tasks": self.tasks,
+            "rec_metrics": self.rec_metrics,
+            "update_batch_size": update_batch_size,
+        }
+        # pyrefly: ignore[bad-argument-type]
+        module = CPUOffloadedRecMetricModule(**{**defaults, **overrides})
+        module.set_under_micro_batching(under_micro_batching)
+        self._modules.append(module)
+        return module
+
+    @staticmethod
+    def _model_out(
+        loss: Optional[float] = None,
+        denom: Optional[float] = None,
+        extra: Optional[dict[str, torch.Tensor]] = None,
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([1.0]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+        if loss is not None:
+            out["task1:loss"] = torch.tensor(loss)
+        if denom is not None:
+            out[f"task1:loss{LOSS_DENOM_SUFFIX}"] = torch.tensor(denom)
+        if extra:
+            out.update(extra)
+        return out
+
+    def test_recombination_matches_plain_rec_metric_module(self) -> None:
+        """The offloaded path must recombine a K-window to the same value the
+        in-process module does. Compares against RecMetricModule rather than a
+        hand-computed constant so the two implementations cannot drift apart."""
+        losses = [(1.0, 4.0), (3.0, 12.0), (2.0, 4.0)]
+
+        reference = RecMetricModule(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([]),
+        )
+        reference.set_under_micro_batching(True)
+        reference.reset_loss_metrics()
+        for loss, denom in losses:
+            reference._accumulate_loss_metrics(self._model_out(loss, denom))
+        expected = reference._loss_acc.reduced_losses()["task1:loss"]
+
+        module = self._make_module()
+        module.reset_loss_metrics()
+        for loss, denom in losses[:-1]:
+            module.update_micro_batch(self._model_out(loss, denom))
+        module.update(self._model_out(*losses[-1]))
+
+        published = module._snapshot_reduced_losses()
+        self.assertIn("task1:loss", published)
+        torch.testing.assert_close(published["task1:loss"], expected)
+        # The reference shares the offloaded module's inherited accumulate/reduce, so
+        # agreeing with it only proves the value survived the offload -- a wrong
+        # recombination RULE would move both. The literal pins the rule:
+        # sum(l*d)/sum(d) over the three samples.
+        torch.testing.assert_close(
+            published["task1:loss"], torch.tensor((1.0 * 4 + 3.0 * 12 + 2.0 * 4) / 20.0)
+        )
+        # An unweighted mean would give 2.0; the weighted answer must not equal it.
+        self.assertNotAlmostEqual(
+            float(published["task1:loss"]), sum(v for v, _ in losses) / len(losses)
+        )
+
+    def test_declared_mergeable_ratio_without_denominator_raises(self) -> None:
+        """A MERGEABLE_RATIO producer that omits its denominator must fail closed,
+        not silently fall back to a call-count mean."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+        module.reset_loss_metrics()
+        with self.assertRaisesRegex(RecMetricException, "MERGEABLE_RATIO"):
+            module._loss_acc.stage(self._model_out(loss=1.0))
+
+    def test_mixed_denominator_presence_within_a_step_raises(self) -> None:
+        """Denominator on some micros of a step but not others has no correct
+        divisor, so it must raise rather than mix `l*d` and raw `l` terms."""
+        module = self._make_module()
+        module.reset_loss_metrics()
+        module.update_micro_batch(self._model_out(1.0, 4.0))
+        with self.assertRaisesRegex(RecMetricException, "on some"):
+            module._loss_acc.stage(self._model_out(loss=2.0))
+
+    def test_queued_snapshot_strips_loss_but_preserves_caller_dict(self) -> None:
+        """Loss keys are consumed on the caller thread, so they must not be queued --
+        and stripping must never mutate the dict the caller handed us."""
+        # update_batch_size=1 so the single queued job is dispatched immediately.
+        # At the default B=10 the worker parks in _drain_update_batch waiting for
+        # nine more jobs or a marker, and nothing is processed. Batching is not
+        # part of this test's claim anyway: the strip happens on the caller thread
+        # at enqueue time.
+        module = self._make_module(update_batch_size=1)
+        model_out = self._model_out(1.0, 4.0)
+        caller_keys = set(model_out)
+
+        captured: list[MetricUpdateJob] = []
+        original = module._process_metric_update_job
+
+        def capture(job: MetricUpdateJob) -> None:
+            captured.append(job)
+            original(job)
+
+        with patch.object(module, "_process_metric_update_job", side_effect=capture):
+            module.reset_loss_metrics()
+            module.update(model_out)
+            wait_until_true(lambda: module._total_updates_processed == 1)
+
+        self.assertEqual(set(model_out), caller_keys, "caller dict was mutated")
+        queued = set(captured[0].model_out)
+        self.assertNotIn("task1:loss", queued)
+        self.assertNotIn(f"task1:loss{LOSS_DENOM_SUFFIX}", queued)
+        # The task inputs the worker genuinely reads must survive.
+        for key in ("task1-prediction", "task1-label", "task1-weight"):
+            self.assertIn(key, queued)
+
+    def test_gate_off_leaves_the_queued_snapshot_untouched(self) -> None:
+        """Falsifier for the strip test above. The strip is GA-only: with the gate off
+        nothing on the caller thread consumes the loss keys, so dropping them would
+        change what the K=1 path queues.
+
+        Asserted as whole-key-set equality, not "the loss key is present": the claim is
+        that the queued snapshot is unchanged, not that one key survived."""
+        module = self._make_module(update_batch_size=1, under_micro_batching=False)
+        model_out = self._model_out(1.0, 4.0)
+
+        captured: list[MetricUpdateJob] = []
+        original = module._process_metric_update_job
+
+        def capture(job: MetricUpdateJob) -> None:
+            captured.append(job)
+            original(job)
+
+        with patch.object(module, "_process_metric_update_job", side_effect=capture):
+            module.reset_loss_metrics()
+            module.update(model_out)
+            wait_until_true(lambda: module._total_updates_processed == 1)
+
+        self.assertEqual(set(captured[0].model_out), set(model_out))
+
+    def test_task_input_named_like_a_loss_is_not_stripped(self) -> None:
+        """The protected set is wider than get_required_inputs(): task field names are
+        free-form, so a label legitimately named '<x>:loss' must survive the strip."""
+        tasks = gen_test_tasks(["task1"])
+        tasks[0].label_name = "task1:loss"
+        module = self._make_module(rec_tasks=tasks)
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1:loss": torch.tensor([1.0]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+        self.assertEqual(module._main_thread_only_loss_keys(model_out), set())
+
+    def test_loss_named_task_input_survives_the_actual_enqueue(self) -> None:
+        """The test above pins the helper; this pins the CALLER PATH to it. A strip
+        written inline in `_update_rec_metrics` as a plain ':loss' suffix test would
+        leave the helper test green while deleting the task's label reaching the worker.
+
+        Covers weight_name as well as label_name: the protected set is a union, so a
+        strip protecting only labels would still eat the weight."""
+        for field, key in (("label_name", "task1:loss"), ("weight_name", "w:loss")):
+            with self.subTest(field=field):
+                tasks = gen_test_tasks(["task1"])
+                setattr(tasks[0], field, key)
+                module = self._make_module(rec_tasks=tasks, update_batch_size=1)
+                captured: list[MetricUpdateJob] = []
+                original = module._process_metric_update_job
+
+                def capture(
+                    job: MetricUpdateJob,
+                    _sink: list[MetricUpdateJob] = captured,
+                    _original: Any = original,
+                ) -> None:
+                    _sink.append(job)
+                    _original(job)
+
+                model_out = {
+                    "task1-prediction": torch.tensor([0.5]),
+                    "task1-label": torch.tensor([1.0]),
+                    "task1-weight": torch.tensor([1.0]),
+                    key: torch.tensor([1.0]),
+                }
+                with patch.object(
+                    module, "_process_metric_update_job", side_effect=capture
+                ):
+                    module.reset_loss_metrics()
+                    module.update(model_out)
+                    wait_until_true(lambda sink=captured: len(sink) == 1)
+
+                self.assertIn(
+                    key,
+                    captured[0].model_out,
+                    f"{field}={key!r} was stripped on the way to the worker",
+                )
+
+    def test_key_present_in_only_some_micros_divides_by_its_own_count(self) -> None:
+        """Each key's divisor is its OWN contribution count, not K. A key emitted by
+        only j of the K micro-batches must be divided by j -- swapping
+        the per-key count for the per-step call count is a one-word change that
+        silently deflates every sparsely-emitted loss."""
+        module = self._make_module()
+        module.reset_loss_metrics()
+        # "aux:loss" appears in micros 0 and 2 only; "task1:loss" in all four.
+        for index, loss in enumerate((1.0, 2.0, 3.0, 4.0)):
+            extra = (
+                {"aux:loss": torch.tensor(10.0 * (index + 1))}
+                if index % 2 == 0
+                else None
+            )
+            model_out = self._model_out(loss, extra=extra)
+            if index == 3:
+                module.update(model_out)
+            else:
+                module.update_micro_batch(model_out)
+
+        published = module._snapshot_reduced_losses()
+        # 4 contributions: (1+2+3+4)/4.
+        torch.testing.assert_close(published["task1:loss"], torch.tensor(2.5))
+        # 2 contributions: (10+30)/2 = 20. Dividing by K=4 would give 10.
+        torch.testing.assert_close(published["aux:loss"], torch.tensor(20.0))
+
+    def test_published_loss_is_owned_not_aliased(self) -> None:
+        """The published value must be a snapshot of THIS step. DeferrableMetrics only
+        takes ownership of CUDA tensors, and the accumulator returns its own tensor
+        itself under SUM, so without a clone a later step would be observable through
+        an already-published result."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.SUM},
+        )
+        module.reset_loss_metrics()
+        # Two micros, so SUM is distinguishable from the default MEAN: 5+7=12, not 6.
+        module.update_micro_batch(self._model_out(loss=5.0))
+        module.update(self._model_out(loss=7.0))
+        published = module._snapshot_reduced_losses()["task1:loss"]
+        torch.testing.assert_close(published, torch.tensor(12.0))
+
+        # Ownership, asserted the only way that actually falsifies a missing clone:
+        # a distinct storage, plus an IN-PLACE mutation of the accumulator. Starting a
+        # new step would not do it -- reset only drops dict references and accumulation
+        # is out-of-place, so an aliased tensor would survive both unchanged.
+        self.assertNotEqual(
+            published.data_ptr(),
+            module._loss_acc.sums["task1:loss"].data_ptr(),
+            "published tensor aliases the live accumulator",
+        )
+        module._loss_acc.sums["task1:loss"].add_(1000.0)
+        torch.testing.assert_close(published, torch.tensor(12.0))
+
+        # And a genuinely new optimizer step must not be visible either.
+        module.reset_loss_metrics()
+        module.update(self._model_out(loss=99.0))
+        torch.testing.assert_close(published, torch.tensor(12.0))
+
+    def test_five_k2_steps_merge_without_losing_micros(self) -> None:
+        """B=10 > K=2: five optimizer steps (ten micros) must all reach rec-metric
+        state, and the merged counts must account for every one of them."""
+        module = self._make_module(update_batch_size=10)
+        captured: list[MetricUpdateJob] = []
+        original = module._process_metric_update_job
+        observed_predictions: list[torch.Tensor] = []
+        original_update = module.rec_metrics.update
+
+        def spy_update(*args: Any, **kwargs: Any) -> None:
+            predictions = kwargs.get("predictions") or {}
+            observed_predictions.extend(predictions.values())
+            original_update(*args, **kwargs)
+
+        def capture(job: MetricUpdateJob) -> None:
+            captured.append(job)
+            original(job)
+
+        with patch.object(
+            module.rec_metrics, "update", side_effect=spy_update
+        ), patch.object(module, "_process_metric_update_job", side_effect=capture):
+            for step in range(5):
+                module.reset_loss_metrics()
+                module.update_micro_batch(self._model_out(float(step), 1.0))
+                module.update(self._model_out(float(step), 1.0))
+            wait_until_true(lambda: module._total_updates_processed == 10)
+
+        self.assertEqual(module._total_updates_processed, 10)
+        self.assertEqual(sum(j.merged_count for j in captured), 10)
+        # trained_batches counts OPTIMIZER steps, not micro-batches.
+        self.assertEqual(module.trained_batches, 5)
+        # Counters alone are bookkeeping: `_total_updates_processed` is incremented by
+        # `_process_metric_update_job` itself, so all of the above would still hold if
+        # the merged jobs never reached the metric. Count the rows that actually
+        # arrived at `rec_metrics.update()` -- one per micro, so ten.
+        self.assertEqual(
+            sum(int(p.numel()) for p in observed_predictions),
+            10,
+            "merged jobs never reached rec_metrics.update() with every micro's row",
+        )
+
+    def test_should_compute_follows_optimizer_steps(self) -> None:
+        """update_micro_batch must not advance the cadence counter; only update does.
+        Asserted as a SEQUENCE, since a count alone cannot tell the two apart."""
+        module = self._make_module(compute_interval_steps=2)
+        observed: list[bool] = []
+        for _ in range(4):
+            module.reset_loss_metrics()
+            module.update_micro_batch(self._model_out(1.0, 1.0))
+            observed.append(module.should_compute())
+            module.update(self._model_out(1.0, 1.0))
+            observed.append(module.should_compute())
+        # Read as four (after-micro, after-update) pairs. The counter starts even, so
+        # the after-micro reading simply repeats whatever the previous optimizer step
+        # left behind -- T,F / F,T / T,F / F,T -- and only `update` ever flips it. If
+        # update_micro_batch also advanced, every micro would flip too and the
+        # sequence would be F,T / F,T / F,T / F,T with trained_batches=8, so the
+        # sequence (not the count) is what separates the two.
+        self.assertEqual(observed, [True, False, False, True, True, False, False, True])
+        self.assertEqual(module.trained_batches, 4)
+
+    def test_loss_validation_failure_keeps_the_rank_symmetric(self) -> None:
+        """The critical rank-symmetry property. A rank-local loss error must NOT skip
+        the enqueue or the trained_batches bump: should_compute() is derived from
+        trained_batches, so an asymmetric skip makes ranks disagree about running the
+        compute collective and strands the peers that did."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+        module.reset_loss_metrics()
+
+        # No denominator => staging raises internally.
+        module.update(self._model_out(loss=1.0))
+
+        self.assertEqual(module.trained_batches, 1, "cadence diverged from peers")
+        self.assertEqual(module._total_updates_enqueued, 1, "rank skipped an enqueue")
+        self.assertTrue(module._step_loss_invalid, "error was swallowed")
+
+    def test_suppression_drops_the_loss_keys_and_nothing_else(self) -> None:
+        """Suppression degrades the publication; it does not fail it.
+
+        Failing would discard NE / CTR / throughput for a step whose rec-metric state is
+        fine, and -- the violation being rank-local and data-dependent -- would desync
+        this rank from its peers at the FOLLOWING collective. The publication must
+        resolve and carry everything except the loss keys."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+            throughput_metric=ThroughputMetric(
+                world_size=self.world_size,
+                batch_size=self.batch_size,
+                window_seconds=1,
+            ),
+        )
+        module.reset_loss_metrics()
+        # No denominator => staging raises internally and suppresses the step.
+        module.update(self._model_out(loss=1.0))
+
+        result = module.async_compute().resolve()
+
+        self.assertNotIn("task1:loss", result)
+        # ... and the rest of the publication survived, which is the whole point:
+        # a non-empty result is what separates "dropped the loss key" from
+        # "dropped everything".
+        self.assertTrue(result, "the whole publication was discarded")
+        # Suppression is scoped to the STEP, not to one publication: publishing must
+        # not clear it, or a second publication within the same step would emit the
+        # partial loss it was meant to drop.
+        self.assertTrue(module._step_loss_invalid)
+
+    def test_a_clean_later_step_publishes_its_loss_again(self) -> None:
+        """Falsifier for the test above. If the loss chain stayed broken after a
+        violation, that test's `assertNotIn` would keep passing for the wrong reason --
+        so a subsequent well-formed step must publish its loss normally."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+        module.reset_loss_metrics()
+        module.update(self._model_out(loss=1.0))
+        self.assertNotIn("task1:loss", module.async_compute().resolve())
+
+        module.reset_loss_metrics()
+        module.update(self._model_out(2.0, 1.0))
+        recovered = module.async_compute().resolve()
+        self.assertIn("task1:loss", recovered)
+        torch.testing.assert_close(
+            torch.as_tensor(recovered["task1:loss"]), torch.tensor(2.0)
+        )
+
+    def test_enqueue_failure_leaves_every_counter_untouched(self) -> None:
+        """The other half of the transaction: the enqueue is the only fallible step,
+        and nothing is committed before it."""
+        module = self._make_module()
+        module.reset_loss_metrics()
+        module._shutdown_event.set()
+        try:
+            with self.assertRaises(RecMetricException):
+                module.update(self._model_out(1.0, 4.0))
+            self.assertEqual(module.trained_batches, 0)
+            self.assertEqual(module._loss_acc.sums, {})
+            self.assertEqual(module._loss_acc.count, 0)
+        finally:
+            module._shutdown_event.clear()
+
+    def _record_events(
+        self, module: CPUOffloadedRecMetricModule
+    ) -> tuple[list[tuple[Any, ...]], Any]:
+        """Patch context capturing this module's ``_log_event`` positional args."""
+        recorded: list[tuple[Any, ...]] = []
+        return recorded, patch.object(
+            module, "_log_event", side_effect=lambda *args, **kw: recorded.append(args)
+        )
+
+    @staticmethod
+    def _loss_failures(recorded: list[tuple[Any, ...]]) -> list[dict[str, str]]:
+        return [
+            args[2]
+            for args in recorded
+            if args[0] == "loss_recombination" and args[1] == EventType.FAILURE
+        ]
+
+    def test_violation_on_a_non_publishing_step_spares_a_later_clean_step(self) -> None:
+        """The core step-scoping property.
+
+        At ``compute_interval_steps > 1`` a violation can land on a step that never
+        publishes. Scoping the suppression to the publication instead of the step would
+        carry it forward and silently drop the loss of the next CLEAN step -- a
+        correct step reported as broken, with no event tying it to the real cause.
+        """
+        module = self._make_module(
+            compute_interval_steps=2,
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+
+        # Step 1 violates, and its cadence slot does not publish.
+        module.reset_loss_metrics()
+        module.update(self._model_out(loss=1.0))
+        self.assertFalse(module.should_compute())
+
+        # Step 2 is clean, and is the one that publishes.
+        module.reset_loss_metrics()
+        module.update(self._model_out(2.0, 1.0))
+        self.assertTrue(module.should_compute())
+
+        published = module.async_compute().resolve()
+        self.assertIn("task1:loss", published)
+        torch.testing.assert_close(
+            torch.as_tensor(published["task1:loss"]), torch.tensor(2.0)
+        )
+
+    def test_sync_does_not_consume_the_suppression(self) -> None:
+        """``sync()`` runs the compute path for its all-gather and DISCARDS the
+        metrics. If it also cleared the suppression, the real publication that follows
+        would emit the step's partial loss -- the exact value the suppression exists to
+        withhold. Violating on micro 2 of 3 is what makes that partial value non-empty,
+        so the assertion cannot pass vacuously.
+        """
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+        module.reset_loss_metrics()
+        module.update_micro_batch(self._model_out(1.0, 1.0))  # committed
+        module.update_micro_batch(self._model_out(loss=2.0))  # violates
+        module.update(self._model_out(3.0, 1.0))
+
+        module.sync()
+
+        self.assertNotIn("task1:loss", module.async_compute().resolve())
+
+    def test_compute_throughput_reports_the_failure_and_keeps_the_suppression(
+        self,
+    ) -> None:
+        """A throughput-only publication returns before the loss merge, so reporting
+        from there would never fire. Reporting at DETECTION makes the event independent
+        of which publication path the step happens to take."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+            throughput_metric=ThroughputMetric(
+                world_size=self.world_size,
+                batch_size=self.batch_size,
+                window_seconds=1,
+            ),
+        )
+        recorded, capture = self._record_events(module)
+        with capture:
+            module.reset_loss_metrics()
+            module.update(self._model_out(loss=1.0))
+
+        self.assertEqual(len(self._loss_failures(recorded)), 1)
+
+        result = module.compute_throughput().resolve()
+        self.assertNotIn("task1:loss", result)
+        self.assertTrue(result, "throughput publication was empty")
+        self.assertTrue(
+            module._step_loss_invalid, "throughput consumed the suppression"
+        )
+
+    def test_failure_event_names_the_offending_step(self) -> None:
+        """``trained_batches`` in the event must identify the step that violated, not
+        whichever later step happened to publish -- otherwise the event points an
+        investigation at a step whose data was fine."""
+        module = self._make_module(
+            compute_interval_steps=3,
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+        recorded, capture = self._record_events(module)
+        with capture:
+            module.reset_loss_metrics()
+            module.update(self._model_out(2.0, 1.0))  # step 0, clean
+            module.reset_loss_metrics()
+            module.update(self._model_out(loss=1.0))  # step 1, violates
+            module.reset_loss_metrics()
+            module.update(self._model_out(3.0, 1.0))  # step 2, clean
+            module.async_compute().resolve()
+
+        failures = self._loss_failures(recorded)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["trained_batches"], "1")
+        self.assertEqual(failures[0]["error_class"], "denominator_contract")
+
+    def test_reset_loss_metrics_clears_the_suppression(self) -> None:
+        """The step boundary, and only the step boundary, ends a suppression."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+        module.reset_loss_metrics()
+        module.update(self._model_out(loss=1.0))
+        self.assertTrue(module._step_loss_invalid)
+
+        module.reset_loss_metrics()
+        self.assertFalse(module._step_loss_invalid)
+
+    def test_unexpected_staging_error_degrades_and_is_reported_as_unexpected(
+        self,
+    ) -> None:
+        """A shape / device / OOM failure inside staging is a bug in staging, not a
+        producer contract violation, and it must not be reported as one. It still has
+        to degrade rather than raise: raising would skip this rank's enqueue and
+        trained_batches bump and strand the peers in the compute collective.
+        """
+        module = self._make_module()
+        recorded, capture = self._record_events(module)
+        module.reset_loss_metrics()
+        with capture, patch.object(
+            module._loss_acc, "stage", side_effect=RuntimeError("device mismatch")
+        ):
+            module.update(self._model_out(1.0, 1.0))
+
+        self.assertEqual(module.trained_batches, 1, "cadence diverged from peers")
+        self.assertEqual(module._total_updates_enqueued, 1, "rank skipped an enqueue")
+        self.assertNotIn("task1:loss", module.async_compute().resolve())
+
+        failures = self._loss_failures(recorded)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["error_type"], "RuntimeError")
+        self.assertEqual(failures[0]["error_class"], "unexpected")
+
+    def test_non_uniform_keyset_across_merged_jobs_names_the_missing_key(self) -> None:
+        """A key present in the first job but missing from a later one must surface as
+        a RecMetricException naming the key. A bare ``KeyError`` escaping the merge
+        handler kills the update worker with no indication of which key or which
+        mapping was at fault."""
+        jobs = [
+            MetricUpdateJob(
+                model_out={"a": torch.tensor([1.0]), "b": torch.tensor([2.0])},
+                kwargs={},
+            ),
+            MetricUpdateJob(model_out={"a": torch.tensor([3.0])}, kwargs={}),
+        ]
+        with self.assertRaisesRegex(RecMetricException, "'b'"):
+            _merge_update_jobs(jobs)
+
+    def test_second_step_does_not_inherit_the_first_steps_loss(self) -> None:
+        """reset_loss_metrics() at the step boundary is what keeps a published loss
+        scoped to its own step."""
+        module = self._make_module()
+        module.reset_loss_metrics()
+        module.update(self._model_out(10.0, 1.0))
+        first = module._snapshot_reduced_losses()["task1:loss"]
+
+        module.reset_loss_metrics()
+        module.update(self._model_out(20.0, 1.0))
+        second = module._snapshot_reduced_losses()["task1:loss"]
+
+        torch.testing.assert_close(first, torch.tensor(10.0))
+        torch.testing.assert_close(second, torch.tensor(20.0))
+
+    def test_gate_off_publishes_no_loss_keys(self) -> None:
+        """With the gate off (the K=1 configuration) the loss chain must be entirely
+        unreachable -- no accumulation, no published loss key."""
+        module = self._make_module(under_micro_batching=False)
+        module.reset_loss_metrics()
+        module.update(self._model_out(1.0, 4.0))
+
+        self.assertEqual(module._loss_acc.sums, {})
+        self.assertEqual(module.trained_batches, 1)
+        deferred = module.async_compute()
+        self.assertNotIn("task1:loss", deferred.resolve())
+
+    def test_compute_throughput_publishes_no_loss_keys(self) -> None:
+        """compute_throughput() delegates to async_compute(), so an unconditional
+        loss merge there would silently widen a result contracted to carry throughput
+        only."""
+        module = self._make_module(
+            throughput_metric=ThroughputMetric(
+                world_size=self.world_size,
+                batch_size=self.batch_size,
+                window_seconds=1,
+            ),
+        )
+        module.reset_loss_metrics()
+        module.update(self._model_out(1.0, 4.0))
+
+        result = module.compute_throughput().resolve()
+        self.assertNotIn("task1:loss", result)
+        self.assertTrue(result, "throughput publication was empty")
+
+    def test_full_publication_still_carries_the_loss(self) -> None:
+        """Falsifier for the test above: if the loss never published at all, the
+        throughput-only assertion would pass vacuously."""
+        module = self._make_module()
+        module.reset_loss_metrics()
+        module.update(self._model_out(2.0, 1.0))
+        self.assertIn("task1:loss", module.async_compute().resolve())
+
+    def test_throughput_counts_each_micro_batch_exactly_once(self) -> None:
+        """Every micro-batch must advance throughput exactly once, offloaded too.
+
+        ``update_micro_batch()`` is the ONE override that deliberately skips
+        ``throughput_metric.update()``: the worker already counts per merged micro-batch,
+        so re-adding the caller call inflates QPS by K x. Swept over the merge width,
+        where at B>1 the count rides on ``merged_count`` and a hardcoded 1 under-counts.
+        """
+        for update_batch_size in (1, 2):
+            with self.subTest(update_batch_size=update_batch_size):
+                module = self._make_module(
+                    update_batch_size=update_batch_size,
+                    throughput_metric=ThroughputMetric(
+                        world_size=self.world_size,
+                        batch_size=self.batch_size,
+                        window_seconds=1,
+                    ),
+                )
+                throughput = module.throughput_metric
+                assert throughput is not None
+                initial_steps = throughput._steps
+
+                # One K=2 optimizer step: one intermediate micro, then the final one.
+                module.reset_loss_metrics()
+                module.update_micro_batch(self._model_out(1.0, 4.0))
+                module.update(self._model_out(3.0, 4.0))
+
+                # The count lands on the WORKER, so it is not observable until the
+                # queue drains. _total_updates_processed accumulates merged_count,
+                # so it reaches 2 whether or not the two jobs were coalesced.
+                wait_until_true(lambda m=module: m._total_updates_processed == 2)
+
+                self.assertEqual(
+                    throughput._steps,
+                    initial_steps + 2,
+                    "throughput must count both micro-batches exactly once",
+                )
+
+    def test_throughput_count_matches_the_in_process_module(self) -> None:
+        """Parity, so the offloaded and in-process counts cannot drift apart.
+
+        The test above pins the offloaded module against a constant; this pins it against the backend
+        whose behaviour it is required to reproduce, so a deliberate change to the
+        micro-batch throughput contract has to break both on purpose.
+        """
+        reference = RecMetricModule(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=self.rec_metrics,
+            throughput_metric=ThroughputMetric(
+                world_size=self.world_size,
+                batch_size=self.batch_size,
+                window_seconds=1,
+            ),
+        )
+        reference.set_under_micro_batching(True)
+        reference_throughput = reference.throughput_metric
+        assert reference_throughput is not None
+        reference_initial = reference_throughput._steps
+        reference.reset_loss_metrics()
+        reference.update_micro_batch(self._model_out(1.0, 4.0))
+        reference.update(self._model_out(3.0, 4.0))
+        reference_delta = reference_throughput._steps - reference_initial
+
+        module = self._make_module(
+            update_batch_size=1,
+            throughput_metric=ThroughputMetric(
+                world_size=self.world_size,
+                batch_size=self.batch_size,
+                window_seconds=1,
+            ),
+        )
+        throughput = module.throughput_metric
+        assert throughput is not None
+        initial_steps = throughput._steps
+        module.reset_loss_metrics()
+        module.update_micro_batch(self._model_out(1.0, 4.0))
+        module.update(self._model_out(3.0, 4.0))
+        wait_until_true(lambda: module._total_updates_processed == 2)
+
+        self.assertEqual(throughput._steps - initial_steps, reference_delta)
 
 
 if __name__ == "__main__":

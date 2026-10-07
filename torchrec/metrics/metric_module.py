@@ -16,7 +16,18 @@ import time
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, cast, Dict, List, Optional, Set, Type, TypeVar, Union
+from typing import (
+    Any,
+    cast,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import torch
 import torch.distributed as dist
@@ -307,13 +318,39 @@ class StateMetric(abc.ABC):
         pass
 
 
+class _StagedLossDelta(NamedTuple):
+    """The prospective result of accumulating one micro-batch's loss keys.
+
+    Every field is the accumulator's fully-resolved REPLACEMENT value (not an increment),
+    so applying it is a plain assignment with nothing left to compute and nothing that can
+    raise. Why the staging split exists: ``_LossAccumulator``.
+    """
+
+    sums: Dict[str, torch.Tensor]
+    key_counts: Dict[str, int]
+    denom_sums: Dict[str, torch.Tensor]
+    ratio_keys: Set[str]
+    # Keys whose "no denominator declared" warning has not been emitted yet.
+    warn_keys: Set[str]
+    # Whether this micro-batch carried any loss key at all (drives the call count).
+    saw_loss: bool
+
+
 class _LossAccumulator:
-    """One optimizer step's per-key loss accumulation, from update to recombination.
+    """One optimizer step's per-key loss accumulation, from staging to recombination.
 
     Six pieces of mutable state plus the per-key aggregation overrides, held together
-    because they are written by ``accumulate``, cleared by ``reset`` and read by
+    because they are written by ``commit``, cleared by ``reset`` and read by
     ``reduced_losses`` as a unit -- and because every one of them has to be restored by
     hand after an unpickle that skipped ``__init__``.
+
+    The staging/committing split is the contract, not an implementation detail. The
+    accumulation rules are validated per key while walking ``model_out``, so a key that
+    violates the denominator contract would otherwise raise after earlier keys had
+    already been folded in, leaving the accumulators holding half a micro-batch.
+    Separating the fallible walk from the infallible apply makes the accumulation
+    all-or-nothing, and lets a caller that must stay rank-symmetric decide what to do
+    with the failure instead of inheriting a partial mutation.
     """
 
     def __init__(
@@ -350,13 +387,21 @@ class _LossAccumulator:
         self.ratio_keys.clear()
 
     def accumulate(self, model_out: Dict[str, torch.Tensor]) -> None:
-        """Accumulate this micro-batch's per-task loss values into the current step.
+        """Stage and commit in one call, for callers with nothing to do on failure."""
+        self.commit(self.stage(model_out))
 
-        How the K values recombine is declared BY THE PRODUCER: a mergeable ratio emits
-        its guarded denominator as ``"{key}" + LOSS_DENOM_SUFFIX`` and recombines as
-        ``sum(l_i * d_i) / sum(d_i)``; a key without one takes the legacy path. Counting
-        is per KEY, not per call -- a key emitted by only j of the K is divided by j.
+    def stage(self, model_out: Dict[str, torch.Tensor]) -> _StagedLossDelta:
+        """Validate and compute this micro-batch's delta WITHOUT mutating state.
+
+        Every branch reads committed state and writes only into the returned delta, so
+        it is safe to call and discard. Raises ``RecMetricException`` if the producer
+        violates the denominator contract.
         """
+        sums: Dict[str, torch.Tensor] = {}
+        key_counts: Dict[str, int] = {}
+        denom_sums: Dict[str, torch.Tensor] = {}
+        ratio_keys: Set[str] = set()
+        warn_keys: Set[str] = set()
         has_loss = False
         for k, v in model_out.items():
             if not (k.endswith(":loss") or k == "loss"):
@@ -381,8 +426,8 @@ class _LossAccumulator:
             )
             if use_ratio != (k in self.ratio_keys) and k in self.sums:
                 # The producer emitted a denominator for some micro-batches of this
-                # step but not others, so `sums[k]` would mix `l*d` terms with
-                # raw `l` terms and no divisor is correct for the result.
+                # step but not others, so `sums[k]` would mix `l*d` terms with raw `l`
+                # terms and no divisor is correct for the result.
                 raise RecMetricException(
                     f"Loss key '{k}' emitted '{k}{LOSS_DENOM_SUFFIX}' on some "
                     "micro-batches of an optimizer step but not others. A producer must "
@@ -394,29 +439,46 @@ class _LossAccumulator:
                 denom = denom.detach()
                 contribution = contribution * denom
                 if k in self.denom_sums:
-                    self.denom_sums[k] = self.denom_sums[k] + denom
+                    denom_sums[k] = self.denom_sums[k] + denom
                 else:
-                    self.denom_sums[k] = denom.clone()
-                self.ratio_keys.add(k)
+                    denom_sums[k] = denom.clone()
+                ratio_keys.add(k)
             elif override is None and k not in self._warned_keys:
-                self._warned_keys.add(k)
-                logger.warning(
-                    f"Loss key '{k}' emitted no '{LOSS_DENOM_SUFFIX}' companion, so "
-                    "under gradient accumulation it is reported as an unweighted mean "
-                    "over micro-batches. That is today's behaviour, but it is only exact "
-                    "when the per-micro-batch denominators are equal. Have the loss "
-                    "module emit its effective guarded denominator, or declare the key "
-                    "in MetricsConfig.loss_aggregation to acknowledge the approximation."
-                )
+                warn_keys.add(k)
 
             if k in self.sums:
-                self.sums[k] = self.sums[k] + contribution
-                self.key_counts[k] += 1
+                sums[k] = self.sums[k] + contribution
+                key_counts[k] = self.key_counts[k] + 1
             else:
-                self.sums[k] = contribution.clone()
-                self.key_counts[k] = 1
+                sums[k] = contribution.clone()
+                key_counts[k] = 1
 
-        if has_loss:
+        return _StagedLossDelta(
+            sums=sums,
+            key_counts=key_counts,
+            denom_sums=denom_sums,
+            ratio_keys=ratio_keys,
+            warn_keys=warn_keys,
+            saw_loss=has_loss,
+        )
+
+    def commit(self, delta: _StagedLossDelta) -> None:
+        """Apply a staged delta. Contains no fallible operation by construction."""
+        for k in delta.warn_keys:
+            self._warned_keys.add(k)
+            logger.warning(
+                f"Loss key '{k}' emitted no '{LOSS_DENOM_SUFFIX}' companion, so "
+                "under gradient accumulation it is reported as an unweighted mean "
+                "over micro-batches. That is today's behaviour, but it is only exact "
+                "when the per-micro-batch denominators are equal. Have the loss "
+                "module emit its effective guarded denominator, or declare the key "
+                "in MetricsConfig.loss_aggregation to acknowledge the approximation."
+            )
+        self.sums.update(delta.sums)
+        self.key_counts.update(delta.key_counts)
+        self.denom_sums.update(delta.denom_sums)
+        self.ratio_keys.update(delta.ratio_keys)
+        if delta.saw_loss:
             self.count += 1
 
     def reduced_losses(self) -> Dict[str, torch.Tensor]:
@@ -430,7 +492,7 @@ class _LossAccumulator:
     def _reduce(self, key: str, accumulated: torch.Tensor) -> torch.Tensor:
         if self.aggregation.get(key) is LossAggregation.SUM:
             return accumulated
-        # `.get` rather than `[]`: accumulate writes `sums` and `key_counts` together, so
+        # `.get` rather than `[]`: commit writes `sums` and `key_counts` together, so
         # this only keeps a future divergence from becoming a KeyError.
         count = self.key_counts.get(key, self.count)
         if key in self.ratio_keys:
