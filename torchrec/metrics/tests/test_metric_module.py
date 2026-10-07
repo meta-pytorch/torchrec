@@ -26,8 +26,10 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessTestBase,
 )
 from torchrec.metrics.auc import _state_reduction, AUCMetric
+from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 from torchrec.metrics.metric_module import (
     generate_metric_module,
+    LossAggregationScope,
     MetricsResult,
     RecMetricModule,
     StateMetric,
@@ -38,6 +40,8 @@ from torchrec.metrics.metrics_config import (
     BatchSizeStage,
     DefaultMetricsConfig,
     DefaultTaskInfo,
+    LOSS_DENOM_SUFFIX,
+    LossAggregation,
     MetricsConfig,
     RecMetricDef,
     RecMetricEnum,
@@ -45,6 +49,7 @@ from torchrec.metrics.metrics_config import (
     validate_batch_size_stages,
 )
 from torchrec.metrics.model_utils import parse_task_model_outputs
+from torchrec.metrics.noop_metric_module import NoOpMetricModule
 from torchrec.metrics.rec_metric import (
     RecMetricException,
     RecMetricList,
@@ -1584,6 +1589,45 @@ class MetricsConfigPostInitTest(unittest.TestCase):
         self.assertEqual(len(config.rec_tasks), 1)
         self.assertEqual(config.rec_metrics[RecMetricEnum.AUC].rec_task_indices, [])
 
+    def test_post_init_rejects_k_below_one(self) -> None:
+        for k in (0, -1):
+            with self.subTest(k=k):
+                with self.assertRaises(ValueError) as context:
+                    _ = MetricsConfig(num_micro_batches_per_step=k)
+                self.assertIn(
+                    "num_micro_batches_per_step must be at least 1",
+                    str(context.exception),
+                )
+
+    def test_post_init_accepts_k_of_one_and_above(self) -> None:
+        for k in (1, 4):
+            with self.subTest(k=k):
+                self.assertEqual(
+                    MetricsConfig(
+                        num_micro_batches_per_step=k
+                    ).num_micro_batches_per_step,
+                    k,
+                )
+
+    def test_post_init_rejects_a_non_member_loss_aggregation(self) -> None:
+        # A plain string compares equal to the member but is not it, and the consumers
+        # select with `is` -- so coercing would hide the typo this rejects.
+        not_members: Dict[str, Any] = {"task1:loss": "sum"}
+        with self.assertRaises(ValueError) as context:
+            _ = MetricsConfig(loss_aggregation=not_members)
+        error_message = str(context.exception)
+        self.assertIn("loss_aggregation['task1:loss']", error_message)
+        self.assertIn("must be a LossAggregation member", error_message)
+
+    def test_post_init_accepts_real_loss_aggregation_members(self) -> None:
+        config = MetricsConfig(
+            loss_aggregation={
+                "task1:loss": LossAggregation.SUM,
+                "task2:loss": LossAggregation.MERGEABLE_RATIO,
+            },
+        )
+        self.assertIs(config.loss_aggregation["task1:loss"], LossAggregation.SUM)
+
     def test_post_init_raises_when_rec_tasks_is_none(self) -> None:
         """Test that _post_init() raises ValueError when rec_tasks is None but rec_task_indices is specified."""
         # Setup: prepare to create config with None rec_tasks but specified indices
@@ -2097,6 +2141,402 @@ def _test_get_metric_states_with_asymmetric_batches(
         )
 
 
+class RecMetricModuleLossAccumulationTest(unittest.TestCase):
+    """Tests for RecMetricModule loss accumulation across micro-batches.
+
+    The _accumulate_loss_metrics() path sums per-task loss values during
+    update() / update_micro_batch() and returns their average in compute().
+    Accumulators are NOT cleared by compute() — they are cleared by
+    reset_loss_metrics() at the start of each optimizer step.
+    This ensures compute() always reports the loss from the most recent
+    step, not a running average across the compute interval.
+    """
+
+    def _make_module(self) -> RecMetricModule:
+        module = RecMetricModule(batch_size=128, world_size=1)
+        # Declare gradient accumulation. The micro-batch gate is driven by CONFIG
+        # (MetricsConfig.num_micro_batches_per_step -> set_under_micro_batching), not by
+        # having called update_micro_batch(), so a K>1 sequence has to say it is K>1. The
+        # K=1 contract tests below deliberately do NOT call this.
+        module.set_under_micro_batching(True)
+        return module
+
+    def _make_k1_module(self) -> RecMetricModule:
+        """A module for the K=1 contract tests: GA is NOT declared, which is exactly
+        what a caller that never enables micro-batching looks like."""
+        return RecMetricModule(batch_size=128, world_size=1)
+
+    def _step(
+        self, module: RecMetricModule, micros: List[Dict[str, torch.Tensor]]
+    ) -> DeferrableMetrics:
+        """Drive one optimizer step of len(micros) micro-batches, then compute().
+
+        K-1 x update_micro_batch() then one update(). The chain is armed by
+        ``_make_module`` declaring GA in the config, not by this call sequence.
+        """
+        module.reset_loss_metrics()
+        for micro in micros[:-1]:
+            module.update_micro_batch(micro)
+        module.update(micros[-1])
+        return module.compute()
+
+    # The micro-batch loss chain is unreachable at K=1
+
+    def test_k1_bare_update_publishes_no_loss(self) -> None:
+        """A K=1 job never declares GA, so the micro-batch loss chain is unreachable and
+        no loss key is published."""
+        module = self._make_k1_module()
+        module.update({"ctr:loss": torch.tensor(0.5)})
+        result = module.compute()
+        self.assertNotIn("ctr:loss", result)
+
+    def test_k1_published_keys_are_unchanged_by_loss_keys(self) -> None:
+        """The K=1 contract: feeding loss values through a pure-update() sequence
+        publishes exactly the key set the same sequence publishes without them.
+
+        This is the assertion that makes the loss chain safe to land unconditionally --
+        every K=1 caller reaches update(), and none of them may gain a key.
+        """
+        with_loss = self._make_k1_module()
+        with_loss.update(
+            {"prediction": torch.tensor(0.5), "ctr:loss": torch.tensor(1.0)}
+        )
+        with_loss.update(
+            {"prediction": torch.tensor(0.7), "ctr:loss": torch.tensor(3.0)}
+        )
+
+        without_loss = self._make_k1_module()
+        without_loss.update({"prediction": torch.tensor(0.5)})
+        without_loss.update({"prediction": torch.tensor(0.7)})
+
+        self.assertEqual(
+            sorted(with_loss.compute().keys()), sorted(without_loss.compute().keys())
+        )
+
+    # Config-driven gate: the key set does not depend on call history
+
+    def test_published_key_set_is_history_independent_under_ga(self) -> None:
+        """The property the config-driven scope selection exists to give us.
+
+        Eval skips the micro-batch loop, so a gate latched by call history would make the
+        SAME eval publish a different key set depending on whether an accumulating training
+        step had already run. Sums reset correctly either way; only key PRESENCE varied.
+        Selecting the scope from config removes the history dependence, so pin it.
+        """
+        before = self._make_module()
+        keys_before = sorted(before.compute().keys())
+
+        after = self._make_module()
+        after.reset_loss_metrics()
+        after.update_micro_batch({"ctr:loss": torch.tensor(0.5)})
+        after.update({"ctr:loss": torch.tensor(0.7)})
+        after.compute()
+        after.reset_loss_metrics()
+        keys_after = sorted(after.compute().keys())
+
+        self.assertEqual(keys_before, keys_after)
+
+    def test_gate_is_off_until_declared(self) -> None:
+        """An undeclared scope refuses the micro-batch call rather than latching on it."""
+        module = self._make_k1_module()
+        self.assertFalse(module.under_micro_batching)
+        with self.assertRaises(RecMetricException):
+            module.update_micro_batch({"ctr:loss": torch.tensor(0.5)})
+        self.assertFalse(
+            module.under_micro_batching,
+            "update_micro_batch() changed the loss-aggregation scope",
+        )
+
+    def test_scope_is_the_declared_policy_and_the_bool_is_its_view(self) -> None:
+        """The scope is the value the three read sites share; ``under_micro_batching`` is
+        only a boolean view of it, so the two can never disagree."""
+        module = self._make_k1_module()
+        self.assertIs(
+            LossAggregationScope.PER_READER_BATCH, module.loss_aggregation_scope
+        )
+        self.assertFalse(module.under_micro_batching)
+
+        module.set_under_micro_batching(True)
+        self.assertIs(
+            LossAggregationScope.PER_OPTIMIZER_STEP, module.loss_aggregation_scope
+        )
+        self.assertTrue(module.under_micro_batching)
+
+        module.set_under_micro_batching(False)
+        self.assertIs(
+            LossAggregationScope.PER_READER_BATCH, module.loss_aggregation_scope
+        )
+        self.assertFalse(module.under_micro_batching)
+
+    def test_eval_key_set_identical_before_and_after_first_ga_step(self) -> None:
+        """Consequence-2, pinned on ONE module instance.
+
+        An eval interlude skips the micro-batch loop -- a bare ``update()`` + ``compute()``
+        -- so a history-latched scope would make the SAME eval publish a loss key only
+        after an accumulating step had run on that module. One eval, one accumulating
+        step, the identical eval again: the key sets must match.
+        """
+        module = self._make_module()
+
+        module.reset_loss_metrics()
+        module.update({"ctr:loss": torch.tensor(0.5)})
+        keys_eval_before = sorted(module.compute().keys())
+
+        module.reset_loss_metrics()
+        module.update_micro_batch({"ctr:loss": torch.tensor(0.4)})
+        module.update({"ctr:loss": torch.tensor(0.6)})
+        module.compute()
+
+        module.reset_loss_metrics()
+        module.update({"ctr:loss": torch.tensor(0.5)})
+        keys_eval_after = sorted(module.compute().keys())
+
+        self.assertEqual(keys_eval_before, keys_eval_after)
+
+    # Basic accumulation
+    def test_two_updates_returns_average(self) -> None:
+        """Two micro-batches -> compute() returns the mean of both."""
+        module = self._make_module()
+        result = self._step(
+            module,
+            [{"ctr:loss": torch.tensor(0.4)}, {"ctr:loss": torch.tensor(0.6)}],
+        )
+        self.assertAlmostEqual(float(result["ctr:loss"]), 0.5, places=6)
+
+    def test_k_updates_returns_average(self) -> None:
+        """K micro-batches -> compute() returns mean over K values."""
+        module = self._make_module()
+        values = [0.1, 0.2, 0.3, 0.4]
+        result = self._step(module, [{"task:loss": torch.tensor(v)} for v in values])
+        expected = sum(values) / len(values)
+        self.assertAlmostEqual(float(result["task:loss"]), expected, places=6)
+
+    # Multiple tasks
+
+    def test_multiple_task_losses_averaged_independently(self) -> None:
+        """Each task's loss is averaged independently across micro-batches."""
+        module = self._make_module()
+        result = self._step(
+            module,
+            [
+                {
+                    "ctr:loss": torch.tensor(1.0),
+                    "reels_ctr:loss": torch.tensor(2.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(3.0),
+                    "reels_ctr:loss": torch.tensor(4.0),
+                },
+            ],
+        )
+        self.assertAlmostEqual(float(result["ctr:loss"]), 2.0, places=6)
+        self.assertAlmostEqual(float(result["reels_ctr:loss"]), 3.0, places=6)
+
+    # Bare "loss" key
+
+    def test_bare_loss_key_accumulated(self) -> None:
+        """The bare 'loss' key (no task prefix) is also accumulated."""
+        module = self._make_module()
+        result = self._step(
+            module, [{"loss": torch.tensor(1.0)}, {"loss": torch.tensor(3.0)}]
+        )
+        self.assertAlmostEqual(float(result["loss"]), 2.0, places=6)
+
+    def test_bare_loss_and_task_loss_coexist(self) -> None:
+        """Bare 'loss' and per-task 'task:loss' keys are accumulated independently."""
+        module = self._make_module()
+        result = self._step(
+            module,
+            [
+                {"loss": torch.tensor(10.0), "ctr:loss": torch.tensor(1.0)},
+                {"loss": torch.tensor(20.0), "ctr:loss": torch.tensor(3.0)},
+            ],
+        )
+        self.assertAlmostEqual(float(result["loss"]), 15.0, places=6)
+        self.assertAlmostEqual(float(result["ctr:loss"]), 2.0, places=6)
+
+    # Reset after compute
+
+    def test_reset_loss_metrics_clears_accumulator(self) -> None:
+        """Each _step() begins with reset_loss_metrics(), so a step reports only its
+        own micro-batches -- not a running average across steps."""
+        module = self._make_module()
+        first = self._step(
+            module, [{"ctr:loss": torch.tensor(1.0)}, {"ctr:loss": torch.tensor(3.0)}]
+        )
+        self.assertAlmostEqual(float(first["ctr:loss"]), 2.0, places=6)
+
+        second = self._step(
+            module, [{"ctr:loss": torch.tensor(10.0)}, {"ctr:loss": torch.tensor(10.0)}]
+        )
+        self.assertAlmostEqual(float(second["ctr:loss"]), 10.0, places=6)
+
+    def test_compute_without_reset_returns_last_step_loss(self) -> None:
+        """Without reset_loss_metrics(), compute() keeps returning the
+        most recent accumulated value — this is the intended behavior
+        when compute_interval_steps > 1."""
+        module = self._make_module()
+        first = self._step(
+            module, [{"ctr:loss": torch.tensor(5.0)}, {"ctr:loss": torch.tensor(5.0)}]
+        )
+        second = module.compute()
+        self.assertAlmostEqual(
+            float(first["ctr:loss"]), float(second["ctr:loss"]), places=6
+        )
+
+    def test_compute_without_losses_returns_empty(self) -> None:
+        """An armed step carrying no loss keys publishes no loss keys."""
+        module = self._make_module()
+        result = self._step(
+            module,
+            [{"prediction": torch.tensor(0.5)}, {"prediction": torch.tensor(0.7)}],
+        )
+        loss_keys = [k for k in result if k.endswith(":loss") or k == "loss"]
+        self.assertEqual(loss_keys, [])
+
+    # Non-loss keys are ignored
+
+    def test_non_loss_keys_not_accumulated(self) -> None:
+        """Keys that don't match the loss pattern are NOT accumulated."""
+        module = self._make_module()
+        micro = {
+            "ctr:loss": torch.tensor(1.0),
+            "ctr:prediction": torch.tensor(0.7),
+            "reg_loss": torch.tensor(0.01),
+        }
+        result = self._step(module, [micro, micro])
+        self.assertIn("ctr:loss", result)
+        self.assertNotIn("ctr:prediction", result)
+        self.assertNotIn("reg_loss", result)
+
+    # Detach behavior
+
+    def test_accumulated_values_are_detached(self) -> None:
+        """Loss tensors are detached before accumulation so they don't
+        participate in the backward graph."""
+        module = self._make_module()
+        t = torch.tensor(1.0, requires_grad=True)
+        result = self._step(module, [{"task:loss": t}, {"task:loss": t}])
+        val = result["task:loss"]
+        assert isinstance(val, torch.Tensor)
+        self.assertFalse(val.requires_grad)
+
+    # Equivalence: K micro-batches == single update with mean
+
+    def test_micro_batch_average_equals_full_batch_loss(self) -> None:
+        """The core correctness property: averaging K micro-batch losses
+        equals the arithmetic mean computed externally."""
+        module = self._make_module()
+        losses = [0.12, 0.34, 0.56, 0.78]
+        result = self._step(module, [{"ctr:loss": torch.tensor(v)} for v in losses])
+        expected = sum(losses) / len(losses)
+        self.assertAlmostEqual(
+            float(result["ctr:loss"]),
+            expected,
+            places=6,
+        )
+
+
+class UpdateMicroBatchTest(unittest.TestCase):
+    """Tests for RecMetricModule.update_micro_batch().
+
+    Verifies that update_micro_batch():
+    - Does NOT increment trained_batches (the optimizer-step counter)
+    - DOES advance throughput _steps once per micro-batch: every micro-batch is
+      a real reader batch of the full configured metrics batch_size (K does NOT
+      auto-divide batch_size), so counting all K is what makes examples/sec
+      correct; skipping would under-report QPS by K x
+    - Does accumulate rec metric state
+    - Does accumulate loss metrics
+    """
+
+    def _make_module(self) -> RecMetricModule:
+        # K=2 so the config-driven micro-batch gate arms via generate_metric_module ->
+        # set_under_micro_batching(). This class tests update_micro_batch(), which is by
+        # definition a gradient-accumulation job, and going through the config (rather
+        # than calling the setter directly) also covers the MetricsConfig plumbing.
+        return generate_metric_module(
+            TestMetricModule,
+            metrics_config=dataclasses.replace(
+                DefaultMetricsConfig, num_micro_batches_per_step=2
+            ),
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+        )
+
+    def test_does_not_increment_trained_batches(self) -> None:
+        module = self._make_module()
+        initial = module.trained_batches
+        module.update_micro_batch(gen_test_batch(128))
+        module.update_micro_batch(gen_test_batch(128))
+        self.assertEqual(module.trained_batches, initial)
+
+    def test_updates_throughput_steps_per_micro_batch(self) -> None:
+        """update_micro_batch MUST advance throughput once per micro-batch.
+
+        Every micro-batch is a real reader batch of the full configured batch_size (K does
+        not auto-divide it), so throughput must count all K for examples/sec to be right.
+        The optimizer-step counter trained_batches is NOT advanced."""
+        module = self._make_module()
+        assert module.throughput_metric is not None
+        initial_steps = module.throughput_metric._steps
+        module.update_micro_batch(gen_test_batch(128))
+        module.update_micro_batch(gen_test_batch(128))
+        self.assertEqual(module.throughput_metric._steps, initial_steps + 2)
+        # A follow-up full update() advances throughput by one more.
+        module.update(gen_test_batch(128))
+        self.assertEqual(module.throughput_metric._steps, initial_steps + 3)
+
+    def test_does_accumulate_rec_metric_state(self) -> None:
+        module = self._make_module()
+        batch = gen_test_batch(128)
+
+        # Get initial weighted_num_samples
+        sd_before = module.state_dict()
+        initial_samples = sd_before[
+            "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+        ].item()
+
+        module.update_micro_batch(batch)
+
+        sd_after = module.state_dict()
+        after_samples = sd_after[
+            "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+        ].item()
+
+        self.assertGreater(after_samples, initial_samples)
+
+    def test_does_accumulate_loss_metrics(self) -> None:
+        module = self._make_module()
+        batch1 = gen_test_batch(128)
+        batch1["ctr:loss"] = torch.tensor(0.5)
+        batch2 = gen_test_batch(128)
+        batch2["ctr:loss"] = torch.tensor(1.5)
+        module.update_micro_batch(batch1)
+        module.update_micro_batch(batch2)
+        result = module.compute()
+        loss_value = result["ctr:loss"]
+        if isinstance(loss_value, torch.Tensor):
+            loss_value = loss_value.item()
+        self.assertAlmostEqual(float(loss_value), 1.0, places=6)
+
+    def test_micro_batch_then_update_increments_trained_batches_once(self) -> None:
+        """K-1 update_micro_batch() + 1 update() increments trained_batches by 1."""
+        module = self._make_module()
+        initial = module.trained_batches
+        batch = gen_test_batch(128)
+
+        module.update_micro_batch(batch)
+        module.update_micro_batch(batch)
+        module.update_micro_batch(batch)
+        module.update(batch)
+
+        self.assertEqual(module.trained_batches, initial + 1)
+
+
 class ValidateBatchSizeStagesTest(unittest.TestCase):
     def test_none_is_valid(self) -> None:
         # Should not raise
@@ -2115,3 +2555,301 @@ class ValidateBatchSizeStagesTest(unittest.TestCase):
     def test_single_stage_valid(self) -> None:
         # Should not raise - single stage with max_iters=None
         validate_batch_size_stages([BatchSizeStage(256, None)])
+
+
+class LossAggregationContractTest(unittest.TestCase):
+    """G-U1a: per-key loss aggregation across the micro-batches of one optimizer step.
+
+    The contract is producer-declared: a loss that is a mergeable ratio emits its
+    effective guarded denominator as ``"{key}" + LOSS_DENOM_SUFFIX`` and is recombined
+    as ``sum(l_i * d_i) / sum(d_i)``. A key with no denominator keeps the legacy
+    per-key mean. ``MetricsConfig.loss_aggregation`` overrides only the exceptions.
+    """
+
+    def _make_module(
+        self, overrides: Optional[Dict[str, LossAggregation]] = None
+    ) -> RecMetricModule:
+        module = RecMetricModule(batch_size=128, world_size=1)
+        module.set_loss_aggregation(overrides)
+        # The K>1 aggregation contract only applies to a GA job, and the gate is config-driven.
+        module.set_under_micro_batching(True)
+        return module
+
+    def _make_k1_module(
+        self, overrides: Optional[Dict[str, LossAggregation]] = None
+    ) -> RecMetricModule:
+        """A K=1 job: GA is NOT declared, so the micro-batch loss chain stays gated off."""
+        module = RecMetricModule(batch_size=128, world_size=1)
+        module.set_loss_aggregation(overrides)
+        return module
+
+    def test_the_noop_module_accepts_an_override_without_an_accumulator(self) -> None:
+        """NoOp has no ``_loss_acc``, so the inherited setter would raise."""
+        module = NoOpMetricModule()
+        module.set_loss_aggregation({"ctr:loss": LossAggregation.SUM})
+        self.assertFalse(hasattr(module, "_loss_acc"))
+
+    def _step(
+        self, module: RecMetricModule, micros: List[Dict[str, torch.Tensor]]
+    ) -> DeferrableMetrics:
+        """Run one optimizer step of len(micros) micro-batches and compute()."""
+        module.reset_loss_metrics()
+        for micro in micros[:-1]:
+            module.update_micro_batch(micro)
+        module.update(micros[-1])
+        return module.compute()
+
+    # A key present in only j of K micro-batches
+
+    def test_key_missing_from_some_micro_batches_divides_by_its_own_count(
+        self,
+    ) -> None:
+        """A key emitted by 2 of 4 micro-batches is divided by 2, not by 4.
+
+        A single call count shared across every key divides a sparsely-emitted
+        auxiliary loss by the window size rather than by its own emission count,
+        scaling it down by j/K without any error.
+        """
+        module = self._make_module()
+        result = self._step(
+            module,
+            [
+                {"ctr:loss": torch.tensor(1.0), "aux:loss": torch.tensor(4.0)},
+                {"ctr:loss": torch.tensor(2.0)},
+                {"ctr:loss": torch.tensor(3.0)},
+                {"ctr:loss": torch.tensor(4.0), "aux:loss": torch.tensor(6.0)},
+            ],
+        )
+        self.assertAlmostEqual(float(result["ctr:loss"]), 2.5, places=6)
+        # 10 / 2, not 10 / 4.
+        self.assertAlmostEqual(float(result["aux:loss"]), 5.0, places=6)
+
+    # Producer-declared mergeable ratio
+
+    def test_denominator_recovers_the_unsplit_batch_value(self) -> None:
+        """Sum(l*d)/Sum(d) equals what the un-split batch would have produced.
+
+        Models a `drop_zero_weight` head: micro 0 contributes 6.0 over 3 nonzero
+        examples, micro 1 contributes 10.0 over 1. The un-split batch is
+        16/4 = 4.0, whereas the legacy unweighted mean of the two micro-batch
+        scalars would report (2.0 + 10.0)/2 = 6.0.
+        """
+        module = self._make_module()
+        result = self._step(
+            module,
+            [
+                {
+                    "ctr:loss": torch.tensor(2.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(3.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(10.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(1.0),
+                },
+            ],
+        )
+        self.assertAlmostEqual(float(result["ctr:loss"]), 4.0, places=6)
+
+    def test_equal_denominators_match_the_legacy_mean(self) -> None:
+        """With equal per-micro denominators the ratio collapses to the mean.
+
+        This is why annotating a producer is safe to do unconditionally: it only
+        changes a value where the denominators actually differ.
+        """
+        annotated = self._make_module()
+        ratio = self._step(
+            annotated,
+            [
+                {
+                    "ctr:loss": torch.tensor(0.4),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(128.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(0.6),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(128.0),
+                },
+            ],
+        )
+        legacy = self._step(
+            self._make_module(),
+            [{"ctr:loss": torch.tensor(0.4)}, {"ctr:loss": torch.tensor(0.6)}],
+        )
+        self.assertAlmostEqual(
+            float(ratio["ctr:loss"]), float(legacy["ctr:loss"]), places=6
+        )
+
+    def test_k1_publishes_no_loss_with_or_without_a_denominator(self) -> None:
+        """At K=1 the chain is gated off, so annotating a producer is a no-op.
+
+        This is the whole reason the denominator path ships unconditionally rather than
+        behind a flag: a K=1 model cannot tell the difference, because it publishes the
+        same key set either way.
+        """
+        with_denom = self._make_k1_module()
+        with_denom.reset_loss_metrics()
+        with_denom.update(
+            {
+                "ctr:loss": torch.tensor(0.37),
+                f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(1024.0),
+            }
+        )
+        without = self._make_k1_module()
+        without.reset_loss_metrics()
+        without.update({"ctr:loss": torch.tensor(0.37)})
+        self.assertEqual(
+            sorted(with_denom.compute().keys()), sorted(without.compute().keys())
+        )
+        self.assertNotIn("ctr:loss", with_denom.compute())
+
+    def test_denominator_key_is_not_itself_reported_as_a_loss(self) -> None:
+        """`:loss_denom` must not be mistaken for a published loss metric."""
+        module = self._make_module()
+        result = self._step(
+            module,
+            [
+                {
+                    "ctr:loss": torch.tensor(1.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(8.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(1.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(8.0),
+                },
+            ],
+        )
+        self.assertIn("ctr:loss", result)
+        self.assertNotIn(f"ctr:loss{LOSS_DENOM_SUFFIX}", result)
+
+    def test_keys_aggregate_independently_within_a_step(self) -> None:
+        """An annotated key and a legacy key coexist without interfering."""
+        module = self._make_module()
+        result = self._step(
+            module,
+            [
+                {
+                    "ctr:loss": torch.tensor(2.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(3.0),
+                    "regularization:loss": torch.tensor(1.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(10.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(1.0),
+                    "regularization:loss": torch.tensor(3.0),
+                },
+            ],
+        )
+        self.assertAlmostEqual(float(result["ctr:loss"]), 4.0, places=6)
+        self.assertAlmostEqual(float(result["regularization:loss"]), 2.0, places=6)
+
+    def test_reset_clears_denominator_state_across_steps(self) -> None:
+        """Step N+1 must not inherit step N's denominator accumulation."""
+        module = self._make_module()
+        self._step(
+            module,
+            [
+                {
+                    "ctr:loss": torch.tensor(2.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(3.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(2.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(3.0),
+                },
+            ],
+        )
+        second = self._step(
+            module,
+            [
+                {
+                    "ctr:loss": torch.tensor(5.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(7.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(5.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(7.0),
+                },
+            ],
+        )
+        self.assertAlmostEqual(float(second["ctr:loss"]), 5.0, places=6)
+
+    # Config overrides (the exceptions)
+
+    def test_sum_override_accumulates_without_dividing(self) -> None:
+        module = self._make_module({"cov:loss": LossAggregation.SUM})
+        result = self._step(
+            module,
+            [{"cov:loss": torch.tensor(1.5)}, {"cov:loss": torch.tensor(2.5)}],
+        )
+        self.assertAlmostEqual(float(result["cov:loss"]), 4.0, places=6)
+
+    def test_sum_override_wins_over_an_emitted_denominator(self) -> None:
+        """A SUM pin defends against a producer that emits a bogus denominator."""
+        module = self._make_module({"cov:loss": LossAggregation.SUM})
+        result = self._step(
+            module,
+            [
+                {
+                    "cov:loss": torch.tensor(1.5),
+                    f"cov:loss{LOSS_DENOM_SUFFIX}": torch.tensor(4.0),
+                },
+                {
+                    "cov:loss": torch.tensor(2.5),
+                    f"cov:loss{LOSS_DENOM_SUFFIX}": torch.tensor(4.0),
+                },
+            ],
+        )
+        self.assertAlmostEqual(float(result["cov:loss"]), 4.0, places=6)
+
+    def test_non_mergeable_override_pins_a_key_to_the_legacy_path(self) -> None:
+        """NON_MERGEABLE ignores an emitted denominator (mis-annotated producer)."""
+        module = self._make_module({"ctr:loss": LossAggregation.NON_MERGEABLE})
+        result = self._step(
+            module,
+            [
+                {
+                    "ctr:loss": torch.tensor(2.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(3.0),
+                },
+                {
+                    "ctr:loss": torch.tensor(10.0),
+                    f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(1.0),
+                },
+            ],
+        )
+        # Legacy per-key mean, not the 4.0 the ratio would give.
+        self.assertAlmostEqual(float(result["ctr:loss"]), 6.0, places=6)
+
+    def test_declared_mergeable_ratio_without_denominator_raises(self) -> None:
+        """Fail closed: the override asserts the producer emits a denominator."""
+        module = self._make_module({"ctr:loss": LossAggregation.MERGEABLE_RATIO})
+        module.reset_loss_metrics()
+        with self.assertRaises(RecMetricException):
+            module.update_micro_batch({"ctr:loss": torch.tensor(1.0)})
+
+    def test_denominator_emitted_on_only_some_micro_batches_raises(self) -> None:
+        """A half-annotated producer would mix `l*d` and raw `l` terms."""
+        module = self._make_module()
+        module.reset_loss_metrics()
+        module.update_micro_batch(
+            {
+                "ctr:loss": torch.tensor(2.0),
+                f"ctr:loss{LOSS_DENOM_SUFFIX}": torch.tensor(3.0),
+            }
+        )
+        with self.assertRaises(RecMetricException):
+            module.update({"ctr:loss": torch.tensor(10.0)})
+
+    # Legacy identity
+
+    def test_unannotated_step_is_byte_identical_to_legacy(self) -> None:
+        """With no denominators and no overrides, nothing changes."""
+        module = self._make_module()
+        result = self._step(
+            module,
+            [
+                {"a:loss": torch.tensor(1.0), "b:loss": torch.tensor(2.0)},
+                {"a:loss": torch.tensor(3.0), "b:loss": torch.tensor(6.0)},
+            ],
+        )
+        self.assertAlmostEqual(float(result["a:loss"]), 2.0, places=6)
+        self.assertAlmostEqual(float(result["b:loss"]), 4.0, places=6)
