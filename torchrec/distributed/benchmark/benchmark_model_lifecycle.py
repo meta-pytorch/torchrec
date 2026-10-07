@@ -50,7 +50,13 @@ every metric reports zero:
         --num_unweighted_features=10 --num_weighted_features=10 \
         --num_float_features=10 --feature_pooling_avg=10 \
         --num_benchmarks=2 --loglevel=INFO \
-        --name=wioc --workflow=weight_init_on_cpu --weight_init_on_cpu=True
+        --name=wioc --workflow=weight_init_on_cpu --weight_init_on_cpu=True \
+        --quantized_weight_dtype=NFP8
+
+The `weight_init_on_cpu` workflow requires `--quantized_weight_dtype`: it is the
+dtype the embeddings are quantized to, and the dtype the planner charges HBM at
+for them. Rerun with `--weight_init_on_cpu=False` and compare the per-rank HBM in
+the planner stats to see the planner's accounting change.
 """
 
 import json
@@ -401,6 +407,15 @@ def weight_init_on_cpu_runner(
 
     bench_inputs = _setup(run_option, input_config, tables, weighted_tables, rank)
 
+    # One dtype for both the planner and quantize, so the HBM the plan reserves
+    # is the HBM the quantized weights actually take.
+    converted_dtype = planner_config.quantized_weight_dtype
+    if converted_dtype is None:
+        raise ValueError(
+            "The weight_init_on_cpu workflow requires --quantized_weight_dtype: "
+            "the dtype both the planner and quantize use for the embedding weights."
+        )
+
     with MultiProcessContext(
         rank=rank,
         world_size=world_size,
@@ -475,7 +490,7 @@ def weight_init_on_cpu_runner(
                 quant_utils = EmbeddingQuantizationUtils()
                 quant_utils.quantize_embedding_modules(
                     sharded_model,
-                    converted_dtype=DataType.NFP8,
+                    converted_dtype=converted_dtype,
                     target_device=ctx.device,
                 )
 

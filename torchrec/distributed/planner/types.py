@@ -1671,6 +1671,12 @@ class ParameterConstraints:
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE, either for
             SSD or PS.
         use_virtual_table (bool): is virtual table enabled for this table.
+        quantized_weight_dtype (Optional[DataType]): dtype the embedding weights are
+            quantized to before they are moved onto the compute device. Only used
+            together with the sharder's ``weight_init_on_cpu`` fused param: the
+            full-precision weights are charged to DDR and the weights at this dtype
+            are charged to HBM. When unset, the full-precision weights stay charged
+            to HBM as well. Must be a float dtype no wider than the table's dtype.
     """
 
     sharding_types: Optional[List[str]] = None
@@ -1691,6 +1697,7 @@ class ParameterConstraints:
     device_group: Optional[str] = None
     key_value_params: Optional[KeyValueParams] = None
     use_virtual_table: bool = False
+    quantized_weight_dtype: Optional[DataType] = None
 
     def _hashable_values(
         self, cache_params: object, key_value_params: object
@@ -1712,6 +1719,12 @@ class ParameterConstraints:
             self.device_group,
             key_value_params,
             self.use_virtual_table,
+        ) + (
+            # Only contribute when set: the persistent hash validates stored plans,
+            # so an unconditional new entry would invalidate every existing plan.
+            (self.quantized_weight_dtype,)
+            if self.quantized_weight_dtype is not None
+            else ()
         )
 
     def _persistent_hash(

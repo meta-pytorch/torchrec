@@ -31,8 +31,10 @@ from torchrec.distributed.planner.constants import (
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.shard_estimators import (
+    _calculate_quantized_weight_bytes,
     _calculate_shard_io_sizes,
     _calculate_storage_specific_sizes,
+    _maybe_charge_weights_to_ddr,
     _validate_io_sizes,
     _validate_perf,
     EmbeddingOffloadStats,
@@ -45,6 +47,7 @@ from torchrec.distributed.planner.types import (
     Shard,
     SharderData,
     ShardingOption,
+    Storage,
     Topology,
 )
 from torchrec.distributed.quant_embeddingbag import QuantEmbeddingBagCollectionSharder
@@ -1796,6 +1799,221 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
             constraint_key_value_params=KeyValueParams(max_l1_cache_size=8),
         )
         self.assertGreater(large, small)
+
+    def _weight_init_on_cpu_storage(
+        self,
+        weight_init_on_cpu: bool,
+        quantized_weight_dtype: Optional[DataType] = None,
+    ) -> Storage:
+        topology = Topology(world_size=2, compute_device="cuda")
+        # The flag reaches the estimator the same way it reaches the kernel --
+        # through the sharder's `fused_params` -- so a plan can never disagree
+        # with where the weights actually get allocated.
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=BATCH_SIZE,
+            constraints=(
+                {
+                    "table_0": ParameterConstraints(
+                        quantized_weight_dtype=quantized_weight_dtype
+                    )
+                }
+                if quantized_weight_dtype is not None
+                else None
+            ),
+        )
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0"],
+                data_type=DataType.FP32,
+            )
+        ]
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        sharding_options = enumerator.enumerate(
+            module=model,
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    TestEBCSharder(
+                        sharding_type=ShardingType.TABLE_WISE.value,
+                        kernel_type=EmbeddingComputeKernel.FUSED.value,
+                        fused_params=(
+                            {"weight_init_on_cpu": True} if weight_init_on_cpu else {}
+                        ),
+                    ),
+                )
+            ],
+        )
+        self.assertEqual(len(sharding_options), 1)
+        self.assertEqual(len(sharding_options[0].shards), 1)
+        storage = sharding_options[0].shards[0].storage
+        assert storage is not None
+        return storage
+
+    def test_weight_init_on_cpu_without_quantized_dtype_keeps_hbm(self) -> None:
+        # FP32 weight tensor bytes for the full (table-wise) shard.
+        weight_bytes = 100 * 64 * 4
+        baseline = self._weight_init_on_cpu_storage(weight_init_on_cpu=False)
+        cpu_init = self._weight_init_on_cpu_storage(weight_init_on_cpu=True)
+
+        # Without a quantized dtype the HBM footprint after quantization is
+        # unknown, so HBM keeps the full-precision charge; DDR gains the weights.
+        self.assertEqual(cpu_init.hbm, baseline.hbm)
+        self.assertEqual(cpu_init.ddr - baseline.ddr, weight_bytes)
+
+    def test_weight_init_on_cpu_charges_quantized_weights_to_hbm(self) -> None:
+        weight_bytes = 100 * 64 * 4
+        baseline = self._weight_init_on_cpu_storage(weight_init_on_cpu=False)
+        for quantized_weight_dtype, quantized_bytes in [
+            (DataType.FP16, weight_bytes // 2),
+            (DataType.BF16, weight_bytes // 2),
+            (DataType.NFP8, weight_bytes // 4),
+        ]:
+            with self.subTest(quantized_weight_dtype=quantized_weight_dtype):
+                cpu_init = self._weight_init_on_cpu_storage(
+                    weight_init_on_cpu=True,
+                    quantized_weight_dtype=quantized_weight_dtype,
+                )
+                # Full-precision weights move to DDR; HBM holds them at the
+                # quantized dtype. Everything else (optimizer/cache/pipeline)
+                # stays put.
+                self.assertEqual(
+                    baseline.hbm - cpu_init.hbm, weight_bytes - quantized_bytes
+                )
+                self.assertEqual(cpu_init.ddr - baseline.ddr, weight_bytes)
+
+    def test_quantized_weight_dtype_ignored_without_weight_init_on_cpu(self) -> None:
+        baseline = self._weight_init_on_cpu_storage(weight_init_on_cpu=False)
+        with_dtype = self._weight_init_on_cpu_storage(
+            weight_init_on_cpu=False, quantized_weight_dtype=DataType.FP16
+        )
+        self.assertEqual(with_dtype, baseline)
+
+    def _shards_by_option(
+        self,
+        weight_init_on_cpu: bool,
+        quantized_weight_dtype: Optional[DataType] = None,
+    ) -> Dict[Tuple[str, str], List[Shard]]:
+        enumerator = EmbeddingEnumerator(
+            topology=Topology(world_size=2, compute_device="cuda"),
+            batch_size=BATCH_SIZE,
+            constraints=(
+                {
+                    "table_0": ParameterConstraints(
+                        quantized_weight_dtype=quantized_weight_dtype
+                    )
+                }
+                if quantized_weight_dtype is not None
+                else None
+            ),
+        )
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0"],
+                data_type=DataType.FP32,
+            )
+        ]
+        sharding_options = enumerator.enumerate(
+            module=TestSparseNN(tables=tables, weighted_tables=[]),
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    EmbeddingBagCollectionSharder(
+                        fused_params=(
+                            {"weight_init_on_cpu": True} if weight_init_on_cpu else None
+                        )
+                    ),
+                )
+            ],
+        )
+        return {
+            (option.sharding_type, option.compute_kernel): option.shards
+            for option in sharding_options
+        }
+
+    def test_weight_init_on_cpu_only_changes_fused_storage(self) -> None:
+        # The flag and dtype only re-account weight storage, and only for the
+        # fused kernel: its TBE is the one that allocates weights on the host and
+        # gets quantized onto the device. Perf must be unchanged for every option.
+        baseline = self._shards_by_option(weight_init_on_cpu=False)
+        cpu_init = self._shards_by_option(
+            weight_init_on_cpu=True, quantized_weight_dtype=DataType.NFP8
+        )
+        self.assertEqual(baseline.keys(), cpu_init.keys())
+        for key, baseline_shards in baseline.items():
+            sharding_type, compute_kernel = key
+            with self.subTest(
+                sharding_type=sharding_type, compute_kernel=compute_kernel
+            ):
+                cpu_init_shards = cpu_init[key]
+                self.assertEqual(
+                    [shard.perf for shard in cpu_init_shards],
+                    [shard.perf for shard in baseline_shards],
+                )
+                if compute_kernel != EmbeddingComputeKernel.FUSED.value:
+                    self.assertEqual(
+                        [shard.storage for shard in cpu_init_shards],
+                        [shard.storage for shard in baseline_shards],
+                    )
+
+    def test_quantized_weights_split_per_shard(self) -> None:
+        # Row-wise over 2 shards: each shard holds half the rows, so it is
+        # charged half of the full-precision bytes to DDR and half of the
+        # quantized bytes to HBM.
+        tensor = torch.empty(10, 10, dtype=torch.float32, device="meta")
+        hbm_sizes, ddr_sizes = _maybe_charge_weights_to_ddr(
+            hbm_specific_sizes=[1000, 1000],
+            ddr_specific_sizes=[0, 0],
+            hbm_storage=400,
+            tensor=tensor,
+            shard_sizes=[[5, 10], [5, 10]],
+            sharding_type=ShardingType.ROW_WISE.value,
+            compute_device="cuda",
+            weight_init_on_cpu=True,
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            use_virtual_table=False,
+            quantized_weight_dtype=DataType.FP16,
+        )
+        self.assertEqual(hbm_sizes, [1000 - 200 + 100, 1000 - 200 + 100])
+        self.assertEqual(ddr_sizes, [200, 200])
+
+    def test_unsupported_quantized_weight_dtype_raises(self) -> None:
+        tensor = torch.empty(10, 10, dtype=torch.float32, device="meta")
+        with self.assertRaisesRegex(ValueError, "Unsupported quantized_weight_dtype"):
+            _calculate_quantized_weight_bytes(tensor, DataType.INT8)
+
+    def test_wider_quantized_weight_dtype_raises(self) -> None:
+        tensor = torch.empty(10, 10, dtype=torch.float16, device="meta")
+        with self.assertRaisesRegex(ValueError, "wider than the table's weight dtype"):
+            _calculate_quantized_weight_bytes(tensor, DataType.FP32)
+
+    def test_weight_init_on_cpu_negative_hbm_raises(self) -> None:
+        # HBM sizes smaller than the weight tensor would go negative after the
+        # move, which the planner would read as free HBM.
+        with self.assertRaises(ValueError) as ctx:
+            _maybe_charge_weights_to_ddr(
+                hbm_specific_sizes=[100],
+                ddr_specific_sizes=[0],
+                hbm_storage=1000,
+                tensor=torch.empty(10, 10, dtype=torch.float32, device="meta"),
+                shard_sizes=[[10, 10]],
+                sharding_type=ShardingType.TABLE_WISE.value,
+                compute_device="cuda",
+                weight_init_on_cpu=True,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                use_virtual_table=False,
+                quantized_weight_dtype=DataType.FP16,
+            )
+        self.assertIn(
+            "Negative HBM size detected in hbm_specific_sizes[0]=-700",
+            str(ctx.exception),
+        )
 
 
 class TestEmbeddingOffloadStats(unittest.TestCase):

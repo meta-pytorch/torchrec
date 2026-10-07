@@ -372,6 +372,23 @@ class TestParameterConstraintsHash(unittest.TestCase):
             hash(pc1), hash(pc2), "Hashes should be different for different instances"
         )
 
+    def test_quantized_weight_dtype_changes_hash(self) -> None:
+        unset = ParameterConstraints()
+        fp16 = ParameterConstraints(quantized_weight_dtype=DataType.FP16)
+        nfp8 = ParameterConstraints(quantized_weight_dtype=DataType.NFP8)
+        self.assertNotEqual(hash(unset), hash(fp16))
+        self.assertNotEqual(hash(fp16), hash(nfp8))
+
+    def test_unset_quantized_weight_dtype_leaves_hash_unchanged(self) -> None:
+        # The persistent hash validates stored plans, so leaving the field unset
+        # must not add an entry -- otherwise every existing plan would mismatch.
+        unset = ParameterConstraints()._hashable_values(None, None)
+        fp16 = ParameterConstraints(
+            quantized_weight_dtype=DataType.FP16
+        )._hashable_values(None, None)
+        self.assertEqual(len(fp16), len(unset) + 1)
+        self.assertEqual(fp16[: len(unset)], unset)
+
     def test_hash_equality_with_non_none_cache_and_key_value_params(self) -> None:
         # Create two identical instances with non-None cache_params and key_value_params
         cache_params1 = CacheParams(

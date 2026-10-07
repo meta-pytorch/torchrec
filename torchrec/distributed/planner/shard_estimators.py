@@ -11,7 +11,7 @@ import hashlib
 import logging
 import math
 import sys
-from typing import cast, Dict, List, Optional, Sequence, Tuple, Type
+from typing import cast, Dict, List, Optional, Sequence, Set, Tuple, Type
 
 import torch
 import torchrec.optim as trec_optim
@@ -45,7 +45,7 @@ from torchrec.distributed.types import (
     PipelineType,
     ShardingType,
 )
-from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
+from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
 
 try:
     # This is a safety measure against torch package issues for when
@@ -176,6 +176,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
             sharding_options (List[ShardingOption]): list of sharding options.
             sharder_data_map (SharderDataMap): sharder data map.
         """
+        tables_warned_missing_quantized_dtype: Set[str] = set()
         for sharding_option in sharding_options:
             sharder_key = sharding_option.module_type_key
 
@@ -234,6 +235,28 @@ class EmbeddingStorageEstimator(ShardEstimator):
             # TODO: remove after deprecating fused_params in sharder
             if mpp_conf is None:
                 mpp_conf = sharder_data.fused_params.get("multipass_prefetch_config")
+
+            # Read off the same `fused_params` the kernel will be built with, so
+            # the plan cannot disagree with where the weights actually land.
+            weight_init_on_cpu: bool = bool(
+                sharder_data.fused_params.get("weight_init_on_cpu", False)
+            )
+            quantized_weight_dtype: Optional[DataType] = (
+                constraints.quantized_weight_dtype if constraints else None
+            )
+            if (
+                weight_init_on_cpu
+                and quantized_weight_dtype is None
+                and sharding_option.name not in tables_warned_missing_quantized_dtype
+            ):
+                tables_warned_missing_quantized_dtype.add(sharding_option.name)
+                logger.warning(
+                    "[TorchRec Planner] weight_init_on_cpu is set for table %s but "
+                    "ParameterConstraints.quantized_weight_dtype is not, so its "
+                    "full-precision weights stay charged to HBM. Set it to the dtype "
+                    "the weights are quantized to before reaching the device.",
+                    sharding_option.name,
+                )
             try:
                 shard_storages = calculate_shard_storages(
                     sharder_data=sharder_data,
@@ -260,6 +283,8 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     key_value_params=key_value_params,
                     kv_cache_load_factor=kv_cache_load_factor,
                     use_virtual_table=use_virtual_table,
+                    weight_init_on_cpu=weight_init_on_cpu,
+                    quantized_weight_dtype=quantized_weight_dtype,
                 )
             except ZeroDivisionError as e:
                 raise ValueError(
@@ -340,6 +365,8 @@ def calculate_shard_storages(
     key_value_params: Optional[KeyValueParams] = None,
     kv_cache_load_factor: float = KV_CACHING_RATIO,
     use_virtual_table: bool = False,
+    weight_init_on_cpu: bool = False,
+    quantized_weight_dtype: Optional[DataType] = None,
 ) -> List[Storage]:
     """
     Calculates estimated storage sizes for each sharded tensor using SharderData.
@@ -390,6 +417,20 @@ def calculate_shard_storages(
         optimizer_class=optimizer_class,
         is_inference=is_inference,
     )
+    hbm_specific_sizes, ddr_specific_sizes = _maybe_charge_weights_to_ddr(
+        hbm_specific_sizes=hbm_specific_sizes,
+        ddr_specific_sizes=ddr_specific_sizes,
+        hbm_storage=hbm_storage,
+        tensor=tensor,
+        shard_sizes=shard_sizes,
+        sharding_type=sharding_type,
+        compute_device=compute_device,
+        weight_init_on_cpu=weight_init_on_cpu,
+        compute_kernel=compute_kernel,
+        use_virtual_table=use_virtual_table,
+        quantized_weight_dtype=quantized_weight_dtype,
+    )
+
     ssd_specific_sizes: List[int] = [
         hbm_specific_size + ddr_specific_size
         for hbm_specific_size, ddr_specific_size in zip(
@@ -896,6 +937,124 @@ def _calculate_storage_specific_sizes(
             cache_aux_state_sizes, tensor_sizes, optimizer_sizes
         )
     ]
+
+
+# Targets `_convert_weights` produces with a plain element-wise cast, so the bytes
+# on HBM are exactly numel * element size. Integer targets are rejected: the cast
+# applies no per-row scale/bias, so it is not a real quantization of the weights.
+_QUANTIZED_WEIGHT_DTYPES: Set[DataType] = {
+    DataType.FP32,
+    DataType.FP16,
+    DataType.BF16,
+    DataType.NFP8,
+}
+
+
+def _calculate_quantized_weight_bytes(
+    tensor: torch.Tensor, quantized_weight_dtype: DataType
+) -> int:
+    """Bytes the full weight tensor occupies once cast to `quantized_weight_dtype`.
+
+    Exact rather than an estimate: quantization casts element-wise (see
+    `_convert_weights` in torchrec/distributed/utils.py) and FBGEMM lays the rows
+    out without padding. Reads `DATA_TYPE_NUM_BITS` instead of
+    `SparseType.as_dtype()`, which queries the device to resolve NFP8.
+    """
+    if quantized_weight_dtype not in _QUANTIZED_WEIGHT_DTYPES:
+        raise ValueError(
+            f"[TorchRec Planner] Unsupported quantized_weight_dtype={quantized_weight_dtype}. "
+            f"Supported: {sorted(d.value for d in _QUANTIZED_WEIGHT_DTYPES)}"
+        )
+    num_bits = DATA_TYPE_NUM_BITS[quantized_weight_dtype]
+    if num_bits > tensor.element_size() * 8:
+        raise ValueError(
+            f"[TorchRec Planner] quantized_weight_dtype={quantized_weight_dtype} is "
+            f"wider than the table's weight dtype {tensor.dtype}."
+        )
+    return math.ceil(tensor.numel() * num_bits / 8)
+
+
+def _maybe_charge_weights_to_ddr(
+    hbm_specific_sizes: List[int],
+    ddr_specific_sizes: List[int],
+    hbm_storage: int,
+    tensor: torch.Tensor,
+    shard_sizes: List[List[int]],
+    sharding_type: str,
+    compute_device: str,
+    compute_kernel: str,
+    weight_init_on_cpu: bool,
+    use_virtual_table: bool,
+    quantized_weight_dtype: Optional[DataType] = None,
+) -> Tuple[List[int], List[int]]:
+    """Charge the embedding weight bytes to DDR, and their quantized bytes to HBM.
+
+    Under `weight_init_on_cpu` the weight buffer is allocated on the host and only
+    reaches HBM after quantization. The full-precision weight bytes are charged to
+    DDR, and HBM is charged the weight bytes at `quantized_weight_dtype` in place
+    of full precision. Without `quantized_weight_dtype` the footprint after
+    quantization is unknown, so HBM keeps the full-precision charge rather than
+    under-reserving. Only the weight tensor is reassigned. `hbm_specific_sizes`
+    also covers optimizer and cache-auxiliary state, which are left charged to HBM
+    because they do stay on the compute device.
+
+    Returns the sizes unchanged when the flag is off, or for anything but the
+    fused kernel: it is the only one whose weights are on HBM, allocated by the TBE
+    that honors the flag, and quantized onto the device. Dense kernels ignore the
+    flag and are never quantized, UVM and cached kernels keep their weights in host
+    memory already, and a non-accelerator compute device has no HBM to free.
+    """
+    if (
+        not weight_init_on_cpu
+        or compute_kernel != EmbeddingComputeKernel.FUSED.value
+        or use_virtual_table
+        or compute_device not in {"cuda", "mtia"}
+    ):
+        return hbm_specific_sizes, ddr_specific_sizes
+
+    weight_tensor_sizes: List[int] = _calculate_tensor_sizes(
+        storage=hbm_storage,
+        shape=tensor.shape,
+        shard_sizes=shard_sizes,
+        sharding_type=sharding_type,
+    )
+    # Split with the same helper so both sizes describe the same rows per shard.
+    quantized_weight_sizes: List[int] = (
+        weight_tensor_sizes
+        if quantized_weight_dtype is None
+        else _calculate_tensor_sizes(
+            storage=_calculate_quantized_weight_bytes(tensor, quantized_weight_dtype),
+            shape=tensor.shape,
+            shard_sizes=shard_sizes,
+            sharding_type=sharding_type,
+        )
+    )
+    new_hbm_specific_sizes: List[int] = [
+        hbm_specific_size - weight_tensor_size + quantized_weight_size
+        for hbm_specific_size, weight_tensor_size, quantized_weight_size in zip(
+            hbm_specific_sizes, weight_tensor_sizes, quantized_weight_sizes
+        )
+    ]
+    # A negative HBM size would read as free HBM and let the planner over-pack
+    # the device, so fail loudly instead.
+    for i, size in enumerate(new_hbm_specific_sizes):
+        if size < 0:
+            raise ValueError(
+                f"[TorchRec Planner] Negative HBM size detected in hbm_specific_sizes[{i}]={size} "
+                f"after charging weights to DDR for sharding_type={sharding_type}. "
+                f"hbm_specific_sizes={hbm_specific_sizes}, "
+                f"weight_tensor_sizes={weight_tensor_sizes}, "
+                f"quantized_weight_sizes={quantized_weight_sizes}"
+            )
+    return (
+        new_hbm_specific_sizes,
+        [
+            ddr_specific_size + weight_tensor_size
+            for ddr_specific_size, weight_tensor_size in zip(
+                ddr_specific_sizes, weight_tensor_sizes
+            )
+        ],
+    )
 
 
 def _calculate_tensor_sizes(
