@@ -1,0 +1,82 @@
+# Validates that prefetch-enabled mixed-dimension tables use separate cache
+# dimensions instead of padding the narrower table to the dominant dimension.
+# Per enforce_hbm setting, the expected FP32 cache allocation is:
+#   1024 rows * 0.5 load factor * (8D + 160D) * 4 bytes = 344064 bytes.
+RunOptions:
+  world_size: 1
+  batch_size: 8
+  num_batches: 2
+  num_benchmarks: 1
+  num_profiles: 0
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "sparse_data_dist_uvm_cache_prefetch"
+  loglevel: "info"
+  expected_cache_size_bytes: 344064
+PipelineConfig:
+  pipeline: "base"
+ModelInputConfig:
+  num_float_features: 4
+  feature_pooling_avg: 2
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 4
+EmbeddingTablesConfig:
+  num_unweighted_features: 0
+  num_weighted_features: 0
+  additional_tables:
+    - - name: uvm_prefetch_table_small
+        embedding_dim: 8
+        num_embeddings: 1024
+        feature_names: ["uvm_prefetch_feature_small"]
+      - name: uvm_prefetch_table_large
+        embedding_dim: 160
+        num_embeddings: 1024
+        feature_names: ["uvm_prefetch_feature_large"]
+      - name: hbm_prefetch_table_small
+        embedding_dim: 8
+        num_embeddings: 1024
+        feature_names: ["hbm_prefetch_feature_small"]
+      - name: hbm_prefetch_table_large
+        embedding_dim: 160
+        num_embeddings: 1024
+        feature_names: ["hbm_prefetch_feature_large"]
+PlannerConfig:
+  world_size: 1
+  batch_size: 8
+  pooling_factors: [2.0]
+  storage_reservation_hbm_gb: 0.0
+  additional_constraints:
+    uvm_prefetch_table_small:
+      sharding_types: [table_wise]
+      compute_kernels: [fused_uvm_caching]
+      cache_params:
+        load_factor: 0.5
+        prefetch_pipeline: true
+      enforce_hbm: false
+    uvm_prefetch_table_large:
+      sharding_types: [table_wise]
+      compute_kernels: [fused_uvm_caching]
+      cache_params:
+        load_factor: 0.5
+        prefetch_pipeline: true
+      enforce_hbm: false
+    hbm_prefetch_table_small:
+      sharding_types: [table_wise]
+      compute_kernels: [fused_uvm_caching]
+      cache_params:
+        load_factor: 0.5
+        prefetch_pipeline: true
+      enforce_hbm: true
+    hbm_prefetch_table_large:
+      sharding_types: [table_wise]
+      compute_kernels: [fused_uvm_caching]
+      cache_params:
+        load_factor: 0.5
+        prefetch_pipeline: true
+      enforce_hbm: true
+ShardingConfig:
+  fused_params:
+    cache_load_factor: 0.5
+    prefetch_pipeline: true

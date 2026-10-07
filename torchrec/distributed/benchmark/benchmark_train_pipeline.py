@@ -23,11 +23,14 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, cast, List, Optional, Tuple
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 import torch
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
 from torch import nn
 from torch.autograd.profiler import record_function
 from torchrec.distributed.benchmark.base import (
@@ -64,6 +67,7 @@ from torchrec.distributed.train_pipeline import (
     TrainPipeline,
 )
 from torchrec.distributed.types import DeviceToHostTensorAwaitable
+from torchrec.distributed.utils import _group_sharded_modules
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.metric_module import RecMetricModule
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -116,6 +120,9 @@ class RunOptions(BenchFuncConfig):
             num_batches iterations are run (no cycling).
         profile_model_init (bool): Initialize the model once inside the first
             profiling iteration. Requires profiling-only mode.
+        expected_cache_size_bytes (Optional[int]): Expected total FBGEMM cache
+            allocation for each enforce_hbm setting. When set, the benchmark validates
+            the instantiated FBGEMM allocation before timing.
     """
 
     world_size: int = 2
@@ -134,6 +141,55 @@ class RunOptions(BenchFuncConfig):
     sync_fwd: bool = True
     sync_batch: bool = False
     profile_model_init: bool = False
+    expected_cache_size_bytes: Optional[int] = None
+
+
+def _validate_cache_sizes(
+    sharded_model: nn.Module,
+    expected_cache_size_bytes: int,
+) -> None:
+    expected_bytes = {
+        False: expected_cache_size_bytes,
+        True: expected_cache_size_bytes,
+    }
+    actual_bytes = {False: 0, True: 0}
+    tbe_counts = {False: 0, True: 0}
+    for module in _group_sharded_modules(sharded_model):
+        if not isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
+            continue
+        cache_weights = cast(torch.Tensor, module.lxu_cache_weights)
+        if cache_weights.numel() == 0:
+            continue
+        enforce_hbm = not bool(torch.ops.fbgemm.is_uvm_tensor(module.weights_uvm))
+        actual_bytes[enforce_hbm] += (
+            cache_weights.numel() * cache_weights.element_size()
+        )
+        tbe_counts[enforce_hbm] += 1
+
+    if actual_bytes != expected_bytes:
+        raise RuntimeError(
+            f"FBGEMM cache sizes {actual_bytes} did not match expected sizes "
+            f"{expected_bytes}; TBE counts by enforce_hbm: {tbe_counts}"
+        )
+    logger.info(
+        "Validated FBGEMM cache sizes by enforce_hbm: %s",
+        expected_bytes,
+    )
+
+
+def _maybe_validate_cache_sizes(
+    sharded_model: nn.Module,
+    run_option: RunOptions,
+) -> None:
+    expected_cache_size_bytes = run_option.expected_cache_size_bytes
+    if expected_cache_size_bytes is None:
+        return
+    if run_option.world_size != 1:
+        raise ValueError("Cache-size validation currently requires world_size=1")
+    _validate_cache_sizes(
+        sharded_model,
+        expected_cache_size_bytes,
+    )
 
 
 @dataclass
@@ -175,6 +231,7 @@ class _InitializedModel:
             device=ctx.device,
             planner=planner,
         )
+        _maybe_validate_cache_sizes(sharded_model, run_option)
         metric_module = metric_config.generate_metric_module(
             batch_size=run_option.batch_size,
             world_size=run_option.world_size,
