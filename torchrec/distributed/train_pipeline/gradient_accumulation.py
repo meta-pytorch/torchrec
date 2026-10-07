@@ -13,10 +13,17 @@ Gradient Accumulation support for TorchRec Train Pipelines.
 This module provides:
 1. GradientAccumulationConfig - Configuration dataclass for GA settings
 2. GradientAccumulationWrapper - Wrapper that adds GA to any TrainPipeline
+
+A partial final window committed under ``PartialWindowPolicy.STEP`` takes a real
+optimizer step that the caller cannot observe: the commit happens on the
+``StopIteration`` path, which re-raises, so ``progress()`` never returns and
+``_optimizer_step_completed`` is never set for it. Callers that need every optimizer
+step to be observable must select ``DISCARD`` or ``RAISE``.
 """
 
 import contextlib
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -187,6 +194,12 @@ class _GAOptimizerWrapper:
         # ``accumulate_into_buckets`` the window-start zero delegates there because it needs
         # the model's DDP topology; ``None`` standalone (unit tests) takes the plain path.
         self._ga_wrapper: Optional["GradientAccumulationWrapper[Any, Any]"] = None
+        # A real count, not the anchor-derived span: ``set_step`` can forge the span in
+        # either direction, so only a count detects a window that closed holding fewer than K.
+        self._micro_batches_counted: int = 0
+        # Whether the current window began on a boundary. A window that did must hold K at
+        # close; one entered off-residue via ``set_step`` legitimately may not.
+        self._window_started_aligned: bool = True
 
     @property
     def micro_batches_into_window(self) -> int:
@@ -231,9 +244,51 @@ class _GAOptimizerWrapper:
             self._optimizer.step(*args, **kwargs)
             self._needs_zero_grad = True
 
-    def advance_step(self) -> None:
-        """Advances the internal step counter."""
+    def advance_step(
+        self, window_completed: bool = False, expect_full_window: bool = True
+    ) -> None:
+        """Advance the micro counter, and close the counted window when one completed.
+
+        Both flags come from the caller's own boundary decision rather than being
+        re-derived: a forced last-batch step completes a window the schedule boundary does
+        not, and that window is legitimately short, so it is not held to K.
+        """
         self._current_step += 1
+        self._micro_batches_counted += 1
+        if window_completed:
+            if expect_full_window:
+                self._validate_completed_window()
+            self._start_counted_window()
+
+    def _start_counted_window(self) -> None:
+        self._micro_batches_counted = 0
+        self._window_started_aligned = True
+
+    def _validate_completed_window(self) -> None:
+        """A completed window must hold exactly the K in force.
+
+        A shortfall means the window was re-anchored mid-flight, so the boundary arithmetic
+        closed a window that never accumulated K micro-batches -- gradients for a smaller
+        batch, silently. Graded: a window that began on a boundary raises, one entered
+        off-residue via ``set_step`` (legitimate public API) only warns.
+        """
+        if self._micro_batches_counted == self._k:
+            return
+        detail = (
+            f"gradient accumulation completed an optimizer step after "
+            f"{self._micro_batches_counted} micro-batch(es) with K={self._k} in force"
+        )
+        if self._window_started_aligned:
+            raise RuntimeError(
+                f"{detail}. The window began on a boundary, so it must hold K. Reaching "
+                "here means it was re-anchored mid-window, which every public entry point "
+                "refuses -- an internal invariant violation rather than a caller error."
+            )
+        logger.warning(
+            "%s. The window was entered off-residue via set_step(), so a short window is "
+            "expected here; the next one starts aligned.",
+            detail,
+        )
 
     def reset(self) -> None:
         """Resets the internal step counter and zero_grad flag."""
@@ -241,6 +296,7 @@ class _GAOptimizerWrapper:
         self._window_base = 0
         self._needs_zero_grad = True
         self._force_step = False
+        self._start_counted_window()
 
     def realign_window(self) -> None:
         """Re-anchor the K-window at the current micro counter.
@@ -251,6 +307,7 @@ class _GAOptimizerWrapper:
         monotonic and keeps ``num_warmup_steps`` counted globally, so warmup is not replayed.
         """
         self._window_base = self._current_step
+        self._start_counted_window()
 
     def set_step(self, step: int) -> None:
         """Set the internal step counter, and drop the window anchor back to 0.
@@ -262,6 +319,10 @@ class _GAOptimizerWrapper:
         """
         self._current_step = step
         self._window_base = 0
+        self._micro_batches_counted = 0
+        # An off-residue placement opens a window that cannot hold K, which is legitimate
+        # here and is what downgrades the completed-window check to a warning.
+        self._window_started_aligned = (step % self._k) == 0
 
     def __getattr__(self, name: str) -> Any:
         """Proxy all other attributes to the wrapped optimizer."""
@@ -295,6 +356,9 @@ class GradientAccumulationWrapper(Generic[In, Out]):
     ) -> None:
         self._pipeline = pipeline
         self._model = model
+        # Own the config rather than the caller's object, so K cannot be mutated
+        # off-boundary by anyone still holding a reference to what they passed in.
+        config = deepcopy(config)
         self._config = config
         # Boundary signal for a pipeline whose sub-steps bypass the wrapped optimizer. Opt-in
         # rather than inferred, so a rename is a type error not a silent every-micro step.
@@ -313,6 +377,9 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         # ``set_to_none`` clear, which also avoids the post-alias-only detach-on-view crash.
         self._bucket_views_ready: bool = False
         self._bucket_view_zeroing: BucketViewZeroing = BucketViewZeroing()
+        # Whether the most recent progress() call completed an optimizer step. Published so
+        # a caller can report per-reader-batch completion without re-deriving the boundary.
+        self._optimizer_step_completed: bool = False
 
         # Only replace the pipeline's optimizer when GA is enabled.
         if config.is_enabled:
@@ -548,9 +615,11 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             return True
         return False
 
-    def _advance_state(self) -> None:
+    def _advance_state(self, window_completed: bool, expect_full_window: bool) -> None:
         """Advances internal state after each progress call."""
-        self._optimizer_wrapper.advance_step()
+        self._optimizer_wrapper.advance_step(
+            window_completed=window_completed, expect_full_window=expect_full_window
+        )
 
     def progress(
         self, dataloader_iter: Iterator[In], is_last_batch: Optional[bool] = None
@@ -563,8 +632,11 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         accumulated gradients.
         """
         if not self._config.is_enabled:
-            # Pass-through: no window, so no boundary to signal.
-            return self._pipeline.progress(dataloader_iter)
+            # Pass-through: no window, so no boundary to signal, and every reader batch is
+            # its own optimizer step.
+            out = self._pipeline.progress(dataloader_iter)
+            self._optimizer_step_completed = True
+            return out
 
         should_sync = self._should_sync_grad(is_last_batch=is_last_batch or False)
         # is_last_batch commits an off-boundary window in-band via the force-step armed
@@ -599,7 +671,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         # optimizer gate on the SAME boundary the wrapped optimizer uses. That boundary is
         # _should_step(), NOT _should_sync_grad() -- the latter force-True's on step-0 and
         # warmup, where the optimizer does not step, and drives DDP no_sync only.
-        should_step = self._optimizer_wrapper._should_step() or bool(is_last_batch)
+        on_schedule_boundary = self._optimizer_wrapper._should_step()
+        should_step = on_schedule_boundary or bool(is_last_batch)
         # One-shot: an explicit last batch forces an in-band step off the schedule boundary.
         # Assigned every progress() so it never leaks into a later window.
         self._optimizer_wrapper._force_step = bool(is_last_batch)
@@ -644,9 +717,12 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             # So a later StopIteration knows a flush is needed, and an is_last_batch window
             # already committed in-band is not double-stepped by a raw flush.
             self._pending_uncommitted = not should_step
+            self._optimizer_step_completed = should_step
             # Training-only: eval reuses this entry point, and advancing there would desync
             # the K-micro window boundaries for the resumed training.
-            self._advance_state()
+            self._advance_state(
+                window_completed=should_step, expect_full_window=on_schedule_boundary
+            )
             # Re-anchor for the same reason the StopIteration path does. After
             # _advance_state(), so the committed micro is counted before the anchor moves.
             if is_last_batch:
@@ -655,6 +731,9 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             # finalized and (re)aliased each managed dense grad.
             if should_sync and self._config.accumulate_into_buckets:
                 self._bucket_views_ready = True
+        else:
+            # Eval reuses this entry point but never steps the optimizer.
+            self._optimizer_step_completed = False
 
         return result
 
@@ -748,13 +827,108 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         """
         return self._optimizer_wrapper._k
 
-    def set_step(self, step: int) -> None:
-        """
-        Sets the current step counter.
+    def set_num_micro_batches_per_step(
+        self, k: int, *, allow_open_window: bool = False
+    ) -> None:
+        """Change the LIVE K, and re-anchor the window so the new K starts clean.
 
-        Use this method instead of directly manipulating internal state
-        to ensure proper synchronization.
+        For a bounded phase needing a different cadence than the job's K. The caller
+        snapshots the previous value and restores it, including on an exception path.
+
+        Writes ``_k`` (the live source of truth) and re-anchors with ``realign_window()``
+        -- not ``set_step()``, which breaks ``current_step`` monotonicity, nor ``reset()``.
+
+        Refuses on ``k < 1``, on uncommitted gradients, and when accumulation is disabled.
+        ``allow_open_window`` waives the second for exactly one situation: unwinding a
+        phase that has ALREADY failed, where raising again would bury the original error.
+        Never pass it on a success path. Waiving DISCARDS the open window and re-arms the
+        window-start zero, so the abandoned gradients clear through the normal path.
         """
+        if k < 1:
+            raise ValueError(
+                f"set_num_micro_batches_per_step requires k >= 1, got {k}."
+            )
+        if not self._config.is_enabled:
+            raise RuntimeError(
+                "set_num_micro_batches_per_step called on a GradientAccumulationWrapper "
+                "with gradient accumulation disabled. The wrapper is a pass-through in "
+                "that state -- every reader batch is already its own optimizer step -- so "
+                "the new K would be stored and never consulted. Enable gradient "
+                "accumulation, or do not change K."
+            )
+        if self._pending_uncommitted:
+            if not allow_open_window:
+                raise RuntimeError(
+                    "set_num_micro_batches_per_step called with an open partial window "
+                    "(accumulated, un-stepped gradients from a non-boundary micro; "
+                    f"current_step={self.current_step}, "
+                    f"num_steps={self.num_micro_batches_per_step}, requested k={k}). Those "
+                    "gradients were accumulated under the old K and the new K would "
+                    "reinterpret them. Close the window first."
+                )
+            logger.warning(
+                "set_num_micro_batches_per_step(%d) is discarding an open partial window "
+                "(current_step=%d, num_steps=%d) because allow_open_window was set. This "
+                "is only correct on the unwind of an already-failed phase.",
+                k,
+                self.current_step,
+                self.num_micro_batches_per_step,
+            )
+            # The window is abandoned: re-arm so the next window start clears these
+            # gradients through the normal path, which preserves the bucket-view alias.
+            self._optimizer_wrapper._needs_zero_grad = True
+            self._pending_uncommitted = False
+        self._optimizer_wrapper._k = k
+        self._optimizer_wrapper.realign_window()
+
+    @property
+    def optimizer_step_completed(self) -> bool:
+        """Whether the last ``progress()`` that returned took an optimizer step.
+
+        Left unchanged when ``progress()`` raises. Under ``PartialWindowPolicy.STEP`` the
+        final partial window steps on the way out, and that step is not reported here.
+        """
+        return self._optimizer_step_completed
+
+    @property
+    def has_uncommitted_gradients(self) -> bool:
+        """Whether a non-boundary micro left accumulated, un-stepped gradients."""
+        return self._pending_uncommitted
+
+    @property
+    def will_complete_optimizer_step(self) -> bool:
+        """Whether the next ``progress()`` will take an optimizer step.
+
+        Answers from the step schedule, for training batches only. It cannot account for
+        ``is_last_batch`` -- that is passed to the next ``progress()``, so only its caller
+        knows. In eval the counter does not move, so the answer is about the next training
+        batch. Stale if ``set_step``, ``reset`` or ``realign_window`` runs first.
+        """
+        return self._optimizer_wrapper._should_step()
+
+    def set_step(self, step: int, *, drop_partial: bool = False) -> None:
+        """Set the step counter, re-anchoring the K-micro window.
+
+        Refuses on an open partial window, as ``reset`` does. ``drop_partial`` discards
+        it and re-arms the window-start zero, so the abandoned gradients clear through
+        the normal path.
+        """
+        if self._pending_uncommitted and not drop_partial:
+            # @lint-ignore FIXIT AllRaisesAreAIExceptions
+            raise RuntimeError(
+                "GradientAccumulationWrapper.set_step() called with an open partial "
+                "window (accumulated, un-stepped gradients left by a non-boundary micro; "
+                f"current_step={self.current_step}, "
+                f"num_steps={self.num_micro_batches_per_step}). Re-anchoring now would "
+                "keep those gradients while restarting the count, so the next step would "
+                "cover more than K micro-batches. Complete the window first, or pass "
+                "drop_partial=True to intentionally discard it."
+            )
+        if self._pending_uncommitted:
+            # The window is abandoned: re-arm so the next window start clears these
+            # gradients through the normal path, which preserves the bucket-view alias.
+            self._optimizer_wrapper._needs_zero_grad = True
+            self._pending_uncommitted = False
         self._optimizer_wrapper.set_step(step)
 
     def __getattr__(self, name: str) -> Any:
