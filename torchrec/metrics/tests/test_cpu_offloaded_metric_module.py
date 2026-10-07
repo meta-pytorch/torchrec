@@ -531,9 +531,11 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         }
 
         block_event: threading.Event = threading.Event()
+        processing_started: threading.Event = threading.Event()
 
         def controlled_process_job(_: MetricUpdateJob) -> None:
             # Simulate "busy" update thread
+            processing_started.set()
             block_event.wait()
 
         with patch.object(
@@ -542,6 +544,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             # Fill the queue beyond capacity
             # First item is polled and blocked. Second item will stay in queue.
             cpu_module._update_rec_metrics(model_out)
+            # Without this wait, put_nowait races the worker's get and the SECOND call
+            # raises Full.
+            processing_started.wait(timeout=5.0)
             cpu_module._update_rec_metrics(model_out)
 
             self.assertRaisesRegex(
@@ -1563,8 +1568,10 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         cpu_module = self._make_module(update_queue_size=1)
 
         block_event = threading.Event()
+        processing_started = threading.Event()
 
         def controlled_process_job(_: MetricUpdateJob) -> None:
+            processing_started.set()
             block_event.wait()
 
         model_out = {
@@ -1577,6 +1584,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             cpu_module, "_process_metric_update_job", side_effect=controlled_process_job
         ), patch.object(cpu_module, "_log_event") as mock_log_event:
             cpu_module._update_rec_metrics(model_out)
+            # Without this wait, put_nowait races the worker's get and the SECOND call
+            # raises Full.
+            processing_started.wait(timeout=5.0)
             cpu_module._update_rec_metrics(model_out)
 
             with self.assertRaises(RecMetricException):
