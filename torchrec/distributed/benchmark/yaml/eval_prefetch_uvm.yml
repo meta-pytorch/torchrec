@@ -1,0 +1,96 @@
+# Eval benchmark for EvalPipelinePrefetchSparseDist (pipeline: "eval-prefetch").
+#
+# The two large tables below are the point of this config: they are the only
+# ones on fused_uvm_caching with prefetch_pipeline enabled, so they are what the
+# prefetch stage actually hides. The remaining tables stay HBM-resident on
+# plain `fused`, which mirrors how prod models are laid out.
+#
+# The dense arch is deliberately heavy (over_arch_out_size 4096 x 10 layers).
+# Eval has no backward pass, so the dense forward is the *only* GPU work
+# available to overlap the prefetch with -- with a light dense arch there is
+# nothing to hide behind and the pipeline degrades to serial.
+#
+# Compare against:
+#   - sparse_data_dist_eval.yml  (eval, no prefetch)
+#   - fused_sdd_uvm_eval.yml     (eval-fused lookup overlap, no cache prefetch)
+#   - prefetch_emo.yml           (same prefetch stage, but training)
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  # The prefetch overlap moves QPS only a few percent, so a single run cannot
+  # distinguish it from noise -- keep enough repeats for a real P10/P90 spread.
+  num_benchmarks: 5
+  num_profiles: 1
+  num_iters: 20
+  profile_dir: "."
+  loglevel: "INFO"
+  memory_snapshot: True
+  name: "eval_prefetch_uvm"
+PipelineConfig:
+  pipeline: "eval-prefetch"
+  # Move stages off their default slot (after the dense forward returns) and onto
+  # a module's forward hook, so batch i+1's sparse work is issued partway through
+  # batch i's forward instead of at the end. Keys are EvalPipelineStage values;
+  # values are module FQNs relative to the unwrapped model.
+  #
+  # test_sparse_nn runs sparse -> dense -> over, so hooking on "dense" issues the
+  # next batch's sparse chain while the 10-layer over arch is still running --
+  # the largest block of dense compute available to overlap. Move them to
+  # "sparse" to start even earlier, or to "over" to approximate the default slot.
+  #
+  # Stages form a chain -- enqueue_batch -> start_sparse_data_dist ->
+  # wait_sparse_data_dist -> prefetch. Unhooked stages keep their default slot,
+  # so hooking only a consumer inverts the order and raises; hook its producer
+  # too, on the same or an earlier module. Hooks on one module always fire in
+  # chain order regardless of the key order below.
+  stage_hooks:
+    wait_sparse_data_dist: "dense"
+    prefetch: "dense"
+  kwargs:
+    # Keep the H2D batch copy off the PCIe path the prefetch is saturating.
+    enqueue_batch_after_forward: True
+ModelInputConfig:
+  num_float_features: 1000
+  feature_pooling_avg: 30
+  use_variable_batch: False
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 1000
+    submodule_kwargs:
+      dense_arch_out_size: 1024
+      over_arch_out_size: 4096
+      over_arch_hidden_layers: 10
+      dense_arch_hidden_sizes: [128, 128, 128]
+EmbeddingTablesConfig:
+  num_unweighted_features: 50
+  num_weighted_features: 50
+  embedding_feature_dim: 256
+  additional_tables:
+    # index 0 appends to the unweighted table group
+    - - name: uvm_cached_table_0
+        embedding_dim: 512
+        num_embeddings: 10_000_000
+        feature_names: ["additional_0_0"]
+      - name: uvm_cached_table_1
+        embedding_dim: 512
+        num_embeddings: 10_000_000
+        feature_names: ["additional_0_1"]
+PlannerConfig:
+  pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
+  sharding_type: table_wise
+  additional_constraints:
+    # load_factor 0.2 keeps the cache small enough that batches genuinely miss,
+    # so the prefetch has real work to do and the overlap is measurable.
+    uvm_cached_table_0:
+      compute_kernels: [fused_uvm_caching]
+      sharding_types: [row_wise]
+      cache_params:
+        load_factor: 0.2
+        prefetch_pipeline: True
+    uvm_cached_table_1:
+      compute_kernels: [fused_uvm_caching]
+      sharding_types: [row_wise]
+      cache_params:
+        load_factor: 0.2
+        prefetch_pipeline: True
