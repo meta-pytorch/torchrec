@@ -7,9 +7,15 @@
 
 # pyre-strict
 
+# Citrine missing_for_each_optimizer is suppressed file-wide below. These are CPU unit
+# tests whose purpose is to pin the optimizer's INTERACTION with the GA wrapper, and
+# `foreach=True` swaps SGD to the multi-tensor kernels, which is exactly the behaviour
+# under test. The perf benefit the rule chases is nil on a CPU unit test.
+# @lint-ignore-every CITRINE
+
 import contextlib
 import unittest
-from typing import Any, Iterator, List
+from typing import Any, cast, Iterator, List
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -18,6 +24,7 @@ from torchrec.distributed.train_pipeline.gradient_accumulation import (
     _GAOptimizerWrapper,
     GradientAccumulationConfig,
     GradientAccumulationWrapper,
+    PartialWindowPolicy,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipeline
 
@@ -65,6 +72,37 @@ class _RealForwardPipeline(TrainPipeline[Any, torch.Tensor]):
         self._optimizer.step()
         self._optimizer.zero_grad()
         self._progress_count += 1
+        return loss
+
+
+class _EvalAwareForwardPipeline(TrainPipeline[Any, torch.Tensor]):
+    """Forward/backward/step pipeline that respects ``model.training``: training micros
+    zero_grad -> forward -> backward -> step, so grads ACCUMULATE across a K-micro window
+    via the GA-wrapped optimizer's gating, while eval micros are forward-only under
+    no_grad. Exercises the invariant that an eval interlude does not advance the window.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+    ) -> None:
+        super().__init__()  # pyrefly: ignore[missing-argument]
+        self._model = model
+        self._optimizer = optimizer
+
+    def progress(self, dataloader_iter: Iterator[torch.Tensor]) -> torch.Tensor:
+        batch = next(dataloader_iter)
+        if not self._model.training:
+            with torch.no_grad():
+                return self._model(batch).sum()
+        # zero_grad FIRST (GA-wrapped: only zeros at micro 0 of a window), so backward
+        # accumulates across the K micros; step is GA-wrapped (only at the boundary).
+        self._optimizer.zero_grad()
+        output = self._model(batch)
+        loss = output.sum()
+        loss.backward()
+        self._optimizer.step()
         return loss
 
 
@@ -529,6 +567,188 @@ class StopIterationHandlingTest(unittest.TestCase):
         self.assertEqual(flush_call_count[0], 1)
 
 
+class EvalInterludeGATest(unittest.TestCase):
+    """Eval-reuse GA-state fix (Layer 1: _advance_state gated on model.training; plus the
+    StopIteration flush guard). In-trainer / checkpoint eval reuses the SAME
+    train_step -> progress() dispatch (keyed on _ga_config, not train/eval). Before the fix
+    _advance_state() ran outside the model.training guard, so an eval interlude advanced the
+    GA micro-step counter and desynced the K-micro window boundaries. These tests go RED
+    without the fix (counter advances in eval / post-eval weights diverge / eval flushes) and
+    GREEN with it."""
+
+    def _make_wrapper(
+        self, model: nn.Module, num_steps: int = 2
+    ) -> GradientAccumulationWrapper[Any, torch.Tensor]:
+        optimizer = optim.SGD(model.parameters(), lr=0.1)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=num_steps, num_warmup_steps=1
+        )
+        pipeline = _EvalAwareForwardPipeline(model, optimizer)
+        return GradientAccumulationWrapper(pipeline, optimizer, model, config)
+
+    def test_eval_interlude_does_not_advance_counter(self) -> None:
+        """Core red/green (Layer 1): an eval interlude must NOT advance the GA counter."""
+        model = nn.Linear(10, 5)
+        wrapper = self._make_wrapper(model, num_steps=2)
+        batch = torch.randn(4, 10)
+
+        model.train()
+        wrapper.progress(iter([batch]))  # micro 0 -> current_step 1
+        wrapper.progress(iter([batch]))  # micro 1 (boundary) -> current_step 2
+        self.assertEqual(wrapper.current_step, 2)
+
+        # Eval interlude: 3 micros (odd, NOT a multiple of K=2). Without the fix the counter
+        # would jump to 5 (misaligned); with the fix it stays frozen at 2.
+        model.eval()
+        for _ in range(3):
+            wrapper.progress(iter([batch]))
+        self.assertEqual(
+            wrapper.current_step,
+            2,
+            "eval advanced the GA micro-step counter -> K-micro window boundaries desynced",
+        )
+
+        # Resume training: the next window starts on a clean K-boundary.
+        model.train()
+        wrapper.progress(iter([batch]))  # current_step 3
+        wrapper.progress(iter([batch]))  # current_step 4
+        self.assertEqual(wrapper.current_step, 4)
+
+    def test_eval_interlude_weight_parity_vs_no_eval(self) -> None:
+        """End-to-end red/green: post-eval training weights are BIT-IDENTICAL to a no-eval
+        control (the eval interlude must not perturb the training trajectory)."""
+        torch.manual_seed(0)
+        control = nn.Linear(10, 5)
+        test = nn.Linear(10, 5)
+        test.load_state_dict(control.state_dict())
+
+        g = torch.Generator().manual_seed(123)
+        train_batches = [torch.randn(4, 10, generator=g) for _ in range(8)]
+        eval_batches = [torch.randn(4, 10, generator=g) for _ in range(3)]
+
+        # Control: 8 training micros, no eval.
+        wc = self._make_wrapper(control, num_steps=2)
+        control.train()
+        for b in train_batches:
+            wc.progress(iter([b]))
+
+        # Test: 4 train micros, eval interlude (3 = odd, non-multiple of K), 4 train micros.
+        wt = self._make_wrapper(test, num_steps=2)
+        test.train()
+        for b in train_batches[:4]:
+            wt.progress(iter([b]))
+        test.eval()
+        for b in eval_batches:
+            wt.progress(iter([b]))
+        test.train()
+        for b in train_batches[4:]:
+            wt.progress(iter([b]))
+
+        # Weight parity FIRST so a regression fails on the actual weight divergence (not just
+        # the counter): without the fix, the eval interlude desyncs the windows and the
+        # post-eval training trajectory diverges from the no-eval control.
+        for (name, pc), (_, pt) in zip(
+            control.named_parameters(), test.named_parameters()
+        ):
+            self.assertTrue(
+                torch.equal(pc, pt),
+                f"post-eval weight divergence on {name}: the eval interlude perturbed training",
+            )
+        self.assertEqual(wt.current_step, 8)
+
+    def test_eval_interlude_does_not_change_weights(self) -> None:
+        """An eval interlude (forward-only) must not modify any training weight."""
+        model = nn.Linear(10, 5)
+        wrapper = self._make_wrapper(model, num_steps=2)
+        batch = torch.randn(4, 10)
+        model.train()
+        for _ in range(2):
+            wrapper.progress(iter([batch]))
+        snapshot = [p.detach().clone() for p in model.parameters()]
+        model.eval()
+        for _ in range(3):
+            wrapper.progress(iter([batch]))
+        for before, p in zip(snapshot, model.parameters()):
+            self.assertTrue(
+                torch.equal(before, p), "eval interlude modified a training weight"
+            )
+
+    def test_eval_stop_iteration_does_not_flush(self) -> None:
+        """An eval StopIteration must NEVER raw-flush / step the optimizer, even
+        with pending mid-window gradients."""
+        model = nn.Linear(10, 5)
+        wrapper = self._make_wrapper(model, num_steps=2)
+        batch = torch.randn(4, 10)
+
+        # One training micro -> mid-window, _pending_uncommitted True.
+        model.train()
+        wrapper.progress(iter([batch]))
+        self.assertTrue(wrapper._pending_uncommitted)
+
+        flush_calls = [0]
+        original_flush = wrapper._flush_accumulated_gradients
+
+        def counting_flush(steps: int) -> bool:
+            flush_calls[0] += 1
+            return original_flush(steps)
+
+        # pyrefly: ignore[bad-assignment]: monkeypatch for the test
+        wrapper._flush_accumulated_gradients = counting_flush
+        model.eval()
+        with self.assertRaises(StopIteration):
+            wrapper.progress(iter([]))  # exhausted iter -> StopIteration under eval
+        self.assertEqual(
+            flush_calls[0], 0, "eval StopIteration triggered a raw flush/step"
+        )
+
+    def test_the_observer_is_training_gated_and_fires_before_the_pipeline(self) -> None:
+        """Gated like the rest of the GA state, and still published before progress()."""
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.1)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=2, num_warmup_steps=1
+        )
+        events: List[str] = []
+
+        def observer(*, should_step: bool, at_window_start: bool) -> None:
+            events.append("observer")
+
+        pipeline = _EvalAwareForwardPipeline(model, optimizer)
+        inner_progress = pipeline.progress
+
+        def recording_progress(dataloader_iter: Iterator[torch.Tensor]) -> torch.Tensor:
+            events.append("pipeline")
+            return inner_progress(dataloader_iter)
+
+        # pyrefly: ignore[bad-assignment]: monkeypatch for the test
+        pipeline.progress = recording_progress
+        wrapper = GradientAccumulationWrapper(
+            pipeline, optimizer, model, config, window_observer=observer
+        )
+        batch = torch.randn(4, 10)
+
+        model.train()
+        wrapper.progress(iter([batch]))
+        self.assertEqual(events, ["observer", "pipeline"])
+
+        del events[:]
+        model.eval()
+        for _ in range(3):
+            wrapper.progress(iter([batch]))
+        self.assertEqual(
+            events, ["pipeline"] * 3, "the observer fired during an eval interlude"
+        )
+
+        del events[:]
+        model.train()
+        wrapper.progress(iter([batch]))
+        self.assertEqual(
+            events,
+            ["observer", "pipeline"],
+            "the window boundary must be published BEFORE the inner pipeline runs",
+        )
+
+
 class FlushGradientsTest(unittest.TestCase):
     """Tests for _flush_accumulated_gradients behavior."""
 
@@ -569,6 +789,359 @@ class FlushGradientsTest(unittest.TestCase):
             wrapper.progress(iter([]))
 
         self.assertFalse(wrapper.optimizer_wrapper._needs_zero_grad)
+
+    def test_flush_partial_window_multi_rank_steps_under_default_policy(self) -> None:
+        """ws>1 under the default STEP policy: a real optimizer step, and a loud warning."""
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        pipeline = _RealForwardPipeline(model, optimizer)
+        wrapper = GradientAccumulationWrapper(pipeline, optimizer, model, config)
+        with patch("torch.distributed.is_available", return_value=True), patch(
+            "torch.distributed.is_initialized", return_value=True
+        ), patch("torch.distributed.get_world_size", return_value=2):
+            with patch.object(
+                wrapper.optimizer_wrapper._optimizer, "step"
+            ) as mock_step, self.assertLogs(
+                "torchrec.distributed.train_pipeline.gradient_accumulation", "WARNING"
+            ) as logs:
+                self.assertTrue(wrapper._flush_accumulated_gradients(2))
+            mock_step.assert_called_once_with()
+            self.assertIn("replicas diverge", "\n".join(logs.output))
+
+
+class GAPartialWindowAbortTest(unittest.TestCase):
+    """A rank-local raise at ``world_size > 1`` strands peers in the next collective
+    until the watchdog fires, so a guard that raises must abort the process groups first.
+
+    Which cells abort, deliberately:
+
+    * ``RAISE`` at ws>1 -- aborts, because it is about to raise rank-locally.
+    * ``STEP`` -- never aborts and never raises; it steps at every world size, warning
+      above one rank, which is what a caller passing no policy already gets.
+    * ws<=1 -- never aborts under either policy. No peers to strand.
+    """
+
+    _ABORT = (
+        "torchrec.distributed.train_pipeline.gradient_accumulation"
+        ".torch.distributed.distributed_c10d._abort_process_group"
+    )
+
+    def _wrapper(self, policy: PartialWindowPolicy) -> GradientAccumulationWrapper:
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        pipeline = _RealForwardPipeline(model, optimizer)
+        return GradientAccumulationWrapper(
+            pipeline, optimizer, model, config, partial_window_policy=policy
+        )
+
+    @contextlib.contextmanager
+    def _force_world_size(self, world_size: int) -> Iterator[None]:
+        with patch("torch.distributed.is_available", return_value=True), patch(
+            "torch.distributed.is_initialized", return_value=True
+        ), patch("torch.distributed.get_world_size", return_value=world_size):
+            yield
+
+    def test_raw_flush_ws2_aborts_under_raise(self) -> None:
+        w = self._wrapper(PartialWindowPolicy.RAISE)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(2):
+            with self.assertRaisesRegex(RuntimeError, "partial final window"):
+                w._flush_accumulated_gradients(2)
+            mock_abort.assert_called_once_with(None)
+
+    def test_raw_flush_ws2_steps_and_warns_under_step(self) -> None:
+        """STEP above one rank: a real step, a warning, and no abort."""
+        w = self._wrapper(PartialWindowPolicy.STEP)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(2):
+            with patch.object(
+                w.optimizer_wrapper._optimizer, "step"
+            ) as mock_step, self.assertLogs(
+                "torchrec.distributed.train_pipeline.gradient_accumulation", "WARNING"
+            ) as logs:
+                self.assertTrue(w._flush_accumulated_gradients(2))
+            mock_step.assert_called_once_with()
+            self.assertIn("replicas diverge", "\n".join(logs.output))
+            mock_abort.assert_not_called()
+
+    def test_raw_flush_ws1_raises_without_abort_under_raise(self) -> None:
+        w = self._wrapper(PartialWindowPolicy.RAISE)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(1):
+            with self.assertRaisesRegex(RuntimeError, "world_size <= 1"):
+                w._flush_accumulated_gradients(2)
+            mock_abort.assert_not_called()
+
+    def test_raw_flush_ws1_steps_without_abort_under_step(self) -> None:
+        # Historical single-process behavior: sanctioned local step, no raise, no abort.
+        w = self._wrapper(PartialWindowPolicy.STEP)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(1):
+            self.assertTrue(w._flush_accumulated_gradients(2))
+            mock_abort.assert_not_called()
+
+    def test_full_window_never_aborts(self) -> None:
+        # remaining == 0 -> not a partial window -> no raise and no abort at any world_size.
+        w = self._wrapper(PartialWindowPolicy.RAISE)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(2):
+            self.assertFalse(w._flush_accumulated_gradients(4))
+            mock_abort.assert_not_called()
+
+
+class GAPartialWindowDiscardTest(unittest.TestCase):
+    """``PartialWindowPolicy.DISCARD``: a partial window at exhaustion is thrown away
+    rank-locally -- zeroed, no optimizer step, no collective, no process-group abort -- so a
+    consume-all phase simply ends instead of raising.
+
+    The load-bearing detail is the ZERO. ``_GAOptimizerWrapper.zero_grad`` early-returns when
+    ``_needs_zero_grad`` is False, and False is exactly the mid-window state, so a bare
+    ``zero_grad()`` here is a guaranteed no-op and the discarded gradients would silently
+    survive into the next window. The implementation re-arms the flag first; these tests pin
+    that, not just "the branch was taken".
+    """
+
+    _ABORT = (
+        "torchrec.distributed.train_pipeline.gradient_accumulation"
+        ".torch.distributed.distributed_c10d._abort_process_group"
+    )
+
+    def _make(
+        self, policy: PartialWindowPolicy, accumulate_into_buckets: bool = False
+    ) -> tuple[GradientAccumulationWrapper, nn.Module, optim.Optimizer]:
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        config = GradientAccumulationConfig(
+            is_enabled=True,
+            num_steps=4,
+            num_warmup_steps=1,
+            accumulate_into_buckets=accumulate_into_buckets,
+        )
+        pipeline = _RealForwardPipeline(model, optimizer)
+        wrapper = GradientAccumulationWrapper(
+            pipeline, optimizer, model, config, partial_window_policy=policy
+        )
+        return wrapper, model, optimizer
+
+    def _accumulate_partial_window(
+        self, wrapper: GradientAccumulationWrapper, model: nn.Module, micros: int = 2
+    ) -> None:
+        """Run ``micros`` of a K=4 window and assert the trap preconditions actually hold:
+        gradients are non-zero AND ``_needs_zero_grad`` is False."""
+        for _ in range(micros):
+            wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertFalse(
+            wrapper.optimizer_wrapper._needs_zero_grad,
+            "precondition broken: mid-window _needs_zero_grad should be False -- without "
+            "it the zero_grad no-op trap this test exists for is not being exercised",
+        )
+        self.assertTrue(
+            any(
+                p.grad is not None and torch.count_nonzero(p.grad) > 0
+                for p in model.parameters()
+            ),
+            "precondition broken: expected accumulated non-zero grads before the discard",
+        )
+
+    @contextlib.contextmanager
+    def _force_world_size(self, world_size: int) -> Iterator[None]:
+        with patch("torch.distributed.is_available", return_value=True), patch(
+            "torch.distributed.is_initialized", return_value=True
+        ), patch("torch.distributed.get_world_size", return_value=world_size):
+            yield
+
+    def test_discard_actually_zeroes_the_gradients(self) -> None:
+        """THE regression test for the ``_needs_zero_grad`` no-op: non-zero grads in, zero
+        (or None) grads out."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+
+        self.assertFalse(wrapper._flush_accumulated_gradients(2))
+
+        for name, p in model.named_parameters():
+            self.assertTrue(
+                p.grad is None or torch.count_nonzero(p.grad) == 0,
+                f"discarded gradients survived on {name}",
+            )
+
+    def test_discard_takes_no_optimizer_step(self) -> None:
+        """Weights must be bit-identical across the discard, and the real optimizer's
+        ``step`` must not be called."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+        before = [p.detach().clone() for p in model.parameters()]
+
+        with patch.object(
+            wrapper.optimizer_wrapper._optimizer, "step"
+        ) as mock_step, patch.object(
+            wrapper.optimizer_wrapper, "step"
+        ) as mock_wrapper_step:
+            wrapper._flush_accumulated_gradients(2)
+            mock_step.assert_not_called()
+            mock_wrapper_step.assert_not_called()
+
+        for b, p in zip(before, model.parameters()):
+            self.assertTrue(
+                torch.equal(b, p), "DISCARD moved the weights (an optimizer step ran)"
+            )
+
+    def test_discard_never_aborts_process_groups_at_ws2(self) -> None:
+        """At ws>1: RAISE aborts then raises, STEP steps and warns, DISCARD does neither."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.RAISE)
+        self._accumulate_partial_window(wrapper, model)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(2):
+            with self.assertRaisesRegex(RuntimeError, "partial final window"):
+                wrapper._flush_accumulated_gradients(2)
+            mock_abort.assert_called_once_with(None)
+
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.STEP)
+        self._accumulate_partial_window(wrapper, model)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(2):
+            self.assertTrue(wrapper._flush_accumulated_gradients(2))
+            mock_abort.assert_not_called()
+
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+        with patch(self._ABORT) as mock_abort, self._force_world_size(2):
+            self.assertFalse(wrapper._flush_accumulated_gradients(2))
+            mock_abort.assert_not_called()
+
+    def test_discard_does_not_rewind_the_counter_or_replay_warmup(self) -> None:
+        """DISCARD must NOT call ``reset()``. Zeroing ``_current_step`` / ``_window_base``
+        would re-enter GA/DDP warmup on every new iterator."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+        step_before = wrapper.optimizer_wrapper._current_step
+        base_before = wrapper.optimizer_wrapper._window_base
+
+        wrapper._flush_accumulated_gradients(2)
+
+        self.assertEqual(wrapper.optimizer_wrapper._current_step, step_before)
+        self.assertEqual(wrapper.optimizer_wrapper._window_base, base_before)
+
+    def test_discard_does_not_realign_the_window_itself(self) -> None:
+        """``realign_window()`` is the CALLER's job (progress() does it right after the
+        flush). Doing it here too would double-anchor."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+
+        with patch.object(
+            wrapper.optimizer_wrapper, "realign_window"
+        ) as mock_realign, patch.object(
+            wrapper.optimizer_wrapper, "reset"
+        ) as mock_reset:
+            wrapper._flush_accumulated_gradients(2)
+            mock_realign.assert_not_called()
+            mock_reset.assert_not_called()
+
+    def test_discard_routes_through_the_wrapper_to_preserve_bucket_views(self) -> None:
+        """Under ``accumulate_into_buckets`` the zero must go through
+        ``_GAOptimizerWrapper.zero_grad`` -> ``_window_start_zero_grad`` (alias-preserving),
+        NOT straight to the real optimizer, or the DDP ``gradient_as_bucket_view`` aliases
+        are dropped."""
+        wrapper, model, _optimizer = self._make(
+            PartialWindowPolicy.DISCARD, accumulate_into_buckets=True
+        )
+        self._accumulate_partial_window(wrapper, model)
+
+        with patch.object(wrapper, "_window_start_zero_grad") as mock_window_zero:
+            wrapper._flush_accumulated_gradients(2)
+            mock_window_zero.assert_called_once_with()
+
+    def test_step_routes_through_the_wrapper_to_preserve_bucket_views(self) -> None:
+        """STEP's post-step zero takes DISCARD's alias-preserving route, not the raw one."""
+        wrapper, model, _optimizer = self._make(
+            PartialWindowPolicy.STEP, accumulate_into_buckets=True
+        )
+        self._accumulate_partial_window(wrapper, model)
+
+        with patch.object(
+            wrapper, "_window_start_zero_grad"
+        ) as mock_window_zero, patch.object(
+            wrapper.optimizer_wrapper._optimizer, "zero_grad"
+        ) as mock_raw_zero:
+            self.assertTrue(wrapper._flush_accumulated_gradients(2))
+            mock_window_zero.assert_called_once_with()
+            # The regression this pins: a raw set_to_none here drops the DDP
+            # gradient_as_bucket_view alias, so the next backward allocates a standalone
+            # dense grad and the bucket memory is held twice.
+            mock_raw_zero.assert_not_called()
+
+    def test_discard_is_inert_on_a_complete_window(self) -> None:
+        """remaining == 0 is not a partial window: no zero, no step, no branch."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+        grads_before = [
+            None if p.grad is None else p.grad.detach().clone()
+            for p in model.parameters()
+        ]
+
+        self.assertFalse(wrapper._flush_accumulated_gradients(4))
+
+        for g, p in zip(grads_before, model.parameters()):
+            if g is None:
+                self.assertIsNone(p.grad)
+            else:
+                self.assertIsNotNone(p.grad)
+                self.assertTrue(torch.equal(g, p.grad))
+
+    def test_explicit_is_last_batch_commits_in_band_rather_than_discarding(
+        self,
+    ) -> None:
+        """DISCARD scopes to the EXHAUSTION path only.
+
+        An explicit ``is_last_batch=True`` partial window still commits in-band, exactly as
+        under STEP: ``is_last_batch`` forces ``should_sync``, so the grads are cross-rank
+        reduced and the step is replica-safe while keeping the data. The asymmetry with
+        RAISE -- which DOES fence the explicit path -- is intentional."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+        before = [p.detach().clone() for p in model.parameters()]
+
+        # Micro 3 of a K=4 window, flagged as the last batch -> forced in-band step.
+        wrapper.progress(iter([torch.randn(2, 10)]), is_last_batch=True)
+
+        moved = any(not torch.equal(b, p) for b, p in zip(before, model.parameters()))
+        self.assertTrue(
+            moved,
+            "explicit is_last_batch under DISCARD must still take the synchronized in-band "
+            "step, not silently discard the window",
+        )
+        self.assertFalse(
+            wrapper._pending_uncommitted,
+            "the in-band commit must clear _pending_uncommitted so a later exhaustion does "
+            "not double-handle the window",
+        )
+
+    def test_explicit_is_last_batch_still_raises_under_raise(self) -> None:
+        """Negative control for the test above: RAISE keeps fencing the explicit path, so
+        the DISCARD carve-out is genuinely policy-scoped and not a blanket removal."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.RAISE)
+        self._accumulate_partial_window(wrapper, model)
+        with patch(self._ABORT):
+            with self.assertRaisesRegex(RuntimeError, "is_last_batch"):
+                wrapper.progress(iter([torch.randn(2, 10)]), is_last_batch=True)
+
+    def test_discard_end_to_end_through_stop_iteration(self) -> None:
+        """The real path: a partial window then an exhausted iterator. StopIteration still
+        propagates, the grads are gone, and the caller's realign leaves the counter
+        monotonic."""
+        wrapper, model, _optimizer = self._make(PartialWindowPolicy.DISCARD)
+        self._accumulate_partial_window(wrapper, model)
+        step_before = wrapper.optimizer_wrapper._current_step
+
+        with self.assertRaises(StopIteration):
+            wrapper.progress(iter([]))
+
+        for name, p in model.named_parameters():
+            self.assertTrue(
+                p.grad is None or torch.count_nonzero(p.grad) == 0,
+                f"discarded gradients survived on {name} via the StopIteration path",
+            )
+        self.assertFalse(wrapper._pending_uncommitted)
+        self.assertEqual(wrapper.optimizer_wrapper._current_step, step_before)
+        self.assertEqual(wrapper.optimizer_wrapper._window_base, step_before)
 
 
 class OptimizerInjectionTest(unittest.TestCase):
@@ -690,6 +1263,70 @@ class FullTrainingLoopTest(unittest.TestCase):
         self.assertEqual(len(results), 3)
         self.assertEqual(model.no_sync_entered, 0)
 
+    def test_disabled_ga_does_not_signal_the_observer(self) -> None:
+        """A disabled wrapper is a pure pass-through: it must leave the caller's own
+        boundary state alone rather than forcing it True every batch."""
+        model = _MockModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        pipeline = _MockPipeline(num_batches=3)
+        observer = MagicMock()
+        ga = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            GradientAccumulationConfig(is_enabled=False),
+            window_observer=observer,
+        )
+
+        dummy_iter: Iterator[Any] = iter([])
+        for _ in range(3):
+            ga.progress(dummy_iter)
+
+        observer.assert_not_called()
+        # And the wrapper must not have injected the retired attribute names either.
+        self.assertFalse(hasattr(pipeline, "_ga_should_step"))
+        self.assertFalse(hasattr(pipeline, "_ga_at_window_start"))
+
+    def test_enabled_ga_signals_observer_before_inner_progress(self) -> None:
+        """The boundary must arrive BEFORE the inner progress(), or a sub-step that
+        bypasses the wrapped optimizer would gate on the previous micro's answer."""
+        model = _MockModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        pipeline = _MockPipeline(num_batches=4)
+        seen_at_progress: List[tuple[bool, bool]] = []
+        state: dict[str, bool] = {"should_step": False, "at_window_start": False}
+
+        def observer(*, should_step: bool, at_window_start: bool) -> None:
+            state["should_step"] = should_step
+            state["at_window_start"] = at_window_start
+
+        inner_progress = pipeline.progress
+
+        def recording_progress(dataloader_iter: Iterator[Any]) -> float:
+            seen_at_progress.append((state["should_step"], state["at_window_start"]))
+            return inner_progress(dataloader_iter)
+
+        # pyrefly: ignore[bad-assignment]: test double rebinds the bound method.
+        pipeline.progress = recording_progress
+        ga = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            GradientAccumulationConfig(is_enabled=True, num_steps=2),
+            window_observer=observer,
+        )
+        model.train()
+
+        dummy_iter: Iterator[Any] = iter([])
+        for _ in range(4):
+            ga.progress(dummy_iter)
+
+        # K=2: window starts on micros 0 and 2, boundary steps land on micros 1 and 3.
+        self.assertEqual(
+            seen_at_progress,
+            [(False, True), (True, False), (False, True), (True, False)],
+        )
+
     def test_is_last_batch_forces_sync_and_flush(self) -> None:
         model = _MockModel()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -721,9 +1358,62 @@ class FullTrainingLoopTest(unittest.TestCase):
             ga.progress(dummy_iter)
         self.assertEqual(ga.current_step, 3)
 
-        ga.reset()
+        # Mid-window (3 of 4 micros) => an open partial window; reset must be an
+        # explicit drop_partial opt-in (the clean-boundary guard).
+        ga.reset(drop_partial=True)
         self.assertEqual(ga.current_step, 0)
         self.assertEqual(ga.optimizer_wrapper._current_step, 0)
+
+    def test_dropped_partial_window_grads_do_not_reach_the_next_window(self) -> None:
+        """A dropped partial window's gradients are gone before the next one accumulates."""
+        model = nn.Linear(10, 5, bias=False)
+        optimizer = optim.SGD(model.parameters(), lr=0.0)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        ga = GradientAccumulationWrapper(
+            _EvalAwareForwardPipeline(model, optimizer), optimizer, model, config
+        )
+        model.train()
+
+        batch = torch.ones(1, 10)
+        for _ in range(3):
+            ga.progress(iter([batch]))
+        self.assertIsNotNone(model.weight.grad)
+        dropped = model.weight.grad.clone()
+        self.assertTrue(torch.any(dropped != 0))
+
+        ga.reset(drop_partial=True)
+        ga.progress(iter([batch]))
+
+        # reset() does not clear .grad; it arms the next window-start zero, which the
+        # bucket-view protocol needs so the DDP reduction alias survives the window.
+        self.assertIsNotNone(model.weight.grad)
+        torch.testing.assert_close(model.weight.grad, dropped / 3)
+
+    def test_reset_raises_on_open_partial_window(self) -> None:
+        """reset() with an open partial window fail-closes unless drop_partial."""
+        model = _MockModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        pipeline = _MockPipeline(num_batches=8)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        ga = GradientAccumulationWrapper(pipeline, optimizer, model, config)
+
+        dummy_iter: Iterator[Any] = iter([])
+        # 3 of 4 micros -> mid-window, un-stepped grads pending.
+        for _ in range(3):
+            ga.progress(dummy_iter)
+        self.assertTrue(ga._pending_uncommitted)
+        with self.assertRaises(RuntimeError):
+            ga.reset()
+
+        # Complete the window (4th micro commits/steps) -> clean boundary -> reset ok.
+        ga.progress(dummy_iter)
+        self.assertFalse(ga._pending_uncommitted)
+        ga.reset()
+        self.assertEqual(ga.current_step, 0)
 
     def test_gradient_values_accumulated(self) -> None:
         """Gradients are accumulated across micro-batches (not replaced)."""
@@ -768,30 +1458,27 @@ class _MockDDPModule(torch.nn.Module):
 
 
 class _ModelWithNestedDDP(torch.nn.Module):
-    """Model that contains an inner DDP-like module, mimicking the VLE pattern.
+    """Model with a REGISTERED inner DDP-like submodule (in ``_modules``).
 
-    ShardedVariableLengthEmbeddingArch wraps its DATA_PARALLEL lookups in
-    their own DistributedDataParallel instances.  This mock replicates that
-    structure so we can verify that GradientAccumulationWrapper propagates
-    no_sync to those inner DDP modules.
+    This exercises the discovery mechanism for inner DDPs that ARE registered submodules
+    (found by the ``root.modules()`` walk and entered via no_sync). It is the structural
+    opposite of the plain-list case, whose contract lives in
+    ``PlainListDDPDiscoveryContractTest``.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.dense_layer = torch.nn.Linear(10, 5)
-        # Simulates VLE's internal DDP wrapper for DP lookup tables
         self.inner_ddp = _MockDDPModule()
 
 
 class NestedDDPNoSyncTest(unittest.TestCase):
-    """Tests that _get_no_sync_context propagates to nested DDP modules.
+    """Tests that _get_no_sync_context propagates to REGISTERED nested DDP modules.
 
-    Regression test for the VLE (Variable Length Embedding) gradient
-    accumulation bug: ShardedVariableLengthEmbeddingArch creates its own
-    internal DDP for DATA_PARALLEL lookups. The original implementation
-    only called no_sync() on the outer DDP, so those inner DDP modules
-    would all-reduce on every backward pass — even intermediate GA
-    micro-batches that should only accumulate locally.
+    Verifies the discovery mechanism for inner DDPs that are registered submodules (in
+    ``_modules``): _get_no_sync_context enters no_sync on them, so intermediate GA
+    micro-batches accumulate locally instead of all-reducing. The unregistered plain-list
+    case is the opposite, and is covered by ``PlainListDDPDiscoveryContractTest``.
     """
 
     def setUp(self) -> None:
@@ -814,11 +1501,12 @@ class NestedDDPNoSyncTest(unittest.TestCase):
         _MockDDPModule,
         GradientAccumulationWrapper[Any, Any],
     ]:
-        """Create a GradientAccumulationWrapper around a model with nested DDP.
+        """Create a GradientAccumulationWrapper around a model with a REGISTERED nested DDP.
 
-        The model itself does NOT have no_sync (it's not wrapped in an
-        outer DDP), but it contains an inner DDP child module. This is the
-        exact pattern that VLE creates.
+        The model itself has no no_sync (no outer DDP), but it contains a REGISTERED inner
+        DDP child in ``_modules``, which the discovery walk finds. This is the structural
+        OPPOSITE of the plain-list case, where lookup DDPs are unregistered and therefore
+        not discovered -- see ``PlainListDDPDiscoveryContractTest`` for that contract.
         """
         model = _ModelWithNestedDDP()
         inner_ddp = model.inner_ddp
@@ -1001,3 +1689,594 @@ class NestedDDPNoSyncTest(unittest.TestCase):
                 raise RuntimeError("test error")
 
         self.assertEqual(inner_ddp.no_sync_exited, 1)
+
+
+class _SplitOrDefaultModePipeline(TrainPipeline[Any, torch.Tensor]):
+    """Faithful CPU model of the two optimizer-step paths a wrapping caller can take.
+
+    A caller zeros grads at the top of ``progress()`` through the (GA-wrapper-replaced)
+    ``self._optimizer.zero_grad()``, gated by ``_needs_zero_grad``, then dispatches the
+    optimizer STEP one of two ways:
+
+    * ``bypass_wrapper_step=False``: step via the wrapper ``self._optimizer.step()`` ->
+      the wrapper resets ``_needs_zero_grad`` at the accumulation boundary.
+    * ``bypass_wrapper_step=True``: step a CHILD optimizer directly (a split dense/sparse
+      optimizer), gated on the GA consume
+      boundary the wrapper delivers via ``window_observer``.
+      This path NEVER calls the wrapper ``.step()``, so nothing resets ``_needs_zero_grad``.
+
+    Records the post-backward grad of ``model.weight`` at every micro-batch so a test
+    can detect grads leaking ACROSS windows (a stale-grad-reset bug).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        bypass_wrapper_step: bool,
+    ) -> None:
+        super().__init__()  # pyrefly: ignore[missing-argument]
+        self._model = model
+        # self._optimizer is replaced by the GA wrapper on enable; _child_optimizer
+        # keeps the raw reference the split path would step directly.
+        self._optimizer = optimizer
+        self._child_optimizer = optimizer
+        self._bypass_wrapper_step = bypass_wrapper_step
+        self.post_backward_grads: List[torch.Tensor] = []
+        self.child_step_count: int = 0
+        # Owned by this pipeline, defaulted to the non-GA answer; the wrapper updates it
+        # through window_observer when GA is enabled.
+        self._ga_should_step: bool = True
+        self._ga_at_window_start: bool = True
+
+    def set_ga_window_state(self, *, should_step: bool, at_window_start: bool) -> None:
+        self._ga_should_step = should_step
+        self._ga_at_window_start = at_window_start
+
+    def progress(self, dataloader_iter: Iterator[torch.Tensor]) -> torch.Tensor:
+        batch = next(dataloader_iter)
+        # Top-of-progress zero_grad through the (wrapper-replaced) optimizer.
+        self._optimizer.zero_grad()
+        out = self._model(batch)
+        loss = out.sum()
+        loss.backward()
+        weight = cast(torch.Tensor, self._model.weight)
+        assert weight.grad is not None
+        self.post_backward_grads.append(weight.grad.detach().clone())
+        if self._bypass_wrapper_step:
+            # Split-optimizer path: step the child directly, gated on the GA boundary.
+            if self._ga_should_step:
+                self.child_step_count += 1
+                self._child_optimizer.step()
+        else:
+            # Default path: step through the wrapper (self-gated at the boundary).
+            self._optimizer.step()
+        return loss
+
+
+class SplitModeCrossWindowGradTest(unittest.TestCase):
+    """The split-mode cross-window gradient-zeroing contract.
+
+    Uses x==ones so every micro-batch contributes an identical grad (== ones) to a
+    bias-free Linear (grad == input, weight-independent), and lr==0 so weights stay
+    fixed and grads stay input-determined. With K=2 and 4 micro-batches (2 full
+    windows), each window START (micro 0 and micro 2) must see a FRESH single-micro
+    grad if zero_grad fires once per window:
+
+      CORRECT: post_backward_grads == [1g, 2g, 1g, 2g]
+      LEAK:    post_backward_grads == [1g, 2g, 3g, 4g]  (grads never re-zeroed)
+    """
+
+    def _run(
+        self,
+        bypass_wrapper_step: bool,
+        k: int = 2,
+        num_micros: int = 4,
+        mark_last: bool = False,
+    ) -> _SplitOrDefaultModePipeline:
+        torch.manual_seed(0)
+        model = nn.Linear(4, 1, bias=False)
+        optimizer = optim.SGD(model.parameters(), lr=0.0)
+        pipeline = _SplitOrDefaultModePipeline(model, optimizer, bypass_wrapper_step)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=k, num_warmup_steps=1
+        )
+        wrapper = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            config,
+            window_observer=pipeline.set_ga_window_state,
+        )
+        data: Iterator[torch.Tensor] = iter(
+            [torch.ones(1, 4) for _ in range(num_micros)]
+        )
+        for i in range(num_micros):
+            wrapper.progress(data, is_last_batch=(mark_last and i == num_micros - 1))
+        return pipeline
+
+    def test_default_mode_zeros_grad_each_window(self) -> None:
+        """CONTROL: default step path (wrapper.step) resets _needs_zero_grad, so each
+        window start sees a fresh single-micro grad. Must PASS on current code."""
+        pipeline = self._run(bypass_wrapper_step=False)
+        g = pipeline.post_backward_grads
+        self.assertEqual(len(g), 4)
+        # Window starts (micro 0, micro 2) see a fresh single-micro grad.
+        self.assertTrue(
+            torch.allclose(g[2], g[0]),
+            f"default-mode window-2-start grad {g[2].flatten().tolist()} != "
+            f"window-1-start grad {g[0].flatten().tolist()}",
+        )
+        # Within-window accumulation still holds (boundary == 2x window-start).
+        self.assertTrue(torch.allclose(g[1], 2.0 * g[0]))
+        self.assertTrue(torch.allclose(g[3], 2.0 * g[2]))
+
+    def test_split_mode_zeros_grad_each_window(self) -> None:
+        """The split step path must zero grads once per window too.
+
+        When the child optimizer steps directly it bypasses ``_GAOptimizerWrapper.step()``,
+        which is where ``_needs_zero_grad`` is reset -- so this path is the one that leaks
+        grads across windows if the reset is not driven from somewhere both paths reach.
+        """
+        pipeline = self._run(bypass_wrapper_step=True)
+        g = pipeline.post_backward_grads
+        self.assertEqual(len(g), 4)
+        self.assertTrue(
+            torch.allclose(g[2], g[0]),
+            "CROSS-WINDOW GRAD LEAK in split mode: window-2-start grad "
+            f"{g[2].flatten().tolist()} != window-1-start grad "
+            f"{g[0].flatten().tolist()} (expected equal; unequal => _needs_zero_grad "
+            "never reset because split child-step bypasses _GAOptimizerWrapper.step()).",
+        )
+        self.assertTrue(torch.allclose(g[3], 2.0 * g[2]))
+
+    def test_split_mode_partial_window_commits_in_band(self) -> None:
+        """Partial window in split mode (N%K!=0): K=2, 3 micros = 1 full window [0,1] +
+        1 partial window [2] marked is_last_batch. The partial window must commit in-band
+        (the split child steps once) with freshly-zeroed grads and no double-step."""
+        pipeline = self._run(
+            bypass_wrapper_step=True, k=2, num_micros=3, mark_last=True
+        )
+        g = pipeline.post_backward_grads
+        self.assertEqual(len(g), 3)
+        # Window starts (micro 0, micro 2) see a fresh single-micro grad; the full
+        # window boundary (micro 1) sees 2x.
+        self.assertTrue(torch.allclose(g[0], torch.ones_like(g[0])))
+        self.assertTrue(torch.allclose(g[1], 2.0 * torch.ones_like(g[1])))
+        self.assertTrue(torch.allclose(g[2], torch.ones_like(g[2])))
+        # ceil(3/2) == 2 optimizer steps: micro-1 boundary + micro-2 forced last batch.
+        self.assertEqual(pipeline.child_step_count, 2)
+
+    def test_default_mode_partial_window_commits_in_band(self) -> None:
+        """Same partial window for default mode: the one-shot forced wrapper step handles
+        the final r<K window and grads are zeroed per window (no cross-window leak)."""
+        pipeline = self._run(
+            bypass_wrapper_step=False, k=2, num_micros=3, mark_last=True
+        )
+        g = pipeline.post_backward_grads
+        self.assertEqual(len(g), 3)
+        self.assertTrue(torch.allclose(g[0], torch.ones_like(g[0])))
+        self.assertTrue(torch.allclose(g[1], 2.0 * torch.ones_like(g[1])))
+        self.assertTrue(torch.allclose(g[2], torch.ones_like(g[2])))
+
+    def test_partial_window_trailing_stop_iteration_no_double_step(self) -> None:
+        """After an explicit partial window commits in-band (is_last_batch on the final
+        r<K micro), a trailing progress() that raises StopIteration must NOT re-flush /
+        re-step: the window already committed so _pending_uncommitted is False. Covers
+        both split and default modes."""
+        for bypass in (True, False):
+            torch.manual_seed(0)
+            model = nn.Linear(4, 1, bias=False)
+            optimizer = optim.SGD(model.parameters(), lr=0.0)
+            pipeline = _SplitOrDefaultModePipeline(model, optimizer, bypass)
+            config = GradientAccumulationConfig(
+                is_enabled=True, num_steps=2, num_warmup_steps=1
+            )
+            wrapper = GradientAccumulationWrapper(
+                pipeline,
+                optimizer,
+                model,
+                config,
+                window_observer=pipeline.set_ga_window_state,
+            )
+            data: Iterator[torch.Tensor] = iter([torch.ones(1, 4) for _ in range(3)])
+            wrapper.progress(data)  # micro 0 (window-1 start)
+            wrapper.progress(data)  # micro 1 (window-1 boundary)
+            wrapper.progress(data, is_last_batch=True)  # micro 2 (partial, in-band)
+            self.assertFalse(
+                wrapper._pending_uncommitted,
+                f"partial window not committed in-band (bypass={bypass})",
+            )
+            flush_calls = [0]
+            orig_flush = wrapper._flush_accumulated_gradients
+
+            def _counting_flush(steps: int, _o=orig_flush, _c=flush_calls) -> bool:
+                _c[0] += 1
+                return _o(steps)
+
+            wrapper._flush_accumulated_gradients = (
+                _counting_flush  # pyrefly: ignore[bad-assignment]
+            )
+            with self.assertRaises(StopIteration):
+                wrapper.progress(iter([]))  # trailing: exhausted -> StopIteration
+            self.assertEqual(
+                flush_calls[0],
+                0,
+                f"trailing StopIteration re-flushed after in-band commit (bypass={bypass})",
+            )
+
+
+class _IteratorDrivenStepPipeline(TrainPipeline[Any, int]):
+    """Pipeline that consumes from the PASSED iterator and steps the (GA-wrapped) optimizer.
+
+    Consuming the passed iterator -- rather than an internal counter -- is what lets a test
+    exhaust iterator A and then drive iterator B through the SAME wrapper, which is the
+    scenario the window-anchor exists for. ``self._optimizer`` is replaced by the
+    ``_GAOptimizerWrapper`` at wrapper construction, so ``step()`` here is gated and the
+    underlying mock optimizer records only the calls that actually reached it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()  # pyrefly: ignore[missing-argument]
+        self._optimizer = MagicMock()
+        # Owned by this pipeline; the wrapper updates them through window_observer.
+        self._ga_at_window_start: bool = False
+        self._ga_should_step: bool = False
+
+    def set_ga_window_state(self, *, should_step: bool, at_window_start: bool) -> None:
+        self._ga_should_step = should_step
+        self._ga_at_window_start = at_window_start
+
+    def progress(self, dataloader_iter: Iterator[Any]) -> int:
+        value = next(dataloader_iter)  # StopIteration when exhausted
+        self._optimizer.step()
+        return value
+
+
+class WindowRealignmentTest(unittest.TestCase):
+    """Re-anchoring the K-window when a data iterator is exhausted.
+
+    The optimizer-step / grad-sync / window-start boundaries are computed off a
+    free-running micro counter. A phase that consumes a NON-multiple of K micro-batches
+    before exhausting leaves that counter off-modulo, so every SUBSEQUENT window's boundary
+    is shifted. ``realign_window()`` moves the window anchor
+    to the exhaustion point; it deliberately does NOT reset ``current_step`` (which would
+    break the public accessor's monotonic contract and replay ``num_warmup_steps`` on every
+    new iterator).
+    """
+
+    K: int = 4
+
+    def _make(self, num_warmup_steps: int = 1) -> tuple[
+        GradientAccumulationWrapper[Any, int],
+        _IteratorDrivenStepPipeline,
+        _MockModel,
+        MagicMock,
+    ]:
+        model = _MockModel()
+        optimizer = MagicMock(spec=torch.optim.Optimizer)
+        pipeline = _IteratorDrivenStepPipeline()
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=self.K, num_warmup_steps=num_warmup_steps
+        )
+        wrapper: GradientAccumulationWrapper[Any, int] = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            config,
+            window_observer=pipeline.set_ga_window_state,
+        )
+        model.train()
+        return wrapper, pipeline, model, optimizer
+
+    @staticmethod
+    def _exhaust(wrapper: GradientAccumulationWrapper[Any, int], n: int) -> None:
+        """Consume n micros from a fresh iterator, then drive it to StopIteration."""
+        it: Iterator[int] = iter(range(n))
+        for _ in range(n):
+            wrapper.progress(it)
+        try:
+            wrapper.progress(it)
+        except StopIteration:
+            pass
+        else:  # pragma: no cover - defensive
+            raise AssertionError("iterator did not raise StopIteration")
+
+    def test_combined_boundary_moves_together_after_exhaustion(self) -> None:
+        """THE load-bearing test: after a non-K-multiple exhaustion, the optimizer step, the
+        DDP sync decision and the ``at_window_start`` signal must ALL move to the
+        SAME new boundary.
+
+        Asserting optimizer steps alone can pass while grad sync stays on the old boundary,
+        which is precisely the silent replica-divergence bug this guards.
+        """
+        wrapper, pipeline, model, optimizer = self._make()
+
+        # Iterator A: 6 micros, 6 % 4 == 2 -> exhausts OFF the window boundary.
+        self._exhaust(wrapper, 6)
+        # The partial window was committed in-band by the flush (world_size <= 1, policy
+        # STEP), then the window was re-anchored at global micro 6.
+        self.assertEqual(wrapper.micro_batches_into_window, 0)
+        self.assertEqual(wrapper.current_step, 6)
+
+        optimizer.step.reset_mock()
+        sync_before = model.no_sync_entered
+
+        # Iterator B: record all three signals per micro.
+        stepped: list[bool] = []
+        synced: list[bool] = []
+        at_start: list[bool] = []
+        it: Iterator[int] = iter(range(self.K))
+        for _ in range(self.K):
+            n_steps_before = optimizer.step.call_count
+            no_sync_before = model.no_sync_entered
+            wrapper.progress(it)
+            stepped.append(optimizer.step.call_count > n_steps_before)
+            # no_sync NOT entered => this micro ran under nullcontext => DDP synced.
+            synced.append(model.no_sync_entered == no_sync_before)
+            at_start.append(pipeline._ga_at_window_start)
+
+        # Without realignment the boundary would land on iterator B's SECOND micro (global
+        # step 7, since (7 + 1) % 4 == 0) instead of its fourth -- so `stepped` would read
+        # [False, True, False, False] and every one of these assertions would fail.
+        self.assertEqual(
+            stepped, [False, False, False, True], "optimizer-step boundary"
+        )
+        self.assertEqual(synced, [False, False, False, True], "DDP grad-sync boundary")
+        self.assertEqual(at_start, [True, False, False, False], "window-start signal")
+        self.assertGreater(model.no_sync_entered, sync_before)
+
+    def test_partial_flush_after_realignment_uses_window_relative_count(self) -> None:
+        """Mutation guard for the flush CALL-SITE input.
+
+        Every other exhaustion test here runs while the anchor is 0, where the global and
+        window-relative counters are indistinguishable. Here the anchor is 6 and 2 micros
+        are accumulated: input 2 gives a partial window and a sanctioned in-band step, the
+        global 8 gives ``8 % 4 == 0`` and the window is silently dropped.
+        """
+        wrapper, _pipeline, _model, optimizer = self._make()
+
+        self._exhaust(wrapper, 6)
+        self.assertEqual(wrapper.micro_batches_into_window, 0)
+        self.assertEqual(wrapper.current_step, 6)
+
+        optimizer.step.reset_mock()
+
+        it: Iterator[int] = iter(range(2))
+        wrapper.progress(it)
+        wrapper.progress(it)
+        # Global counter is ON a K boundary; the window-relative one is NOT.
+        self.assertEqual(wrapper.current_step, 8)
+        self.assertEqual(wrapper.micro_batches_into_window, 2)
+        self.assertEqual(
+            optimizer.step.call_count, 0, "no boundary reached inside a partial window"
+        )
+
+        with self.assertRaises(StopIteration):
+            wrapper.progress(it)
+
+        self.assertEqual(
+            optimizer.step.call_count,
+            1,
+            "the partial window (remaining=2) must be committed in-band; feeding the "
+            "flush the GLOBAL counter computes remaining=0 and skips the commit",
+        )
+
+    def test_current_step_stays_monotonic_across_exhaustion(self) -> None:
+        """``current_step`` is monotonic across iterator exhaustion.
+
+        Re-anchoring a window on a new iterator must not rewind the public counter: it is
+        a global micro-batch count, not a within-window offset."""
+        wrapper, _pipeline, _model, _optimizer = self._make()
+        self._exhaust(wrapper, 6)
+        self.assertEqual(wrapper.current_step, 6)
+
+        seen = [wrapper.current_step]
+        it: Iterator[int] = iter(range(4))
+        for _ in range(4):
+            wrapper.progress(it)
+            seen.append(wrapper.current_step)
+        self.assertEqual(seen, [6, 7, 8, 9, 10])
+
+    def test_warmup_does_not_replay_on_a_new_iterator(self) -> None:
+        """``num_warmup_steps`` counts against the GLOBAL micro counter, so a re-anchored
+        window must NOT re-enter warmup (a counter reset would have)."""
+        wrapper, _pipeline, model, _optimizer = self._make(num_warmup_steps=3)
+        self._exhaust(wrapper, 6)
+
+        # First micro of the new window: warmup is long over (current_step == 6 >= 3), and
+        # it is not a boundary micro, so it must run under no_sync.
+        before = model.no_sync_entered
+        it: Iterator[int] = iter(range(1))
+        wrapper.progress(it)
+        self.assertEqual(
+            model.no_sync_entered,
+            before + 1,
+            "warmup replayed on the new iterator (forced a sync on a non-boundary micro)",
+        )
+
+    def test_eval_exhaustion_does_not_realign(self) -> None:
+        """An eval interlude whose iterator exhausts must leave GA state untouched, so a
+        mid-window TRAINING window survives it."""
+        wrapper, _pipeline, model, _optimizer = self._make()
+        it: Iterator[int] = iter(range(2))
+        wrapper.progress(it)
+        wrapper.progress(it)
+        self.assertEqual(wrapper.micro_batches_into_window, 2)
+
+        model.eval()
+        with self.assertRaises(StopIteration):
+            wrapper.progress(iter([]))
+        self.assertEqual(
+            wrapper.micro_batches_into_window,
+            2,
+            "an eval StopIteration re-anchored the window and dropped the open training window",
+        )
+        self.assertEqual(wrapper._optimizer_wrapper._window_base, 0)
+
+    def test_bucket_views_ready_survives_realignment(self) -> None:
+        """Re-anchoring is a window-boundary concern; the DDP bucket-view aliases are a
+        property of the (unchanged) model + DDP instances and must not be invalidated.
+        """
+        wrapper, _pipeline, _model, _optimizer = self._make()
+        wrapper._bucket_views_ready = True
+        self._exhaust(wrapper, 6)
+        self.assertTrue(wrapper._bucket_views_ready)
+
+    def test_set_step_after_realignment_uses_raw_step_semantics(self) -> None:
+        """``set_step`` callers place the wrapper at a point in the accumulation cycle and
+        assume ``(step + 1) % K`` on the RAW value, so it must also drop the anchor.
+        Bounding ``micro_batches_into_window`` hides the symptom but not the bug: with a
+        stale base of 6, ``set_step(3)`` would read ``(3 - 6) % 4 == 1`` and ``_should_step``
+        would miss the boundary the caller just asked for.
+        """
+        wrapper, _pipeline, _model, _optimizer = self._make()
+        self._exhaust(wrapper, 6)
+        self.assertEqual(wrapper._optimizer_wrapper._window_base, 6)
+
+        wrapper.set_step(3)  # K=4 => (3 + 1) % 4 == 0 => on-boundary FULL window
+        self.assertEqual(wrapper._optimizer_wrapper._window_base, 0)
+        self.assertEqual(wrapper.micro_batches_into_window, 3)
+        self.assertTrue(wrapper.optimizer_wrapper._should_step())
+
+    def test_reset_clears_the_window_anchor(self) -> None:
+        wrapper, _pipeline, _model, _optimizer = self._make()
+        self._exhaust(wrapper, 6)
+        self.assertEqual(wrapper._optimizer_wrapper._window_base, 6)
+        wrapper.reset()
+        self.assertEqual(wrapper._optimizer_wrapper._window_base, 0)
+        self.assertEqual(wrapper.current_step, 0)
+        self.assertEqual(wrapper.micro_batches_into_window, 0)
+
+    def test_clean_boundary_exhaustion_also_realigns(self) -> None:
+        """Exhausting ON a boundary leaves nothing to flush, but the anchor must still track
+        the counter so the two never drift apart."""
+        wrapper, _pipeline, _model, _optimizer = self._make()
+        self._exhaust(wrapper, self.K)
+        self.assertEqual(wrapper.current_step, self.K)
+        self.assertEqual(wrapper._optimizer_wrapper._window_base, self.K)
+        self.assertEqual(wrapper.micro_batches_into_window, 0)
+
+    def test_is_last_batch_realigns_after_advancing(self) -> None:
+        """The generic-caller path: an explicit last batch closes the phase, so the next
+        iterator starts a fresh window even though this one ended off-modulo."""
+        wrapper, _pipeline, _model, _optimizer = self._make()
+        it: Iterator[int] = iter(range(2))
+        wrapper.progress(it)
+        wrapper.progress(it, is_last_batch=True)
+        self.assertEqual(wrapper.current_step, 2)
+        self.assertEqual(wrapper.micro_batches_into_window, 0)
+
+    def test_micro_batches_into_window_stays_in_range_across_orderings(self) -> None:
+        """The counter is bounded to ``[0, K)`` through every reachable public ordering,
+        including the stale-anchor sequences an unbounded span drives negative."""
+        wrapper, _pipeline, _model, _optimizer = self._make()
+        self._exhaust(wrapper, 6)
+        self._assert_in_window_range(wrapper)
+        wrapper.set_step(2)
+        self._assert_in_window_range(wrapper)
+        self._exhaust(wrapper, 3)
+        self._assert_in_window_range(wrapper)
+        wrapper.reset()
+        self._assert_in_window_range(wrapper)
+
+    def _assert_in_window_range(self, wrapper: Any) -> None:
+        value = wrapper.micro_batches_into_window
+        self.assertGreaterEqual(value, 0)
+        self.assertLess(value, self.K)
+
+
+class UnsupportedPipelineTest(unittest.TestCase):
+    """An ENABLED GA config plus a pipeline that exposes no ``_optimizer`` at all must fail
+    closed: otherwise the injection is skipped and that pipeline steps on every micro-batch
+    while the caller believes gradients accumulate over K.
+
+    Scope is deliberately narrow: ``hasattr('_optimizer')`` is necessary, not sufficient --
+    a pipeline can expose ``_optimizer``, accept the replacement, and still step a
+    separately captured optimizer. That needs a rebind contract and is NOT what this guard
+    claims.
+    """
+
+    class _NoOptimizerPipeline(TrainPipeline[Any, int]):
+        def __init__(self) -> None:
+            super().__init__()  # pyrefly: ignore[missing-argument]
+
+        def progress(self, dataloader_iter: Iterator[Any]) -> int:
+            return 0
+
+    def test_enabled_ga_with_no_optimizer_attr_raises(self) -> None:
+        pipeline = self._NoOptimizerPipeline()
+        model = _MockModel()
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        config = GradientAccumulationConfig(is_enabled=True, num_steps=4)
+        with self.assertRaises(RuntimeError) as ctx:
+            GradientAccumulationWrapper(pipeline, optimizer, model, config)
+        msg = str(ctx.exception)
+        self.assertIn("_NoOptimizerPipeline", msg)
+        self.assertIn("_optimizer", msg)
+
+    def test_disabled_ga_with_no_optimizer_attr_does_not_raise(self) -> None:
+        """The raise lives inside ``if config.is_enabled``: a disabled config keeps the old
+        no-injection behavior for any pipeline."""
+        pipeline = self._NoOptimizerPipeline()
+        model = _MockModel()
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        config = GradientAccumulationConfig(num_steps=1)  # disabled
+        GradientAccumulationWrapper(
+            pipeline, optimizer, model, config
+        )  # must not raise
+        self.assertFalse(hasattr(pipeline, "_optimizer"))
+
+    def test_double_wrapping_the_same_pipeline_raises(self) -> None:
+        """Wrapping a pipeline twice would nest the optimizer gates, stepping once per
+        K**2 micro-batches instead of per K -- silent under-stepping, not a crash."""
+        model = _MockModel()
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        pipeline = _MockPipeline(num_batches=4)
+        config = GradientAccumulationConfig(is_enabled=True, num_steps=4)
+
+        GradientAccumulationWrapper(pipeline, optimizer, model, config)
+        with self.assertRaises(RuntimeError) as ctx:
+            GradientAccumulationWrapper(pipeline, optimizer, model, config)
+        self.assertIn("already has a GA-wrapped", str(ctx.exception))
+
+    def test_disabled_second_wrap_does_not_raise(self) -> None:
+        """The guard sits inside ``if config.is_enabled``: a disabled second wrapper
+        injects nothing, so it cannot nest anything."""
+        model = _MockModel()
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        pipeline = _MockPipeline(num_batches=4)
+
+        GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            GradientAccumulationConfig(is_enabled=True, num_steps=4),
+        )
+        first_wrapper = pipeline._optimizer
+        GradientAccumulationWrapper(
+            pipeline, optimizer, model, GradientAccumulationConfig(num_steps=1)
+        )  # must not raise
+        self.assertIs(pipeline._optimizer, first_wrapper)
+
+
+class LiveKSingleSourceTest(unittest.TestCase):
+    """K in force is wrapper-private state seeded from the config, not a live config read.
+
+    Every boundary computation and every diagnostic must agree on one value, so that
+    changing K is one write rather than a hunt through the config reads in this file.
+    """
+
+    K: int = 4
+
+    def test_mutating_the_callers_config_does_not_move_the_boundary(self) -> None:
+        model = _MockModel()
+        pipeline = _IteratorDrivenStepPipeline()
+        config = GradientAccumulationConfig(is_enabled=True, num_steps=self.K)
+        wrapper: GradientAccumulationWrapper[Any, int] = GradientAccumulationWrapper(
+            pipeline, MagicMock(spec=torch.optim.Optimizer), model, config
+        )
+        model.train()
+
+        config.num_steps = 2
+        self.assertEqual(self.K, wrapper.num_micro_batches_per_step)
