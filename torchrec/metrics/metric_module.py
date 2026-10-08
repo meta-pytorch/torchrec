@@ -15,7 +15,8 @@ import logging
 import time
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
-from typing import Any, cast, Dict, List, Optional, Type, TypeVar, Union
+from enum import Enum
+from typing import Any, cast, Dict, List, Optional, Set, Type, TypeVar, Union
 
 import torch
 import torch.distributed as dist
@@ -78,6 +79,8 @@ from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
 from torchrec.metrics.mae import MAEMetric
 from torchrec.metrics.metrics_config import (
     BatchSizeStage,
+    LOSS_DENOM_SUFFIX,
+    LossAggregation,
     MetricsConfig,
     RecMetricEnum,
     RecMetricEnumBase,
@@ -128,6 +131,15 @@ from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetr
 from torchrec.metrics.xauc import XAUCMetric
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+class LossAggregationScope(Enum):
+    """Select the span covered by a published ``:loss`` value."""
+
+    # Publish one value per reader batch without recombination.
+    PER_READER_BATCH = "per_reader_batch"
+    # Recombine the reader batches used by one optimizer step.
+    PER_OPTIMIZER_STEP = "per_optimizer_step"
 
 
 @dataclass(frozen=True)
@@ -289,6 +301,123 @@ class StateMetric(abc.ABC):
         pass
 
 
+class _LossAccumulator:
+    """Accumulate each loss key across one optimizer step."""
+
+    def __init__(
+        self, aggregation: Optional[Dict[str, LossAggregation]] = None
+    ) -> None:
+        self.sums: Dict[str, torch.Tensor] = {}
+        # Calls containing any loss key; used when a per-key count is unavailable.
+        self.count: int = 0
+        # Track each key separately because a key may be absent from some reader batches.
+        self.key_counts: Dict[str, int] = {}
+        # Sum the denominators supplied with ratio losses.
+        self.denom_sums: Dict[str, torch.Tensor] = {}
+        # Track keys that supplied denominators; configuration alone does not identify them.
+        self.ratio_keys: Set[str] = set()
+        self.aggregation: Dict[str, LossAggregation] = (
+            dict(aggregation) if aggregation else {}
+        )
+        self._warned_keys: Set[str] = set()
+
+    def set_aggregation(
+        self, aggregation: Optional[Dict[str, LossAggregation]]
+    ) -> None:
+        self.aggregation = dict(aggregation) if aggregation else {}
+
+    def reset(self) -> None:
+        self.sums.clear()
+        self.count = 0
+        self.key_counts.clear()
+        self.denom_sums.clear()
+        self.ratio_keys.clear()
+
+    def accumulate(self, model_out: Dict[str, torch.Tensor]) -> None:
+        """Accumulate loss values from one reader batch.
+
+        A companion denominator recombines a ratio as
+        ``sum(loss * denominator) / sum(denominator)``. Other keys use a per-key mean,
+        counting only reader batches that contain that key.
+        """
+        has_loss = False
+        for k, v in model_out.items():
+            if not (k.endswith(":loss") or k == "loss"):
+                continue
+            has_loss = True
+            override = self.aggregation.get(k)
+            denom = model_out.get(f"{k}{LOSS_DENOM_SUFFIX}")
+
+            if override is LossAggregation.MERGEABLE_RATIO and denom is None:
+                raise RecMetricException(
+                    f"Loss key '{k}' uses MERGEABLE_RATIO but this reader batch has no "
+                    f"'{k}{LOSS_DENOM_SUFFIX}'. Supply the denominator with every "
+                    "reader batch."
+                )
+
+            contribution = v.detach()
+            use_ratio = denom is not None and override not in (
+                LossAggregation.NON_MERGEABLE,
+                LossAggregation.SUM,
+            )
+            if use_ratio != (k in self.ratio_keys) and k in self.sums:
+                raise RecMetricException(
+                    f"Loss key '{k}' supplied '{k}{LOSS_DENOM_SUFFIX}' for only some "
+                    "reader batches in this optimizer step. Supply it for every reader "
+                    "batch or none."
+                )
+            if use_ratio:
+                # Guarded by `denom is not None` inside `use_ratio`.
+                # pyrefly: ignore[missing-attribute]
+                denom = denom.detach()
+                contribution = contribution * denom
+                if k in self.denom_sums:
+                    self.denom_sums[k] = self.denom_sums[k] + denom
+                else:
+                    self.denom_sums[k] = denom.clone()
+                self.ratio_keys.add(k)
+            elif override is None and k not in self._warned_keys:
+                self._warned_keys.add(k)
+                logger.warning(
+                    f"Loss key '{k}' has no '{LOSS_DENOM_SUFFIX}' companion. During "
+                    "gradient accumulation it is reported as an unweighted mean across "
+                    "reader batches, which is exact only when their denominators are "
+                    "equal. Emit the effective denominator or configure this key in "
+                    "MetricsConfig.loss_aggregation."
+                )
+
+            if k in self.sums:
+                self.sums[k] = self.sums[k] + contribution
+                self.key_counts[k] += 1
+            else:
+                self.sums[k] = contribution.clone()
+                self.key_counts[k] = 1
+
+        if has_loss:
+            self.count += 1
+
+    def reduced_losses(self) -> Dict[str, torch.Tensor]:
+        """Return each loss key recombined across the current optimizer step.
+
+        For ``LossAggregation.SUM``, the returned tensor is the accumulator itself.
+        Clone it before mutation.
+        """
+        return {key: self._reduce(key, value) for key, value in self.sums.items()}
+
+    def _reduce(self, key: str, accumulated: torch.Tensor) -> torch.Tensor:
+        if self.aggregation.get(key) is LossAggregation.SUM:
+            return accumulated
+        # `.get` rather than `[]`: accumulate writes `sums` and `key_counts` together, so
+        # this only keeps a future divergence from becoming a KeyError.
+        count = self.key_counts.get(key, self.count)
+        if key in self.ratio_keys:
+            denom = self.denom_sums[key]
+            # Replace only a zero divisor; clamping would change valid fractional values.
+            safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+            return accumulated / safe_denom
+        return accumulated / count if count else accumulated
+
+
 class RecMetricModule(nn.Module):
     r"""
     For the current recommendation models, we assume there will be three
@@ -301,6 +430,9 @@ class RecMetricModule(nn.Module):
 
     StateMetric is a metric that is computed based on a model componenet
     (e.g., Optimizer) internal logic.
+
+    An optimizer step applies accumulated gradients to the model weights. One optimizer
+    step may span several reader batches.
 
     Args:
         batch_size (int): batch size used by this trainer.
@@ -357,6 +489,7 @@ class RecMetricModule(nn.Module):
         compute_interval_steps: int = 100,
         min_compute_interval: float = 0.0,
         max_compute_interval: float = float("inf"),
+        loss_aggregation: Optional[Dict[str, LossAggregation]] = None,
     ) -> None:
         super().__init__()
         self.rec_tasks = rec_tasks if rec_tasks else []
@@ -371,6 +504,11 @@ class RecMetricModule(nn.Module):
         self.compute_count = 0
         self._debug_mode: bool = False
         self._debug_rank: int = 0
+        self._loss_acc: _LossAccumulator = _LossAccumulator(loss_aggregation)
+        # Job configuration sets this scope so output keys do not depend on call history.
+        self._loss_aggregation_scope: LossAggregationScope = (
+            LossAggregationScope.PER_READER_BATCH
+        )
 
         self.compute_interval_steps = compute_interval_steps
         self.min_compute_interval = min_compute_interval
@@ -492,6 +630,48 @@ class RecMetricModule(nn.Module):
         if records:
             raise RecMetricValidationError(self._format_input_validation_error(records))
 
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        # Older serialized modules lack these attributes because loading skips __init__.
+        super().__setstate__(state)
+        if not hasattr(self, "_loss_acc"):
+            self._loss_acc = _LossAccumulator()
+        if not hasattr(self, "_loss_aggregation_scope"):
+            self._loss_aggregation_scope = LossAggregationScope.PER_READER_BATCH
+
+    def set_loss_aggregation(
+        self, loss_aggregation: Optional[Dict[str, LossAggregation]]
+    ) -> None:
+        """Override how specific ``:loss`` keys recombine across micro-batches.
+
+        Most ratio losses declare their denominator through ``:loss_denom`` and need no
+        override. See ``LossAggregation`` for exceptions.
+        """
+        self._loss_acc.set_aggregation(loss_aggregation)
+
+    def set_under_micro_batching(self, value: bool) -> None:
+        """Declare whether this job accumulates several reader batches per optimizer step.
+
+        Job configuration supplies this value so prior training calls cannot change the
+        loss keys published during evaluation.
+        """
+        self._loss_aggregation_scope = (
+            LossAggregationScope.PER_OPTIMIZER_STEP
+            if value
+            else LossAggregationScope.PER_READER_BATCH
+        )
+
+    @property
+    def loss_aggregation_scope(self) -> LossAggregationScope:
+        """Return the span covered by each published ``:loss`` value."""
+        return getattr(
+            self, "_loss_aggregation_scope", LossAggregationScope.PER_READER_BATCH
+        )
+
+    @property
+    def under_micro_batching(self) -> bool:
+        """Return whether losses span several reader batches per optimizer step."""
+        return self.loss_aggregation_scope is LossAggregationScope.PER_OPTIMIZER_STEP
+
     def load_state_dict_hook(
         self,
         state_dict: OrderedDict[str, torch.Tensor],
@@ -560,6 +740,43 @@ class RecMetricModule(nn.Module):
             if self.throughput_metric:
                 self.throughput_metric.update()
             self.trained_batches += 1
+            if self.loss_aggregation_scope is LossAggregationScope.PER_OPTIMIZER_STEP:
+                self._accumulate_loss_metrics(model_out)
+
+    def update_micro_batch(
+        self, model_out: Dict[str, torch.Tensor], **kwargs: Any
+    ) -> None:
+        """Update metrics for a nonfinal batch in an accumulation window.
+
+        This method does not advance ``trained_batches``. It advances throughput because
+        ``batch_size`` describes each reader batch, not the full optimizer step.
+        """
+        if self.loss_aggregation_scope is not LossAggregationScope.PER_OPTIMIZER_STEP:
+            raise RecMetricException(
+                "update_micro_batch() requires loss aggregation across an optimizer "
+                "step. Call set_under_micro_batching(True), or use update() for one "
+                "reader batch."
+            )
+        with record_function("## RecMetricModule:update_micro_batch ##"):
+            self._update_rec_metrics(model_out, **kwargs)
+            if self.throughput_metric:
+                self.throughput_metric.update()
+            self._accumulate_loss_metrics(model_out)
+
+    def reset_loss_metrics(self) -> None:
+        """Reset the per-step loss accumulators, before any update for that step.
+
+        Resetting at optimizer-step boundaries lets ``compute()`` keep reporting the most
+        recent step when ``compute_interval_steps`` is greater than one.
+        """
+        self._loss_acc.reset()
+
+    def _accumulate_loss_metrics(self, model_out: Dict[str, torch.Tensor]) -> None:
+        """Accumulate loss values from one reader batch.
+
+        If a later key fails validation, earlier keys from the same batch remain stored.
+        """
+        self._loss_acc.accumulate(model_out)
 
     def _adjust_compute_interval(self) -> None:
         """
@@ -637,6 +854,9 @@ class RecMetricModule(nn.Module):
                             for metric_name, metric_value in component.get_metrics().items()
                         }
                     )
+            # Per-reader-batch users keep their existing output keys.
+            if self.loss_aggregation_scope is LossAggregationScope.PER_OPTIMIZER_STEP:
+                ret.update(self._loss_acc.reduced_losses())
         return DeferrableMetrics(ret)
 
     def compute_throughput(self) -> DeferrableMetrics:
@@ -981,6 +1201,12 @@ def generate_metric_module(
     metrics._configure_debug_mode(
         debug_mode,
         my_rank,
+    )
+    # Configure after construction because subclasses have fixed __init__ signatures.
+    # getattr supports MetricsConfig subclasses created before these fields existed.
+    metrics.set_loss_aggregation(getattr(metrics_config, "loss_aggregation", None))
+    metrics.set_under_micro_batching(
+        getattr(metrics_config, "num_micro_batches_per_step", 1) > 1
     )
     metrics.to(device)
     return metrics

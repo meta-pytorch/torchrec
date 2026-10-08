@@ -15,13 +15,11 @@ import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh
 from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 from torchrec.metrics.metric_module import MetricValue, RecMetricModule
+from torchrec.metrics.metrics_config import LossAggregation
 
 
 class NoOpMetricModule(RecMetricModule):
-    """
-    A no-op implementation of RecMetricModule for when metrics
-    computation is disabled.
-    """
+    """Disable metric computation while preserving the module interface."""
 
     def __init__(self) -> None:
         torch.nn.Module.__init__(self)
@@ -32,6 +30,22 @@ class NoOpMetricModule(RecMetricModule):
         pass
 
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
+        pass
+
+    def update_micro_batch(
+        self, model_out: Dict[str, torch.Tensor], **kwargs: Any
+    ) -> None:
+        """Ignore an intermediate reader batch when metrics are disabled."""
+        pass
+
+    def reset_loss_metrics(self) -> None:
+        """Ignore loss reset when metrics are disabled."""
+        pass
+
+    def set_loss_aggregation(
+        self, loss_aggregation: Optional[Dict[str, LossAggregation]]
+    ) -> None:
+        """Ignore loss aggregation configuration when metrics are disabled."""
         pass
 
     def should_compute(self) -> bool:
