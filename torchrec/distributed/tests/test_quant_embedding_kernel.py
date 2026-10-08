@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 import torch
 import torchrec.distributed.quant_embedding_kernel as qek
 from torchrec.distributed.fused_params import (
+    FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER,
+    fused_param_enable_fs_2d_async_allgather,
     FUSED_PARAM_IS_DEVICE_RO,
     is_fused_param_device_ro,
     tbe_fused_params,
@@ -108,4 +110,33 @@ class QuantBatchedEmbeddingBagDeviceRoTest(unittest.TestCase):
         filtered_params = tbe_fused_params(fused_params)
         self.assertIsNotNone(filtered_params)
         self.assertNotIn(FUSED_PARAM_IS_DEVICE_RO, filtered_params)
+        self.assertIn("output_dtype", filtered_params)
+
+    def test_fs_2d_async_allgather_fused_param_is_internal_to_torchrec(self) -> None:
+        fused_params: Dict[str, Any] = {
+            FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: True,
+            "output_dtype": object(),
+        }
+
+        self.assertFalse(fused_param_enable_fs_2d_async_allgather(None))
+        self.assertFalse(fused_param_enable_fs_2d_async_allgather({}))
+        self.assertFalse(
+            fused_param_enable_fs_2d_async_allgather(
+                {FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: False}
+            )
+        )
+        self.assertFalse(
+            fused_param_enable_fs_2d_async_allgather(
+                {FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: "shared_arch"}
+            )
+        )
+        self.assertFalse(
+            fused_param_enable_fs_2d_async_allgather(
+                {FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: 1}
+            )
+        )
+        self.assertTrue(fused_param_enable_fs_2d_async_allgather(fused_params))
+        filtered_params = tbe_fused_params(fused_params)
+        self.assertIsNotNone(filtered_params)
+        self.assertNotIn(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER, filtered_params)
         self.assertIn("output_dtype", filtered_params)
