@@ -7,10 +7,16 @@
 
 # pyre-strict
 
-"""Gradient accumulation for TorchRec training pipelines."""
+"""Gradient accumulation for TorchRec training pipelines.
+
+When input exhaustion causes ``PartialWindowPolicy.STEP`` to apply a final incomplete
+window, ``progress()`` raises ``StopIteration`` before it can report that optimizer step.
+Use ``DISCARD`` or ``RAISE`` when every optimizer step must be observable.
+"""
 
 import contextlib
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -143,6 +149,10 @@ class _GAOptimizerWrapper:
         self._force_step: bool = False
         # The owning wrapper provides model topology for bucket-view zeroing.
         self._ga_wrapper: Optional["GradientAccumulationWrapper[Any, Any]"] = None
+        # Track processed micro-batches because set_step() can change the window position.
+        self._micro_batches_counted: int = 0
+        # A window that starts on a boundary must contain exactly _k micro-batches.
+        self._window_started_aligned: bool = True
 
     @property
     def micro_batches_into_window(self) -> int:
@@ -173,9 +183,49 @@ class _GAOptimizerWrapper:
             self._optimizer.step(*args, **kwargs)
             self._needs_zero_grad = True
 
-    def advance_step(self) -> None:
-        """Advance the global micro-batch counter."""
+    def advance_step(
+        self, window_completed: bool = False, expect_full_window: bool = True
+    ) -> None:
+        """Advance the batch count and validate completed windows.
+
+        An explicit final batch can complete a partial window, so the caller reports
+        whether to require a full window.
+        """
         self._current_step += 1
+        self._micro_batches_counted += 1
+        if window_completed:
+            if expect_full_window:
+                self._validate_completed_window()
+            self._start_counted_window()
+
+    def _start_counted_window(self) -> None:
+        self._micro_batches_counted = 0
+        self._window_started_aligned = True
+
+    def _validate_completed_window(self) -> None:
+        """Validate the number of micro-batches in a completed window.
+
+        A window that started on a boundary must contain ``_k`` micro-batches.
+        ``set_step()`` can start between boundaries, so an incomplete first window from
+        that public API produces a warning instead.
+        """
+        if self._micro_batches_counted == self._k:
+            return
+        detail = (
+            "gradient accumulation completed an optimizer step after "
+            f"{self._micro_batches_counted} micro-batch(es); configured window size "
+            f"is {self._k}"
+        )
+        if self._window_started_aligned:
+            raise RuntimeError(
+                f"{detail}. The window started on an accumulation boundary, so this "
+                "indicates an internal state error."
+            )
+        logger.warning(
+            "%s. set_step() started this window between accumulation boundaries; the "
+            "next window starts on a boundary.",
+            detail,
+        )
 
     def reset(self) -> None:
         """Reset the counter and gradient-clear state."""
@@ -183,10 +233,12 @@ class _GAOptimizerWrapper:
         self._window_base = 0
         self._needs_zero_grad = True
         self._force_step = False
+        self._start_counted_window()
 
     def realign_window(self) -> None:
         """Start a new window without resetting the global micro-batch counter."""
         self._window_base = self._current_step
+        self._start_counted_window()
 
     def set_step(self, step: int) -> None:
         """Set the micro-batch counter and reset the window origin.
@@ -196,6 +248,9 @@ class _GAOptimizerWrapper:
         """
         self._current_step = step
         self._window_base = 0
+        self._micro_batches_counted = 0
+        # An incomplete first window created by set_step() produces a warning.
+        self._window_started_aligned = (step % self._k) == 0
 
     def __getattr__(self, name: str) -> Any:
         """Proxy all other attributes to the wrapped optimizer."""
@@ -220,6 +275,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
     ) -> None:
         self._pipeline = pipeline
         self._model = model
+        # Copy the config so caller mutations cannot change accumulation boundaries.
+        config = deepcopy(config)
         self._config = config
         # Share accumulation boundaries with pipeline operations that bypass this optimizer.
         self._window_observer = window_observer
@@ -232,6 +289,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         # Set after a synchronized backward establishes DDP bucket-view aliases.
         self._bucket_views_ready: bool = False
         self._bucket_view_zeroing: BucketViewZeroing = BucketViewZeroing()
+        # Report optimizer completion without requiring callers to reproduce boundary logic.
+        self._optimizer_step_completed: bool = False
 
         # Only replace the pipeline's optimizer when GA is enabled.
         if config.is_enabled:
@@ -402,9 +461,11 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             return True
         return False
 
-    def _advance_state(self) -> None:
+    def _advance_state(self, window_completed: bool, expect_full_window: bool) -> None:
         """Advances internal state after each progress call."""
-        self._optimizer_wrapper.advance_step()
+        self._optimizer_wrapper.advance_step(
+            window_completed=window_completed, expect_full_window=expect_full_window
+        )
 
     def progress(
         self, dataloader_iter: Iterator[In], is_last_batch: Optional[bool] = None
@@ -416,7 +477,10 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         ``StopIteration`` is raised.
         """
         if not self._config.is_enabled:
-            return self._pipeline.progress(dataloader_iter)
+            out = self._pipeline.progress(dataloader_iter)
+            self._optimizer_step_completed = True if self._model.training else False
+
+            return out
 
         should_sync = self._should_sync_grad(is_last_batch=is_last_batch or False)
         # Reject an explicit partial window before the optimizer runs.
@@ -440,7 +504,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                 "divisible batch count or select PartialWindowPolicy.STEP."
             )
         # Publish the optimizer boundary before pipeline operations run.
-        should_step = self._optimizer_wrapper._should_step() or bool(is_last_batch)
+        on_schedule_boundary = self._optimizer_wrapper._should_step()
+        should_step = on_schedule_boundary or bool(is_last_batch)
         # An explicit final batch may step before the scheduled boundary.
         self._optimizer_wrapper._force_step = bool(is_last_batch)
         # The counter advances after progress(), so zero marks the window start.
@@ -473,12 +538,17 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             if should_step:
                 self._optimizer_wrapper._needs_zero_grad = True
             self._pending_uncommitted = not should_step
+            self._optimizer_step_completed = should_step
             # Evaluation must not advance the training accumulation window.
-            self._advance_state()
+            self._advance_state(
+                window_completed=should_step, expect_full_window=on_schedule_boundary
+            )
             if is_last_batch:
                 self._optimizer_wrapper.realign_window()
             if should_sync and self._config.accumulate_into_buckets:
                 self._bucket_views_ready = True
+        else:
+            self._optimizer_step_completed = False
 
         return result
 
@@ -549,13 +619,91 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         """Number of micro-batches accumulated per optimizer step."""
         return self._optimizer_wrapper._k
 
-    def set_step(self, step: int) -> None:
-        """
-        Sets the current step counter.
+    def set_num_micro_batches_per_step(
+        self, k: int, *, allow_open_window: bool = False
+    ) -> None:
+        """Set the number of micro-batches per optimizer step.
 
-        Use this method instead of directly manipulating internal state
-        to ensure proper synchronization.
+        This starts a new window without resetting ``current_step``. An incomplete current
+        window is rejected unless ``allow_open_window`` is true, which discards its
+        gradients. Use that option only while handling an existing failure.
         """
+        if k < 1:
+            raise ValueError(
+                f"set_num_micro_batches_per_step requires k >= 1, got {k}."
+            )
+        if not self._config.is_enabled:
+            raise RuntimeError(
+                "cannot change num_micro_batches_per_step when gradient accumulation "
+                "is disabled"
+            )
+        if self._pending_uncommitted:
+            if not allow_open_window:
+                raise RuntimeError(
+                    "cannot change num_micro_batches_per_step with uncommitted gradients "
+                    "("
+                    f"current_step={self.current_step}, "
+                    f"num_steps={self.num_micro_batches_per_step}, requested k={k}). "
+                    "Complete the current window or pass allow_open_window=True to "
+                    "discard it."
+                )
+            logger.warning(
+                "discarding uncommitted gradients while changing "
+                "num_micro_batches_per_step to %d (current_step=%d, num_steps=%d) "
+                "because allow_open_window=True",
+                k,
+                self.current_step,
+                self.num_micro_batches_per_step,
+            )
+            # Clear the discarded gradients when the next window starts.
+            self._optimizer_wrapper._needs_zero_grad = True
+            self._pending_uncommitted = False
+        self._optimizer_wrapper._k = k
+        self._optimizer_wrapper.realign_window()
+
+    @property
+    def optimizer_step_completed(self) -> bool:
+        """Whether the last successful ``progress()`` took an optimizer step.
+
+        This remains unchanged if ``progress()`` raises. It cannot report a partial-window
+        step performed while handling ``StopIteration`` because ``progress()`` does not
+        return.
+        """
+        return self._optimizer_step_completed
+
+    @property
+    def has_uncommitted_gradients(self) -> bool:
+        """Whether the current window contains gradients not yet applied."""
+        return self._pending_uncommitted
+
+    @property
+    def will_complete_optimizer_step(self) -> bool:
+        """Whether the next scheduled training batch will take an optimizer step.
+
+        This does not account for ``is_last_batch`` passed to the next ``progress()`` call.
+        Evaluation does not advance the schedule. ``set_step()``, ``reset()``, or
+        ``realign_window()`` can change the result before the next batch.
+        """
+        return self._optimizer_wrapper._should_step()
+
+    def set_step(self, step: int, *, drop_partial: bool = False) -> None:
+        """Set the step counter and start a new accumulation window.
+
+        Uncommitted gradients are rejected unless ``drop_partial`` is true. Dropped
+        gradients are cleared when the next window starts.
+        """
+        if self._pending_uncommitted and not drop_partial:
+            # @lint-ignore FIXIT AllRaisesAreAIExceptions
+            raise RuntimeError(
+                "cannot set the step with uncommitted gradients ("
+                f"current_step={self.current_step}, "
+                f"num_steps={self.num_micro_batches_per_step}). Complete the current "
+                "window or pass drop_partial=True to discard it."
+            )
+        if self._pending_uncommitted:
+            # Clear the discarded gradients when the next window starts.
+            self._optimizer_wrapper._needs_zero_grad = True
+            self._pending_uncommitted = False
         self._optimizer_wrapper.set_step(step)
 
     def __getattr__(self, name: str) -> Any:
