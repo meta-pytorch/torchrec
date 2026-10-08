@@ -78,6 +78,36 @@ Environment variables (all optional):
     BENCH_CONTEND_DIM    int              (default: 4096; GEMM size for the above)
     BENCH_CONTEND_GEMMS  int              (default: 8; GEMMs per timed iteration)
 
+Registered TP4 all-reduce benchmark (exact 0.5 and 1 MiB BF16 SUM):
+    buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \
+        //torchrec/distributed/tests:bench_sharded_relay_perf -- \
+        torchrec.distributed.tests.bench_sharded_relay_perf.BenchRegisteredAllReducePerfTest.test_registered_all_reduce_perf
+
+    BENCH_REGISTERED_WARMUPS int           (default: 20)
+    BENCH_REGISTERED_ITERS   int           (default: 100 per event batch)
+    BENCH_REGISTERED_CLOCK_WARMUPS int      (default: 8 4096x4096 BF16 GEMMs)
+    BENCH_REGISTERED_PAYLOAD_BYTES          (524288, 1048576, or unset for both)
+
+Run one payload in a fresh benchmark process for tuning isolation:
+    BENCH_REGISTERED_PAYLOAD_BYTES=524288 buck2 run \
+        @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \
+        //torchrec/distributed/tests:bench_sharded_relay_perf -- \
+        torchrec.distributed.tests.bench_sharded_relay_perf.BenchRegisteredAllReducePerfTest.test_registered_all_reduce_perf
+    BENCH_REGISTERED_PAYLOAD_BYTES=1048576 buck2 run \
+        @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \
+        //torchrec/distributed/tests:bench_sharded_relay_perf -- \
+        torchrec.distributed.tests.bench_sharded_relay_perf.BenchRegisteredAllReducePerfTest.test_registered_all_reduce_perf
+Unset BENCH_REGISTERED_PAYLOAD_BYTES to run both payloads in one invocation.
+
+The registered benchmark compares its fixed out-of-place path with ordinary in-place
+ncclAllReduce on the same TP4 RCCLX communicator. It uses six backend-ABBA rounds
+per direct/staged producer and eager/graph mode, prints rank-0 and max-rank timings,
+and writes separate
+/tmp/bench_registered_all_reduce_non_lp_results.txt and
+/tmp/bench_registered_all_reduce_lp_results.txt reports by default. Registered
+low-precision mode is unsupported by ABI v1; its report states that it was not
+timed and that no fallback executed.
+
 The benchmark automatically sweeps BOTH 2-active and 4-active sharded relay
 groups and prints a full report for each. The 4-active sweep covers all four
 collectives: allreduce, reduce-scatter, all-to-all, and all-gather.
@@ -147,11 +177,15 @@ except ImportError:
     FUSED_AVAILABLE = False
 
 try:
-    from torchcomms import new_comm as _torchcomms_new_comm  # type: ignore[import]
+    from torchcomms import (  # type: ignore[import]
+        new_comm as _torchcomms_new_comm,
+        ReduceOp as _TorchCommReduceOp,
+    )
 
     RCCLX_AVAILABLE: bool = True
 except ImportError:
     _torchcomms_new_comm = None  # type: ignore[misc, assignment]
+    _TorchCommReduceOp = None  # type: ignore[misc, assignment]
     RCCLX_AVAILABLE = False
 
 
@@ -1054,6 +1088,596 @@ def _measure_ms(
 NUM_GPUS: int = 8
 _NCCL_PORT: int = 29500
 _TCPSTORE_PORT: int = 29502
+_REGISTERED_WORLD_SIZE: int = 4
+_REGISTERED_SHAPES: tuple[tuple[int, int], ...] = ((64, 4096), (64, 8192))
+_REGISTERED_ABBA_ROUNDS: int = 6
+
+
+def _registered_shapes() -> tuple[tuple[int, int], ...]:
+    value = os.environ.get("BENCH_REGISTERED_PAYLOAD_BYTES", "").strip()
+    if not value:
+        return _REGISTERED_SHAPES
+    try:
+        payload_bytes = int(value)
+    except ValueError as error:
+        raise ValueError(
+            "BENCH_REGISTERED_PAYLOAD_BYTES must be 524288 or 1048576"
+        ) from error
+    selected = tuple(
+        shape
+        for shape in _REGISTERED_SHAPES
+        if shape[0] * shape[1] * torch.bfloat16.itemsize == payload_bytes
+    )
+    if not selected:
+        raise ValueError("BENCH_REGISTERED_PAYLOAD_BYTES must be 524288 or 1048576")
+    return selected
+
+
+def _registered_median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return (
+        ordered[middle]
+        if len(ordered) % 2 == 1
+        else 0.5 * (ordered[middle - 1] + ordered[middle])
+    )
+
+
+def _registered_local_or_exit(phase: str, fn: Any) -> None:
+    try:
+        fn()
+    except Exception as error:
+        print(
+            f"registered all-reduce {phase} failed on rank "
+            f"{dist.get_rank()}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(1)
+
+
+def _registered_agree_or_exit(phase: str, fn: Any) -> None:
+    local_error = None
+    try:
+        fn()
+    except Exception as error:
+        local_error = f"rank {dist.get_rank()}: {type(error).__name__}: {error}"
+    errors: list[Any] = [None] * _REGISTERED_WORLD_SIZE
+    dist.all_gather_object(errors, local_error)
+    failures = [str(error) for error in errors if error is not None]
+    if failures:
+        print(
+            f"registered all-reduce {phase} failed: {'; '.join(failures)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        # A rank may already have launched a request epoch. Process exit is the
+        # only safe way to prevent peers from spinning forever on a missing rank.
+        os._exit(1)
+
+
+class _RegisteredPerfOps:
+    def __init__(
+        self,
+        comm: Any,
+        request: Any,
+        registered_input: torch.Tensor,
+        staged_input: torch.Tensor,
+        persistent_output: torch.Tensor,
+        standard_input: torch.Tensor,
+    ) -> None:
+        self.comm = comm
+        self.request = request
+        self.registered_input = registered_input
+        self.staged_input = staged_input
+        self.persistent_output = persistent_output
+        self.standard_input = standard_input
+        self.graphs: dict[str, torch.cuda.CUDAGraph] = {}
+
+    def prepare_registered_direct(self) -> None:
+        pass
+
+    def prepare_registered_staged(self) -> None:
+        pass
+
+    def prepare_standard_direct(self) -> None:
+        pass
+
+    def prepare_standard_staged(self) -> None:
+        pass
+
+    def registered_direct(self) -> None:
+        assert _TorchCommReduceOp is not None
+        self.request.all_reduce(
+            self.registered_input,
+            op=_TorchCommReduceOp.SUM,
+            out=self.persistent_output,
+            registered_input=True,
+        )
+
+    def registered_staged(self) -> None:
+        self.registered_input.copy_(self.staged_input)
+        self.registered_direct()
+
+    def standard_direct(self) -> None:
+        assert _TorchCommReduceOp is not None
+        self.comm.all_reduce(
+            self.standard_input,
+            _TorchCommReduceOp.SUM,
+            async_op=False,
+        )
+
+    def standard_staged(self) -> None:
+        self.standard_input.copy_(self.staged_input)
+        self.standard_direct()
+
+    def capture(self, name: str, fn: Any, stream: torch.cuda.Stream) -> None:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            fn()
+        self.graphs[name] = graph
+
+    def replay(self, name: str) -> None:
+        self.graphs[name].replay()
+
+    def prepare_timing_inputs(self) -> None:
+        self.registered_input.zero_()
+        self.staged_input.zero_()
+        self.standard_input.zero_()
+        self.persistent_output.zero_()
+
+    def reset_graphs(self) -> None:
+        for graph in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
+
+
+def _registered_batch_us(prepare: Any, fn: Any, iterations: int) -> tuple[float, float]:
+    try:
+        prepare()
+        dist.barrier()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            fn()
+        end.record()
+        end.synchronize()
+    except Exception as error:
+        print(
+            f"registered all-reduce timed launch failed on rank "
+            f"{dist.get_rank()}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(1)
+    local_us = start.elapsed_time(end) * 1000.0 / iterations
+    gathered: list[Any] = [None] * _REGISTERED_WORLD_SIZE
+    dist.all_gather_object(gathered, local_us)
+    rank_us = [float(value) for value in gathered]
+    return rank_us[0], max(rank_us)
+
+
+def _registered_validate(
+    phase: str,
+    prepare: Any,
+    fn: Any,
+    output: torch.Tensor,
+    expected: float,
+    stream: torch.cuda.Stream,
+) -> None:
+    _registered_agree_or_exit(
+        f"{phase} enqueue",
+        lambda: (prepare(), fn()),
+    )
+    _registered_local_or_exit(f"{phase} completion", stream.synchronize)
+    _registered_agree_or_exit(
+        f"{phase} result",
+        lambda: torch.testing.assert_close(
+            output,
+            torch.full_like(output, expected),
+            rtol=0,
+            atol=0,
+        ),
+    )
+
+
+def _registered_measure_comparison(
+    producer: str,
+    registered_prepare: Any,
+    registered_eager: Any,
+    registered_graph: Any,
+    standard_prepare: Any,
+    standard_eager: Any,
+    standard_graph: Any,
+    warmups: int,
+    iterations: int,
+) -> dict[str, list[float]]:
+    implementations = {
+        "registered": (registered_prepare, registered_eager, registered_graph),
+        "standard": (standard_prepare, standard_eager, standard_graph),
+    }
+
+    def warm_up() -> None:
+        for _ in range(warmups):
+            for prepare, eager, graph in implementations.values():
+                prepare()
+                eager()
+                prepare()
+                graph()
+        torch.cuda.current_stream().synchronize()
+
+    _registered_local_or_exit(f"{producer} warmup", warm_up)
+
+    samples: dict[str, list[float]] = {
+        f"{implementation}:{mode}:{aggregation}": []
+        for implementation in implementations
+        for mode in ("eager", "graph")
+        for aggregation in ("rank0", "max")
+    }
+    for mode_index, mode in enumerate(("eager", "graph"), start=1):
+        for round_index in range(_REGISTERED_ABBA_ROUNDS):
+            order = (
+                ("registered", "standard", "standard", "registered")
+                if (round_index + mode_index) % 2
+                else ("standard", "registered", "registered", "standard")
+            )
+            for implementation in order:
+                prepare, eager, graph = implementations[implementation]
+                fn = eager if mode == "eager" else graph
+                rank0_us, max_us = _registered_batch_us(prepare, fn, iterations)
+                samples[f"{implementation}:{mode}:rank0"].append(rank0_us)
+                samples[f"{implementation}:{mode}:max"].append(max_us)
+    return {f"{producer}:{key}": values for key, values in samples.items()}
+
+
+def _registered_measure_payload(
+    comm: Any,
+    rank: int,
+    world_size: int,
+    shape: tuple[int, int],
+    stream: torch.cuda.Stream,
+    warmups: int,
+    iterations: int,
+) -> dict[str, list[float]]:
+    direct_value = float(rank + 1)
+    staged_value = 2.0 * direct_value
+    device = torch.device(f"cuda:{rank}")
+    registered_input = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    staged_input = torch.full_like(registered_input, staged_value)
+    persistent_output = torch.empty_like(registered_input)
+    standard_input = torch.empty_like(registered_input)
+    nbytes = registered_input.nbytes
+    if nbytes not in (512 * 1024, 1024 * 1024):
+        raise ValueError(f"unsupported registered payload {shape}: {nbytes} bytes")
+    stream.wait_stream(torch.cuda.current_stream(device))
+    request = comm.registered_all_reduce(
+        registered_input,
+        persistent_output,
+        capacity_bytes=nbytes,
+    )
+    ops = _RegisteredPerfOps(
+        comm,
+        request,
+        registered_input,
+        staged_input,
+        persistent_output,
+        standard_input,
+    )
+    direct_expected = float(world_size * (world_size + 1) // 2)
+    staged_expected = 2.0 * direct_expected
+    try:
+        with torch.cuda.stream(stream):
+            _registered_validate(
+                "registered eager direct validation",
+                lambda: registered_input.fill_(direct_value),
+                ops.registered_direct,
+                persistent_output,
+                direct_expected,
+                stream,
+            )
+            _registered_validate(
+                "standard eager direct validation",
+                lambda: standard_input.fill_(direct_value),
+                ops.standard_direct,
+                standard_input,
+                direct_expected,
+                stream,
+            )
+            registered_input.fill_(direct_value)
+            _registered_agree_or_exit(
+                "registered direct graph capture",
+                lambda: ops.capture("registered_direct", ops.registered_direct, stream),
+            )
+            standard_input.fill_(direct_value)
+            _registered_agree_or_exit(
+                "standard direct graph capture",
+                lambda: ops.capture("standard_direct", ops.standard_direct, stream),
+            )
+            _registered_validate(
+                "registered direct graph validation",
+                lambda: registered_input.fill_(direct_value),
+                lambda: ops.replay("registered_direct"),
+                persistent_output,
+                direct_expected,
+                stream,
+            )
+            _registered_validate(
+                "standard direct graph validation",
+                lambda: standard_input.fill_(direct_value),
+                lambda: ops.replay("standard_direct"),
+                standard_input,
+                direct_expected,
+                stream,
+            )
+            _registered_validate(
+                "registered eager staged validation",
+                lambda: staged_input.fill_(staged_value),
+                ops.registered_staged,
+                persistent_output,
+                staged_expected,
+                stream,
+            )
+            _registered_validate(
+                "standard eager staged validation",
+                lambda: staged_input.fill_(staged_value),
+                ops.standard_staged,
+                standard_input,
+                staged_expected,
+                stream,
+            )
+            staged_input.fill_(staged_value)
+            _registered_agree_or_exit(
+                "registered staged graph capture",
+                lambda: ops.capture("registered_staged", ops.registered_staged, stream),
+            )
+            _registered_agree_or_exit(
+                "standard staged graph capture",
+                lambda: ops.capture("standard_staged", ops.standard_staged, stream),
+            )
+            _registered_validate(
+                "registered staged graph validation",
+                lambda: staged_input.fill_(staged_value),
+                lambda: ops.replay("registered_staged"),
+                persistent_output,
+                staged_expected,
+                stream,
+            )
+            _registered_validate(
+                "standard staged graph validation",
+                lambda: staged_input.fill_(staged_value),
+                lambda: ops.replay("standard_staged"),
+                standard_input,
+                staged_expected,
+                stream,
+            )
+            ops.prepare_timing_inputs()
+            _registered_local_or_exit("timing input preparation", stream.synchronize)
+            measured: dict[str, list[float]] = {}
+            measured.update(
+                _registered_measure_comparison(
+                    "direct",
+                    ops.prepare_registered_direct,
+                    ops.registered_direct,
+                    lambda: ops.replay("registered_direct"),
+                    ops.prepare_standard_direct,
+                    ops.standard_direct,
+                    lambda: ops.replay("standard_direct"),
+                    warmups,
+                    iterations,
+                )
+            )
+            measured.update(
+                _registered_measure_comparison(
+                    "staged",
+                    ops.prepare_registered_staged,
+                    ops.registered_staged,
+                    lambda: ops.replay("registered_staged"),
+                    ops.prepare_standard_staged,
+                    ops.standard_staged,
+                    lambda: ops.replay("standard_staged"),
+                    warmups,
+                    iterations,
+                )
+            )
+            return {f"{nbytes}:{key}": value for key, value in measured.items()}
+    finally:
+        ops.reset_graphs()
+        if not request.closed:
+            request.close()
+
+
+def _registered_warm_gpu_clocks(
+    device: torch.device, stream: torch.cuda.Stream
+) -> None:
+    warmups = max(1, _env_int("BENCH_REGISTERED_CLOCK_WARMUPS", 8))
+    dim = 4096
+    left = torch.randn((dim, dim), dtype=torch.bfloat16, device=device)
+    right = torch.randn_like(left)
+    output = torch.empty_like(left)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for _ in range(warmups):
+            torch.mm(left, right, out=output)
+    stream.synchronize()
+
+
+def _registered_perf_worker(
+    rank: int,
+    world_size: int,
+    store_port: int,
+    shape: tuple[int, int],
+    results_dict: Any,
+) -> None:
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(store_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    store = dist.TCPStore(
+        host_name="localhost",
+        port=store_port,
+        world_size=world_size,
+        is_master=rank == 0,
+        wait_for_workers=True,
+    )
+    dist.init_process_group(
+        backend="gloo",
+        rank=rank,
+        world_size=world_size,
+        store=store,
+    )
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    comm = _setup_rcclx_comm(rank, world_size, 50, store)
+    if comm is None or _TorchCommReduceOp is None:
+        raise RuntimeError("TorchComm RCCLX registered all-reduce is unavailable")
+
+    warmups = max(1, _env_int("BENCH_REGISTERED_WARMUPS", 20))
+    iterations = max(1, _env_int("BENCH_REGISTERED_ITERS", 100))
+    execution_stream = torch.cuda.Stream(device=device)
+    try:
+        _registered_warm_gpu_clocks(device, execution_stream)
+        local_results = _registered_measure_payload(
+            comm,
+            rank,
+            world_size,
+            shape,
+            execution_stream,
+            warmups,
+            iterations,
+        )
+        if rank == 0:
+            results_dict.update(local_results)
+    finally:
+        comm.finalize()
+        dist.destroy_process_group()
+
+
+def _spawn_registered_perf_payloads(results_dict: Any) -> None:
+    for index, shape in enumerate(_registered_shapes()):
+        port = _TCPSTORE_PORT + 750 + index
+        mp.spawn(
+            _registered_perf_worker,
+            args=(
+                _REGISTERED_WORLD_SIZE,
+                port,
+                shape,
+                results_dict,
+            ),
+            nprocs=_REGISTERED_WORLD_SIZE,
+            join=True,
+        )
+
+
+def _registered_perf_report(results_dict: Any) -> list[str]:
+    warmups = max(1, _env_int("BENCH_REGISTERED_WARMUPS", 20))
+    iterations = max(1, _env_int("BENCH_REGISTERED_ITERS", 100))
+    current_device = (
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unavailable"
+    )
+    lines = [
+        "RCCLX TP4 REGISTERED VS STANDARD TORCHCOMM ALL-REDUCE — BF16 SUM",
+        (
+            f"warmups={warmups} iterations/batch={iterations} "
+            f"ordering={_REGISTERED_ABBA_ROUNDS} backend-ABBA rounds "
+            "statistic=median(device-event batch averages), rank0 and max-rank"
+        ),
+        (
+            "clock warmup: "
+            f"{max(1, _env_int('BENCH_REGISTERED_CLOCK_WARMUPS', 8))} "
+            "4096x4096 BF16 GEMMs per rank"
+        ),
+        (
+            "registered is out-of-place with fixed buffers and no TorchWork; "
+            "standard is in-place TorchComm ncclAllReduce"
+        ),
+        (
+            "standard eager creates TorchWork tracking per call; graph rows replay "
+            "captured device work without per-replay TorchWork creation"
+        ),
+        (
+            "direct: producer already wrote collective input; staged: timed copy "
+            "into collective input"
+        ),
+        "graph includes standalone torch.cuda.CUDAGraph replay latency",
+        "Registered LP requested: unsupported by ABI v1 and not timed; no fallback.",
+        "",
+        f"Current device: {current_device}; Torch HIP: {torch.version.hip}",
+        (
+            "Payload | Producer | Mode  | Reg r0 us | Std r0 us | Reg max us | "
+            "Std max us | R0 delta"
+        ),
+        "--------|----------|-------|-----------|-----------|------------|------------|----------",
+    ]
+    for shape in _registered_shapes():
+        nbytes = shape[0] * shape[1] * torch.bfloat16.itemsize
+        payload = "0.5 MiB" if nbytes == 512 * 1024 else "1.0 MiB"
+        for producer in ("direct", "staged"):
+            for mode in ("eager", "graph"):
+                samples = {
+                    implementation: {
+                        aggregation: list(
+                            results_dict[
+                                f"{nbytes}:{producer}:{implementation}:{mode}:"
+                                f"{aggregation}"
+                            ]
+                        )
+                        for aggregation in ("rank0", "max")
+                    }
+                    for implementation in ("registered", "standard")
+                }
+                registered_rank0 = _registered_median(samples["registered"]["rank0"])
+                standard_rank0 = _registered_median(samples["standard"]["rank0"])
+                registered_max = _registered_median(samples["registered"]["max"])
+                standard_max = _registered_median(samples["standard"]["max"])
+                if registered_rank0 <= standard_rank0:
+                    delta = standard_rank0 / registered_rank0 - 1.0
+                    comparison = f"{delta * 100.0:.1f}% faster"
+                else:
+                    delta = registered_rank0 / standard_rank0 - 1.0
+                    comparison = f"{delta * 100.0:.1f}% slower"
+                lines.append(
+                    f"{payload:>7} | {producer:>8} | {mode:>5} | "
+                    f"{registered_rank0:>9.3f} | {standard_rank0:>9.3f} | "
+                    f"{registered_max:>10.3f} | {standard_max:>10.3f} | "
+                    f"{comparison:>9}"
+                )
+                for implementation in ("registered", "standard"):
+                    rank0_values = " ".join(
+                        f"{value:.3f}" for value in samples[implementation]["rank0"]
+                    )
+                    max_values = " ".join(
+                        f"{value:.3f}" for value in samples[implementation]["max"]
+                    )
+                    max_samples = samples[implementation]["max"]
+                    spread = max(max_samples) / min(max_samples)
+                    lines.append(f"          {implementation} rank0: {rank0_values}")
+                    lines.append(
+                        f"          {implementation} max: {max_values}; "
+                        f"spread={spread:.3f}x"
+                    )
+    return lines
+
+
+def _registered_lp_report() -> list[str]:
+    current_device = (
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unavailable"
+    )
+    lines = [
+        "RCCLX TP4 REGISTERED ALL-REDUCE — LOW PRECISION REQUEST",
+        f"Current device: {current_device}; Torch HIP: {torch.version.hip}",
+        "ABI version 1 does not implement registered low-precision execution.",
+        "No low-precision collective was timed and no non-LP fallback executed.",
+        "",
+        "Payload | Status",
+        "--------|-------",
+    ]
+    for shape in _registered_shapes():
+        nbytes = shape[0] * shape[1] * torch.bfloat16.itemsize
+        payload = "0.5 MiB" if nbytes == 512 * 1024 else "1.0 MiB"
+        lines.append(f"{payload:>7} | unsupported; not timed; no fallback")
+    return lines
 
 
 def _bench_a_worker(
@@ -3694,6 +4318,194 @@ class EmitReportTest(unittest.TestCase):
                 _emit_report(["second"], "same.txt")
                 with open(target) as f:
                     self.assertIn("second", f.read())
+
+    def test_registered_lp_report_has_no_fallback(self) -> None:
+        report = "\n".join(_registered_lp_report())
+        self.assertIn("0.5 MiB | unsupported; not timed; no fallback", report)
+        self.assertIn("1.0 MiB | unsupported; not timed; no fallback", report)
+        self.assertIn("no non-LP fallback executed", report)
+
+    def test_registered_comparison_uses_balanced_backend_abba(self) -> None:
+        callbacks: dict[int, str] = {}
+
+        def callback(name: str) -> Any:
+            def run() -> None:
+                pass
+
+            callbacks[id(run)] = name
+            return run
+
+        calls: list[tuple[str, str]] = []
+
+        def batch(prepare: Any, fn: Any, iterations: int) -> tuple[float, float]:
+            self.assertEqual(iterations, 3)
+            calls.append((callbacks[id(prepare)], callbacks[id(fn)]))
+            return 1.0, 2.0
+
+        with mock.patch(f"{__name__}._registered_local_or_exit"), mock.patch(
+            f"{__name__}._registered_batch_us", side_effect=batch
+        ):
+            results = _registered_measure_comparison(
+                "direct",
+                callback("registered_prepare"),
+                callback("registered_eager"),
+                callback("registered_graph"),
+                callback("standard_prepare"),
+                callback("standard_eager"),
+                callback("standard_graph"),
+                warmups=0,
+                iterations=3,
+            )
+
+        self.assertEqual(
+            calls[:4],
+            [
+                ("registered_prepare", "registered_eager"),
+                ("standard_prepare", "standard_eager"),
+                ("standard_prepare", "standard_eager"),
+                ("registered_prepare", "registered_eager"),
+            ],
+        )
+        self.assertEqual(
+            calls[4:8],
+            [
+                ("standard_prepare", "standard_eager"),
+                ("registered_prepare", "registered_eager"),
+                ("registered_prepare", "registered_eager"),
+                ("standard_prepare", "standard_eager"),
+            ],
+        )
+        self.assertEqual(
+            calls[24:28],
+            [
+                ("standard_prepare", "standard_graph"),
+                ("registered_prepare", "registered_graph"),
+                ("registered_prepare", "registered_graph"),
+                ("standard_prepare", "standard_graph"),
+            ],
+        )
+        self.assertEqual(
+            set(results),
+            {
+                f"direct:{implementation}:{mode}:{aggregation}"
+                for implementation in ("registered", "standard")
+                for mode in ("eager", "graph")
+                for aggregation in ("rank0", "max")
+            },
+        )
+        self.assertTrue(all(len(samples) == 12 for samples in results.values()))
+
+    def test_registered_payload_filter_is_exact(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BENCH_REGISTERED_PAYLOAD_BYTES", None)
+            self.assertEqual(_registered_shapes(), _REGISTERED_SHAPES)
+        with mock.patch.dict(
+            os.environ, {"BENCH_REGISTERED_PAYLOAD_BYTES": "524288"}, clear=False
+        ):
+            self.assertEqual(_registered_shapes(), ((64, 4096),))
+        with mock.patch.dict(
+            os.environ, {"BENCH_REGISTERED_PAYLOAD_BYTES": "1048576"}, clear=False
+        ):
+            self.assertEqual(_registered_shapes(), ((64, 8192),))
+        for invalid in ("1", "half"):
+            with mock.patch.dict(
+                os.environ, {"BENCH_REGISTERED_PAYLOAD_BYTES": invalid}, clear=False
+            ):
+                with self.assertRaises(ValueError):
+                    _registered_shapes()
+
+    def test_registered_payload_filter_controls_spawns_and_reports(self) -> None:
+        cases = (
+            ("524288", (64, 4096), "0.5 MiB", "1.0 MiB"),
+            ("1048576", (64, 8192), "1.0 MiB", "0.5 MiB"),
+        )
+        for payload_bytes, shape, included, excluded in cases:
+            nbytes = shape[0] * shape[1] * torch.bfloat16.itemsize
+            results = {
+                f"{nbytes}:{producer}:{implementation}:{mode}:{aggregation}": [
+                    10.0 if implementation == "registered" else 12.0
+                ]
+                for producer in ("direct", "staged")
+                for implementation in ("registered", "standard")
+                for mode in ("eager", "graph")
+                for aggregation in ("rank0", "max")
+            }
+            spawned_shapes: list[tuple[int, int]] = []
+
+            def spawn(
+                worker: Any,
+                args: tuple[Any, ...],
+                nprocs: int,
+                join: bool,
+                captured_shapes: list[tuple[int, int]] = spawned_shapes,
+            ) -> None:
+                self.assertIs(worker, _registered_perf_worker)
+                self.assertEqual(nprocs, _REGISTERED_WORLD_SIZE)
+                self.assertTrue(join)
+                captured_shapes.append(args[2])
+
+            with self.subTest(payload_bytes=payload_bytes), mock.patch.dict(
+                os.environ,
+                {"BENCH_REGISTERED_PAYLOAD_BYTES": payload_bytes},
+                clear=False,
+            ), mock.patch(f"{__name__}.mp.spawn", side_effect=spawn):
+                _spawn_registered_perf_payloads(results)
+                self.assertEqual(spawned_shapes, [shape])
+                non_lp_report = "\n".join(_registered_perf_report(results))
+                lp_report = "\n".join(_registered_lp_report())
+                self.assertIn(included, non_lp_report)
+                self.assertNotIn(excluded, non_lp_report)
+                self.assertIn(included, lp_report)
+                self.assertNotIn(excluded, lp_report)
+
+    def test_registered_report_compares_live_standard_collective(self) -> None:
+        results = {
+            f"{nbytes}:{producer}:{implementation}:{mode}:{rank_aggregation}": [
+                10.0 if implementation == "registered" else 12.0
+            ]
+            for shape in _REGISTERED_SHAPES
+            for nbytes in (shape[0] * shape[1] * torch.bfloat16.itemsize,)
+            for producer in ("direct", "staged")
+            for implementation in ("registered", "standard")
+            for mode in ("eager", "graph")
+            for rank_aggregation in ("rank0", "max")
+        }
+        report = "\n".join(_registered_perf_report(results))
+        self.assertIn("REGISTERED VS STANDARD TORCHCOMM", report)
+        self.assertIn("in-place TorchComm ncclAllReduce", report)
+        self.assertIn("20.0% faster", report)
+        self.assertNotIn("AITER", report)
+
+
+class BenchRegisteredAllReducePerfTest(unittest.TestCase):
+    """Exact TP4 registered-input benchmark for the production RCCLX API."""
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA/ROCm not available")
+        if torch.cuda.device_count() < _REGISTERED_WORLD_SIZE:
+            self.skipTest(
+                f"Benchmark requires {_REGISTERED_WORLD_SIZE} GPUs, "
+                f"found {torch.cuda.device_count()}"
+            )
+        if not RCCLX_AVAILABLE:
+            self.skipTest("TorchComm RCCLX not available")
+
+    def test_registered_all_reduce_perf(self) -> None:
+        manager = mp.Manager()
+        results: Any = manager.dict()
+        try:
+            _spawn_registered_perf_payloads(results)
+            _emit_report(
+                _registered_perf_report(results),
+                "bench_registered_all_reduce_non_lp_results.txt",
+            )
+            _emit_report(
+                _registered_lp_report(),
+                "bench_registered_all_reduce_lp_results.txt",
+            )
+        finally:
+            manager.shutdown()
 
 
 class BenchShardedRelayPerfTest(unittest.TestCase):
