@@ -350,6 +350,7 @@ def _get_recat(
                 output_offset_tensor,
                 output_offset[-1],
             )
+            # pyrefly: ignore [bad-return]
             return recat
         else:
             return torch.tensor(recat, device=device, dtype=torch.int32)

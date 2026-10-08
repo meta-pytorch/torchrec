@@ -538,6 +538,7 @@ def reduce_scatter_tensors_with_sharded_relay(
     input_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
     output_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
     annotation: str,
+    # pyrefly: ignore [bad-function-definition]
     op: dist.ReduceOp = dist.ReduceOp.SUM,
     in_place: bool = False,
     low_precision: bool = False,

@@ -1020,6 +1020,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                         current_storage = cast(
                             Storage,
                             reduce(
+                                # pyrefly: ignore [unsupported-operation]
                                 lambda x, y: x + y,
                                 [
                                     shard.storage

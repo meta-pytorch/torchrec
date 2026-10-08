@@ -900,6 +900,7 @@ def shard_qebc(
         )
 
     if expected_shards is not None:
+        # pyrefly: ignore [missing-attribute]
         msp = plan.plan[ebc_fqn]
         for i in range(mi.num_features):
             # pyrefly: ignore[bad-index]
@@ -953,6 +954,7 @@ def shard_qec(
         )
 
     if expected_shards is not None:
+        # pyrefly: ignore [missing-attribute]
         msp: ModuleShardingPlan = plan.plan["_module_kjt_input.0"]  # TODO: hardcoded
         for i in range(mi.num_features):
             # pyrefly: ignore[bad-index]

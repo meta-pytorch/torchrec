@@ -682,6 +682,7 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
                 num_groups=4,
                 per_group_sizes=per_group_sizes,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
                 skip_validation=False,
             )
@@ -712,6 +713,7 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
                 num_groups=4,
                 per_group_sizes=per_group_sizes,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
                 skip_validation=False,
             )
@@ -737,6 +739,7 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
                 num_groups=4,
                 per_group_sizes=per_group_sizes,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
             )
         self.assertNotIsInstance(cm.exception, ValueError)
@@ -758,6 +761,7 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
                 num_groups=4,
                 per_group_sizes=per_group_sizes,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
             )
         self.assertNotIsInstance(cm.exception, ValueError)
@@ -1063,6 +1067,7 @@ class FusedReduceScatterValidationTest(unittest.TestCase):
                 num_groups=4,
                 per_group_recv_counts=per_group_recv_counts,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
                 skip_validation=False,
             )
@@ -1091,6 +1096,7 @@ class FusedReduceScatterValidationTest(unittest.TestCase):
                 num_groups=4,
                 per_group_recv_counts=per_group_recv_counts,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
                 skip_validation=False,
             )
@@ -1122,6 +1128,7 @@ class FusedReduceScatterValidationTest(unittest.TestCase):
                 num_groups=4,
                 per_group_recv_counts=per_group_recv_counts,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
             )
         self.assertNotIsInstance(cm.exception, ValueError)
@@ -1882,6 +1889,7 @@ class FusedAllreduce4ActiveValidationTest(unittest.TestCase):
                 num_groups=2,
                 per_group_sizes=per_group_sizes,
                 all_active_ranks=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
             )
         self.assertNotIsInstance(cm.exception, ValueError)
@@ -2014,6 +2022,7 @@ class FusedReduceScatter4ActiveValidationTest(unittest.TestCase):
                 num_groups=2,
                 per_group_recv_counts=per_group_recv_counts,
                 all_active_ranks=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                # pyrefly: ignore [bad-argument-type]
                 op=dist.ReduceOp.SUM,
             )
         self.assertNotIsInstance(cm.exception, ValueError)

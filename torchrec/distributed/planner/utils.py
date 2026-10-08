@@ -250,12 +250,14 @@ def _find_imbalance_tables(
     if target_imbalance == "perf":
         # sort tables by total perf from largest to smallest
         tables_in_max_value_ranks.sort(
+            # pyrefly: ignore [missing-attribute]
             key=lambda sharding_option: sharding_option.shards[0].perf.total,
             reverse=True,
         )
     elif target_imbalance == "hbm":
         # sort tables by hbm from largest to smallest
         tables_in_max_value_ranks.sort(
+            # pyrefly: ignore [missing-attribute]
             key=lambda sharding_option: sharding_option.shards[0].storage.hbm,
             reverse=True,
         )
