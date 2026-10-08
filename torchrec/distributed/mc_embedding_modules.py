@@ -138,6 +138,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
         )
 
         self._table_to_tbe_and_index = {}
+        self._table_to_logical_table_ids: Dict[str, torch.Tensor] = {}
         for lookup in self._embedding_module._lookups:
             #  a function.
             # pyrefly: ignore[not-iterable]
@@ -146,6 +147,13 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                     self._table_to_tbe_and_index[table.name] = (
                         emb_module._emb_module,
                         torch.tensor([table_idx], dtype=torch.int, device=self._device),
+                    )
+                    # Reset uses feature indices, which differ from table indices
+                    # when an embedding table has multiple features.
+                    self._table_to_logical_table_ids[table.name] = torch.tensor(
+                        [emb_module._feature_table_map.index(table_idx)],
+                        dtype=torch.int,
+                        device=self._device,
                     )
         self._buffer_ids: torch.Tensor = torch.tensor(
             [0], device=self._device, dtype=torch.int
@@ -169,7 +177,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
         # pyrefly: ignore[bad-assignment]
         for table, evictions_indices_for_table in evictions_per_table.items():
             if evictions_indices_for_table is not None:
-                (tbe, logical_table_ids) = self._table_to_tbe_and_index[table]
+                tbe, _ = self._table_to_tbe_and_index[table]
                 pruned_indices_offsets = torch.tensor(
                     [0, evictions_indices_for_table.shape[0]],
                     dtype=torch.long,
@@ -185,7 +193,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                     tbe.reset_embedding_weight_momentum(
                         pruned_indices=evictions_indices_for_table.long(),
                         pruned_indices_offsets=pruned_indices_offsets,
-                        logical_table_ids=logical_table_ids,
+                        logical_table_ids=self._table_to_logical_table_ids[table],
                         buffer_ids=self._buffer_ids,
                     )
 
