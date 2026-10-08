@@ -2748,3 +2748,21 @@ class LossAggregationTest(unittest.TestCase):
         )
         self.assertAlmostEqual(float(result["a:loss"]), 2.0, places=6)
         self.assertAlmostEqual(float(result["b:loss"]), 4.0, places=6)
+
+    def test_rejected_micro_batch_does_not_change_accumulated_losses(self) -> None:
+        """Discard every loss from a rejected micro-batch."""
+        module = self._make_module({"bad:loss": LossAggregation.MERGEABLE_RATIO})
+        module.reset_loss_metrics()
+        module.update_micro_batch({"ok:loss": torch.tensor(1.0)})
+
+        with self.assertRaisesRegex(RecMetricException, "MERGEABLE_RATIO"):
+            module.update_micro_batch(
+                {
+                    "ok:loss": torch.tensor(100.0),
+                    "bad:loss": torch.tensor(2.0),
+                }
+            )
+
+        module.update({"ok:loss": torch.tensor(3.0)})
+        result = module.compute()
+        self.assertAlmostEqual(float(result["ok:loss"]), 2.0, places=6)
