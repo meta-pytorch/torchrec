@@ -587,6 +587,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
         async_inplace_copy: bool = False,
+        async_next_batch: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -605,6 +606,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             f"execute_all_batches: {self._execute_all_batches} "
             f"enable_inplace_copy_batch: {enable_inplace_copy_batch} "
             f"async_inplace_copy: {async_inplace_copy} "
+            f"async_next_batch: {async_next_batch} "
             f"free_features_storage_early: {free_features_storage_early}"
         )
 
@@ -653,7 +655,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
 
         # Opt-in: offload the in-place H2D copy dispatch to a background thread.
         # Must run after self.batches / self._memcpy_stream / self._device are set.
-        self._setup_async_inplace_copy(async_inplace_copy, device)
+        self._setup_async_inplace_copy(
+            async_inplace_copy, device, async_next_batch=async_next_batch
+        )
 
         self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
             custom_model_fwd if custom_model_fwd else model
@@ -1151,7 +1155,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             batch = None
         else:
             with record_function("## next_batch ##"):
-                batch = next(dataloader_iter, None)
+                batch = (
+                    self._take_async_next_batch(dataloader_iter)
+                    if self._async_next_batch
+                    else next(dataloader_iter, None)
+                )
             if batch is None:
                 self._dataloader_exhausted = True
 
