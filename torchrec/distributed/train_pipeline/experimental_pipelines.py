@@ -53,6 +53,7 @@ from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSpa
 from torchrec.distributed.train_pipeline.types import PipelineState
 from torchrec.distributed.train_pipeline.utils import (
     _batch_tensor_size,
+    _init_inplace_copy_worker as _bind_worker_to_device,
     _override_input_dist_forwards,
     _rewrite_model,
     _start_data_dist,
@@ -1550,6 +1551,35 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
             Stage names are the ``EvalPipelineStage`` values, e.g.
             ``{"wait_sparse_data_dist": "dense", "prefetch": "dense"}``.
             Default: None.
+        async_prefetch (bool): dispatch the prefetch stage on a background thread
+            so its CPU work runs concurrently with the dense forward rather than
+            serializing in front of it. See the section below. Default: False.
+
+    Overlapping the prefetch:
+        Relocating the prefetch with ``hook_stage`` moves *where* in the forward
+        the stage runs, but it still runs on the forward's own thread, so the
+        forward stops for its whole duration. That is only worth paying when the
+        step is GPU-bound and the stall is covered by kernels already enqueued.
+        It is not covered when the step is CPU-dispatch-bound -- the queue drains
+        within microseconds of the thread stopping, and the stall shows up one
+        for one in step time.
+
+        ``async_prefetch=True`` hands the stage to a single background worker
+        instead, so the forward keeps issuing kernels while the prefetch
+        dispatches::
+
+            main thread:     ... dense_forward(i) ...............
+            prefetch worker:      wait+populate cache for (i+1)
+
+        The stage is a good candidate for this because it is dispatch, not GPU
+        work, and because it issues no collectives -- see ``_submit_prefetch``
+        for the invariants that make it safe. The join happens at the top of the
+        next ``progress()``, i.e. before the forward that reads the cache lines.
+
+        The ceiling is the stage's own wall time, and the GIL is what decides how
+        much of it is actually recovered: both threads are part Python, and only
+        the C++ op bodies release the GIL. Measure on end-to-end throughput at a
+        matched example count, not on trace step time.
 
     Example:
         >>> model.eval()
@@ -1583,6 +1613,7 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
         free_features_storage_early: bool = False,
         enqueue_batch_after_forward: bool = False,
         stage_hooks: Optional[Dict[str, str]] = None,
+        async_prefetch: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1609,6 +1640,12 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
             else None
         )
         stage_hooks = stage_hooks or {}
+
+        self._async_prefetch = async_prefetch
+        self._prefetch_device = device
+        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._start_prefetch_executor()
+        self._prefetch_future: Optional[Future[None]] = None
 
         # Stages relocated out of their default slot in progress() and into a
         # module forward hook. See hook_stage().
@@ -1730,7 +1767,7 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
         if stage is EvalPipelineStage.WAIT_SPARSE_DATA_DIST:
             self.wait_sparse_data_dist(context)
         elif stage is EvalPipelineStage.PREFETCH:
-            self._prefetch(context)
+            self._submit_prefetch(context)
 
     def _check_hook_site_not_too_early(self, stage: "EvalPipelineStage") -> None:
         """
@@ -1835,8 +1872,18 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
         pin this pipeline -- and the in-flight batches ``detach`` deliberately
         keeps -- for as long as the caller holds the model.
 
+        Any backgrounded prefetch is joined first, for the same reason: the
+        caller is about to run the returned model itself. Its executor is also
+        shut down so a detached pipeline does not retain a worker thread;
+        ``attach`` starts a fresh one when asynchronous prefetch is enabled.
+
         Returns the original model.
         """
+        self._join_prefetch()
+        executor = self._prefetch_executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._prefetch_executor = None
         self._remove_stage_hooks()
         return super().detach()
 
@@ -1851,10 +1898,22 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
         ``progress`` can resume -- so the hooks are reinstalled here instead.
         """
         super().attach(model, sparse_dist)
+        self._start_prefetch_executor()
         # An empty context deque means super() deferred model surgery to the next
         # fill_pipeline, which installs the hooks itself once the FQNs resolve.
         if self._pipelined_modules:
             self._try_hook_stages()
+
+    def _start_prefetch_executor(self) -> None:
+        """Start the async prefetch worker when requested and not already live."""
+        if not self._async_prefetch or self._prefetch_executor is not None:
+            return
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="eval_prefetch",
+            initializer=_bind_worker_to_device,
+            initargs=(self._prefetch_device,),
+        )
 
     def _warn_on_missed_stage_hooks(self) -> None:
         """
@@ -1933,6 +1992,9 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
                 in the pipeline has been evaluated.
         """
         self._state = PipelineState.IDLE
+        # batch i's prefetch may still be dispatching on the worker, and the
+        # forward below is what consumes it.
+        self._join_prefetch()
         # attach the model just in case the user forgets to call it, especially when the
         # user pauses the pipeline.progress and detaches the model for other purposes.
         if not self._model_attached:
@@ -1996,6 +2058,56 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
 
             self.dequeue_batch()
             return output
+
+    def _submit_prefetch(self, context: PrefetchTrainPipelineContext) -> None:
+        """
+        Runs the prefetch for ``context``'s batch, on a worker thread under
+        ``async_prefetch`` and inline otherwise.
+
+        The stage is CPU dispatch, not GPU work: it resolves the input_dist
+        awaitables and issues the per-table cache-populate kernels. Run inline it
+        stops the forward for its whole duration, and on a dispatch-bound eval
+        step the GPU has nothing enqueued to cover the stall.
+
+        Two properties make the hand-off safe, and both are load-bearing:
+
+        - The stage issues no collectives. Every input_dist all2all is started by
+          ``wait_sparse_data_dist``, which stays on the main thread;
+          ``KJTAllToAllTensorsAwaitable.wait()`` only waits on the ``dist.Work``
+          that call already issued. So the per-rank order of collectives on the
+          process group is unchanged and the worker cannot interleave into it.
+        - It touches no module the concurrent forward touches. It acts on batch
+          i+1's context, and ``_check_hook_site_not_too_early`` already rejects
+          hook sites that run before batch i's sparse modules, so no pipelined
+          module's forward is in flight when the worker calls ``prefetch()``.
+
+        The worker enters the prefetch stream itself -- the current stream is
+        thread-local, so a fresh thread would otherwise dispatch onto the default
+        stream -- and the main thread picks the GPU-side dependency back up
+        through the ``_wait_for_batch(..., self._prefetch_stream)`` it already
+        does at the top of the next step.
+        """
+        executor = self._prefetch_executor
+        if executor is None:
+            self._prefetch(context)
+            return
+        self._prefetch_future = executor.submit(self._prefetch, context)
+
+    def _join_prefetch(self) -> None:
+        """
+        Blocks until a backgrounded prefetch has finished dispatching.
+
+        Has to happen before anything reads what the prefetch produced: the
+        forward that consumes the cache lines, and ``detach``, which hands the
+        model back to a caller who may run it standalone. Re-raises on the main
+        thread whatever the worker threw.
+        """
+        future = self._prefetch_future
+        if future is None:
+            return
+        self._prefetch_future = None
+        with record_function("## prefetch_join ##"):
+            future.result()
 
     def _prefetch(self, context: PrefetchTrainPipelineContext) -> None:
         """
