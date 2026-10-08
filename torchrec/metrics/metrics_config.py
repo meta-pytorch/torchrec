@@ -107,6 +107,31 @@ _DEFAULT_WINDOW_SIZE = 10_000_000
 _DEFAULT_THROUGHPUT_WINDOW_SECONDS = 100
 _DEFAULT_THROUGHPUT_WARMUP_STEPS = 100
 
+# Reserved suffix for a loss key's companion denominator in ``named_tensors``.
+LOSS_DENOM_SUFFIX = ":loss_denom"
+
+
+class LossAggregation(StrValueMixin, Enum):
+    """Override how a loss key combines across one optimizer step.
+
+    By default, a companion denominator recombines ratio losses as
+    ``sum(loss * denominator) / sum(denominator)``. A key without a denominator uses its
+    per-key mean. The overrides handle exceptions:
+
+    ``SUM`` adds the emitted values. ``NON_MERGEABLE`` ignores a denominator and uses the
+    per-key mean. ``MERGEABLE_RATIO`` requires a denominator with every reader batch and
+    raises when one is missing.
+
+    Choose from the loss reduction, not its final tensor shape. Weighted means with a
+    denominator can use ratio recombination; losses using cross-example statistics are
+    ``NON_MERGEABLE``. Configure the emitted loss key because one task may publish losses
+    with different reductions.
+    """
+
+    MERGEABLE_RATIO = "mergeable_ratio"
+    SUM = "sum"
+    NON_MERGEABLE = "non_mergeable"
+
 
 @dataclass
 class RecMetricDef:
@@ -181,6 +206,8 @@ class MetricsConfig:
         enable_pt2_compile (bool): whether to enable PT2 compilation for metrics.
         should_clone_update_inputs (bool): whether to clone the inputs of update(). This
             prevents CUDAGraph error on overwritting tensor outputs by subsequent runs.
+        loss_aggregation (Dict[str, LossAggregation]): Per-key exceptions to the default
+            loss recombination rules. See ``LossAggregation``.
     """
 
     rec_tasks: List[RecTaskInfo] = field(default_factory=list)
@@ -197,8 +224,23 @@ class MetricsConfig:
     enable_pt2_compile: bool = False
     should_clone_update_inputs: bool = False
     use_cpu_offloaded_rec_metric_module: Optional[bool] = None
+    loss_aggregation: Dict[str, LossAggregation] = field(default_factory=dict)
+    # Values above one enable per-optimizer-step loss aggregation.
+    num_micro_batches_per_step: int = 1
 
     def __post_init__(self) -> None:
+        if self.num_micro_batches_per_step < 1:
+            raise ValueError(
+                "num_micro_batches_per_step must be at least 1, got "
+                f"{self.num_micro_batches_per_step}."
+            )
+        for key, aggregation in self.loss_aggregation.items():
+            # Consumers compare enum members by identity.
+            if not isinstance(aggregation, LossAggregation):
+                raise ValueError(
+                    f"loss_aggregation[{key!r}] must be a LossAggregation member, got "
+                    f"{aggregation!r} of type {type(aggregation).__name__}."
+                )
         for metric_enum, metric_def in self.rec_metrics.items():
             if metric_def.rec_task_indices:
                 if self.rec_tasks is None:
