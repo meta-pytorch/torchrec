@@ -10,20 +10,27 @@
 #!/usr/bin/env python3
 
 import copy
+import operator
 import unittest
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 from torch import nn
+from torch.export import Dim
+from torch.export.unflatten import InterpreterModule
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.passes.utils.fuser_utils import fuse_by_partitions
 from torchrec.ir.serializer import JsonSerializer
 from torchrec.ir.utils import (
+    _fix_tbe_output_getitems,
+    _SimpleTensorRegroup,
+    decapsulate_and_fixup_ir_modules,
     decapsulate_ir_modules,
     encapsulate_ir_modules,
     ir_tbe_lookup_impl,
     mark_dynamic_kjt,
     qualname,
+    trim_call_module_args,
 )
 from torchrec.modules.embedding_configs import data_type_to_dtype, EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
@@ -127,6 +134,171 @@ class IRTBELookupTest(unittest.TestCase):
         offset_count = offsets_node.meta["val"].shape[0]
         output_batch = lookup_node.meta["val"][0].shape[0]
         self.assertTrue(statically_known_true(output_batch == (offset_count - 1) // 2))
+
+
+class _TensorRegroupModule(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.regroup = KTRegroupAsDict([["f1", "f2"], ["f3"]], ["front", "back"])
+
+    def forward(self, values: torch.Tensor) -> Dict[str, torch.Tensor]:
+        kt = KeyedTensor(
+            keys=["f1", "f2", "f3"], length_per_key=[1, 2, 3], values=values
+        )
+        return self.regroup([kt])
+
+
+class DecapsulateAndFixupTest(unittest.TestCase):
+    def test_regroup_of_a_dynamic_batch(self) -> None:
+        model, _ = encapsulate_ir_modules(_TensorRegroupModule(), JsonSerializer)
+        # No preserved call signatures, so unflatten passes the regroup its batch size.
+        exported_program = torch.export.export(
+            model,
+            (torch.randn(2, 6),),
+            dynamic_shapes=({0: Dim.AUTO},),
+            strict=False,
+        )
+        restored = decapsulate_and_fixup_ir_modules(
+            torch.export.unflatten(exported_program), JsonSerializer
+        )
+
+        values = torch.randn(3, 6)
+        output = restored(values)
+
+        self.assertTrue(torch.equal(output["front"], values[:, :3]))
+        self.assertTrue(torch.equal(output["back"], values[:, 3:]))
+
+
+class SimpleTensorRegroupTest(unittest.TestCase):
+    def test_ignores_a_non_tensor_arg(self) -> None:
+        regroup = _SimpleTensorRegroup(splits=[2, 1], keys=["front", "back"])
+        values = torch.randn(3, 3)
+
+        front, back = regroup(3, values)
+
+        self.assertTrue(torch.equal(front, values[:, :2]))
+        self.assertTrue(torch.equal(back, values[:, 2:]))
+
+    def test_rejects_three_tensors(self) -> None:
+        regroup = _SimpleTensorRegroup(splits=[2, 1], keys=["front", "back"])
+
+        with self.assertRaises(ValueError):
+            regroup(torch.randn(3, 1), torch.randn(3, 1), torch.randn(3, 1))
+
+
+class _PooledLookup(nn.Module):
+    def forward(self, indices: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        return torch.ones(offsets.numel() - 1, 4)
+
+
+class FixTBEOutputGetitemsTest(unittest.TestCase):
+    def _fix(self, batch_size_first: bool, with_meta: bool) -> InterpreterModule:
+        graph = torch.fx.Graph()
+        indices, offsets = graph.placeholder("indices"), graph.placeholder("offsets")
+        lookup = graph.call_module("lookup", (indices, offsets))
+        kinds = ["batch_size", "embeddings"]
+        if not batch_size_first:
+            kinds.reverse()
+        getitems = {
+            kind: graph.call_function(operator.getitem, (lookup, idx))
+            for idx, kind in enumerate(kinds)
+        }
+        if with_meta:
+            getitems["batch_size"].meta["val"] = 3
+            getitems["embeddings"].meta["val"] = torch.empty(3, 4)
+        filled = graph.call_function(torch.full, ((getitems["batch_size"],), 2.0))
+        graph.output((getitems["embeddings"], filled))
+        mod = InterpreterModule(graph)
+        mod.lookup = _PooledLookup()
+
+        for node in reversed(_fix_tbe_output_getitems(lookup, mod)):
+            graph.erase_node(node)
+        mod.finalize()
+        return mod
+
+    def test_batch_size_before_the_embeddings(self) -> None:
+        mod = self._fix(batch_size_first=True, with_meta=True)
+
+        embeddings, filled = mod(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2, 3]))
+
+        self.assertTrue(torch.equal(embeddings, torch.ones(3, 4)))
+        self.assertTrue(torch.equal(filled, torch.full((3,), 2.0)))
+
+    def test_index_without_meta(self) -> None:
+        mod = self._fix(batch_size_first=False, with_meta=False)
+
+        embeddings, filled = mod(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2, 3]))
+
+        self.assertTrue(torch.equal(embeddings, torch.ones(3, 4)))
+        self.assertTrue(torch.equal(filled, torch.full((3,), 2.0)))
+
+
+class TrimCallModuleArgsTest(unittest.TestCase):
+    def test_unused_placeholder_after_the_first(self) -> None:
+        child_graph = torch.fx.Graph()
+        x, _, y = (child_graph.placeholder(name) for name in ("x", "unused", "y"))
+        child_graph.output(child_graph.call_function(torch.sub, (x, y)))
+        parent_graph = torch.fx.Graph()
+        a, b, c = (parent_graph.placeholder(name) for name in ("a", "b", "c"))
+        call = parent_graph.call_module("child", (a, b, c))
+        parent_graph.output(parent_graph.call_function(torch.add, (call, a)))
+        parent = InterpreterModule(parent_graph)
+        child = InterpreterModule(child_graph)
+        parent.child = child
+
+        trim_call_module_args(parent)
+        child.finalize()
+        parent.finalize()
+
+        output = parent(torch.tensor(5), torch.tensor(99), torch.tensor(2))
+        self.assertEqual(output.item(), 8)
+
+    def test_kwarg_after_an_unused_placeholder(self) -> None:
+        child_graph = torch.fx.Graph()
+        x, _, y = (child_graph.placeholder(name) for name in ("x", "unused", "y"))
+        child_graph.output(child_graph.call_function(torch.sub, (x, y)))
+        parent_graph = torch.fx.Graph()
+        a, b, c = (parent_graph.placeholder(name) for name in ("a", "b", "c"))
+        parent_graph.output(parent_graph.call_module("child", (a, b), {"y": c}))
+        parent = InterpreterModule(parent_graph)
+        child = InterpreterModule(child_graph)
+        parent.child = child
+
+        trim_call_module_args(parent)
+        child.finalize()
+        parent.finalize()
+
+        output = parent(torch.tensor(5), torch.tensor(99), torch.tensor(2))
+        self.assertEqual(output.item(), 3)
+
+    def test_unused_placeholder_of_a_child_of_the_root(self) -> None:
+        class Child(nn.Module):
+            def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                return x - y
+
+        class Root(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.child = Child()
+
+            def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                return self.child(a, b)
+
+        inputs = (torch.tensor(5), torch.tensor(2))
+        root = torch.export.unflatten(torch.export.export(Root(), inputs))
+        child = root.get_submodule("child")
+        assert isinstance(child, InterpreterModule)
+        _, used = (node for node in child.graph.nodes if node.op == "placeholder")
+        (sub,) = (node for node in child.graph.nodes if node.op == "call_function")
+        sub.args = (used, 1)
+        child.finalize()
+        expected = root(*inputs)
+
+        trim_call_module_args(root)
+        child.finalize()
+        root.finalize()
+
+        self.assertEqual(root(*inputs), expected)
 
 
 class TestJsonSerializer(unittest.TestCase):
