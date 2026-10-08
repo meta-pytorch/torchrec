@@ -3945,6 +3945,258 @@ def _print_single_group_msg_sweep_report(results_dict: Any, dtype: torch.dtype) 
 
 
 # ---------------------------------------------------------------------------
+# Registered all-reduce relay route (two-rank TorchComm registered_all_reduce)
+#
+# Two processes per pair and nothing else. At or above
+# NCCL_REGISTERED_AR_RELAY_MIN_BYTES the registered request relays part of each
+# payload through the node's other GPUs, staging it in rings the pair allocates
+# in their HBM; nothing runs there. Compared, in the same processes, against
+# the standard 2-rank all-reduce on the same RCCLX communicator: one pair with
+# six and with two relay GPUs ([redacted]'s 4-GPU reservation), and four concurrent
+# pairs. The helper relay (8-rank comm with helper processes) comes from the
+# existing sweep workers under the same size axis.
+# ---------------------------------------------------------------------------
+
+_REGISTERED_RELAY_SIZES_MB: tuple[float, ...] = (9.0, 72.0, 144.0)
+# (label, pairs, NCCL_RELAY_MAX_HELPERS or None for every other GPU)
+_REGISTERED_RELAY_CONFIGS: tuple[tuple[str, int, int | None], ...] = (
+    ("p1", 1, None),
+    ("p1h2", 1, 2),
+    ("p4", 4, None),
+)
+
+
+def _ensure_registered_relay_sizes() -> None:
+    """Add the [redacted] prefill sizes to the sweep axis via BENCH_SWEEP_EXTRA_MB so
+    every worker (registered and helper relay) enumerates the same keys."""
+    have = {tok.strip() for tok in _env_str("BENCH_SWEEP_EXTRA_MB", "").split(",")}
+    want = [f"{mb:g}" for mb in _REGISTERED_RELAY_SIZES_MB if f"{mb:g}" not in have]
+    if want:
+        merged = [tok for tok in have if tok] + want
+        os.environ["BENCH_SWEEP_EXTRA_MB"] = ",".join(merged)
+
+
+def _setup_pair_rcclx_comm(rank: int, pair: int, store: Any) -> Any:
+    """A 2-rank RCCLX communicator for `pair` (global ranks 2*pair, 2*pair+1)."""
+    assert _torchcomms_new_comm is not None
+    orig = {k: os.environ.get(k) for k in ("TORCHCOMM_RANK", "TORCHCOMM_SIZE")}
+    try:
+        os.environ["TORCHCOMM_RANK"] = str(rank % 2)
+        os.environ["TORCHCOMM_SIZE"] = "2"
+        return _torchcomms_new_comm(
+            backend="rcclx",
+            device=torch.device(f"cuda:{rank}"),
+            name=f"bench_registered_relay_pair{pair}",
+            store=dist.PrefixStore(f"bench_registered_relay_pair{pair}", store),
+        )
+    finally:
+        for k, v in orig.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _free_bytes_per_device() -> list[int]:
+    return [torch.cuda.mem_get_info(d)[0] for d in range(torch.cuda.device_count())]
+
+
+def _registered_relay_worker(
+    rank: int,
+    world_size: int,
+    label: str,
+    results_dict: Any,
+    store_port: int,
+) -> None:
+    """One process of `world_size // 2` concurrent pairs; writes, per size index
+    i, results_dict[f"regrelay_{label}_{i}_r{rank}"] = (registered_ms,
+    standard_ms, mismatches) and, on rank 0, the largest per-GPU HBM growth on
+    the other GPUs from registering the largest request under
+    f"regrelay_{label}_hbm_mib"."""
+    store = dist.TCPStore(
+        host_name="localhost",
+        port=store_port,
+        world_size=world_size,
+        is_master=rank == 0,
+        wait_for_workers=True,
+    )
+    dist.init_process_group("gloo", rank=rank, world_size=world_size, store=store)
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    comm = _setup_pair_rcclx_comm(rank, rank // 2, store)
+    assert _TorchCommReduceOp is not None
+    dtype = _sweep_dtype()
+    warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
+    iters = max(1, _env_int("BENCH_BENCH_ITERS", 50))
+    sum_op = _TorchCommReduceOp.SUM
+    int_view = torch.int16 if dtype.itemsize == 2 else torch.int32
+    sizes = _sweep_sizes()
+    # With more than one pair every GPU also hosts an active rank's registered
+    # buffers, so device-wide free memory no longer isolates the staging.
+    largest = (
+        max(range(len(sizes)), key=lambda k: sizes[k][1]) if world_size == 2 else -1
+    )
+    try:
+        for i, (_label, nbytes) in enumerate(sizes):
+            count = nbytes // dtype.itemsize
+            gen = torch.Generator(device=device).manual_seed(4242 + rank)
+            source = torch.randn(count, generator=gen, device=device).to(dtype)
+            registered_in = torch.empty_like(source)
+            registered_out = torch.empty_like(source)
+            before: list[int] = []
+            if i == largest:
+                torch.cuda.synchronize()
+                dist.barrier()
+                before = _free_bytes_per_device() if rank == 0 else []
+            request = comm.registered_all_reduce(
+                registered_in, registered_out, registered_in.nbytes
+            )
+            if i == largest:
+                torch.cuda.synchronize()
+                dist.barrier()
+                if rank == 0:
+                    after = _free_bytes_per_device()
+                    grown = [
+                        (b - a) / _MIB
+                        for d, (b, a) in enumerate(zip(before, after))
+                        if d != rank
+                    ]
+                    results_dict[f"regrelay_{label}_hbm_mib"] = (
+                        max(grown) if grown else 0.0
+                    )
+            ref = source.clone()
+            registered_in.copy_(source)
+            request.all_reduce(registered_in, out=registered_out, registered_input=True)
+            comm.all_reduce(ref, sum_op, async_op=False)
+            torch.cuda.synchronize()
+            bad = int(
+                (registered_out.view(int_view) != ref.view(int_view)).sum().item()
+            )
+            reg_ms, _ = _measure_ms(
+                lambda request=request, i_=registered_in, o_=registered_out: (
+                    request.all_reduce(i_, out=o_, registered_input=True)
+                ),
+                warmup,
+                iters,
+                reps=_sweep_reps(),
+            )
+            std_ms, _ = _measure_ms(
+                lambda ref=ref: comm.all_reduce(ref, sum_op, async_op=False),
+                warmup,
+                iters,
+                reps=_sweep_reps(),
+            )
+            request.close()
+            results_dict[f"regrelay_{label}_{i}_r{rank}"] = (reg_ms, std_ms, bad)
+            del source, registered_in, registered_out, ref, request
+            torch.cuda.empty_cache()
+        dist.barrier()
+    finally:
+        comm.finalize()
+        dist.destroy_process_group()
+
+
+def _registered_relay_report(results_dict: Any, dtype: torch.dtype) -> list[str]:
+    width = 100
+    line = "=" * width
+    out: list[str] = [
+        "",
+        line,
+        f"Registered all-reduce (relay route) vs NCCL vs helper relay, TP2 (MI350X, {dtype})",
+        "  registered: 2 processes per pair; from NCCL_REGISTERED_AR_RELAY_MIN_BYTES part of each",
+        "    payload is staged in the other GPUs' HBM (no helper processes); below it, one-shot",
+        "  NCCL: standard 2-rank all-reduce on the same RCCLX comm; helper relay: 8-rank comm + 6 helper processes",
+        "  times = median over reps of best-of-iters, max over ranks (and pairs); mism = bitwise vs NCCL",
+        "  the helper relay always uses 6 helper processes, also in the 2-relay-GPU table",
+        line,
+    ]
+    titles = {
+        "p1": ("1 pair, 6 relay GPUs", 1),
+        "p1h2": ("1 pair, 2 relay GPUs ([redacted] 4-GPU reservation)", 1),
+        "p4": ("4 concurrent pairs, 6 relay GPUs each", 4),
+    }
+    for label, _pairs, _helpers in _REGISTERED_RELAY_CONFIGS:
+        title, pairs = titles[label]
+        hbm = results_dict.get(f"regrelay_{label}_hbm_mib")
+        relay_label = "Helper" if pairs == 1 else "Helper x4"
+        out += [
+            title
+            + (f"; staging per other GPU: {hbm:.1f} MiB" if hbm is not None else ""),
+            f"{'Msg Size':>10} | {'NCCL(ms)':>9} {relay_label + '(ms)':>13} {'Registered(ms)':>15}"
+            f" | {'vs NCCL':>8} {'vs Helper':>10} | {'mism':>5}",
+            "-" * width,
+        ]
+        for i, (size_label, _nbytes) in enumerate(_sweep_sizes()):
+            rows = [
+                results_dict.get(f"regrelay_{label}_{i}_r{r}") for r in range(2 * pairs)
+            ]
+            rows = [r for r in rows if r is not None]
+            if not rows:
+                continue
+            reg = max(r[0] for r in rows)
+            std = max(r[1] for r in rows)
+            bad = sum(r[2] for r in rows)
+            rel = _sweep_get_ms(
+                results_dict, f"relay_parallel_allreduce_a2_{i}_pairs{pairs}"
+            )
+            out.append(
+                f"{size_label:>10} | {_sweep_fmt_ms(std):>9} {_sweep_fmt_ms(rel):>13} "
+                f"{_sweep_fmt_ms(reg):>15} | {_sweep_fmt_speedup(std, reg):>8} "
+                f"{_sweep_fmt_speedup(rel, reg):>10} | {bad:>5}"
+            )
+        out.append(line)
+    return out
+
+
+def _run_helper_relay_for_comparison(results: Any, jobs: int) -> None:
+    """Existing helper relay (A=2 all-reduce) on the same size axis, `jobs`
+    co-resident jobs, stored under ..._pairs{jobs} for the registered report."""
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "BENCH_SWEEP_ONLY",
+            "BENCH_SWEEP_ACTIVE",
+            "GPU_MAX_HW_QUEUES",
+            "TORCH_NCCL_TRACE_BUFFER_SIZE",
+        )
+    }
+    os.environ["BENCH_SWEEP_ONLY"] = "allreduce"
+    os.environ["BENCH_SWEEP_ACTIVE"] = "2"
+    # Same regime as the parallel sweep: co-resident jobs would otherwise
+    # collide on the NCCL flight recorder's named pipes.
+    os.environ["GPU_MAX_HW_QUEUES"] = "2"
+    os.environ["TORCH_NCCL_TRACE_BUFFER_SIZE"] = "0"
+    try:
+        scratch: Any = {}
+        total_procs = jobs * NUM_GPUS
+        mp.spawn(
+            _parallel_msg_sweep_relay_worker,
+            args=(total_procs, 2, results, _find_free_port()),
+            nprocs=total_procs,
+            join=True,
+        )
+        for i, _ in enumerate(_sweep_sizes()):
+            vals = [
+                results.get(f"relay_parallel_allreduce_a2_{i}_job{j}")
+                for j in range(jobs)
+            ]
+            present = [v for v in vals if v is not None]
+            if present:
+                scratch[f"relay_parallel_allreduce_a2_{i}_pairs{jobs}"] = max(
+                    present, key=lambda v: v[0]
+                )
+            for j in range(jobs):
+                results.pop(f"relay_parallel_allreduce_a2_{i}_job{j}", None)
+        results.update(scratch)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
 # TestCase — works with both "buck2 test" and "buck2 run" (same as the old
 # test_sharded_relay_2d_integration.py pattern).
 # ---------------------------------------------------------------------------
@@ -4504,6 +4756,65 @@ class BenchRegisteredAllReducePerfTest(unittest.TestCase):
                 _registered_lp_report(),
                 "bench_registered_all_reduce_lp_results.txt",
             )
+        finally:
+            manager.shutdown()
+
+
+class BenchRegisteredAllReduceRelayPerfTest(unittest.TestCase):
+    """Two-rank registered all-reduce (relay route) vs NCCL vs the helper relay.
+
+    Run selectively:
+        buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
+            //torchrec/distributed/tests:bench_sharded_relay_perf -- \\
+            torchrec.distributed.tests.bench_sharded_relay_perf.BenchRegisteredAllReduceRelayPerfTest
+
+    BENCH_REGRELAY_SKIP_HELPER=1 skips the helper-relay columns (they spawn 8
+    or 32 processes). NCCL_REGISTERED_AR_RELAY_* tune the relay route.
+    """
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA/ROCm not available")
+        if torch.cuda.device_count() < NUM_GPUS:
+            self.skipTest(f"Benchmark requires {NUM_GPUS} GPUs")
+        if not RCCLX_AVAILABLE:
+            self.skipTest("TorchComm RCCLX not available")
+
+    def test_registered_relay_all_reduce(self) -> None:
+        _ensure_registered_relay_sizes()
+        os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+        manager = mp.Manager()
+        results: Any = manager.dict()
+        saved_helpers = os.environ.get("NCCL_RELAY_MAX_HELPERS")
+        try:
+            for label, pairs, helpers in _REGISTERED_RELAY_CONFIGS:
+                if helpers is None:
+                    os.environ.pop("NCCL_RELAY_MAX_HELPERS", None)
+                else:
+                    os.environ["NCCL_RELAY_MAX_HELPERS"] = str(helpers)
+                mp.spawn(
+                    _registered_relay_worker,
+                    args=(2 * pairs, label, results, _find_free_port()),
+                    nprocs=2 * pairs,
+                    join=True,
+                )
+            if saved_helpers is None:
+                os.environ.pop("NCCL_RELAY_MAX_HELPERS", None)
+            else:
+                os.environ["NCCL_RELAY_MAX_HELPERS"] = saved_helpers
+            if _env_int("BENCH_REGRELAY_SKIP_HELPER", 0) == 0:
+                for jobs in (1, 4):
+                    _run_helper_relay_for_comparison(results, jobs)
+            _emit_report(
+                _registered_relay_report(results, _sweep_dtype()),
+                "bench_registered_relay_results.txt",
+            )
+            mismatches = sum(
+                v[2]
+                for k, v in results.items()
+                if k.startswith("regrelay_") and isinstance(v, tuple)
+            )
+            self.assertEqual(mismatches, 0)
         finally:
             manager.shutdown()
 
