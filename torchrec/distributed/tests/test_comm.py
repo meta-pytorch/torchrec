@@ -22,9 +22,17 @@ import torch.distributed as dist
 import torchrec
 import torchrec.distributed.comm_ops as comm_ops
 from hypothesis import given, settings
+from torch import Tensor
 from torch.distributed.distributed_c10d import GroupMember
 from torchrec.distributed import comm
 from torchrec.distributed.comm import get_2d_pod_size, get_resolved_pod_size
+from torchrec.distributed.fbgemm_qcomm_codec import (
+    CommType,
+    get_qcomm_codecs,
+    QCommsConfig,
+)
+from torchrec.distributed.types import QuantizedCommCodecs
+from torchrec.distributed.utils import none_throws
 from torchrec.test_utils import get_free_port, seed_and_log
 
 torch.ops.import_module("fbgemm_gpu.sparse_ops")
@@ -397,6 +405,102 @@ class TestAllToAll(unittest.TestCase):
             specify_pg=specify_pg,
             gradient_division=gradient_division,
         )
+
+    @classmethod
+    def _test_alltoall_pooled_fp8_bwd_padding(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+        batch_size_per_rank: List[int],
+        dim_sum_per_rank: List[int],
+        variable_batch: bool,
+        gradient_division: bool,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        pg = dist.distributed_c10d._get_default_group()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        comm_ops.set_gradient_division(gradient_division)
+
+        torch.manual_seed(rank)
+        pooled_embs = torch.randn(
+            sum(batch_size_per_rank), dim_sum_per_rank[rank], device=device
+        )
+        grad_out = torch.randn(
+            batch_size_per_rank[rank], sum(dim_sum_per_rank), device=device
+        )
+
+        def bwd_grad(codecs: Optional[QuantizedCommCodecs], padding: bool) -> Tensor:
+            os.environ["TORCHREC_ENABLE_FP8_ROWWISE_PADDING"] = str(int(padding))
+            embs = pooled_embs.clone().requires_grad_()
+            if variable_batch:
+                # One feature per rank, each with every rank's batch size.
+                out = comm_ops.variable_batch_alltoall_pooled(
+                    embs.view(-1),
+                    batch_size_per_rank_per_feature=[[b] for b in batch_size_per_rank],
+                    batch_size_per_feature_pre_a2a=[batch_size_per_rank[rank]]
+                    * world_size,
+                    emb_dim_per_rank_per_feature=[[d] for d in dim_sum_per_rank],
+                    group=pg,
+                    codecs=codecs,
+                ).wait()
+                out.backward(grad_out.view(-1))
+            else:
+                comm_ops.alltoall_pooled(
+                    embs, batch_size_per_rank, dim_sum_per_rank, group=pg, codecs=codecs
+                ).wait().backward(grad_out)
+            return none_throws(embs.grad)
+
+        fp8 = get_qcomm_codecs(
+            QCommsConfig(
+                forward_precision=CommType.FP8,
+                backward_precision=CommType.FP8,
+                fp8_quantize_dim=256,
+                fp8_quantize_dim_bwd=256,
+            )
+        )
+        padded = bwd_grad(fp8, padding=True)
+        torch.testing.assert_close(
+            padded, bwd_grad(None, padding=False), rtol=0.1, atol=0.1
+        )
+        if all(b * d % 256 == 0 for b in batch_size_per_rank for d in dim_sum_per_rank):
+            # Backward grads don't depend on forward values, so forward padding
+            # can't affect this comparison.
+            torch.testing.assert_close(
+                padded, bwd_grad(fp8, padding=False), rtol=0, atol=0
+            )
+        dist.destroy_process_group()
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
+    )
+    @given(
+        variable_batch=st.sampled_from([False, True]),
+        gradient_division=st.sampled_from([False, True]),
+    )
+    @settings(deadline=None)
+    def test_alltoall_pooled_fp8_bwd_padding(
+        self, variable_batch: bool, gradient_division: bool
+    ) -> None:
+        for batch_size_per_rank, dim_sum_per_rank in [
+            # Every B_r * D_s split unaligned to 256.
+            ([3, 5], [36, 72]),
+            # Rank 0 sends aligned splits but receives a padded one.
+            ([4, 3], [64, 64]),
+            # Aligned splits: the comm is unchanged with padding on.
+            ([4, 4], [128, 256]),
+        ]:
+            self._run_multi_process_test(
+                world_size=self.WORLD_SIZE,
+                backend="nccl",
+                # pyrefly: ignore[bad-argument-type]
+                callable=self._test_alltoall_pooled_fp8_bwd_padding,
+                batch_size_per_rank=batch_size_per_rank,
+                dim_sum_per_rank=dim_sum_per_rank,
+                variable_batch=variable_batch,
+                gradient_division=gradient_division,
+            )
 
     @classmethod
     def _test_reduce_scatter_pooled(
