@@ -74,8 +74,13 @@ from torchrec.metrics.metric_job_types import (
     MetricUpdateJob,
     SynchronizationMarker,
 )
-from torchrec.metrics.metric_module import MetricsResult, RecMetricModule
+from torchrec.metrics.metric_module import (
+    _StagedLossDelta,
+    MetricsResult,
+    RecMetricModule,
+)
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
+from torchrec.metrics.metrics_config import LOSS_DENOM_SUFFIX
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException
 from torchrec.utils.percentile_logger import PercentileLogger
@@ -176,14 +181,20 @@ def _merge_tensor_mappings(
     jagged_value_keys = _jagged_value_keys(first, jagged_value_keys)
     merged: Dict[str, torch.Tensor] = {}
     for key in first:
-        tensors = [mapping[key] for mapping in mappings]
         try:
+            tensors = [mapping[key] for mapping in mappings]
             if key in jagged_value_keys or all(
                 tensor.numel() == 0 for tensor in tensors
             ):
                 merged[key] = _concatenate_variable_cardinality(tensors)
             else:
                 merged[key] = _merge_tensors_across_jobs(tensors, batch_sizes)
+        except KeyError as error:
+            raise RecMetricException(
+                f"failed to merge {mapping_name}: key {key!r} is present in the first "
+                "job but missing from a later one; all merged jobs must share one "
+                "key set"
+            ) from error
         except (RecMetricException, RuntimeError) as error:
             raise RecMetricException(
                 f"failed to merge {mapping_name} key {key!r}: {error}"
@@ -257,12 +268,19 @@ def _merge_update_jobs(
     )
 
 
-def _foreach_clone_dict(d: Mapping[str, Any]) -> Dict[str, Any]:
-    """Clone tensor values while preserving their mapping keys."""
+def _foreach_clone_dict(
+    d: Mapping[str, Any], skip_keys: Collection[str] | None = None
+) -> Dict[str, Any]:
+    """Clone tensor values while preserving their mapping keys.
+
+    Keys in ``skip_keys`` are omitted from the copy.
+    """
     tensor_keys: list[str] = []
     tensor_values: list[torch.Tensor] = []
-    out: Dict[str, Any] = dict(d)
-    for k, v in d.items():
+    out: Dict[str, Any] = (
+        {k: v for k, v in d.items() if k not in skip_keys} if skip_keys else dict(d)
+    )
+    for k, v in out.items():
         if isinstance(v, torch.Tensor):
             tensor_keys.append(k)
             tensor_values.append(v)
@@ -425,6 +443,10 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self._shutdown_complete: bool = False
         self._captured_exception_event: threading.Event = threading.Event()
         self._captured_exception: Optional[Exception] = None
+        # A rank-local loss error cannot abort before enqueue without desynchronizing
+        # compute collectives. Suppress that step's loss publication instead.
+        self._suppress_step_loss: bool = False
+        self._loss_strip_protected_keys: set[str] = self._protected_model_out_keys()
 
         self.update_queue: queue.Queue[
             Union[MetricUpdateJob, SynchronizationMarker]
@@ -563,10 +585,117 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             )
         return cap
 
+    def _protected_model_out_keys(self) -> set[str]:
+        """Return worker-read keys, including task names that resemble loss keys."""
+        protected: set[str] = set(self.get_required_inputs() or ())
+        for task in self.rec_tasks:
+            protected.add(task.label_name)
+            protected.add(task.prediction_name)
+            protected.add(task.weight_name)
+            if task.tensor_name:
+                protected.add(task.tensor_name)
+            session_def = task.session_metric_def
+            if session_def is not None:
+                protected.add(session_def.session_var_name)
+        return protected
+
+    def _main_thread_only_loss_keys(
+        self, model_out: Mapping[str, torch.Tensor]
+    ) -> set[str]:
+        """Return loss keys used only by caller-side recombination.
+
+        Subclasses must expose extra worker-read keys through ``get_required_inputs``.
+        """
+        protected = self._loss_strip_protected_keys
+        drop: set[str] = set()
+        for key in model_out:
+            owner = (
+                key[: -len(LOSS_DENOM_SUFFIX)]
+                if key.endswith(LOSS_DENOM_SUFFIX)
+                else key
+            )
+            if not (owner.endswith(":loss") or owner == "loss"):
+                continue
+            if key in protected or owner in protected:
+                continue
+            drop.add(key)
+        return drop
+
+    def _snapshot_reduced_losses(self) -> Dict[str, torch.Tensor]:
+        """Clone reduced losses so published CPU tensors own their storage."""
+        return {
+            key: value.detach().clone()
+            for key, value in self._loss_acc.reduced_losses().items()
+        }
+
     @override
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
+        self._update_and_accumulate_loss(model_out, advance_step=True, **kwargs)
+
+    @override
+    def update_micro_batch(
+        self, model_out: Dict[str, torch.Tensor], **kwargs: Any
+    ) -> None:
+        """Queue an intermediate batch; the worker accounts for throughput."""
+        self._update_and_accumulate_loss(model_out, advance_step=False, **kwargs)
+
+    def _update_and_accumulate_loss(
+        self,
+        model_out: Dict[str, torch.Tensor],
+        *,
+        advance_step: bool,
+        **kwargs: Any,
+    ) -> None:
+        """Stage losses, enqueue the metric update, then commit.
+
+        A rejected loss delta still enqueues so every rank keeps compute cadence.
+        """
+        staged: Optional[_StagedLossDelta] = None
+        if self.under_micro_batching:
+            try:
+                staged = self._loss_acc.stage(model_out)
+            except Exception as e:  # noqa: BLE001 - preserve cross-rank compute cadence
+                self._report_loss_failure(e)
+
         self._update_rec_metrics(model_out, **kwargs)
-        self.trained_batches += 1
+
+        if staged is not None:
+            self._loss_acc.commit(staged)
+        if advance_step:
+            self.trained_batches += 1
+
+    def _report_loss_failure(self, error: Exception) -> None:
+        """Suppress this step's loss output and report the first failure."""
+        if self._suppress_step_loss:
+            return
+        self._suppress_step_loss = True
+        contract_violation = isinstance(error, RecMetricException)
+        reason = (
+            "the producer violated the loss denominator contract"
+            if contract_violation
+            else f"loss staging raised an unexpected {type(error).__name__}"
+        )
+        logger.error(
+            f"Dropping this step's recombined loss metrics: {reason}: {error}",
+            exc_info=True,
+        )
+        self._log_event(
+            "loss_recombination",
+            EventType.FAILURE,
+            {
+                "trained_batches": str(self.trained_batches),
+                "error_type": type(error).__name__,
+                "error_class": (
+                    "denominator_contract" if contract_violation else "unexpected"
+                ),
+            },
+            error_message=str(error),
+        )
+
+    @override
+    def reset_loss_metrics(self) -> None:
+        super().reset_loss_metrics()
+        self._suppress_step_loss = False
 
     @override
     def _update_rec_metrics(
@@ -608,11 +737,23 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             )
             self._validate_rec_metric_inputs(labels, predictions, weights)
 
+        drop_keys: set[str] = (
+            self._main_thread_only_loss_keys(metric_model_out)
+            if self.under_micro_batching
+            else set()
+        )
+
         if self._clone_model_out:
-            snapshot_model_out = _foreach_clone_dict(metric_model_out)
+            snapshot_model_out = _foreach_clone_dict(
+                metric_model_out, skip_keys=drop_keys
+            )
             snapshot_kwargs = _foreach_clone_kwargs(kwargs)
         else:
-            snapshot_model_out = dict(metric_model_out)
+            snapshot_model_out = {
+                key: value
+                for key, value in metric_model_out.items()
+                if key not in drop_keys
+            }
             snapshot_kwargs = dict(kwargs)
 
         try:
@@ -861,7 +1002,17 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             raise RecMetricException(
                 "update queue is full when enqueueing compute marker."
             )
-        return DeferrableMetrics(metrics_future)
+
+        deferred = DeferrableMetrics(metrics_future)
+
+        if _throughput_only or not self.under_micro_batching:
+            return deferred
+
+        if self._suppress_step_loss:
+            return deferred
+
+        deferred.update(self._snapshot_reduced_losses())
+        return deferred
 
     @override
     def compute_throughput(self) -> DeferrableMetrics:
