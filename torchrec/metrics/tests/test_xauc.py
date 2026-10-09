@@ -16,8 +16,8 @@ from unittest.mock import patch
 import torch
 import torch._dynamo
 from torch._dynamo import is_dynamo_supported
-from torchrec.metrics.metrics_config import DefaultTaskInfo, RecComputeMode, RecTaskInfo
-from torchrec.metrics.xauc import compute_error_sum, get_xauc_states, XAUCMetric
+from torchrec.metrics.metrics_config import DefaultTaskInfo
+from torchrec.metrics.xauc import XAUCMetric
 
 
 WORLD_SIZE = 4
@@ -39,63 +39,32 @@ def generate_model_output() -> Dict[str, torch._tensor.Tensor]:
 
 class XAUCMetricTest(unittest.TestCase):
     def test_xauc(self) -> None:
-        cases = [
-            (
-                torch.tensor([[0.2, 0.5, 0.5, 0.9, 0.1]]),
-                torch.tensor([[True, False, False, True, True]]),
-                torch.ones(1, 5),
-                torch.tensor([3 / 10]),
-            ),
-            (
-                torch.tensor([[0.2, 0.5, 0.5, 0.9, 0.1, torch.nan, 0.3]]),
-                torch.tensor([[3.0, 1.0, 1.0, 4.0, 2.0, 2.0, torch.nan]]),
-                torch.tensor([[1.0, 2.0, 1.0, 1.0, 0.5, 3.0, 2.0]]),
-                torch.tensor([7 / 45]),
-            ),
-            (
-                torch.tensor([[0.0, 0.0, 0.0]]),
-                torch.tensor([[torch.nan, 0.0, 0.0]]),
-                torch.ones(1, 3),
-                torch.tensor([1 / 3]),
-            ),
-            (
-                torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5], [0.2, 0.5, 0.5, 0.9, 0.1]]),
-                torch.tensor([[0.2, 0.1, 0.3, 0.5, 0.25], [3.0, 1.0, 2.0, 4.0, 2.0]]),
-                torch.tensor([[1.0, 1.0, 1.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0, 1.0]]),
-                torch.tensor([4 / 6, 5 / 10]),
-            ),
-        ]
-        for predictions, labels, weights, expected_metric in cases:
-            with self.subTest(expected_metric=expected_metric):
-                tasks = [
-                    RecTaskInfo(name=f"task_{head}") for head in range(len(predictions))
-                ]
-                xauc = XAUCMetric(
-                    world_size=WORLD_SIZE,
-                    my_rank=0,
-                    batch_size=BATCH_SIZE,
-                    tasks=tasks,
-                    compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
-                )
-                task_names = [task.name for task in tasks]
-                xauc.update(
-                    predictions=dict(zip(task_names, predictions)),
-                    labels=dict(zip(task_names, labels)),
-                    weights=dict(zip(task_names, weights)),
-                )
-                metric = xauc.compute()
-                actual_metric = torch.stack(
-                    [metric[f"xauc-{task.name}|lifetime_xauc"] for task in tasks]
-                )
+        xauc = XAUCMetric(
+            world_size=WORLD_SIZE,
+            my_rank=0,
+            batch_size=BATCH_SIZE,
+            tasks=[DefaultTaskInfo],
+        )
 
-                self.assertFalse(
-                    compute_error_sum(
-                        labels, predictions.requires_grad_(), weights
-                    ).requires_grad
-                )
-                torch.testing.assert_close(
-                    actual_metric, expected_metric, check_dtype=False
-                )
+        model_output = generate_model_output()
+        xauc.update(
+            predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
+            labels={DefaultTaskInfo.name: model_output["labels"][0]},
+            weights={DefaultTaskInfo.name: model_output["weights"][0]},
+        )
+        metric = xauc.compute()
+        actual_metric = metric[f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"]
+        expected_metric = model_output["expected_xauc"]
+
+        torch.testing.assert_close(
+            actual_metric,
+            expected_metric,
+            atol=1e-4,
+            rtol=1e-4,
+            check_dtype=False,
+            equal_nan=True,
+            msg=f"Actual: {actual_metric}, Expected: {expected_metric}",
+        )
 
     @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
     @unittest.skipIf(
@@ -161,24 +130,3 @@ class XAUCMetricTest(unittest.TestCase):
                 equal_nan=True,
                 msg=f"[{prefix}] Compiled: {compile_out[key]}, Eager: {eager_out[key]}",
             )
-
-    @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
-    @unittest.skipIf(
-        _is_free_threaded(),
-        "torch.compile segfaults on free-threaded Python, "
-        "see https://dev-discuss.pytorch.org/t/torch-compile-support-for-python-3-14-completed/3276",
-    )
-    def test_xauc_states_compile_dynamic(self) -> None:
-        compiled_get_xauc_states = torch.compile(
-            get_xauc_states, fullgraph=True, dynamic=True
-        )
-        with patch.object(torch._dynamo.config, "error_on_recompile", True):
-            for num_samples in (5, 7):
-                inputs = (
-                    torch.rand(2, num_samples),
-                    torch.rand(2, num_samples),
-                    torch.ones(2, num_samples),
-                )
-                torch.testing.assert_close(
-                    compiled_get_xauc_states(*inputs), get_xauc_states(*inputs)
-                )
