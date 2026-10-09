@@ -591,6 +591,7 @@ def set_embedding_config(
             with open(embedding_config_json, "r") as f:
                 embedding_config_json = json.load(f)
 
+            # pyrefly: ignore [missing-attribute]
             for _, config in embedding_config_json.items():
                 embedding_configs.append(
                     (config["num_embeddings"], config["embedding_dim"])

@@ -71,6 +71,7 @@ class TestFusedOptim(unittest.TestCase):
         )
         # pyrefly: ignore[invalid-param-spec]
         ebc = shard(
+            # pyrefly: ignore [bad-argument-count, unexpected-keyword]
             module=ebc,
             plan=plan,
             device=self.curr_device,
@@ -115,6 +116,7 @@ class TestFusedOptim(unittest.TestCase):
         )
         # pyrefly: ignore[invalid-param-spec]
         ebc = shard(
+            # pyrefly: ignore [bad-argument-count, unexpected-keyword]
             module=ebc,
             plan=plan,
             device=self.curr_device,

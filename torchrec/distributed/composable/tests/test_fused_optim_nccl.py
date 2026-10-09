@@ -75,6 +75,7 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
 
             # pyrefly: ignore[invalid-param-spec]
             ebc = shard(
+                # pyrefly: ignore [bad-argument-count, unexpected-keyword]
                 module=ebc,
                 plan=parameter_sharding_plan,
                 device=ctx.device,
