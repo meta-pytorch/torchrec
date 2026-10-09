@@ -66,6 +66,10 @@ class PipelineConfig:
     # TrainPipelineSparseDist). Only takes effect together with
     # enable_inplace_copy_batch=True. Applies to the "sparse" pipeline.
     async_inplace_copy: bool = False
+    # Keep one next(dataloader_iter) in flight on a background thread (base flag
+    # on TrainPipelineSparseDist). Independent of the copy mode. Applies to the
+    # "sparse" pipeline.
+    async_next_batch: bool = False
     free_features_storage_early: bool = False
     clear_data_dist_inputs: bool = False
     pipeline_postproc: bool = False
@@ -232,6 +236,7 @@ class PipelineConfig:
                     device=device,
                     enable_inplace_copy_batch=self.enable_inplace_copy_batch,
                     async_inplace_copy=self.async_inplace_copy,
+                    async_next_batch=self.async_next_batch,
                     free_features_storage_early=self.free_features_storage_early,
                     clear_data_dist_inputs=self.clear_data_dist_inputs,
                     **self.get_kwargs(),

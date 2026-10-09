@@ -1,0 +1,45 @@
+# Dataloader-stall variant of sparse_cpu_bound.
+#
+# Purpose: reproduce a next(dataloader_iter) stall on the main thread, the
+# regime where async_next_batch has wait to hide. The in-memory benchmark
+# dataloader costs nothing, so a simulated latency is added inside next():
+#   - dataloader_delay_ms: fixed per-batch latency
+#   - dataloader_delay_ms_per_gb: latency that grows with per-rank input size
+#   - dataloader_delay_jitter_ms: per-rank random latency; with 2D, the
+#     DMPCollection sync waits on the slowest rank
+#
+# Compare async_next_batch off vs on, 1D vs 2D (sync in-place copy for all):
+#   ... --yaml_config=.../sparse_dataloader_stall.yml --name=stall_1d
+#   ... --yaml_config=.../sparse_dataloader_stall.yml --async_next_batch=True --name=stall_1d_async
+#   ... --yaml_config=.../sparse_dataloader_stall.yml --sharding_group_size=2 --name=stall_2d
+#   ... --yaml_config=.../sparse_dataloader_stall.yml --sharding_group_size=2 --async_next_batch=True --name=stall_2d_async
+# FS2D (fully sharded 2D) instead of the default periodic-allreduce 2D:
+#   ... --sharding_group_size=2 --sharding_strategy=fully_sharded [--async_next_batch=True]
+RunOptions:
+  world_size: 4
+  batch_size: 4096
+  num_batches: 20
+  num_benchmarks: 5
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "sparse_dataloader_stall"
+  memory_snapshot: False
+  loglevel: "info"
+  dataloader_delay_ms: 20.0
+PipelineConfig:
+  pipeline: "sparse"
+  enable_inplace_copy_batch: true
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 20
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 100
+EmbeddingTablesConfig:
+  num_unweighted_features: 20
+  num_weighted_features: 10
+  embedding_feature_dim: 64
+PlannerConfig:
+  pooling_factors: [20.0]  # Must match ModelInputConfig.feature_pooling_avg

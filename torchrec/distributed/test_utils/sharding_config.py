@@ -37,6 +37,7 @@ from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.model_parallel import (
     DefaultDataParallelWrapper,
+    DMPCollection,
     HybridEvalDMP,
 )
 from torchrec.distributed.pec_embedding import PECEmbeddingCollectionSharder
@@ -56,6 +57,7 @@ from torchrec.distributed.types import (
     ShardingEnv,
     ShardingPlan,
     ShardingPlanner,
+    ShardingStrategy,
     ShardingType,
 )
 from torchrec.modules.embedding_configs import (
@@ -445,6 +447,14 @@ class ShardingConfig:
         ddp_bucket_cap_mb: DDP reducer bucket capacity in MiB for dense parameters.
         lazy_reducer: Whether DDP reducer bucket storage is allocated during
             backward and released after backward finishes.
+        sharding_group_size: If set, shard with 2D parallelism (``DMPCollection``):
+            embeddings are sharded within groups of this many ranks and replicated
+            across the world_size // sharding_group_size groups. The planner must
+            be built for this group size; ``benchmark_train_pipeline`` does so.
+        sharding_strategy: ``ShardingStrategy`` value for 2D: "default" (replicas
+            synced by periodic allreduce), "per_module", or "fully_sharded" (FS2D:
+            weights reduce-scattered after the lookup and all-gathered before
+            backward, every iteration). Only used with ``sharding_group_size``.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -460,6 +470,8 @@ class ShardingConfig:
     allreduce_comm_precision: Optional[str] = None
     ddp_bucket_cap_mb: int = 25
     lazy_reducer: bool = False
+    sharding_group_size: Optional[int] = None
+    sharding_strategy: str = ShardingStrategy.DEFAULT.value
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -520,7 +532,8 @@ class ShardingConfig:
         planner: Optional[ShardingPlanner] = None,
     ) -> DistributedModelParallel:
         """
-        Generate a standard DistributedModelParallel model.
+        Generate a DistributedModelParallel model, or a DMPCollection when
+        ``sharding_group_size`` is set (2D).
 
         All modules are placed on the same device.
         """
@@ -546,8 +559,24 @@ class ShardingConfig:
             else None
         )
 
+        module = copy.deepcopy(model) if self.deepcopy_model else model
+        if self.sharding_group_size is not None:
+            assert plan is not None, "2D sharding requires a planner"
+            return DMPCollection(
+                module=module,
+                device=device,
+                plan=plan,
+                world_size=pg.size(),
+                sharding_group_size=self.sharding_group_size,
+                global_pg=pg,
+                sharding_strategy=ShardingStrategy(self.sharding_strategy),
+                sharders=sharders,
+                init_data_parallel=self.init_data_parallel,
+                data_parallel_wrapper=data_parallel_wrapper,
+            ).to(device)
+
         return DistributedModelParallel(
-            module=copy.deepcopy(model) if self.deepcopy_model else model,
+            module=module,
             env=ShardingEnv.from_process_group(pg),
             init_data_parallel=self.init_data_parallel,
             device=device,
