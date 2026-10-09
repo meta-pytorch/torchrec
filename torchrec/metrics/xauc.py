@@ -7,9 +7,11 @@
 
 # pyre-strict
 
+import math
 from typing import Any, cast, Dict, List, Optional, Type
 
 import torch
+import torch.nn.functional as F
 from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace, MetricPrefix
 from torchrec.metrics.rec_metric import (
     MetricComputationReport,
@@ -31,40 +33,126 @@ def compute_xauc(
     ).double()
 
 
+@torch.no_grad()
 def compute_error_sum(
     labels: torch.Tensor, predictions: torch.Tensor, weights: torch.Tensor
 ) -> torch.Tensor:
-    predictions = predictions.double()
+    if not labels.is_floating_point():
+        labels = labels.double()
+    is_nan_sample = labels.isnan() | predictions.isnan()
+    labels = labels.masked_fill(is_nan_sample, 0)
+    predictions = predictions.masked_fill(is_nan_sample, 0)
+    weights = weights.double().masked_fill(is_nan_sample, 0)
 
-    errors = []
-    for predictions_i, labels_i, weights_i in zip(predictions, labels, weights):
-        preds_x, preds_y = torch.meshgrid(predictions_i, predictions_i)
-        labels_x, labels_y = torch.meshgrid(labels_i, labels_i)
-        weights_x, weights_y = torch.meshgrid(weights_i, weights_i)
-        weights_flag = weights_x * weights_y
-        match = torch.logical_or(
-            torch.logical_and(preds_x > preds_y, labels_x > labels_y),
-            torch.logical_and(preds_x < preds_y, labels_x < labels_y),
-        )
-        match = (
-            weights_flag
-            * torch.logical_or(
-                match, torch.logical_and(preds_x == preds_y, labels_x == labels_y)
-            ).double()
-        )
-        errors.append(torch.sum(torch.triu(match, diagonal=1)).view(1))
+    order = _get_indices_sorted_by_prediction_asc_label_desc(
+        labels=labels, predictions=predictions
+    )
+    sorted_labels = labels.gather(-1, order)
+    sorted_predictions = predictions.gather(-1, order)
+    sorted_weights = weights.gather(-1, order)
 
-    return torch.cat(errors)
+    weighted_num_strictly_increasing_label_pairs = (
+        _get_weighted_num_strictly_increasing_label_pairs(
+            labels=sorted_labels, weights=sorted_weights
+        )
+    )
+    weighted_num_prediction_and_label_tied_pairs = (
+        _get_weighted_num_prediction_and_label_tied_pairs(
+            labels=sorted_labels, predictions=sorted_predictions, weights=sorted_weights
+        )
+    )
+    return (
+        weighted_num_strictly_increasing_label_pairs
+        + weighted_num_prediction_and_label_tied_pairs
+    )
+
+
+def _get_indices_sorted_by_prediction_asc_label_desc(
+    *, labels: torch.Tensor, predictions: torch.Tensor
+) -> torch.Tensor:
+    label_order = labels.argsort(dim=-1, descending=True)
+    prediction_order = predictions.gather(-1, label_order).argsort(dim=-1, stable=True)
+    return label_order.gather(-1, prediction_order)
+
+
+def _get_weighted_num_strictly_increasing_label_pairs(
+    *, labels: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    num_samples = labels.shape[-1]
+    block_size = math.ceil(math.sqrt(num_samples))
+    labels = F.pad(labels, [0, block_size**2 - num_samples])
+    weights = F.pad(weights, [0, block_size**2 - num_samples])
+    return _get_weighted_num_strictly_increasing_label_pairs_across_blocks(
+        labels=labels, weights=weights, block_size=block_size
+    ) + _get_weighted_num_strictly_increasing_label_pairs_within_blocks(
+        block_labels=labels.unflatten(-1, (block_size, block_size)),
+        block_weights=weights.unflatten(-1, (block_size, block_size)),
+    )
+
+
+def _get_weighted_num_strictly_increasing_label_pairs_across_blocks(
+    *, labels: torch.Tensor, weights: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    sorted_block_labels, block_label_order = labels.unflatten(
+        -1, (block_size, block_size)
+    ).sort(dim=-1)
+    block_weight_prefix_sums = F.pad(
+        weights.unflatten(-1, (block_size, block_size))
+        .gather(-1, block_label_order)
+        .cumsum(-1),
+        [1, 0],
+    )
+
+    num_smaller_labels_per_block = torch.searchsorted(
+        sorted_block_labels, labels.unsqueeze(1).repeat(1, block_size, 1)
+    )
+    smaller_label_weight_per_block = block_weight_prefix_sums.gather(
+        -1, num_smaller_labels_per_block
+    )
+
+    block_indices = torch.arange(block_size, device=labels.device)
+    is_earlier_block = block_indices.unsqueeze(-1) < block_indices.repeat_interleave(
+        block_size
+    )
+    strictly_increasing_label_pair_weights = torch.where(
+        is_earlier_block, smaller_label_weight_per_block, 0
+    ) * weights.unsqueeze(1)
+    return strictly_increasing_label_pair_weights.sum(-1).sum(-1)
+
+
+def _get_weighted_num_strictly_increasing_label_pairs_within_blocks(
+    *, block_labels: torch.Tensor, block_weights: torch.Tensor
+) -> torch.Tensor:
+    is_strictly_increasing_pair = torch.triu(
+        block_labels.unsqueeze(-1) < block_labels.unsqueeze(-2), diagonal=1
+    )
+    pair_weights = block_weights.unsqueeze(-1) * block_weights.unsqueeze(-2)
+    strictly_increasing_pair_weights = torch.where(
+        is_strictly_increasing_pair, pair_weights, 0
+    )
+    return strictly_increasing_pair_weights.sum(-1).flatten(1).sum(-1)
+
+
+def _get_weighted_num_prediction_and_label_tied_pairs(
+    *, labels: torch.Tensor, predictions: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    is_new_tie_group = torch.ones_like(labels, dtype=torch.bool)
+    is_new_tie_group[:, 1:] = (labels[:, 1:] != labels[:, :-1]) | (
+        predictions[:, 1:] != predictions[:, :-1]
+    )
+    positions = torch.arange(labels.shape[-1], device=labels.device)
+    tie_group_starts = torch.where(is_new_tie_group, positions, 0).cummax(-1).values
+
+    earlier_weight_sums = weights.cumsum(-1) - weights
+    earlier_tied_weight_sums = earlier_weight_sums - earlier_weight_sums.gather(
+        -1, tie_group_starts
+    )
+    return (weights * earlier_tied_weight_sums).sum(-1)
 
 
 def compute_weighted_num_pairs(weights: torch.Tensor) -> torch.Tensor:
-    num_pairs = []
-    for weight_i in weights:
-        weights_x, weights_y = torch.meshgrid(weight_i, weight_i)
-        weights_flag = weights_x * weights_y
-        num_pairs.append(torch.sum(torch.triu(weights_flag, diagonal=1)).view(1))
-
-    return torch.cat(num_pairs)
+    weights = weights.double()
+    return (weights.sum(-1).square() - weights.square().sum(-1)) / 2
 
 
 def get_xauc_states(
