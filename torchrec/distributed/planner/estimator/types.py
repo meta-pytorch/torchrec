@@ -516,6 +516,9 @@ class ShardPerfContext:
     local_world_size: int = 1
     intra_group_size: int = 1  # pod_size * local_world_size; TWRW group size
 
+    # Per-table TWRW group span.
+    table_num_twrw_groups: int = 1
+
     # Data type sizes
     input_data_type_size: float = BIGINT_DTYPE
     table_data_type_size: float = 4.0
@@ -747,6 +750,19 @@ class ShardPerfContext:
                 f"compute kernel: {sharding_option.compute_kernel}"
             )
 
+        table_num_twrw_groups = 1
+        if sharding_option.sharding_type == ShardingType.TABLE_ROW_WISE.value:
+            table_num_twrw_groups = sharding_option.num_twrw_groups or 1
+            expected_shards = table_num_twrw_groups * topology.intra_group_size
+            if len(shard_sizes) != expected_shards:
+                # PlannerError would trigger a futile lower-storage retry.
+                raise ValueError(
+                    f"'{sharding_option.name}': "
+                    f"num_twrw_groups={table_num_twrw_groups} needs "
+                    f"{expected_shards} shards at an intra_group_size of "
+                    f"{topology.intra_group_size}, got {len(shard_sizes)}."
+                )
+
         # Build contexts
         contexts: List["ShardPerfContext"] = []
         for hash_size, emb_dim in shard_sizes:
@@ -761,6 +777,7 @@ class ShardPerfContext:
                 world_size=topology.world_size,
                 local_world_size=topology.local_world_size,
                 intra_group_size=topology.intra_group_size,
+                table_num_twrw_groups=table_num_twrw_groups,
                 input_data_type_size=input_data_type_size,
                 table_data_type_size=table_data_type_size,
                 output_data_type_size=output_data_type_size,
