@@ -54,7 +54,7 @@ except ImportError:
     # from split_table_batched_embeddings_ops_common to tbe/ssd).
     from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
 from torch.autograd.profiler import record_function
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.device_mesh import BackendConfig, DeviceMesh, init_device_mesh
 from torch.distributed.distributed_c10d import _get_object_coll_device
 from torchrec.tensor_types import UInt2Tensor, UInt4Tensor
 from torchrec.types import DataType, ModuleNoCopyMixin
@@ -1034,6 +1034,7 @@ class DMPCollectionConfig:
         node_group_size: Optional logical group size for TWRW/GRID sharding.
         use_inter_host_allreduce: Whether to use inter-host allreduce for sync.
         sharding_strategy: The sharding strategy to use.
+        device_mesh_backend_override: Backend override for the device mesh.
     """
 
     module: Type[nn.Module]
@@ -1042,6 +1043,7 @@ class DMPCollectionConfig:
     node_group_size: Optional[int]
     use_inter_host_allreduce: bool
     sharding_strategy: ShardingStrategy
+    device_mesh_backend_override: Optional[Tuple[BackendConfig, ...]]
 
     def __init__(
         self,
@@ -1051,6 +1053,7 @@ class DMPCollectionConfig:
         node_group_size: Optional[int] = None,
         use_inter_host_allreduce: bool = False,
         sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
+        device_mesh_backend_override: Optional[Tuple[BackendConfig, ...]] = None,
     ) -> None:
         self.module = module
         self.plan = plan
@@ -1058,6 +1061,7 @@ class DMPCollectionConfig:
         self.node_group_size = node_group_size
         self.use_inter_host_allreduce = use_inter_host_allreduce
         self.sharding_strategy = sharding_strategy
+        self.device_mesh_backend_override = device_mesh_backend_override
 
         if self.module is not None and isinstance(self.module, ShardedModule):
             raise ValueError(
@@ -1070,7 +1074,8 @@ class DMPCollectionConfig:
             f"sharding_group_size={self.sharding_group_size}, "
             f"node_group_size={self.node_group_size}, "
             f"use_inter_host_allreduce={self.use_inter_host_allreduce}, "
-            f"sharding_strategy={self.sharding_strategy})"
+            f"sharding_strategy={self.sharding_strategy}, "
+            f"device_mesh_backend_override={self.device_mesh_backend_override})"
         )
 
     def __eq__(self, other: object) -> bool:
@@ -1083,6 +1088,7 @@ class DMPCollectionConfig:
             and self.node_group_size == other.node_group_size
             and self.use_inter_host_allreduce == other.use_inter_host_allreduce
             and self.sharding_strategy == other.sharding_strategy
+            and self.device_mesh_backend_override == other.device_mesh_backend_override
         )
 
 
@@ -1110,6 +1116,7 @@ class DMPCollectionContext(DMPCollectionConfig):
         node_group_size: Optional[int] = None,
         use_inter_host_allreduce: bool = False,
         sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
+        device_mesh_backend_override: Optional[Tuple[BackendConfig, ...]] = None,
         modules_to_sync: Optional[List[Tuple[nn.Module, nn.Module]]] = None,
         sharded_module: Optional[nn.Module] = None,
         device_mesh: Optional["DeviceMesh"] = None,
@@ -1128,6 +1135,7 @@ class DMPCollectionContext(DMPCollectionConfig):
             node_group_size=node_group_size,
             use_inter_host_allreduce=use_inter_host_allreduce,
             sharding_strategy=sharding_strategy,
+            device_mesh_backend_override=device_mesh_backend_override,
         )
         self.modules_to_sync: List[Tuple[nn.Module, nn.Module]] = (
             modules_to_sync if modules_to_sync is not None else []
