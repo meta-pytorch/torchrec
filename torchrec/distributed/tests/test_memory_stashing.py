@@ -27,6 +27,7 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.logging_utils import OptimizationTechnique
 from torchrec.distributed.memory_stashing import (
     _collect_cuda_tensors_from_value,
     _DEFAULT_CHUNK_SIZE_BYTES,
@@ -57,7 +58,7 @@ class TestStashTensors(unittest.TestCase):
         original = tensor.clone()
 
         await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
-            [tensor]
+            [tensor], use_case="activation"
         )
 
         # Verify tensor is on CPU (HBM freed, data readable for checkpoint)
@@ -78,7 +79,7 @@ class TestStashTensors(unittest.TestCase):
         originals = [t1.clone(), t2.clone()]
 
         await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
-            [t1, t2]
+            [t1, t2], use_case="activation"
         )
 
         # All on CPU (HBM freed)
@@ -96,7 +97,7 @@ class TestStashTensors(unittest.TestCase):
     def test_empty_list(self) -> None:
         """Test that an empty tensor list returns no-op callbacks."""
         await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
-            []
+            [], use_case="activation"
         )
         # No-op callbacks must be callable and must not raise.
         self.assertTrue(callable(restore))
@@ -110,7 +111,7 @@ class TestStashTensors(unittest.TestCase):
         version_before = tensor._version
 
         await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
-            [tensor]
+            [tensor], use_case="activation"
         )
         restore(None)
         await_restore(None)
@@ -123,7 +124,7 @@ class TestStashTensors(unittest.TestCase):
         original = tensor.clone()
 
         await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
-            [tensor]
+            [tensor], use_case="activation"
         )
 
         dummy_grad = torch.tensor([1.0])
@@ -525,7 +526,9 @@ class TestStashCycleSummary(unittest.TestCase):
         MemoryStashingManager._logged_event_keys.clear()
         MemoryStashingManager._last_cycle_signatures.clear()
         MemoryStashingManager._cycle_summary_log_counts.clear()
-        patcher = patch("torchrec.distributed.memory_stashing.log_ems_event")
+        patcher = patch(
+            "torchrec.distributed.memory_stashing.log_ems_event", autospec=True
+        )
         self.log_ems_event: Mock = patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -622,12 +625,12 @@ class TestStashCycleSummary(unittest.TestCase):
         MemoryStashingManager.stash_optimizer_state(
             self._adam_with_state(), num_slices=2
         )
-        self.assertEqual(self._logged("ems_stash_cycle_summary"), [])
+        self.assertEqual(self._logged("oms_stash_cycle_summary"), [])
 
         MemoryStashingManager.restore_optimizer_state_next()
         MemoryStashingManager.restore_optimizer_state_next()
 
-        summaries = self._logged("ems_stash_cycle_summary")
+        summaries = self._logged("oms_stash_cycle_summary")
         self.assertEqual(len(summaries), 1)
         self.assertEqual(summaries[0]["use_case"], "optimizer_state")
         self.assertEqual(summaries[0]["stashed_bytes"], str(2 * 512 * 512 * 4))
@@ -638,7 +641,7 @@ class TestStashCycleSummary(unittest.TestCase):
         MemoryStashingManager.stash_optimizer_state(self._adam_with_state())
         MemoryStashingManager.restore_optimizer_state()
 
-        summaries = self._logged("ems_stash_cycle_summary")
+        summaries = self._logged("oms_stash_cycle_summary")
         self.assertEqual(len(summaries), 1)
         self.assertEqual(summaries[0]["stashed_bytes"], str(2 * 2 * 512 * 512 * 4))
         self.assertEqual(
@@ -656,6 +659,120 @@ class TestStashCycleSummary(unittest.TestCase):
         self.assertEqual(len(collected), 1)
         self.assertEqual(collected[0]["caller"], "Stash")
         self.assertEqual(collected[0]["num_tensors"], "1")
+
+
+class TestStashTechniqueTagging(unittest.TestCase):
+    """Optimizer stashing is logged as OMS, never as EMS."""
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+        MemoryStashingManager._logged_event_keys.clear()
+        MemoryStashingManager._last_cycle_signatures.clear()
+        MemoryStashingManager._cycle_summary_log_counts.clear()
+        patcher = patch(
+            "torchrec.distributed.memory_stashing.log_ems_event", autospec=True
+        )
+        self.log_ems_event: Mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def _techniques_by_event(self) -> Dict[str, OptimizationTechnique]:
+        return {
+            c.args[0]: c.kwargs["technique"] for c in self.log_ems_event.call_args_list
+        }
+
+    def test_optimizer_only_flow_logs_no_ems_event(self) -> None:
+        model = nn.Linear(512, 512).to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
+        model(torch.randn(32, 512, device=self.device)).sum().backward()
+        optimizer.step()
+
+        MemoryStashingManager.stash_optimizer_state(optimizer)
+        # An optimizer-only pipeline still runs the embedding restore hook.
+        MemoryStashingManager.restore_embedding_weights()
+        MemoryStashingManager.restore_optimizer_state()
+
+        techniques = self._techniques_by_event()
+        self.assertIn("oms_stash_cycle_summary", techniques)
+        self.assertIn("oms_stash_summary_optimizer_state", techniques)
+        self.assertEqual(
+            set(techniques.values()) - {OptimizationTechnique.NONE},
+            {OptimizationTechnique.OMS},
+        )
+        self.assertTrue(
+            all(
+                name.startswith("oms_")
+                for name, technique in techniques.items()
+                if technique != OptimizationTechnique.NONE
+            )
+        )
+
+    def test_restores_with_nothing_stashed_log_nothing(self) -> None:
+        MemoryStashingManager.restore_embedding_weights()
+        MemoryStashingManager.restore_optimizer_state()
+        MemoryStashingManager.restore_emo_cache()
+        self.assertEqual(
+            set(self._techniques_by_event()), {"memory_stashing_streams_initialized"}
+        )
+
+    def test_unregistered_use_case_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "_USE_CASE_TECHNIQUES"):
+            MemoryStashingManager._stash_tensors(
+                [torch.ones(4, device=self.device)], use_case="bogus"
+            )
+
+    def test_activation_stash_is_not_counted_as_a_technique(self) -> None:
+        tensor = torch.ones((512, 512), device=self.device)
+        MemoryStashingManager._stash_tensors([tensor], use_case="activation")
+        self.assertEqual(
+            self._techniques_by_event()["activation_stash_summary_tensor"],
+            OptimizationTechnique.NONE,
+        )
+        self.assertEqual(MemoryStashingManager._cycle_tallies, {})
+
+    def test_streams_setup_event_is_technique_neutral(self) -> None:
+        self.assertEqual(
+            self._techniques_by_event()["memory_stashing_streams_initialized"],
+            OptimizationTechnique.NONE,
+        )
+
+    def test_emo_cache_restore_is_tagged_as_stashing(self) -> None:
+        MemoryStashingManager._emo_cache_restore_callbacks.append(lambda *_: None)
+        MemoryStashingManager.restore_emo_cache()
+        self.assertEqual(
+            self._techniques_by_event()["emo_restore_cache_callbacks"],
+            OptimizationTechnique.EMS,
+        )
+
+    def test_threaded_optimizer_restore_is_oms(self) -> None:
+        MemoryStashingManager.restore_optimizer_state_threaded().result()
+        self.assertEqual(
+            self._techniques_by_event()["oms_restore_optimizer_state_threaded"],
+            OptimizationTechnique.OMS,
+        )
+
+    def test_embedding_events_are_ems(self) -> None:
+        inner = Mock()
+        inner.weights_dev = torch.ones((10, 8), device=self.device)
+        emb_module = Mock()
+        emb_module._emb_module = inner
+        lookup = Mock(spec=["_emb_modules"])
+        lookup._emb_modules = [emb_module]
+
+        MemoryStashingManager.stash_embedding_weights(lookup)
+        MemoryStashingManager.restore_embedding_weights()
+
+        techniques = self._techniques_by_event()
+        self.assertIn("ems_stash_cycle_summary", techniques)
+        self.assertEqual(
+            set(techniques.values()) - {OptimizationTechnique.NONE},
+            {OptimizationTechnique.EMS},
+        )
 
 
 class ScratchBufferOptimizer(torch.optim.SGD):
@@ -1920,7 +2037,9 @@ class TestRestoreStashedSyncTensors(unittest.TestCase):
         original = momentum_dev.clone()
         sync_view = momentum_dev.detach().view(-1)
 
-        _await, restore, _exec = MemoryStashingManager._stash_tensors([momentum_dev])
+        _await, restore, _exec = MemoryStashingManager._stash_tensors(
+            [momentum_dev], use_case="activation"
+        )
         MemoryStashingManager._optimizer_state_restore_callbacks.append(restore)
         # The sync view keeps the original (now freed) CUDA storage.
         self.assertTrue(sync_view.is_cuda)
@@ -2008,7 +2127,7 @@ class TestCheckpointWhileStashed(unittest.TestCase):
         original = tensor.detach().clone()
         captured = tensor.detach().view_as(tensor)  # separate view, shares GPU storage
 
-        MemoryStashingManager._stash_tensors([tensor])
+        MemoryStashingManager._stash_tensors([tensor], use_case="activation")
         self.assertEqual(captured.untyped_storage().size(), 0)  # GPU storage freed
 
         cpu_src = MemoryStashingManager.staged_cpu_view_for(captured)
@@ -2029,7 +2148,7 @@ class TestCheckpointWhileStashed(unittest.TestCase):
         self.assertEqual(len(collected), 1)
         captured_local = dtensor.to_local()
 
-        MemoryStashingManager._stash_tensors(collected)
+        MemoryStashingManager._stash_tensors(collected, use_case="activation")
 
         cpu_src = MemoryStashingManager.staged_cpu_view_for(captured_local)
         self.assertIsNotNone(
@@ -2054,7 +2173,7 @@ class TestCheckpointWhileStashed(unittest.TestCase):
         original = noncontig.detach().clone()  # logical values, contiguous copy
         captured = noncontig.detach()  # separate view sharing the GPU storage
 
-        MemoryStashingManager._stash_tensors([noncontig])
+        MemoryStashingManager._stash_tensors([noncontig], use_case="activation")
 
         cpu_src = MemoryStashingManager.staged_cpu_view_for(captured)
         self.assertIsNotNone(cpu_src)
@@ -2069,7 +2188,9 @@ class TestCheckpointWhileStashed(unittest.TestCase):
         self.assertFalse(noncontig.is_contiguous())
         original = noncontig.detach().clone()
 
-        await_restore, restore, _ = MemoryStashingManager._stash_tensors([noncontig])
+        await_restore, restore, _ = MemoryStashingManager._stash_tensors(
+            [noncontig], use_case="activation"
+        )
         restore(None)
         await_restore(None)
 
@@ -2093,7 +2214,7 @@ class TestCheckpointWhileStashed(unittest.TestCase):
         original = collected[0].detach().clone()
         captured = collected[0].detach()  # separate view for the DCP stager
 
-        MemoryStashingManager._stash_tensors(collected)
+        MemoryStashingManager._stash_tensors(collected, use_case="activation")
 
         cpu_src = MemoryStashingManager.staged_cpu_view_for(captured)
         self.assertIsNotNone(

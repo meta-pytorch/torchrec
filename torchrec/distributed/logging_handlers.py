@@ -395,6 +395,14 @@ def log_ems_config(
     pass
 
 
+def log_oms_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.OMS,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_inplace_copy_batch(
     size_bytes: int = 0,
     technique: OptimizationTechnique = OptimizationTechnique.INPLACE_COPY_BATCH,

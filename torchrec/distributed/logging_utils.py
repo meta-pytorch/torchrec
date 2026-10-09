@@ -44,6 +44,7 @@ class OptimizationTechnique(Enum):
     SSD_OFFLOADING = "ssd_offloading"
     TWO_DIM_SHARDING = "two_dim_sharding"
     EMS = "ems"
+    OMS = "oms"
     MPZCH = "mpzch"
     KVZCH = "kvzch"
     ZORM = "zorm"
