@@ -15,8 +15,10 @@ Covers the eval-only prefetch pipeline:
 - output parity against non-pipelined eval
 """
 
+import threading
 import unittest
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+from unittest.mock import patch
 
 import torch
 from hypothesis import given, settings, strategies as st
@@ -50,6 +52,18 @@ class EvalPipelinePrefetchTestBase(TrainPipelineSparseDistTestBase):
         "prefetch_pipeline": True,
     }
 
+    def setUp(self) -> None:
+        feature_gate_patcher = patch(
+            "torch.ops.fbgemm.check_feature_gate_key", return_value=False
+        )
+        feature_gate_patcher.start()
+        self.addCleanup(feature_gate_patcher.stop)
+        with patch(
+            "torch.distributed.distributed_c10d."
+            "set_pytorch_distributed_envs_from_justknobs"
+        ):
+            super().setUp()
+
     def _create_pipeline(
         self,
         num_batches: int = 5,
@@ -58,6 +72,7 @@ class EvalPipelinePrefetchTestBase(TrainPipelineSparseDistTestBase):
         sharding_type: str = ShardingType.TABLE_WISE.value,
         kernel_type: str = EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
         stage_hooks: Optional[Dict[str, str]] = None,
+        async_prefetch: bool = False,
     ) -> Tuple[
         EvalPipelinePrefetchSparseDist,
         Iterator[ModelInput],
@@ -90,6 +105,7 @@ class EvalPipelinePrefetchTestBase(TrainPipelineSparseDistTestBase):
             optimizer=optim,
             device=self.device,
             stage_hooks=stage_hooks,
+            async_prefetch=async_prefetch,
         )
 
         return pipeline, dataloader, sharded_model, optim
@@ -351,6 +367,10 @@ class EvalPipelinePrefetchTest(EvalPipelinePrefetchTestBase):
 
         self.assertTrue(pipeline._stage_ran[EvalPipelineStage.PREFETCH])
 
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     def test_stage_hooks_ctor_arg_rejects_unknown_stage(self) -> None:
         """A typo'd stage name fails at construction, naming the valid stages."""
         with self.assertRaisesRegex(ValueError, "Unknown pipeline stage"):
@@ -499,6 +519,181 @@ class EvalPipelinePrefetchTest(EvalPipelinePrefetchTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    def test_async_prefetch_allocates_worker_only_when_enabled(self) -> None:
+        """The worker is opt-in; the default path stays single-threaded."""
+        pipeline, _, _, _ = self._create_pipeline(num_batches=4)
+        self.assertIsNone(pipeline._prefetch_executor)
+
+        async_pipeline, _, _, _ = self._create_pipeline(
+            num_batches=4, async_prefetch=True
+        )
+        self.assertIsNotNone(async_pipeline._prefetch_executor)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_prefetch_runs_off_the_main_thread(self) -> None:
+        """
+        The point of the flag is that the stage leaves the forward's thread.
+        ``fill_pipeline`` still prefetches inline, so only the steady-state
+        calls are expected off-thread.
+        """
+        pipeline, dataloader, _, _ = self._create_pipeline(
+            num_batches=6, async_prefetch=True
+        )
+        original = pipeline._prefetch
+        idents: List[int] = []
+
+        def _record(context: PrefetchTrainPipelineContext) -> None:
+            idents.append(threading.get_ident())
+            original(context)
+
+        pipeline._prefetch = _record
+
+        for _ in range(3):
+            pipeline.progress(dataloader)
+
+        self.assertTrue(idents)
+        self.assertTrue(
+            any(ident != threading.get_ident() for ident in idents),
+            "no prefetch ran on the worker thread",
+        )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_prefetch_is_joined_before_the_forward(self) -> None:
+        """
+        The forward reads the cache lines the worker fills, so no prefetch may
+        still be in flight once it starts.
+        """
+        pipeline, dataloader, _, _ = self._create_pipeline(
+            num_batches=6, async_prefetch=True
+        )
+        original_fwd = pipeline._model_fwd
+        pending_at_forward: List[bool] = []
+
+        def _record(batch: Optional[ModelInput]) -> Tuple[torch.Tensor, Any]:
+            pending_at_forward.append(pipeline._prefetch_future is not None)
+            return original_fwd(batch)
+
+        pipeline._model_fwd = _record
+
+        for _ in range(3):
+            pipeline.progress(dataloader)
+
+        self.assertEqual(pending_at_forward, [False, False, False])
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_prefetch_propagates_worker_failure(self) -> None:
+        """
+        A worker that dies must surface on the main thread at the join, not
+        strand the pipeline with a silently unprefetched batch.
+        """
+        pipeline, dataloader, _, _ = self._create_pipeline(
+            num_batches=6, async_prefetch=True
+        )
+        # Prime inline so the failure below can only come from the worker.
+        pipeline.fill_pipeline(dataloader)
+
+        def _boom(context: PrefetchTrainPipelineContext) -> None:
+            raise RuntimeError("prefetch worker exploded")
+
+        pipeline._prefetch = _boom
+
+        pipeline.progress(dataloader)
+        with self.assertRaisesRegex(RuntimeError, "prefetch worker exploded"):
+            pipeline.progress(dataloader)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_detach_joins_async_prefetch(self) -> None:
+        """
+        ``detach`` hands the model back to a caller who may run it standalone,
+        so no worker may still be mutating the embedding cache behind it.
+        """
+        pipeline, dataloader, _, _ = self._create_pipeline(
+            num_batches=6, async_prefetch=True
+        )
+        pipeline.progress(dataloader)
+        self.assertIsNotNone(pipeline._prefetch_future)
+
+        pipeline.detach()
+
+        self.assertIsNone(pipeline._prefetch_future)
+        self.assertIsNone(pipeline._prefetch_executor)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_attach_restarts_async_prefetch_executor(self) -> None:
+        """An async pipeline can resume after detach without leaking its worker."""
+        pipeline, _, _, _ = self._create_pipeline(num_batches=6, async_prefetch=True)
+
+        model = pipeline.detach()
+        self.assertIsNone(pipeline._prefetch_executor)
+
+        pipeline.attach(model)
+
+        self.assertIsNotNone(pipeline._prefetch_executor)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_prefetch_drains_every_batch(self) -> None:
+        """Backgrounding the stage must not lose the in-flight tail batches."""
+        num_batches = 7
+        pipeline, dataloader, _, _ = self._create_pipeline(
+            num_batches=num_batches, async_prefetch=True
+        )
+
+        outputs = []
+        try:
+            for _ in range(num_batches + 5):
+                outputs.append(pipeline.progress(dataloader))
+        except StopIteration:
+            pass
+
+        self.assertEqual(len(outputs), num_batches)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_prefetch_correctness(self) -> None:
+        """
+        Moving the stage to a worker must not change the predictions, in the
+        default slot or hooked mid-forward.
+        """
+        for hooked_stages in (
+            None,
+            [
+                EvalPipelineStage.WAIT_SPARSE_DATA_DIST,
+                EvalPipelineStage.PREFETCH,
+            ],
+        ):
+            with self.subTest(hooked_stages=hooked_stages):
+                self._assert_matches_non_pipelined(
+                    cache_precision=DataType.FP32,
+                    load_factor=0.5,
+                    sharding_type=ShardingType.TABLE_WISE.value,
+                    hooked_stages=hooked_stages,
+                    async_prefetch=True,
+                )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     @settings(max_examples=6, deadline=None)
     @given(
         cache_precision=st.sampled_from([DataType.FP16, DataType.FP32]),
@@ -529,6 +724,7 @@ class EvalPipelinePrefetchTest(EvalPipelinePrefetchTestBase):
         load_factor: float,
         sharding_type: str,
         hooked_stages: Optional[List[EvalPipelineStage]] = None,
+        async_prefetch: bool = False,
     ) -> None:
         """
         Runs the same batches through a non-pipelined model and the pipeline and
@@ -572,6 +768,7 @@ class EvalPipelinePrefetchTest(EvalPipelinePrefetchTestBase):
             model=sharded_model_pipelined,
             optimizer=optim_pipelined,
             device=self.device,
+            async_prefetch=async_prefetch,
         )
         for stage in hooked_stages or []:
             pipeline.hook_stage(stage, "dense")
