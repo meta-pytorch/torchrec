@@ -15,6 +15,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh
 from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 from torchrec.metrics.metric_module import MetricValue, RecMetricModule
+from torchrec.metrics.metrics_config import LossAggregation
 
 
 class NoOpMetricModule(RecMetricModule):
@@ -32,6 +33,29 @@ class NoOpMetricModule(RecMetricModule):
         pass
 
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
+        pass
+
+    def update_micro_batch(
+        self, model_out: Dict[str, torch.Tensor], **kwargs: Any
+    ) -> None:
+        # NoOp: metrics are disabled. The base RecMetricModule.update_micro_batch
+        # accumulates into the loss accumulator, which NoOp never initializes
+        # (__init__ calls only nn.Module.__init__). Under gradient accumulation
+        # (K>1) train_step calls this K-1 times, so it must be a true no-op.
+        pass
+
+    def reset_loss_metrics(self) -> None:
+        # NoOp: metrics are disabled. The base RecMetricModule.reset_loss_metrics
+        # clears the loss accumulator; NoOp never initializes one, so the
+        # inherited version raises AttributeError. train_step calls this on every
+        # step (even K=1), so it must be a true no-op.
+        pass
+
+    def set_loss_aggregation(
+        self, loss_aggregation: Optional[Dict[str, LossAggregation]]
+    ) -> None:
+        # NoOp: metrics are disabled. The base version writes to the loss
+        # accumulator, which NoOp never initializes.
         pass
 
     def should_compute(self) -> bool:

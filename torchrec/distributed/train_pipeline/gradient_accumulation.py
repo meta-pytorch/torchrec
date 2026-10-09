@@ -13,18 +13,110 @@ Gradient Accumulation support for TorchRec Train Pipelines.
 This module provides:
 1. GradientAccumulationConfig - Configuration dataclass for GA settings
 2. GradientAccumulationWrapper - Wrapper that adds GA to any TrainPipeline
+
+A partial final window committed under ``PartialWindowPolicy.STEP`` takes a real
+optimizer step that the caller cannot observe: the commit happens on the
+``StopIteration`` path, which re-raises, so ``progress()`` never returns and
+``_optimizer_step_completed`` is never set for it. Callers that need every optimizer
+step to be observable must select ``DISCARD`` or ``RAISE``.
 """
 
 import contextlib
+import logging
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, ContextManager, Generic, Iterator, Optional, TYPE_CHECKING
+from enum import Enum
+from typing import (
+    Any,
+    cast,
+    ContextManager,
+    Generic,
+    Iterator,
+    Optional,
+    Protocol,
+    TYPE_CHECKING,
+)
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.train_pipeline.bucket_view_zeroing import BucketViewZeroing
 from torchrec.distributed.train_pipeline.pipeline_context import In, Out
 
 if TYPE_CHECKING:
     from torchrec.distributed.train_pipeline.train_pipelines import TrainPipeline
+
+
+class GAWindowObserver(Protocol):
+    """Notified once per micro-batch, immediately before the inner ``progress()``.
+
+    For pipelines whose sparse/dense sub-steps or grad-clip bypass the GA-wrapped
+    optimizer and so must gate on the same boundary the wrapper uses. Supplied explicitly
+    at wrapper construction: the wrapper never writes state onto the pipeline it wraps.
+    Keyword-only so the two booleans cannot be transposed.
+
+    Not called when GA is disabled -- that path is a pure pass-through, and the observer's
+    owner keeps whatever default it initialised.
+    """
+
+    def __call__(self, *, should_step: bool, at_window_start: bool) -> None: ...
+
+
+class _GAPipelineHooks(Protocol):
+    """The surface the GA wrapper drives on the pipeline it wraps.
+
+    ``TrainPipeline`` does not declare ``attach``, so naming the surface lets the one call
+    site be a plain attribute access instead of ``getattr``.
+    """
+
+    def attach(
+        self, model: Optional[torch.nn.Module] = None, *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _ga_abort_all_process_groups(reason: str) -> None:
+    """Tear down every process group before a rank-local raise on a collective boundary.
+
+    Peers would otherwise block in the next collective until the NCCL watchdog fires, with
+    the timeout masking the real cause. Best-effort and NCCL-only; elsewhere the abort may
+    fail and the raise still stands. Not gated on ``get_backend()``, which reports only the
+    default group while the abort covers all of them. No-op at ``world_size <= 1``.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    if torch.distributed.get_world_size() <= 1:
+        return
+    logger.error(
+        f"[gradient_accumulation] aborting all process groups before raising: {reason}"
+    )
+    try:
+        torch.distributed.distributed_c10d._abort_process_group(None)
+    except Exception:
+        # `_abort_process_group(None)` raises AssertionError when there is no default
+        # group. Log loudly: peers were NOT torn down, so fail-closed does not hold.
+        logger.exception(
+            "[gradient_accumulation] _abort_process_group FAILED -- peers were NOT torn "
+            "down; the raise that follows is rank-local and may strand them"
+        )
+
+
+class PartialWindowPolicy(Enum):
+    """Caller policy for a partial (r < K) final window.
+
+    - ``STEP`` (default): step it, warning that the un-reduced tail diverges
+      replicas above one rank. Invisible to metrics and checkpoint progress
+      (``progress()`` re-raises first); ``is_last_batch=True`` is reduced instead.
+    - ``RAISE``: fail closed, aborting the process groups first above one rank.
+      Also fences the explicit ``is_last_batch`` path; no other policy does.
+    - ``DISCARD``: drop rank-locally on exhaustion. Needs out-of-band agreement
+      that every rank exhausted; unlocks consume-all (``num_batches < 0``).
+    """
+
+    STEP = "step"
+    RAISE = "raise"
+    DISCARD = "discard"
 
 
 @dataclass
@@ -35,12 +127,26 @@ class GradientAccumulationConfig:
     Attributes:
         is_enabled: Whether gradient accumulation is enabled.
         num_steps: Number of micro-batches to accumulate before optimizer step.
-        num_warmup_steps: Number of warmup steps where all iterations sync.
+            The pipeline provider builds this independently of the K the train
+            module derives, and the two are asserted equal -- so this is not the
+            operator-facing setting.
+        num_warmup_steps: Number of warmup MICRO-steps (NOT optimizer steps)
+            during which every iteration syncs gradients. Counted against
+            the global micro counter (current_step), so with num_steps=K a value
+            of W means the first W micro-batches sync (~the first ceil(W/K)
+            windows). Default 1 (only the very first micro).
     """
 
     is_enabled: bool = False
     num_steps: int = 1
     num_warmup_steps: int = 1
+    # Zero dense grads in place at window-start instead of set_to_none=True, preserving the
+    # DDP gradient_as_bucket_view alias so autograd accumulates into the persistent reduction
+    # bucket rather than allocating a standalone dense .grad set held across the K-micro
+    # window (~1x dense-grad-size of extra HBM). Semantic delta vs OFF: a dense param holding
+    # a live bucket-view grad at window start but unused through the window keeps a present
+    # zero instead of None, so a dense optimizer sees participate-on-zero rather than skip.
+    accumulate_into_buckets: bool = False
 
     def __post_init__(self) -> None:
         if self.num_steps < 1:
@@ -50,7 +156,6 @@ class GradientAccumulationConfig:
                 f"num_warmup_steps must be >= 1, got {self.num_warmup_steps}. "
                 "At least 1 warmup step is required for DDP static_graph compatibility."
             )
-        # Auto-enable if num_steps > 1
         if self.num_steps > 1 and not self.is_enabled:
             self.is_enabled = True
 
@@ -73,44 +178,151 @@ class _GAOptimizerWrapper:
     ) -> None:
         self._optimizer = optimizer
         self._config = config
+        # The live K, and the single source of truth for every boundary computation.
+        # ``config.num_steps`` is only the seed.
+        self._k: int = config.num_steps
         self._current_step: int = 0
+        # Anchor of the current K-window. Every boundary is relative to this rather than to
+        # ``_current_step``, so ``realign_window`` restarts a window without breaking the
+        # counter's monotonic contract or replaying ``num_warmup_steps``.
+        self._window_base: int = 0
         self._needs_zero_grad: bool = True
+        # One-shot: when True, step() fires even off the schedule boundary, forcing an
+        # in-band optimizer step on an explicit final partial window (r<K).
+        self._force_step: bool = False
+        # Backref to the owning wrapper, set just after construction. Under
+        # ``accumulate_into_buckets`` the window-start zero delegates there because it needs
+        # the model's DDP topology; ``None`` standalone (unit tests) takes the plain path.
+        self._ga_wrapper: Optional["GradientAccumulationWrapper[Any, Any]"] = None
+        # A real count, not the anchor-derived span: ``set_step`` can forge the span in
+        # either direction, so only a count detects a window that closed holding fewer than K.
+        self._micro_batches_counted: int = 0
+        # Whether the current window began on a boundary. A window that did must hold K at
+        # close; one entered off-residue via ``set_step`` legitimately may not.
+        self._window_started_aligned: bool = True
+
+    @property
+    def micro_batches_into_window(self) -> int:
+        """Micro-batches accumulated into the current window, bounded to ``[0, num_steps)``.
+
+        Bounded because every consumer reduces mod ``num_steps`` anyway, and because the raw
+        span reads far outside ``[0, K)`` after a re-anchor while describing a window that
+        holds only its residue.
+        """
+        return (self._current_step - self._window_base) % self._k
 
     def _should_step(self) -> bool:
         """Returns True if optimizer.step() should actually execute."""
-        return (self._current_step + 1) % self._config.num_steps == 0
+        return (self.micro_batches_into_window + 1) % self._k == 0
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        """Clear gradients only at accumulation boundaries, tracked by ``_needs_zero_grad``
+        so timing does not depend on where the pipeline calls zero_grad. Under
+        ``accumulate_into_buckets`` the window-start zero goes to
+        ``GradientAccumulationWrapper._window_start_zero_grad``, which preserves the DDP
+        ``gradient_as_bucket_view`` alias so autograd accumulates into the persistent
+        reduction bucket instead of a standalone dense ``.grad`` set held across the window.
         """
-        Intercepts zero_grad to only clear gradients at accumulation boundaries.
-
-        Uses the _needs_zero_grad flag to ensure proper timing regardless of
-        when zero_grad is called in the pipeline execution order.
-        """
-        if self._needs_zero_grad:
+        if not self._needs_zero_grad:
+            return
+        if self._config.accumulate_into_buckets and self._ga_wrapper is not None:
+            # ``set_to_none`` is deliberately not forwarded: the selective protocol fixes its
+            # own per-leaf semantics -- tree-clear for non-targets, in-place zero for targets.
+            self._ga_wrapper._window_start_zero_grad()
+        else:
             self._optimizer.zero_grad(set_to_none=set_to_none)
-            self._needs_zero_grad = False
+        self._needs_zero_grad = False
 
     def step(self, *args: Any, **kwargs: Any) -> None:
         """
-        Intercepts step to execute only at accumulation boundaries.
+        Intercepts step to execute only at accumulation boundaries, or when a
+        one-shot forced step is requested (an explicit last batch whose partial
+        window is not on the schedule boundary -- see
+        GradientAccumulationWrapper.progress).
         """
-        if self._should_step():
+        if self._should_step() or self._force_step:
             self._optimizer.step(*args, **kwargs)
             self._needs_zero_grad = True
 
-    def advance_step(self) -> None:
-        """Advances the internal step counter."""
+    def advance_step(
+        self, window_completed: bool = False, expect_full_window: bool = True
+    ) -> None:
+        """Advance the micro counter, and close the counted window when one completed.
+
+        Both flags come from the caller's own boundary decision rather than being
+        re-derived: a forced last-batch step completes a window the schedule boundary does
+        not, and that window is legitimately short, so it is not held to K.
+        """
         self._current_step += 1
+        self._micro_batches_counted += 1
+        if window_completed:
+            if expect_full_window:
+                self._validate_completed_window()
+            self._start_counted_window()
+
+    def _start_counted_window(self) -> None:
+        self._micro_batches_counted = 0
+        self._window_started_aligned = True
+
+    def _validate_completed_window(self) -> None:
+        """A completed window must hold exactly the K in force.
+
+        A shortfall means the window was re-anchored mid-flight, so the boundary arithmetic
+        closed a window that never accumulated K micro-batches -- gradients for a smaller
+        batch, silently. Graded: a window that began on a boundary raises, one entered
+        off-residue via ``set_step`` (legitimate public API) only warns.
+        """
+        if self._micro_batches_counted == self._k:
+            return
+        detail = (
+            f"gradient accumulation completed an optimizer step after "
+            f"{self._micro_batches_counted} micro-batch(es) with K={self._k} in force"
+        )
+        if self._window_started_aligned:
+            raise RuntimeError(
+                f"{detail}. The window began on a boundary, so it must hold K. Reaching "
+                "here means it was re-anchored mid-window, which every public entry point "
+                "refuses -- an internal invariant violation rather than a caller error."
+            )
+        logger.warning(
+            "%s. The window was entered off-residue via set_step(), so a short window is "
+            "expected here; the next one starts aligned.",
+            detail,
+        )
 
     def reset(self) -> None:
         """Resets the internal step counter and zero_grad flag."""
         self._current_step = 0
+        self._window_base = 0
         self._needs_zero_grad = True
+        self._force_step = False
+        self._start_counted_window()
+
+    def realign_window(self) -> None:
+        """Re-anchor the K-window at the current micro counter.
+
+        Called on iterator exhaustion: a phase that consumed a non-multiple of K would
+        otherwise leave the counter off-modulo and shift every subsequent window boundary.
+        Moving the anchor rather than zeroing ``_current_step`` keeps ``current_step``
+        monotonic and keeps ``num_warmup_steps`` counted globally, so warmup is not replayed.
+        """
+        self._window_base = self._current_step
+        self._start_counted_window()
 
     def set_step(self, step: int) -> None:
-        """Sets the internal step counter. Use this instead of directly modifying _current_step."""
+        """Set the internal step counter, and drop the window anchor back to 0.
+
+        Callers place the wrapper at a specific point in the accumulation cycle and expect
+        plain ``(step + 1) % K`` semantics; without the anchor reset a preceding
+        ``realign_window()`` would leave a stale base. ``step`` is not validated: a negative
+        value yields a negative ``current_step``, as it did before the anchor existed.
+        """
         self._current_step = step
+        self._window_base = 0
+        self._micro_batches_counted = 0
+        # An off-residue placement opens a window that cannot hold K, which is legitimate
+        # here and is what downgrades the completed-window check to a warning.
+        self._window_started_aligned = (step % self._k) == 0
 
     def __getattr__(self, name: str) -> Any:
         """Proxy all other attributes to the wrapped optimizer."""
@@ -139,16 +351,59 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         optimizer: torch.optim.Optimizer,
         model: torch.nn.Module,
         config: GradientAccumulationConfig,
+        partial_window_policy: PartialWindowPolicy = PartialWindowPolicy.STEP,
+        window_observer: Optional[GAWindowObserver] = None,
     ) -> None:
         self._pipeline = pipeline
         self._model = model
+        # Own the config rather than the caller's object, so K cannot be mutated
+        # off-boundary by anyone still holding a reference to what they passed in.
+        config = deepcopy(config)
         self._config = config
+        # Boundary signal for a pipeline whose sub-steps bypass the wrapped optimizer. Opt-in
+        # rather than inferred, so a rename is a type error not a silent every-micro step.
+        self._window_observer = window_observer
+        # Caller policy for a partial (r < K) final window, read in
+        # _flush_accumulated_gradients and honoured at every world size.
+        self._partial_window_policy = partial_window_policy
         self._optimizer_wrapper = _GAOptimizerWrapper(optimizer, config)
+        self._optimizer_wrapper._ga_wrapper = self
         self._cached_ddp_modules: list[Any] | None = None
+        # True after a non-boundary micro left accumulated-but-un-stepped gradients;
+        # gates the StopIteration flush so an in-band-committed window is not re-stepped.
+        self._pending_uncommitted: bool = False
+        # True once a synchronized training backward has established the DDP
+        # ``gradient_as_bucket_view`` aliases. Until then the window-start zero uses a plain
+        # ``set_to_none`` clear, which also avoids the post-alias-only detach-on-view crash.
+        self._bucket_views_ready: bool = False
+        self._bucket_view_zeroing: BucketViewZeroing = BucketViewZeroing()
+        # Whether the most recent progress() call completed an optimizer step. Published so
+        # a caller can report per-reader-batch completion without re-deriving the boundary.
+        self._optimizer_step_completed: bool = False
 
-        # Only replace optimizer in pipeline when GA is enabled
-        # This avoids unintended side effects when GA is disabled
-        if config.is_enabled and hasattr(pipeline, "_optimizer"):
+        # Only replace the pipeline's optimizer when GA is enabled.
+        if config.is_enabled:
+            if not hasattr(pipeline, "_optimizer"):
+                # Necessary, not sufficient: a pipeline can expose ``_optimizer``, accept this
+                # replacement, and still step a separately captured reference.
+                raise RuntimeError(
+                    "Gradient accumulation is enabled but the wrapped pipeline "
+                    f"{type(pipeline).__name__} exposes no `_optimizer` attribute, so the "
+                    "GA optimizer wrapper cannot be injected and optimizer-step gating to "
+                    f"one step per {config.num_steps}-micro window cannot be guaranteed. "
+                    "Use a pipeline that exposes `_optimizer` (e.g. "
+                    "TrainPipelineSparseDist), or disable gradient accumulation."
+                )
+            if isinstance(getattr(pipeline, "_optimizer", None), _GAOptimizerWrapper):
+                # Nesting the gates under-steps silently rather than crashing.
+                raise RuntimeError(
+                    "Gradient accumulation is enabled but the wrapped pipeline "
+                    f"{type(pipeline).__name__} already has a GA-wrapped `_optimizer`, so "
+                    "this pipeline is being wrapped a second time. Nesting the wrappers "
+                    "would gate the optimizer to one step per "
+                    f"{config.num_steps}**2 micro-batches instead of per "
+                    f"{config.num_steps}. Wrap each pipeline exactly once."
+                )
             # pyrefly: ignore[missing-attribute]: pipeline may not have _optimizer
             pipeline._optimizer = self._optimizer_wrapper
 
@@ -163,12 +418,10 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         if is_last_batch:
             return True
 
-        # Always sync on the first step. DDP with static_graph=True requires
-        # gradient synchronization on the first iteration to initialize its
-        # internal state. Using no_sync() on the first step causes an error
-        # in Reducer::finalize_backward() because prepare_for_backward() was
-        # never called. This check is intentionally separate from warmup to
-        # make the requirement explicit.
+        # Always sync on the first step: DDP with static_graph=True requires gradient
+        # synchronization on the first iteration to initialize its internal state, and
+        # no_sync() there fails in Reducer::finalize_backward(). Kept separate from the
+        # warmup check so the requirement stays explicit.
         if self.current_step == 0:
             return True
 
@@ -176,52 +429,26 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         if self.current_step < self._config.num_warmup_steps:
             return True
 
-        # Sync on the last step of each accumulation cycle
-        return (self.current_step + 1) % self._config.num_steps == 0
+        # Delegated, not recomputed -- a second copy of the boundary predicate drifts. Unlike
+        # the two guards above this is window-relative, so it moves with a re-anchor.
+        return self._optimizer_wrapper._should_step()
 
     def _get_no_sync_context(self) -> ContextManager[None]:
-        """
-        Returns a composite ``no_sync`` context manager that suppresses gradient
-        synchronization on **all** ``DistributedDataParallel`` modules in the
-        model tree, not just the outermost one.
-
-        Some sharded submodules — notably ``ShardedVariableLengthEmbeddingArch``
-        — wrap their DATA_PARALLEL lookups in their own internal DDP instances.
-        If ``no_sync()`` is only called on the outer DDP, those inner DDP
-        modules will still all-reduce on every backward pass, breaking gradient
-        accumulation for those parameters.
-
-        This method uses a cached list of DDP modules (computed once on first
-        call) and composes their ``no_sync()`` contexts with
-        ``contextlib.ExitStack`` so that a single ``with ctx:`` block
-        suppresses gradient sync everywhere.
+        """Composite ``no_sync()`` over EVERY ``DistributedDataParallel`` in the model tree,
+        not just the outermost one. A DDP held in a plain Python list is not in ``_modules``,
+        is not found by the ``root.modules()`` walk, and all-reduces every micro-batch --
+        correct, but it forgoes the no_sync saving. ``PlainListDDPDiscoveryContractTest``
+        guards that.
         """
         return self._compose_no_sync_contexts()
 
     def _get_ddp_modules(self) -> list[Any]:
-        """
-        Discover and cache all modules that need ``no_sync()``.
+        """Discover and cache all modules that need ``no_sync()``.
 
-        The module tree is static after model construction, so this walk
-        is performed once and the result is reused on every subsequent
-        non-sync step — avoiding an O(num_modules) traversal in the
-        training-loop hot path.
-
-        After unwrapping ``DistributedModelParallel`` (if present), the method
-        uses a two-tier detection strategy:
-
-          1. **Root** (the outer wrapper) is added if it has ``no_sync``,
-             regardless of its concrete type. This broad check covers DDP,
-             FSDP, and any custom parallel wrapper.
-          2. **Descendants** are added only if they are ``isinstance`` of
-             ``DistributedDataParallel``. This strict check prevents
-             accidentally entering ``no_sync`` on non-DDP modules (e.g.
-             nested FSDP) that may have different ``no_sync`` semantics.
-
-        The asymmetry is intentional: the root is *known* to be the
-        top-level parallel wrapper (set by ``DistributedModelParallel``),
-        while descendants are arbitrary submodules that need positive
-        identification.
+        The module tree is static after construction, so the walk runs once. Detection is
+        deliberately asymmetric: the root is added on ``hasattr(no_sync)`` alone -- it is
+        known to be the top-level parallel wrapper, DDP or FSDP or custom -- while
+        descendants are arbitrary and need a strict ``DistributedDataParallel`` check.
         """
         if self._cached_ddp_modules is not None:
             return self._cached_ddp_modules
@@ -238,18 +465,14 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             elif hasattr(dmp_wrapped, "no_sync"):
                 ddp_modules.append(dmp_wrapped)
 
-        # Collect the root module if it supports no_sync (broad check:
-        # covers DDP, FSDP, or any custom parallel wrapper).
+        # Collect the root if it supports no_sync (broad check: DDP, FSDP, or a custom
+        # parallel wrapper).
         if hasattr(root, "no_sync"):
             ddp_modules.append(root)
 
-        # Walk descendants for any inner DDP instances (e.g. VLE's
-        # internal DDP for DATA_PARALLEL lookups). Uses a strict
-        # isinstance check — only actual DDP modules are collected,
-        # not FSDP or other modules that happen to have no_sync.
-        # The hasattr guard is needed because root may not be an
-        # nn.Module (e.g. when _dmp_wrapped_module is a non-Module
-        # wrapper object and model itself lacks modules()).
+        # Walk descendants for REGISTERED inner DDPs (present in ``_modules``), strict
+        # isinstance so FSDP and other no_sync-bearing modules are not collected. The
+        # hasattr guard is needed because root may not be an nn.Module.
         if hasattr(root, "modules"):
             for module in root.modules():
                 if module is not root and isinstance(module, DistributedDataParallel):
@@ -278,54 +501,190 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                 stack.enter_context(ddp.no_sync())
             yield
 
+    def _window_start_zero_grad(self) -> None:
+        """Window-start zero that preserves the DDP ``gradient_as_bucket_view`` alias.
+
+        Only the WHEN lives here. Before the views exist (first window), and whenever no
+        leaf is eligible, this is a plain ``set_to_none`` clear -- inert, and identical to
+        ``accumulate_into_buckets`` being off.
+        """
+        optimizer = self._optimizer_wrapper._optimizer
+        if not self._bucket_views_ready:
+            # First window / views not yet established: plain None clear, which also avoids
+            # the detach-on-view crash that only exists post-alias.
+            optimizer.zero_grad(set_to_none=True)
+            return
+        targets = self._bucket_view_zeroing.collect(self._get_ddp_modules(), optimizer)
+        if not targets:
+            # No live bucket-view DDP targets (e.g. promoted tables on the fp32-grad manual
+            # reducer; or a custom/FSDP root; or grads not yet present).
+            optimizer.zero_grad(set_to_none=True)
+            return
+        self._bucket_view_zeroing.zero(optimizer, targets)
+
     def _flush_accumulated_gradients(self, steps_accumulated: int) -> bool:
-        """
-        Force a gradient sync and optimizer step for any remaining gradients.
+        """Resolve an exhaustion-time partial window per ``PartialWindowPolicy``.
 
-        Args:
-            steps_accumulated: Number of micro-batches accumulated so far.
-                This is passed explicitly to ensure consistent behavior regardless
-                of when flush is called (before or after _advance_state).
-
-        Returns:
-            True if gradients were flushed, False if no flush was needed.
+        ``steps_accumulated`` is explicit so the result does not depend on whether flush
+        runs before or after ``_advance_state``. True only when the window was stepped.
         """
-        remaining = steps_accumulated % self._config.num_steps
+        remaining = steps_accumulated % self.num_micro_batches_per_step
         if remaining > 0:
-            # Step, zero gradients to prevent stale state, and reset flag
+            if self._partial_window_policy is PartialWindowPolicy.DISCARD:
+                # Rank-local drop: no step, no collective, no abort.
+                self._optimizer_wrapper._needs_zero_grad = True
+                # Re-arm first: zero_grad() early-returns while _needs_zero_grad is False.
+                # Through the wrapper, so accumulate_into_buckets alias routing survives.
+                self._optimizer_wrapper.zero_grad(set_to_none=True)
+                logger.warning(
+                    "Gradient accumulation discarded a partial final window "
+                    "(steps_accumulated=%d, num_steps=%d, remaining=%d) under "
+                    "PartialWindowPolicy.DISCARD: %d micro-batch(es) of accumulated "
+                    "gradients were zeroed without an optimizer step. Expected at the end "
+                    "of a consume-all phase. If a downstream collective later times out, "
+                    "suspect an ASYMMETRIC exhaustion (one rank's reader errored) rather "
+                    "than a clean end-of-data.",
+                    steps_accumulated,
+                    self.num_micro_batches_per_step,
+                    remaining,
+                    remaining,
+                )
+                # No reset() (it would replay GA/DDP warmup on every new iterator) and no
+                # realign_window() (the caller does that right after this returns).
+                return False
+            multi_rank = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            )
+            if self._partial_window_policy is PartialWindowPolicy.RAISE:
+                if multi_rank:
+                    # Abort before raising: a rank-local raise strands peers in the next
+                    # collective until the watchdog fires, burying the real cause.
+                    _ga_abort_all_process_groups(
+                        f"partial final window at world_size>1 "
+                        f"(steps_accumulated={steps_accumulated}, remaining={remaining})"
+                    )
+                    raise RuntimeError(
+                        "Gradient accumulation reached a partial final window "
+                        f"(steps_accumulated={steps_accumulated}, num_steps="
+                        f"{self.num_micro_batches_per_step}, remaining={remaining}) that was never "
+                        "committed in-band. Flushing would step un-reduced rank-local "
+                        "gradients (replica divergence), so the caller's selected "
+                        "PartialWindowPolicy.RAISE fails closed instead. "
+                        "The total reader-batch count is not a whole multiple of "
+                        "num_micro_batches_per_step: either it never was, or a checkpoint "
+                        "resume left a remainder that no config-time guard can catch. "
+                        "Remedies: make the total reader batches a whole multiple of K; or, "
+                        "if every rank is known to exhaust on the same batch, select "
+                        "PartialWindowPolicy.DISCARD to drop the partial window rank-locally; "
+                        "or warm-start without restoring the saved training progress so "
+                        "training restarts at step 0."
+                    )
+                raise RuntimeError(
+                    "Gradient accumulation reached a partial final window "
+                    f"(steps_accumulated={steps_accumulated}, num_steps="
+                    f"{self.num_micro_batches_per_step}, remaining={remaining}) at world_size <= 1 "
+                    "and the caller selected PartialWindowPolicy.RAISE. The local grads "
+                    "would be a correct single-process step, but this caller requires the "
+                    "total reader batch count to be a whole multiple of "
+                    "num_micro_batches_per_step. Make it a whole multiple of K, or select "
+                    "PartialWindowPolicy.STEP to take the sanctioned local step."
+                )
+            # PartialWindowPolicy.STEP: in-band step, at every world size.
+            if multi_rank:
+                logger.warning(
+                    "Gradient accumulation stepped a partial final window at world_size>1 "
+                    "(steps_accumulated=%d, num_steps=%d, remaining=%d) under "
+                    "PartialWindowPolicy.STEP. Those %d micro-batch(es) ran under "
+                    "no_sync(), so every rank applied its own un-reduced gradients and the "
+                    "replicas diverge from here. Select DISCARD when all ranks exhaust "
+                    "together, or RAISE to fail closed. The reduced alternative is "
+                    "is_last_batch=True through progress(), which commits the short window "
+                    "through a synchronized step.",
+                    steps_accumulated,
+                    self.num_micro_batches_per_step,
+                    remaining,
+                    remaining,
+                )
             self._optimizer_wrapper._optimizer.step()
-            self._optimizer_wrapper._optimizer.zero_grad(set_to_none=True)
-            self._optimizer_wrapper._needs_zero_grad = False
+            # Re-arm first, then zero through the wrapper, exactly as DISCARD does: a raw
+            # set_to_none would drop the accumulate_into_buckets alias.
+            self._optimizer_wrapper._needs_zero_grad = True
+            self._optimizer_wrapper.zero_grad(set_to_none=True)
             return True
         return False
 
-    def _advance_state(self) -> None:
+    def _advance_state(self, window_completed: bool, expect_full_window: bool) -> None:
         """Advances internal state after each progress call."""
-        self._optimizer_wrapper.advance_step()
+        self._optimizer_wrapper.advance_step(
+            window_completed=window_completed, expect_full_window=expect_full_window
+        )
 
     def progress(
         self, dataloader_iter: Iterator[In], is_last_batch: Optional[bool] = None
     ) -> Out:
-        """
-        Runs one step of the training pipeline with gradient accumulation.
+        """Run one pipeline step with gradient accumulation.
 
-        Args:
-            dataloader_iter: Iterator providing input batches.
-            is_last_batch: Optional flag to indicate this is the last batch.
-                When True, forces gradient sync and optimizer step.
-                When None (default), relies on StopIteration for detection.
-
-        Returns:
-            Output from the wrapped pipeline's progress call.
-
-        Raises:
-            StopIteration: When the dataloader is exhausted. Flushes any
-                remaining accumulated gradients before raising.
+        ``is_last_batch=True`` forces the gradient sync and the optimizer step on an
+        off-boundary final window; ``None`` relies on ``StopIteration`` instead. Raises
+        ``StopIteration`` when the dataloader is exhausted, after flushing any remaining
+        accumulated gradients.
         """
         if not self._config.is_enabled:
-            return self._pipeline.progress(dataloader_iter)
+            # Pass-through: no window, so no boundary to signal, and every reader batch is
+            # its own optimizer step.
+            out = self._pipeline.progress(dataloader_iter)
+            self._optimizer_step_completed = True
+            return out
 
         should_sync = self._should_sync_grad(is_last_batch=is_last_batch or False)
+        # is_last_batch commits an off-boundary window in-band via the force-step armed
+        # below, bypassing _flush_accumulated_gradients and so PartialWindowPolicy. Fail
+        # closed here, before arming it. Training-only; a FULL window is not partial.
+        if (
+            is_last_batch
+            and self._partial_window_policy is PartialWindowPolicy.RAISE
+            and getattr(self._model, "training", True)
+            and not self._optimizer_wrapper._should_step()
+        ):
+            steps_accumulated = self.micro_batches_into_window + 1
+            remaining = steps_accumulated % self.num_micro_batches_per_step
+            # Gated with the RAISE branch it belongs to.
+            _ga_abort_all_process_groups(
+                f"partial final window via is_last_batch under PartialWindowPolicy.RAISE "
+                f"(steps_accumulated={steps_accumulated}, remaining={remaining})"
+            )
+            raise RuntimeError(
+                "Gradient accumulation reached a partial final window "
+                f"(steps_accumulated={steps_accumulated}, num_steps="
+                f"{self.num_micro_batches_per_step}, remaining={remaining}) via an explicit "
+                "is_last_batch commit and the caller selected PartialWindowPolicy.RAISE. "
+                "The in-band step would be synchronized (replica-safe), but this caller "
+                "requires the total reader batch count to be a whole multiple of "
+                "num_micro_batches_per_step. Make it a whole multiple of K, or select "
+                "PartialWindowPolicy.STEP to take the sanctioned synchronized final-window "
+                "step."
+            )
+        # Publish the GA CONSUME BOUNDARY onto the inner pipeline BEFORE progress() so
+        # split-optimizer sub-steps (sparse/dense) + grad-clip that BYPASS the GA-wrapped
+        # optimizer gate on the SAME boundary the wrapped optimizer uses. That boundary is
+        # _should_step(), NOT _should_sync_grad() -- the latter force-True's on step-0 and
+        # warmup, where the optimizer does not step, and drives DDP no_sync only.
+        on_schedule_boundary = self._optimizer_wrapper._should_step()
+        should_step = on_schedule_boundary or bool(is_last_batch)
+        # One-shot: an explicit last batch forces an in-band step off the schedule boundary.
+        # Assigned every progress() so it never leaks into a later window.
+        self._optimizer_wrapper._force_step = bool(is_last_batch)
+        # Not yet advanced, so == 0 marks the first micro of each window and stays correct
+        # across a re-anchor. The FP-param own-grad-bucket path zeroes its buffer there.
+        at_window_start = (
+            self.micro_batches_into_window % self.num_micro_batches_per_step
+        ) == 0
+        if self._window_observer is not None and getattr(self._model, "training", True):
+            self._window_observer(
+                should_step=should_step, at_window_start=at_window_start
+            )
         ctx: ContextManager[None] = (
             contextlib.nullcontext() if should_sync else self._get_no_sync_context()
         )
@@ -334,30 +693,111 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             with ctx:
                 result = self._pipeline.progress(dataloader_iter)
         except StopIteration:
-            # When StopIteration is raised, pipeline.progress() had no batch
-            # to process — no forward, backward, or optimizer step happened in
-            # this call. In TrainPipelineSparseDist, StopIteration is raised at
-            # the top of progress() when self.batches is empty (all prefetched
-            # batches were already fully processed in prior calls). Therefore
-            # current_step accurately reflects the number of completed batches
-            # and we should NOT add +1.
-            self._flush_accumulated_gradients(self.current_step)
+            # No batch was processed (TrainPipelineSparseDist raises at the top of progress()
+            # on an empty prefetch queue), so current_step already reflects completed micros
+            # -- do NOT add +1. Training-only: an eval interlude must not flush or step.
+            if getattr(self._model, "training", True):
+                if self._pending_uncommitted:
+                    self._flush_accumulated_gradients(self.micro_batches_into_window)
+                    # Committed (single-process step + zero) or raised (distributed). Clear
+                    # so a later reset() sees clean state instead of raising.
+                    self._pending_uncommitted = False
+                # Re-anchor at the exhaustion point: a phase consuming a non-multiple of K
+                # would otherwise shift every later window boundary. Inside the training
+                # gate so an eval interlude cannot touch accumulation state.
+                self._optimizer_wrapper.realign_window()
             raise
 
-        self._advance_state()
-
-        # If user explicitly marked this as last batch, flush remaining gradients
-        # Use current_step which now includes this batch after _advance_state()
-        if is_last_batch:
-            self._flush_accumulated_gradients(self.current_step)
+        # Split-optimizer modes step their child optimizers directly and never call
+        # _GAOptimizerWrapper.step(), the only other place that re-arms _needs_zero_grad.
+        # Without this the next zero_grad() no-ops and dense grads LEAK across windows.
+        if getattr(self._model, "training", True):
+            if should_step:
+                self._optimizer_wrapper._needs_zero_grad = True
+            # So a later StopIteration knows a flush is needed, and an is_last_batch window
+            # already committed in-band is not double-stepped by a raw flush.
+            self._pending_uncommitted = not should_step
+            self._optimizer_step_completed = should_step
+            # Training-only: eval reuses this entry point, and advancing there would desync
+            # the K-micro window boundaries for the resumed training.
+            self._advance_state(
+                window_completed=should_step, expect_full_window=on_schedule_boundary
+            )
+            # Re-anchor for the same reason the StopIteration path does. After
+            # _advance_state(), so the committed micro is counted before the anchor moves.
+            if is_last_batch:
+                self._optimizer_wrapper.realign_window()
+            # should_sync True means progress() ran under nullcontext, so the DDP reducer
+            # finalized and (re)aliased each managed dense grad.
+            if should_sync and self._config.accumulate_into_buckets:
+                self._bucket_views_ready = True
+        else:
+            # Eval reuses this entry point but never steps the optimizer.
+            self._optimizer_step_completed = False
 
         return result
 
-    def reset(self) -> None:
-        """Resets the wrapper and underlying pipeline state."""
+    def reset(self, drop_partial: bool = False) -> None:
+        """Resets the wrapper and underlying pipeline state.
+
+        ``_bucket_views_ready`` is intentionally NOT cleared: reset() runs at epoch or
+        dataloader boundaries where the same model and DDP instances stay alive, and
+        ``attach()`` rejects a model swap, so preserved readiness can never be stale.
+        """
+        # Tests semantic dirtiness rather than current_step % K, because an explicit
+        # is_last_batch can commit a clean partial window off the modulo boundary.
+        if self._pending_uncommitted and not drop_partial:
+            # @lint-ignore FIXIT AllRaisesAreAIExceptions
+            raise RuntimeError(
+                "GradientAccumulationWrapper.reset() called with an open partial window "
+                "(accumulated, un-stepped gradients left by a non-boundary micro; "
+                f"current_step={self.current_step}, "
+                f"num_steps={self.num_micro_batches_per_step}). "
+                "Resetting now would silently drop those gradients and desync the K-micro "
+                "window. Complete the window (reach the K-th micro) before reset, or pass "
+                "drop_partial=True to intentionally discard the partial window."
+            )
         self._optimizer_wrapper.reset()
+        self._pending_uncommitted = False
         if hasattr(self._pipeline, "reset"):
             self._pipeline.reset()
+
+    def attach(
+        self, model: Optional[torch.nn.Module] = None, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Reject a model swap; otherwise delegate.
+
+        This class is not a ``TrainPipeline`` subclass, so ``__getattr__`` would forward
+        ``attach(new_model)`` to the inner pipeline while the wrapped optimizer stayed bound
+        to the original model's parameters. A swap needs a fresh wrapper. ``*args`` is
+        forwarded because ``TrainPipelineSparseDist.attach`` takes ``sparse_dist`` first.
+        """
+        if model is not None and model is not self._model:
+            raise RuntimeError(
+                "GradientAccumulationWrapper does not support swapping the model via "
+                "attach(): the wrapped optimizer stays bound to the original model's "
+                "parameters and the selective bucket-view zero caches the original DDP "
+                "topology. Construct a new GradientAccumulationWrapper with the new model "
+                "and its optimizer instead."
+            )
+        if not hasattr(  # @lint-ignore FIXIT [AvoidHasattrEverywhere] the wrapped pipeline is an unconstrained TrainPipeline; attach() is optional on it
+            self._pipeline, "attach"
+        ):
+            raise RuntimeError(
+                "GradientAccumulationWrapper requires the wrapped pipeline to provide "
+                f"attach(); {type(self._pipeline).__name__} does not. Wrap a pipeline "
+                "that implements the TrainPipeline attach protocol."
+            )
+        return self._ga_hooks.attach(model, *args, **kwargs)
+
+    @property
+    def _ga_hooks(self) -> _GAPipelineHooks:
+        """The wrapped pipeline seen through the GA hook surface.
+
+        ``TrainPipeline`` does not declare ``attach``, so the cast is what lets the one
+        call site be a plain attribute access.
+        """
+        return cast(_GAPipelineHooks, self._pipeline)
 
     @property
     def optimizer_wrapper(self) -> _GAOptimizerWrapper:
@@ -369,17 +809,128 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         """Returns the current step count (single source of truth from optimizer wrapper)."""
         return self._optimizer_wrapper._current_step
 
-    def set_step(self, step: int) -> None:
-        """
-        Sets the current step counter.
+    @property
+    def micro_batches_into_window(self) -> int:
+        """Micro-batches accumulated into the current window, bounded to ``[0, K)``.
 
-        Use this method instead of directly manipulating internal state
-        to ensure proper synchronization.
+        This -- not ``current_step`` -- is what the optimizer-step, grad-sync and
+        window-start boundaries key on.
         """
+        return self._optimizer_wrapper.micro_batches_into_window
+
+    @property
+    def num_micro_batches_per_step(self) -> int:
+        """Number of micro-batches (K) accumulated per optimizer step.
+
+        Public accessor for the wrapper's configured K so a Layer-1 trainer loop can
+        assert its own K matches the wrapper's without reaching into private config.
+        """
+        return self._optimizer_wrapper._k
+
+    def set_num_micro_batches_per_step(
+        self, k: int, *, allow_open_window: bool = False
+    ) -> None:
+        """Change the LIVE K, and re-anchor the window so the new K starts clean.
+
+        For a bounded phase needing a different cadence than the job's K. The caller
+        snapshots the previous value and restores it, including on an exception path.
+
+        Writes ``_k`` (the live source of truth) and re-anchors with ``realign_window()``
+        -- not ``set_step()``, which breaks ``current_step`` monotonicity, nor ``reset()``.
+
+        Refuses on ``k < 1``, on uncommitted gradients, and when accumulation is disabled.
+        ``allow_open_window`` waives the second for exactly one situation: unwinding a
+        phase that has ALREADY failed, where raising again would bury the original error.
+        Never pass it on a success path. Waiving DISCARDS the open window and re-arms the
+        window-start zero, so the abandoned gradients clear through the normal path.
+        """
+        if k < 1:
+            raise ValueError(
+                f"set_num_micro_batches_per_step requires k >= 1, got {k}."
+            )
+        if not self._config.is_enabled:
+            raise RuntimeError(
+                "set_num_micro_batches_per_step called on a GradientAccumulationWrapper "
+                "with gradient accumulation disabled. The wrapper is a pass-through in "
+                "that state -- every reader batch is already its own optimizer step -- so "
+                "the new K would be stored and never consulted. Enable gradient "
+                "accumulation, or do not change K."
+            )
+        if self._pending_uncommitted:
+            if not allow_open_window:
+                raise RuntimeError(
+                    "set_num_micro_batches_per_step called with an open partial window "
+                    "(accumulated, un-stepped gradients from a non-boundary micro; "
+                    f"current_step={self.current_step}, "
+                    f"num_steps={self.num_micro_batches_per_step}, requested k={k}). Those "
+                    "gradients were accumulated under the old K and the new K would "
+                    "reinterpret them. Close the window first."
+                )
+            logger.warning(
+                "set_num_micro_batches_per_step(%d) is discarding an open partial window "
+                "(current_step=%d, num_steps=%d) because allow_open_window was set. This "
+                "is only correct on the unwind of an already-failed phase.",
+                k,
+                self.current_step,
+                self.num_micro_batches_per_step,
+            )
+            # The window is abandoned: re-arm so the next window start clears these
+            # gradients through the normal path, which preserves the bucket-view alias.
+            self._optimizer_wrapper._needs_zero_grad = True
+            self._pending_uncommitted = False
+        self._optimizer_wrapper._k = k
+        self._optimizer_wrapper.realign_window()
+
+    @property
+    def optimizer_step_completed(self) -> bool:
+        """Whether the last ``progress()`` that returned took an optimizer step.
+
+        Left unchanged when ``progress()`` raises. Under ``PartialWindowPolicy.STEP`` the
+        final partial window steps on the way out, and that step is not reported here.
+        """
+        return self._optimizer_step_completed
+
+    @property
+    def has_uncommitted_gradients(self) -> bool:
+        """Whether a non-boundary micro left accumulated, un-stepped gradients."""
+        return self._pending_uncommitted
+
+    @property
+    def will_complete_optimizer_step(self) -> bool:
+        """Whether the next ``progress()`` will take an optimizer step.
+
+        Answers from the step schedule, for training batches only. It cannot account for
+        ``is_last_batch`` -- that is passed to the next ``progress()``, so only its caller
+        knows. In eval the counter does not move, so the answer is about the next training
+        batch. Stale if ``set_step``, ``reset`` or ``realign_window`` runs first.
+        """
+        return self._optimizer_wrapper._should_step()
+
+    def set_step(self, step: int, *, drop_partial: bool = False) -> None:
+        """Set the step counter, re-anchoring the K-micro window.
+
+        Refuses on an open partial window, as ``reset`` does. ``drop_partial`` discards
+        it and re-arms the window-start zero, so the abandoned gradients clear through
+        the normal path.
+        """
+        if self._pending_uncommitted and not drop_partial:
+            # @lint-ignore FIXIT AllRaisesAreAIExceptions
+            raise RuntimeError(
+                "GradientAccumulationWrapper.set_step() called with an open partial "
+                "window (accumulated, un-stepped gradients left by a non-boundary micro; "
+                f"current_step={self.current_step}, "
+                f"num_steps={self.num_micro_batches_per_step}). Re-anchoring now would "
+                "keep those gradients while restarting the count, so the next step would "
+                "cover more than K micro-batches. Complete the window first, or pass "
+                "drop_partial=True to intentionally discard it."
+            )
+        if self._pending_uncommitted:
+            # The window is abandoned: re-arm so the next window start clears these
+            # gradients through the normal path, which preserves the bucket-view alias.
+            self._optimizer_wrapper._needs_zero_grad = True
+            self._pending_uncommitted = False
         self._optimizer_wrapper.set_step(step)
 
     def __getattr__(self, name: str) -> Any:
         """Proxy attribute access to the wrapped pipeline."""
-        # This is called when the attribute is not found on the wrapper itself.
-        # We delegate to the wrapped pipeline to support attributes like 'metrics'.
         return getattr(self._pipeline, name)
