@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 import itertools
 import logging
@@ -164,6 +163,10 @@ def _safe_tolist_2d(tensor: torch.Tensor) -> List[List[int]]:
     Killswitch: pytorch/torchrec:killswitch_safe_tolist (default on). When off,
     falls back to plain tensor.tolist() — the literal pre-fix call — so the
     revert path is bit-exact, not just behaviorally equivalent.
+    The shared pytorch/sparsenn:enable_gpu_preproc_pinned_d2h_readback knob
+    selects the helper's pinned versus pageable destination; both modes retain
+    its explicit current-stream wait. The existing killswitch still controls
+    whether this wrapper uses that helper at all.
     """
     if not tensor.is_cuda:
         return tensor.tolist()
