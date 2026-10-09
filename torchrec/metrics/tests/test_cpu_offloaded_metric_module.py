@@ -41,6 +41,8 @@ from torchrec.metrics.metric_module import (
 )
 from torchrec.metrics.metrics_config import (
     DefaultMetricsConfig,
+    LOSS_DENOM_SUFFIX,
+    LossAggregation,
     MetricsConfig,
     RecComputeMode,
     RecMetricDef,
@@ -381,7 +383,10 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
 
     def _make_module(self, **overrides: object) -> CPUOffloadedRecMetricModule:
-        """K=1 isolates per-call semantics; batching paths use dedicated tests."""
+        """Build a module that processes each update separately by default.
+
+        Batching tests override ``update_batch_size`` explicitly.
+        """
         defaults: dict[str, object] = {
             "model_out_device": torch.device("cpu"),
             "batch_size": self.batch_size,
@@ -1124,16 +1129,11 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         "Not enough GPUs, this test requires at least 2 GPUs",
     )
     def test_transfer_tensors_to_cpu_event_on_source_device_stream(self) -> None:
-        """
-        Regression test for ZORM metric corruption on non-rank-0 processes.
+        """Verify transfer completion follows the source device's stream.
 
-        Bug: transfer_tensors_to_cpu recorded the CUDA event on cuda:0 (default)
-        instead of the source tensor's device (cuda:N), making event.synchronize()
-        a no-op on non-rank-0 processes.
-
-        Verifies the event tracks cuda:1's stream via event.query(): with the bug,
-        the event on idle cuda:0 completes immediately; with the fix, it stays
-        pending behind cuda:1's queued work.
+        With cuda:0 current, work queued on cuda:1 must keep the event pending.
+        Recording on the default device would let it complete before the source
+        transfer and make synchronization ineffective.
         """
         with torch.cuda.device(0):
             source_tensors = {
@@ -1142,12 +1142,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "weights": torch.ones(1024, device="cuda:1") * 2.0,
             }
 
-            # Warm the pinned-memory cache and the dedicated DtoH stream first.
-            # The first pinned allocation triggers a synchronizing cudaHostAlloc;
-            # if that ran during the measured transfer it would drain the busy
-            # matmuls and complete the event immediately, masking the cuda:0 bug
-            # this test guards against. Warming up lets the measured transfer
-            # reuse cached pinned blocks with no host-alloc sync.
+            # Warm pinned allocation so it cannot mask a wrong-device event.
             warmup_cpu, warmup_event = transfer_tensors_to_cpu(
                 {k: torch.ones_like(v) for k, v in source_tensors.items()}
             )
@@ -2122,7 +2117,7 @@ class WorkerSideBatchingTest(unittest.TestCase):
         threading.Thread(target=call_sync, daemon=True).start()
         self.assertTrue(
             sync_completed.wait(timeout=5.0),
-            "sync() deadlocked when called with a partial K-batch in flight",
+            "sync() deadlocked with a partial worker batch in flight",
         )
         self.assertEqual(cpu_module._total_updates_processed, 3)
 
@@ -2291,9 +2286,7 @@ class MergeUpdateJobsTest(unittest.TestCase):
         )
 
     def test_scalar_required_input_expands_to_batch(self) -> None:
-        # Regression: a per-batch scalar required-input (e.g. a TensorWeightedAvg
-        # target) must expand to each job's batch size so it stays row-aligned with
-        # the per-example tensors after a K>1 merge, rather than stacking to (K,).
+        # Expand scalar inputs to keep rows aligned after worker merging.
         jobs = [
             MetricUpdateJob(
                 model_out={"prediction": torch.tensor([0.1, 0.2])},
@@ -2343,6 +2336,17 @@ class MergeUpdateJobsTest(unittest.TestCase):
             RecMetricException,
             "failed to merge required_inputs key 'target_tensor'",
         ):
+            _merge_update_jobs(jobs)
+
+    def test_missing_model_output_key_raises_with_key_name(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"a": torch.tensor([1.0]), "b": torch.tensor([2.0])},
+                kwargs={},
+            ),
+            MetricUpdateJob(model_out={"a": torch.tensor([3.0])}, kwargs={}),
+        ]
+        with self.assertRaisesRegex(RecMetricException, "'b'"):
             _merge_update_jobs(jobs)
 
     def test_all_empty_unused_model_output_is_preserved(self) -> None:
@@ -3012,9 +3016,11 @@ class WindowOverEvictionMergeTest(unittest.TestCase):
 
 
 class CapUpdateBatchSizeTest(unittest.TestCase):
-    """Directly asserts the cap-K policy: update_batch_size stays at the
-    requested value on prod-shaped configs (window >> K*batch) and is lowered
-    on dlrm-shaped configs (small NE window relative to K*batch)."""
+    """Verify worker batching is limited by the smallest per-rank window.
+
+    The requested ``update_batch_size`` stays unchanged when the merged entry
+    fits and is reduced when it would over-evict a bounded metric window.
+    """
 
     def setUp(self) -> None:
         self.tasks = gen_test_tasks(["task1"])
@@ -3035,8 +3041,12 @@ class CapUpdateBatchSizeTest(unittest.TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _effective_k(
-        self, window_size: int, batch_size: int, world_size: int, requested_k: int
+    def _effective_update_batch_size(
+        self,
+        window_size: int,
+        batch_size: int,
+        world_size: int,
+        requested_update_batch_size: int,
     ) -> int:
         config = MetricsConfig(
             rec_tasks=self.tasks,
@@ -3061,33 +3071,258 @@ class CapUpdateBatchSizeTest(unittest.TestCase):
                 process_group=dist.group.WORLD,
                 module_kwargs={
                     "model_out_device": torch.device("cpu"),
-                    "update_batch_size": requested_k,
+                    "update_batch_size": requested_update_batch_size,
                 },
             ),
         )
         self._modules.append(module)
         return module._update_batch_size
 
-    def test_prod_settings_k_uncapped(self) -> None:
-        # NE window 1,000,000 / world 16 => per-rank 62,500; batch 2,048 =>
-        # floor(62500/2048)=30 >= 10 => K stays 10.
+    def test_prod_settings_update_batch_size_unchanged(self) -> None:
+        # floor((1,000,000 / 16) / 2,048) = 30, so the requested value is kept.
         self.assertEqual(
-            self._effective_k(
-                window_size=1_000_000, batch_size=2048, world_size=16, requested_k=10
+            self._effective_update_batch_size(
+                window_size=1_000_000,
+                batch_size=2048,
+                world_size=16,
+                requested_update_batch_size=10,
             ),
             10,
         )
 
-    def test_dlrm_settings_k_capped(self) -> None:
-        # NE window 100,000 / world 16 => per-rank 6,250; batch 1,280 =>
-        # floor(6250/1280)=4 < 10 => K capped to 4.
+    def test_dlrm_settings_update_batch_size_capped(self) -> None:
+        # floor((100,000 / 16) / 1,280) = 4, so the requested value is capped.
         self.assertEqual(
-            self._effective_k(
-                window_size=100_000, batch_size=1280, world_size=16, requested_k=10
+            self._effective_update_batch_size(
+                window_size=100_000,
+                batch_size=1280,
+                world_size=16,
+                requested_update_batch_size=10,
             ),
             4,
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
+class CPUOffloadedGradientAccumulationTest(unittest.TestCase):
+    """Gradient-accumulation contracts for CPU-offloaded metrics.
+
+    Every reader batch still reaches the worker for metric and throughput updates,
+    while loss values are recombined on the caller thread over one optimizer step.
+    Rejecting a loss delta must suppress only that step's loss without changing the
+    queue and compute cadence shared across ranks.
+    """
+
+    def setUp(self) -> None:
+        self.world_size = 1
+        self.batch_size = 1
+        self.tasks = gen_test_tasks(["task1"])
+        self.initial_states = create_tensor_states(["cross_entropy_sum"])
+
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+
+        self.mock_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=0,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states=self.initial_states,
+        )
+        self.rec_metrics = RecMetricList([self.mock_metric])
+        init_process_group_single_rank("gloo")
+        self._modules: list[CPUOffloadedRecMetricModule] = []
+
+    def tearDown(self) -> None:
+        try:
+            for module in self._modules:
+                module.shutdown()
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+    def _make_module(
+        self,
+        *,
+        update_batch_size: int = 10,
+        **overrides: Any,
+    ) -> CPUOffloadedRecMetricModule:
+        defaults: dict[str, Any] = {
+            "model_out_device": torch.device("cpu"),
+            "batch_size": self.batch_size,
+            "world_size": self.world_size,
+            "rec_tasks": self.tasks,
+            "rec_metrics": self.rec_metrics,
+            "update_batch_size": update_batch_size,
+        }
+        # pyrefly: ignore[bad-argument-type]
+        module = CPUOffloadedRecMetricModule(**{**defaults, **overrides})
+        module.set_under_micro_batching(True)
+        self._modules.append(module)
+        return module
+
+    @staticmethod
+    def _model_out(
+        loss: float | None = None,
+        denom: float | None = None,
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([1.0]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+        if loss is not None:
+            out["task1:loss"] = torch.tensor(loss)
+        if denom is not None:
+            out[f"task1:loss{LOSS_DENOM_SUFFIX}"] = torch.tensor(denom)
+        return out
+
+    def test_weighted_loss_recombination(self) -> None:
+        """Recombine a weighted loss across one optimizer step's micro-batches."""
+        losses = [(1.0, 4.0), (3.0, 12.0), (2.0, 4.0)]
+
+        module = self._make_module()
+        module.reset_loss_metrics()
+        for loss, denom in losses[:-1]:
+            module.update_micro_batch(self._model_out(loss, denom))
+        module.update(self._model_out(*losses[-1]))
+
+        published = module.async_compute().resolve()
+        self.assertIn("task1:loss", published)
+        torch.testing.assert_close(
+            torch.as_tensor(published["task1:loss"]),
+            torch.tensor((1.0 * 4 + 3.0 * 12 + 2.0 * 4) / 20.0),
+        )
+
+    def test_loss_named_task_inputs_reach_worker(self) -> None:
+        """Preserve loss-shaped task fields for worker-side metrics."""
+        tasks = gen_test_tasks(["task1"])
+        tasks[0].label_name = "label:loss"
+        tasks[0].weight_name = "weight:loss"
+        mock_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=0,
+            batch_size=self.batch_size,
+            tasks=tasks,
+            initial_states=self.initial_states,
+        )
+        module = self._make_module(
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+            update_batch_size=1,
+        )
+        labels = torch.tensor([1.0])
+        weights = torch.tensor([0.5])
+
+        module.reset_loss_metrics()
+        module.update(
+            {
+                "task1-prediction": torch.tensor([0.5]),
+                "label:loss": labels,
+                "weight:loss": weights,
+            }
+        )
+        wait_until_true(mock_metric.update_called)
+
+        received_labels = cast(
+            dict[str, torch.Tensor], mock_metric.labels_update_calls[0]
+        )
+        torch.testing.assert_close(received_labels["task1"], labels)
+        received_weights = cast(
+            dict[str, torch.Tensor] | None, mock_metric.weights_update_calls[0]
+        )
+        if received_weights is None:
+            self.fail("expected task weights")
+        torch.testing.assert_close(received_weights["task1"], weights)
+
+    def test_should_compute_follows_optimizer_steps(self) -> None:
+        """Advance compute cadence only on the closing micro-batch."""
+        module = self._make_module(compute_interval_steps=2)
+        observed: list[bool] = []
+        for _ in range(4):
+            module.reset_loss_metrics()
+            module.update_micro_batch(self._model_out(1.0, 1.0))
+            observed.append(module.should_compute())
+            module.update(self._model_out(1.0, 1.0))
+            observed.append(module.should_compute())
+        self.assertEqual(observed, [True, False, False, True, True, False, False, True])
+
+    def test_loss_validation_failure_suppresses_only_the_current_step(self) -> None:
+        """Keep compute cadence while suppressing one invalid step's loss."""
+        module = self._make_module(
+            compute_interval_steps=1,
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+            throughput_metric=ThroughputMetric(
+                world_size=self.world_size,
+                batch_size=self.batch_size,
+                window_seconds=1,
+            ),
+        )
+        module.reset_loss_metrics()
+        module.update(self._model_out(loss=1.0))
+        self.assertTrue(module.should_compute())
+        # Throughput can remain empty during warmup; loss omission is the contract.
+        failed_step = module.async_compute().resolve()
+        self.assertNotIn("task1:loss", failed_step)
+
+        module.reset_loss_metrics()
+        module.update(self._model_out(2.0, 1.0))
+        recovered = module.async_compute().resolve()
+        self.assertIn("task1:loss", recovered)
+        torch.testing.assert_close(
+            torch.as_tensor(recovered["task1:loss"]), torch.tensor(2.0)
+        )
+
+    def test_sync_does_not_consume_the_suppression(self) -> None:
+        """Keep loss suppression across an intermediate ``sync()``."""
+        module = self._make_module(
+            loss_aggregation={"task1:loss": LossAggregation.MERGEABLE_RATIO},
+        )
+        module.reset_loss_metrics()
+        module.update_micro_batch(self._model_out(1.0, 1.0))
+        module.update_micro_batch(self._model_out(loss=2.0))
+        module.update(self._model_out(3.0, 1.0))
+
+        module.sync()
+
+        self.assertNotIn("task1:loss", module.async_compute().resolve())
+
+    def test_throughput_only_publication_omits_loss_keys(self) -> None:
+        """Exclude loss keys only from throughput-only publication."""
+        module = self._make_module(
+            throughput_metric=ThroughputMetric(
+                world_size=self.world_size,
+                batch_size=self.batch_size,
+                window_seconds=1,
+            ),
+        )
+        module.reset_loss_metrics()
+        module.update(self._model_out(1.0, 4.0))
+
+        result = module.compute_throughput().resolve()
+        self.assertNotIn("task1:loss", result)
+        self.assertTrue(result, "throughput publication was empty")
+        self.assertIn("task1:loss", module.async_compute().resolve())
+
+    def test_throughput_counts_each_micro_batch_exactly_once(self) -> None:
+        """Count both micro-batches across worker merge widths."""
+        for update_batch_size in (1, 2):
+            with self.subTest(update_batch_size=update_batch_size):
+                module = self._make_module(
+                    update_batch_size=update_batch_size,
+                    throughput_metric=ThroughputMetric(
+                        world_size=self.world_size,
+                        batch_size=self.batch_size,
+                        window_seconds=1,
+                    ),
+                )
+                module.reset_loss_metrics()
+                module.update_micro_batch(self._model_out(1.0, 4.0))
+                module.update(self._model_out(3.0, 4.0))
+
+                result = module.compute_throughput().resolve()
+                torch.testing.assert_close(
+                    torch.as_tensor(result["throughput-throughput|total_examples"]),
+                    torch.tensor(2),
+                )

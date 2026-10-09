@@ -16,7 +16,18 @@ import time
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, cast, Dict, List, Optional, Set, Type, TypeVar, Union
+from typing import (
+    Any,
+    cast,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import torch
 import torch.distributed as dist
@@ -301,8 +312,26 @@ class StateMetric(abc.ABC):
         pass
 
 
+class _StagedLossDelta(NamedTuple):
+    """Loss state prepared from one reader batch before commit.
+
+    The accumulator remains unchanged until every loss key passes validation.
+    """
+
+    sums: Dict[str, torch.Tensor]
+    key_counts: Dict[str, int]
+    denom_sums: Dict[str, torch.Tensor]
+    ratio_keys: Set[str]
+    new_warning_keys: Set[str]
+    saw_loss: bool
+
+
 class _LossAccumulator:
-    """Accumulate each loss key across one optimizer step."""
+    """Accumulate each loss key across one optimizer step.
+
+    ``stage`` validates one reader batch without changing stored losses. ``commit``
+    applies the validated state.
+    """
 
     def __init__(
         self, aggregation: Optional[Dict[str, LossAggregation]] = None
@@ -340,6 +369,18 @@ class _LossAccumulator:
         ``sum(loss * denominator) / sum(denominator)``. Other keys use a per-key mean,
         counting only reader batches that contain that key.
         """
+        self.commit(self.stage(model_out))
+
+    def stage(self, model_out: Dict[str, torch.Tensor]) -> _StagedLossDelta:
+        """Validate one reader batch and return its replacement state.
+
+        If any key fails, no losses from that batch are stored.
+        """
+        sums: Dict[str, torch.Tensor] = {}
+        key_counts: Dict[str, int] = {}
+        denom_sums: Dict[str, torch.Tensor] = {}
+        ratio_keys: Set[str] = set()
+        new_warning_keys: Set[str] = set()
         has_loss = False
         for k, v in model_out.items():
             if not (k.endswith(":loss") or k == "loss"):
@@ -372,28 +413,45 @@ class _LossAccumulator:
                 denom = denom.detach()
                 contribution = contribution * denom
                 if k in self.denom_sums:
-                    self.denom_sums[k] = self.denom_sums[k] + denom
+                    denom_sums[k] = self.denom_sums[k] + denom
                 else:
-                    self.denom_sums[k] = denom.clone()
-                self.ratio_keys.add(k)
+                    denom_sums[k] = denom.clone()
+                ratio_keys.add(k)
             elif override is None and k not in self._warned_keys:
-                self._warned_keys.add(k)
-                logger.warning(
-                    f"Loss key '{k}' has no '{LOSS_DENOM_SUFFIX}' companion. During "
-                    "gradient accumulation it is reported as an unweighted mean across "
-                    "reader batches, which is exact only when their denominators are "
-                    "equal. Emit the effective denominator or configure this key in "
-                    "MetricsConfig.loss_aggregation."
-                )
+                new_warning_keys.add(k)
 
             if k in self.sums:
-                self.sums[k] = self.sums[k] + contribution
-                self.key_counts[k] += 1
+                sums[k] = self.sums[k] + contribution
+                key_counts[k] = self.key_counts[k] + 1
             else:
-                self.sums[k] = contribution.clone()
-                self.key_counts[k] = 1
+                sums[k] = contribution.clone()
+                key_counts[k] = 1
 
-        if has_loss:
+        return _StagedLossDelta(
+            sums=sums,
+            key_counts=key_counts,
+            denom_sums=denom_sums,
+            ratio_keys=ratio_keys,
+            new_warning_keys=new_warning_keys,
+            saw_loss=has_loss,
+        )
+
+    def commit(self, delta: _StagedLossDelta) -> None:
+        """Apply validated loss state."""
+        for k in delta.new_warning_keys:
+            self._warned_keys.add(k)
+            logger.warning(
+                f"Loss key '{k}' has no '{LOSS_DENOM_SUFFIX}' companion. During "
+                "gradient accumulation it is reported as an unweighted mean across "
+                "reader batches, which is exact only when their denominators are "
+                "equal. Emit the denominator or configure this key in "
+                "MetricsConfig.loss_aggregation."
+            )
+        self.sums.update(delta.sums)
+        self.key_counts.update(delta.key_counts)
+        self.denom_sums.update(delta.denom_sums)
+        self.ratio_keys.update(delta.ratio_keys)
+        if delta.saw_loss:
             self.count += 1
 
     def reduced_losses(self) -> Dict[str, torch.Tensor]:
@@ -407,8 +465,7 @@ class _LossAccumulator:
     def _reduce(self, key: str, accumulated: torch.Tensor) -> torch.Tensor:
         if self.aggregation.get(key) is LossAggregation.SUM:
             return accumulated
-        # `.get` rather than `[]`: accumulate writes `sums` and `key_counts` together, so
-        # this only keeps a future divergence from becoming a KeyError.
+        # Keep malformed internal state from raising KeyError during publication.
         count = self.key_counts.get(key, self.count)
         if key in self.ratio_keys:
             denom = self.denom_sums[key]
