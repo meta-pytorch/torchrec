@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 import torch
 from torch.distributed._shard.sharding_spec import EnumerableShardingSpec
@@ -54,6 +56,14 @@ def _resolve(
 
 
 class ResolvePlacementRanksTest(unittest.TestCase):
+    def setUp(self) -> None:
+        gate = patch(
+            "torchrec.distributed.utils.is_twrw_multi_group_enabled",
+            return_value=True,
+        )
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_shard_and_rank_counts_must_match(self) -> None:
         for placed, num_shards in ((8, 7), (0, 8)):
             with self.subTest(placed=placed):
@@ -96,6 +106,25 @@ class ResolvePlacementRanksTest(unittest.TestCase):
                 num_twrw_groups=2,
                 plan_ranks=list(range(8)),
                 is_2D_parallel=True,
+            )
+
+    def test_killswitch_rejects_multi_group_only(self) -> None:
+        with patch(
+            "torchrec.distributed.utils.is_twrw_multi_group_enabled",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "disabled by killswitch"):
+                _resolve(num_twrw_groups=2, plan_ranks=list(range(8)))
+
+        with patch(
+            "torchrec.distributed.utils.is_twrw_multi_group_enabled",
+            side_effect=AssertionError(
+                "single-group placement must not read the multi-group killswitch"
+            ),
+        ):
+            self.assertEqual(
+                _resolve(num_twrw_groups=1, plan_ranks=list(range(4))),
+                list(range(4)),
             )
 
     def test_single_group_placed_wider_than_a_group_is_rejected(self) -> None:
@@ -220,7 +249,7 @@ def _sharding_info(
     num_shards: int,
     num_twrw_groups: int | None = None,
 ) -> EmbeddingShardingInfo:
-    rows_per_shard = rows // num_shards
+    rows_per_shard = math.ceil(rows / num_shards)
     return EmbeddingShardingInfo(
         embedding_config=EmbeddingTableConfig(
             num_embeddings=rows,
@@ -236,8 +265,11 @@ def _sharding_info(
             sharding_spec=EnumerableShardingSpec(
                 [
                     ShardMetadata(
-                        shard_sizes=[rows_per_shard, dim],
-                        shard_offsets=[i * rows_per_shard, 0],
+                        shard_sizes=[
+                            min(rows_per_shard, rows - min(i * rows_per_shard, rows)),
+                            dim,
+                        ],
+                        shard_offsets=[min(i * rows_per_shard, rows), 0],
                         placement=f"rank:{i}/cpu",
                     )
                     for i in range(num_shards)
@@ -250,11 +282,20 @@ def _sharding_info(
 
 
 class ShardPlacementTest(unittest.TestCase):
+    def setUp(self) -> None:
+        gate = patch(
+            "torchrec.distributed.utils.is_twrw_multi_group_enabled",
+            return_value=True,
+        )
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_single_group_pairs_shards_with_the_derived_group(self) -> None:
         sharder = _Sharder(world_size=8, local_size=4)
         info = _sharding_info("t", rows=400, dim=8, ranks=[4], num_shards=4)
-        per_rank = sharder._shard([info])
+        per_rank, placement_ranks = sharder._shard([info])
 
+        self.assertEqual(placement_ranks["t"], [4, 5, 6, 7])
         placed = {r: t for r, t in enumerate(per_rank) if t}
         self.assertEqual(sorted(placed), [4, 5, 6, 7])
         self.assertEqual(
@@ -265,18 +306,37 @@ class ShardPlacementTest(unittest.TestCase):
             [0, 100, 200, 300],
         )
 
-    def test_multi_group_is_refused_until_the_forward_path_exists(self) -> None:
+    def test_multi_group_pairs_shards_with_the_plan_order(self) -> None:
         sharder = _Sharder(world_size=8, local_size=4)
+        # Deliberately not ascending: group 1 before group 0.
+        ranks = [4, 5, 6, 7, 0, 1, 2, 3]
         info = _sharding_info(
             "t",
             rows=800,
             dim=8,
-            ranks=list(range(8)),
+            ranks=ranks,
             num_shards=8,
             num_twrw_groups=2,
         )
-        with self.assertRaisesRegex(NotImplementedError, r"num_twrw_groups=2"):
-            sharder._shard([info])
+        with patch(
+            "torchrec.distributed.sharding.twrw_sharding.is_2d_pod_size_enabled",
+            side_effect=AssertionError(
+                "a valid multi-group placement must not read the width killswitch"
+            ),
+        ):
+            per_rank, placement_ranks = sharder._shard([info])
+
+        self.assertEqual(placement_ranks["t"], ranks)
+        # `ranks[i]` holds `shards[i]`, so rank 4 holds shard 0 and rank 0 holds
+        # shard 4. Sorting the placement would swap them.
+        offsets = {
+            r: none_throws(t[0].local_metadata).shard_offsets[0]
+            for r, t in enumerate(per_rank)
+            if t
+        }
+        self.assertEqual(offsets[4], 0)
+        self.assertEqual(offsets[0], 400)
+        self.assertEqual(sorted(offsets.values()), [i * 100 for i in range(8)])
 
     def test_multi_group_shard_rank_mismatch_raises(self) -> None:
         sharder = _Sharder(world_size=8, local_size=4)
@@ -291,3 +351,24 @@ class ShardPlacementTest(unittest.TestCase):
         info.param_sharding.ranks = list(range(7))
         with self.assertRaisesRegex(ValueError, r"7 placement ranks for 8 shards"):
             sharder._shard([info])
+
+    def test_multi_group_accepts_empty_trailing_shards(self) -> None:
+        sharder = _Sharder(world_size=8, local_size=4)
+        info = _sharding_info(
+            "t",
+            rows=5,
+            dim=8,
+            ranks=list(range(8)),
+            num_shards=8,
+            num_twrw_groups=2,
+        )
+
+        per_rank, _ = sharder._shard([info])
+
+        self.assertEqual(
+            [
+                none_throws(tables[0].local_metadata).shard_offsets[0]
+                for tables in per_rank
+            ],
+            [0, 1, 2, 3, 4, 5, 5, 5],
+        )
