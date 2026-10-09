@@ -512,27 +512,27 @@ class _SimpleTensorRegroup(nn.Module):
         self._used_indices = used_indices
 
     # pyre-ignore[3]: Return type should match forward signature.
-    def forward(
-        self,
-        input_tensor: torch.Tensor,
-        input_tensor2: Optional[torch.Tensor] = None,
-    ) -> Union[Tuple[torch.Tensor, ...], torch.Tensor]:
+    def forward(self, *args: object) -> Union[Tuple[torch.Tensor, ...], torch.Tensor]:
         r"""Split fused tensor along dim=1 and return selected outputs.
 
         Args:
-            input_tensor (torch.Tensor): primary fused embedding tensor.
-            input_tensor2 (torch.Tensor, optional): optional second tensor
-                from a separate EBC shard, concatenated before splitting.
-                Default: ``None``
+            *args: the primary fused embedding tensor, optionally followed by
+                a second tensor from a separate EBC shard, which is
+                concatenated before splitting. Non-tensor args are ignored:
+                with a dynamic batch, unflatten also passes the batch size
+                that ``ir_kt_regroup`` used.
 
         Returns:
             Union[Tuple[torch.Tensor, ...], torch.Tensor]: split tensors as
                 a tuple, or a single tensor for single-output regroups.
         """
-        if input_tensor2 is not None:
-            input_tensor = torch.cat([input_tensor, input_tensor2], dim=1)
-        elif isinstance(input_tensor, (list, tuple)):
-            input_tensor = input_tensor[0]
+        tensors = [arg[0] if isinstance(arg, (list, tuple)) else arg for arg in args]
+        tensors = [t for t in tensors if isinstance(t, torch.Tensor)]
+        if not 1 <= len(tensors) <= 2:
+            raise ValueError(
+                f"_SimpleTensorRegroup expects 1 or 2 tensors, got {len(tensors)}"
+            )
+        input_tensor = torch.cat(tensors, dim=1) if len(tensors) == 2 else tensors[0]
         expected_dim = sum(self._splits)
         actual_dim = input_tensor.size(1)
         n_outputs = (
@@ -794,7 +794,11 @@ def _get_child_expected_args(child: nn.Module) -> Optional[int]:
 
 
 def _trim_single_module_args(mod: InterpreterModule) -> bool:
-    """Trim call_module args and remove unused placeholders in one module."""
+    """Drop leading extra call_module args to children with smaller signatures.
+
+    Unused placeholders are kept on purpose: erasing one would shift the args
+    of every call to this module.
+    """
     changed = False
     for node in mod.graph.nodes:
         if node.op != "call_module":
@@ -809,20 +813,15 @@ def _trim_single_module_args(mod: InterpreterModule) -> bool:
         if actual > expected:
             node.args = tuple(node.args[actual - expected :])
             changed = True
-    for node in list(mod.graph.nodes):
-        if node.op == "placeholder" and len(node.users) == 0:
-            mod.graph.erase_node(node)
-            changed = True
     return changed
 
 
 def trim_call_module_args(module: nn.Module) -> None:
     """Iteratively trim call_module args to match child module expected
-    counts and remove unused placeholders until stable.
+    counts until stable.
 
-    After unflatten, InterpreterModule graphs may have extra args (e.g.,
-    sym_size_int from TBE batch_size). This trims them and cascades the
-    cleanup upward through the module tree.
+    After decapsulation, real modules may receive extra leading args (e.g.,
+    sym_size_int from TBE batch_size) that their forward does not take.
     """
     for iteration in range(20):
         changed = False
@@ -891,15 +890,20 @@ def _fix_tbe_output_getitems(
             continue
         if user.target is not operator.getitem:
             continue
+        # The batch size can come before the pooled embeddings in the output
+        # list, so tell them apart by value. The index is only a fallback.
+        val = user.meta.get("val")
         idx = user.args[1]
-        if idx == 0:
+        if isinstance(val, torch.Tensor) or (val is None and idx == 0):
             user.replace_all_uses_with(node)
-            nodes_to_erase.append(user)
-        elif idx == 1:
+        elif isinstance(val, (int, torch.SymInt)) or (val is None and idx == 1):
             with mod.graph.inserting_after(node):
                 batch_size_node = mod.graph.call_method("size", (node, 0))
+            batch_size_node.meta = dict(user.meta)
             user.replace_all_uses_with(batch_size_node)
-            nodes_to_erase.append(user)
+        else:
+            continue
+        nodes_to_erase.append(user)
     return nodes_to_erase
 
 
