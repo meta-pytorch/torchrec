@@ -108,12 +108,14 @@ class DDPTest(MultiProcessTestBase):
             )
             # pyrefly: ignore[invalid-param-spec]
             m.sparse.ebc = trec_shard(
+                # pyrefly: ignore [bad-argument-count, unexpected-keyword]
                 module=m.sparse.ebc,
                 device=ctx.device,
                 plan=column_wise(ranks=list(range(world_size))),
             )
             # pyrefly: ignore[invalid-param-spec]
             m.sparse.weighted_ebc = trec_shard(
+                # pyrefly: ignore [bad-argument-count, unexpected-keyword]
                 module=m.sparse.weighted_ebc,
                 device=ctx.device,
                 plan=column_wise(ranks=list(range(world_size))),

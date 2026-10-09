@@ -84,12 +84,14 @@ class FullyShardTest(MultiProcessTestBase):
             )
             # pyrefly: ignore[invalid-param-spec]
             m.sparse.ebc = trec_shard(
+                # pyrefly: ignore [bad-argument-count, unexpected-keyword]
                 module=m.sparse.ebc,
                 device=ctx.device,
                 plan=row_wise(),
             )
             # pyrefly: ignore[invalid-param-spec]
             m.sparse.weighted_ebc = trec_shard(
+                # pyrefly: ignore [bad-argument-count, unexpected-keyword]
                 module=m.sparse.weighted_ebc,
                 device=ctx.device,
                 plan=row_wise(),

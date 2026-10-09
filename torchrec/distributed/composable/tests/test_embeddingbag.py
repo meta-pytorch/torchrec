@@ -125,9 +125,12 @@ def _test_sharding(  # noqa C901
         plan: ShardingPlan = planner.collective_plan(model, [sharder], ctx.pg)
         # pyrefly: ignore[invalid-param-spec]
         sharded_model = shard(
+            # pyrefly: ignore [bad-argument-count, unexpected-keyword]
             module=model,
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore [bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
+            # pyrefly: ignore [bad-argument-type]
             plan=plan.get_plan_for_module(""),
             sharder=sharder,
             device=ctx.device,

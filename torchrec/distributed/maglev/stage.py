@@ -1635,6 +1635,7 @@ class StageWrapper(nn.Module):
         if self.is_last:
             with record_function(f"## backward mb{microbatch_id} ##"):
                 loss = outputs[0]
+                # pyrefly: ignore [missing-attribute]
                 loss.backward()
         else:
             with record_function(f"## backward mb{microbatch_id} ##"):
