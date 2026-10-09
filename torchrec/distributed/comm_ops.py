@@ -259,7 +259,7 @@ class Request(Awaitable[W]):
         # pyrefly: ignore[missing-attribute]
         ret = self.wait_function.apply(self.pg, self, self.dummy_tensor)
         if isinstance(ret, torch.Tensor) and ret.device.type == "cuda":
-            ret.record_stream(torch.get_device_module(ret.device).current_stream())
+            ret.record_stream(torch.accelerator.current_stream(ret.device))
         self.req = None
         self.tensor = None
         return ret
