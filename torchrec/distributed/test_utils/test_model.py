@@ -2958,7 +2958,8 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             ):
                 await_restore, restore, _execute_stash = (
                     MemoryStashingManager._stash_tensors(
-                        [ec_result[e]._values for e in self._ec_features]
+                        [ec_result[e]._values for e in self._ec_features],
+                        use_case="activation",
                     )
                 )
                 ec_embeddings.register_hook(await_restore)
