@@ -9,14 +9,18 @@
 
 import os
 import unittest
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, cast, Dict, Optional, Tuple, Type
 
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from hypothesis import assume, given, Phase, settings, strategies as st, Verbosity
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
-from torchrec.distributed.planner import ParameterConstraints
+from torchrec.distributed.planner import (
+    EmbeddingShardingPlanner,
+    ParameterConstraints,
+    Topology,
+)
 from torchrec.distributed.test_utils.test_model import (
     TestSparseNN,
     TestTowerCollectionSparseNN,
@@ -28,7 +32,8 @@ from torchrec.distributed.test_utils.test_sharding import (
     SharderType,
     sharding_single_rank_test,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import EmbeddingModuleShardingPlan, ShardingType
+from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import PoolingType
 from torchrec.test_utils import skip_if_asan_class
 
@@ -526,4 +531,142 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             variable_batch_per_feature=variable_batch_per_feature,
             has_weighted_tables=False,
             global_constant_batch=global_constant_batch,
+        )
+
+    MIXED_NUM_TWRW_GROUPS: Dict[str, int] = {"table_0": 2, "table_3": 2}
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_twrw_num_twrw_groups_constraints_produce_multi_group_plans(self) -> None:
+        """Verify the constraints produce mixed single- and multi-group plans."""
+        self._build_tables_and_groups()
+        model = TestSparseNN(
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            embedding_groups=self.embedding_groups,
+            sparse_device=torch.device("meta"),
+            num_float_features=16,
+        )
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=4,
+                local_world_size=2,
+                compute_device="cuda",
+                ssd_cap=2 * 1024**4,
+            ),
+            constraints={
+                name: ParameterConstraints(num_twrw_groups=num_twrw_groups)
+                for name, num_twrw_groups in self.MIXED_NUM_TWRW_GROUPS.items()
+            },
+        )
+        plan = planner.plan(
+            module=model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[
+                create_test_sharder(
+                    SharderType.EMBEDDING_BAG_COLLECTION.value,
+                    ShardingType.TABLE_ROW_WISE.value,
+                    EmbeddingComputeKernel.FUSED.value,
+                    device=torch.device("cuda"),
+                ),
+            ],
+        )
+        ebc_plan = cast(EmbeddingModuleShardingPlan, plan.plan["sparse.ebc"])
+
+        for name in self.MIXED_NUM_TWRW_GROUPS:
+            parameter_sharding = ebc_plan[name]
+            self.assertEqual(
+                parameter_sharding.num_twrw_groups,
+                2,
+                f"{name} is not multi-group",
+            )
+            ranks = none_throws(parameter_sharding.ranks)
+            self.assertEqual(len(ranks), 4, f"{name} ranks: {ranks}")
+            self.assertEqual({rank // 2 for rank in ranks}, {0, 1})
+
+        for name in self.table_names:
+            if name in self.MIXED_NUM_TWRW_GROUPS:
+                continue
+            parameter_sharding = ebc_plan[name]
+            self.assertIsNone(parameter_sharding.num_twrw_groups, f"{name} opted in")
+            ranks = none_throws(parameter_sharding.ranks)
+            self.assertEqual(len({rank // 2 for rank in ranks}), 1, f"{name}: {ranks}")
+
+    def _test_twrw_num_twrw_groups(
+        self,
+        num_twrw_groups_by_table: Dict[str, int],
+        pooling: PoolingType = PoolingType.SUM,
+        variable_batch_size: bool = False,
+        variable_batch_per_feature: bool = False,
+    ) -> None:
+        """Compare a two-group TWRW model with an unsharded reference."""
+        self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[
+                create_test_sharder(
+                    SharderType.EMBEDDING_BAG_COLLECTION.value,
+                    ShardingType.TABLE_ROW_WISE.value,
+                    EmbeddingComputeKernel.FUSED.value,
+                    device=torch.device("cuda"),
+                ),
+            ],
+            backend="nccl",
+            world_size=4,
+            local_size=2,
+            constraints={
+                name: ParameterConstraints(num_twrw_groups=num_twrw_groups)
+                for name, num_twrw_groups in num_twrw_groups_by_table.items()
+            },
+            variable_batch_size=variable_batch_size,
+            variable_batch_per_feature=variable_batch_per_feature,
+            has_weighted_tables=not variable_batch_per_feature,
+            pooling=pooling,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_sharding_nccl_twrw_mixed_num_twrw_groups(self) -> None:
+        # Includes a feature shared by single- and multi-group tables.
+        self._test_twrw_num_twrw_groups(self.MIXED_NUM_TWRW_GROUPS)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_sharding_nccl_twrw_all_num_twrw_groups(self) -> None:
+        self._test_twrw_num_twrw_groups(dict.fromkeys(self.table_names, 2))
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_sharding_nccl_twrw_mixed_num_twrw_groups_mean_pooling(self) -> None:
+        self._test_twrw_num_twrw_groups(
+            self.MIXED_NUM_TWRW_GROUPS, pooling=PoolingType.MEAN
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_sharding_nccl_twrw_mixed_num_twrw_groups_variable_batch(self) -> None:
+        self._test_twrw_num_twrw_groups(
+            self.MIXED_NUM_TWRW_GROUPS, variable_batch_size=True
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_sharding_nccl_twrw_mixed_num_twrw_groups_variable_batch_per_feature(
+        self,
+    ) -> None:
+        self._test_twrw_num_twrw_groups(
+            self.MIXED_NUM_TWRW_GROUPS,
+            variable_batch_size=True,
+            variable_batch_per_feature=True,
         )

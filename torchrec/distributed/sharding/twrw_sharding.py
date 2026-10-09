@@ -10,12 +10,14 @@
 import itertools
 import logging
 import math
-from typing import Any, cast, Dict, List, Optional, Tuple, TypeVar
+from dataclasses import dataclass
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, TypeVar
 
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.distributed_c10d import get_process_group_ranks
+from torchrec.distributed import utils as distributed_utils
 from torchrec.distributed.comm import (
     get_2d_pod_size,
     get_local_size,
@@ -109,6 +111,11 @@ def _resolve_multi_group_ranks(
     local_size: int,
     is_2D_parallel: bool,
 ) -> List[int]:
+    if not distributed_utils.is_twrw_multi_group_enabled():
+        raise NotImplementedError(
+            f"'{table_name}': TABLE_ROW_WISE num_twrw_groups={num_twrw_groups} "
+            "is disabled by killswitch."
+        )
     if is_2D_parallel:
         raise ValueError(
             f"'{table_name}': TABLE_ROW_WISE "
@@ -130,7 +137,7 @@ def _resolve_multi_group_ranks(
     if len(set(plan_ranks)) != len(plan_ranks):
         raise ValueError(
             f"'{table_name}': placement ranks {plan_ranks} repeat a rank; each "
-            "row shard needs its own."
+            "shard needs its own."
         )
     groups = {rank // local_size for rank in plan_ranks}
     if len(groups) != num_twrw_groups:
@@ -138,7 +145,189 @@ def _resolve_multi_group_ranks(
             f"'{table_name}': num_twrw_groups={num_twrw_groups} but its "
             f"{len(plan_ranks)} ranks span {len(groups)} groups."
         )
+    # At this point there are exactly num_twrw_groups complete groups of
+    # local_size ranks.
     return plan_ranks
+
+
+@dataclass(frozen=True)
+class TwRwFeatureDistLayout:
+    """Feature-ID distribution layout for variable TWRW group counts.
+
+    `hash_sizes` and `shard_counts` are in logical feature order. Each feature
+    is bucketized using its shard count. `rank_order_indices` then places the
+    resulting `(feature, shard)` entries in destination-rank order across all
+    TWRW-sharded tables. `features_per_rank` gives the AlltoAll splits.
+
+    Example: A/C have 2 shards and B has 4. Their shard-count groups bucketize
+    to `(A0, C0, A1, C1)` and `(B0, B1, B2, B3)`. Concatenating those groups,
+    then reordering to `(A0, B0, C0, A1, B1, C1, B2, B3)` by destination rank,
+    gives `rank_order_indices=(0, 4, 1, 2, 5, 3, 6, 7)`.
+    """
+
+    hash_sizes: tuple[int, ...]
+    shard_counts: tuple[int, ...]
+    rank_order_indices: tuple[int, ...]
+    features_per_rank: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TwRwEmbeddingDistLayout:
+    """Logical pooled-output dimensions and each group's physical partials.
+
+    `embedding_dims` is in logical feature order. Each inner tuple maps one
+    TWRW group's physical partials back to those logical features.
+
+    Example: logical features A/B/C have dims `(4, 8, 6)`. Group indices
+    `((0, 1, 2), (1,))` mean group 0 emits `(A, B, C)` and group 1 emits `(B)`.
+    The physical order is `(A, B, C, B)`; both B partials map to logical B
+    and are summed.
+    """
+
+    embedding_dims: tuple[int, ...]
+    feature_indices_by_twrw_group: tuple[tuple[int, ...], ...]
+
+
+@dataclass
+class _LogicalFeatureMetadata:
+    """Names and shard-zero metadata for one logical feature."""
+
+    feature_name: str
+    embedding_name: str
+    shard_metadata: Optional[ShardMetadata]
+
+
+def _shard_count_groups(
+    shard_counts: tuple[int, ...],
+) -> list[tuple[int, list[int]]]:
+    """Group logical features that can share one bucketization call.
+
+    Groups follow the first logical feature with each shard count. Features
+    within each group remain in logical feature order.
+    """
+    features_by_shard_count: Dict[int, List[int]] = {}
+    for feature, shard_count in enumerate(shard_counts):
+        features_by_shard_count.setdefault(shard_count, []).append(feature)
+    return list(features_by_shard_count.items())
+
+
+def _rank_order_indices(
+    shard_counts: tuple[int, ...], feature_shards: list[tuple[int, int]]
+) -> tuple[int, ...]:
+    """Map bucketization output into destination-rank order.
+
+    Bucketization is shard-major within each shard-count group; `feature_shards`
+    lists those same `(feature, shard)` entries in rank order.
+    """
+    index_by_feature_shard: Dict[Tuple[int, int], int] = {}
+    group_offset = 0
+    for shard_count, features in _shard_count_groups(shard_counts):
+        for shard in range(shard_count):
+            for position, feature in enumerate(features):
+                index_by_feature_shard[(feature, shard)] = (
+                    group_offset + shard * len(features) + position
+                )
+        group_offset += shard_count * len(features)
+    return tuple(index_by_feature_shard[item] for item in feature_shards)
+
+
+def _uniform_feature_dist_layout(
+    hash_sizes: List[int], features_per_rank: List[int], local_size: int
+) -> TwRwFeatureDistLayout:
+    """Build the legacy uniform layout used by GRID's input distribution."""
+    features_per_group = features_per_rank[::local_size]
+    group_offsets = [0] + list(itertools.accumulate(features_per_group))
+    return TwRwFeatureDistLayout(
+        hash_sizes=tuple(hash_sizes),
+        shard_counts=(local_size,) * len(hash_sizes),
+        rank_order_indices=tuple(
+            shard * len(hash_sizes) + feature
+            for group in range(len(features_per_group))
+            for shard in range(local_size)
+            for feature in range(group_offsets[group], group_offsets[group + 1])
+        ),
+        features_per_rank=tuple(features_per_rank),
+    )
+
+
+def _build_twrw_dist_layouts(
+    grouped_configs_per_rank: List[List[GroupedEmbeddingConfig]],
+    table_placement_ranks: Dict[str, List[int]],
+    local_size: int,
+) -> tuple[
+    TwRwFeatureDistLayout,
+    TwRwEmbeddingDistLayout,
+    list[_LogicalFeatureMetadata],
+]:
+    """Build both distribution layouts in one traversal by destination rank.
+
+    Returns feature-ID routing, pooled-partial reconstruction, and the logical
+    names/shard-zero metadata exposed by the sharding API.
+    """
+    feature_metadata: list[_LogicalFeatureMetadata] = []
+    hash_sizes: list[int] = []
+    shard_counts: list[int] = []
+    embedding_dims: list[int] = []
+    feature_index_by_key: dict[tuple[str, int], int] = {}
+    feature_shards: list[tuple[int, int]] = []
+    features_per_rank: list[int] = []
+    feature_indices_by_group: list[list[int]] = [
+        [] for _ in range(len(grouped_configs_per_rank) // local_size)
+    ]
+    rank_to_shard_by_table = {
+        table: {rank: shard for shard, rank in enumerate(ranks)}
+        for table, ranks in table_placement_ranks.items()
+    }
+    for rank, grouped_configs in enumerate(grouped_configs_per_rank):
+        rank_feature_count = 0
+        tables = itertools.chain.from_iterable(
+            config.embedding_tables for config in grouped_configs
+        )
+        for table in tables:
+            placement_ranks = table_placement_ranks[table.name]
+            shard = rank_to_shard_by_table[table.name][rank]
+            for position, feature_name in enumerate(table.feature_names):
+                key = (table.name, position)
+                feature_index = feature_index_by_key.get(key)
+                if feature_index is None:
+                    feature_index = len(hash_sizes)
+                    feature_index_by_key[key] = feature_index
+                    feature_metadata.append(
+                        _LogicalFeatureMetadata(
+                            feature_name=feature_name,
+                            embedding_name=table.embedding_names[position],
+                            shard_metadata=None,
+                        )
+                    )
+                    hash_sizes.append(table.num_embeddings)
+                    shard_counts.append(len(placement_ranks))
+                    embedding_dims.append(table.local_cols)
+                if shard == 0:
+                    feature_metadata[feature_index].shard_metadata = (
+                        table.local_metadata
+                    )
+                if rank % local_size == 0:
+                    feature_indices_by_group[rank // local_size].append(feature_index)
+                feature_shards.append((feature_index, shard))
+                rank_feature_count += 1
+        features_per_rank.append(rank_feature_count)
+
+    shard_counts_tuple = tuple(shard_counts)
+    return (
+        TwRwFeatureDistLayout(
+            hash_sizes=tuple(hash_sizes),
+            shard_counts=shard_counts_tuple,
+            rank_order_indices=_rank_order_indices(shard_counts_tuple, feature_shards),
+            features_per_rank=tuple(features_per_rank),
+        ),
+        TwRwEmbeddingDistLayout(
+            embedding_dims=tuple(embedding_dims),
+            feature_indices_by_twrw_group=tuple(
+                tuple(indices) for indices in feature_indices_by_group
+            ),
+        ),
+        feature_metadata,
+    )
 
 
 class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
@@ -217,25 +406,27 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             )
         self._local_size: int = local_size
 
-        sharded_tables_per_rank = self._shard(sharding_infos)
+        sharded_tables_per_rank, table_placement_ranks = self._shard(sharding_infos)
         self._grouped_embedding_configs_per_rank: List[List[GroupedEmbeddingConfig]] = (
             []
         )
-        self._grouped_embedding_configs_per_node: List[List[GroupedEmbeddingConfig]] = (
-            []
-        )
         self._grouped_embedding_configs_per_rank = group_tables(sharded_tables_per_rank)
-        self._grouped_embedding_configs_per_node = [
-            self._grouped_embedding_configs_per_rank[rank]
-            for rank in range(self._world_size)
-            if rank % self._local_size == 0
-        ]
         self._has_feature_processor: bool = False
         for group_config in self._grouped_embedding_configs_per_rank[
             self._rank // self._local_size
         ]:
             if group_config.has_feature_processor:
                 self._has_feature_processor = True
+
+        (
+            self._feature_dist_layout,
+            self._embedding_dist_layout,
+            self._feature_metadata,
+        ) = _build_twrw_dist_layouts(
+            grouped_configs_per_rank=self._grouped_embedding_configs_per_rank,
+            table_placement_ranks=table_placement_ranks,
+            local_size=self._local_size,
+        )
 
     def _resolve_placement_ranks(
         self,
@@ -245,7 +436,7 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         num_shards: int,
         table_group: int,
     ) -> List[int]:
-        """Resolve one rank per row shard.
+        """Resolve one rank per shard.
 
         Single-group plans preserve the legacy `ranks[0]` behavior. Multi-group
         plans preserve `ranks[i]` to `shards[i]`; `num_twrw_groups` explicitly
@@ -279,12 +470,18 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
     def _shard(
         self,
         sharding_infos: List[EmbeddingShardingInfo],
-    ) -> List[List[ShardedEmbeddingTable]]:
+    ) -> Tuple[List[List[ShardedEmbeddingTable]], Dict[str, List[int]]]:
+        """Assign each shard to its resolved placement rank.
+
+        Returns the sharded tables assigned to each rank and each table's
+        placement ranks in shard order: `placement_ranks[i]` owns `shards[i]`.
+        """
         world_size = self._world_size
         local_size = self._local_size
         tables_per_rank: List[List[ShardedEmbeddingTable]] = [
             [] for _ in range(world_size)
         ]
+        table_placement_ranks: Dict[str, List[int]] = {}
         peer_group = get_process_group_ranks(self._pg) if self._is_2D_parallel else None
         for info in sharding_infos:
             # Under 2D parallelism we transform rank to the logical ordering in a regular parallelism scheme
@@ -344,23 +541,17 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 raise ValueError(
                     f"TWRW group span mismatch for table "
                     f"'{info.embedding_config.name}': the plan has {len(shards)} "
-                    f"row shards but {num_twrw_groups} TWRW groups at a runtime "
-                    f"group width of {local_size} need {expected_shards}. "
-                    f"is_2D={self._is_2D_parallel}, "
+                    f"shards but num_twrw_groups={num_twrw_groups} with a "
+                    f"runtime TWRW group of {local_size} ranks requires "
+                    f"{expected_shards}. is_2D={self._is_2D_parallel}, "
                     f"pod_size={get_resolved_pod_size()}, "
                     f"node_group_size={self._node_group_size}, "
                     f"local_world_size={get_local_size(self._global_world_size)}. "
-                    f"A TWRW plan must carry one shard per placement rank; "
+                    f"A TWRW plan must carry one shard per rank in every "
+                    f"requested TWRW group; "
                     f"continuing would mean {consequence}. Check that the plan was "
                     f"built against Topology.intra_group_size rather than "
                     f"local_world_size."
-                )
-
-            if num_twrw_groups > 1:
-                raise NotImplementedError(
-                    f"'{table_name}': TABLE_ROW_WISE "
-                    f"num_twrw_groups={num_twrw_groups} is not supported by "
-                    "the runtime yet."
                 )
 
             # construct the global sharded_tensor_metadata
@@ -388,6 +579,7 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                     stride=info.param.stride(),
                 )
 
+            table_placement_ranks[table_name] = placement_ranks
             for rank_idx, rank in enumerate(placement_ranks):
                 tables_per_rank[rank].append(
                     ShardedEmbeddingTable(
@@ -416,63 +608,25 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                     )
                 )
 
-        return tables_per_rank
+        return tables_per_rank, table_placement_ranks
 
     def embedding_dims(self) -> List[int]:
-        embedding_dims = []
-        for grouped_embedding_configs in self._grouped_embedding_configs_per_node:
-            for grouped_config in grouped_embedding_configs:
-                embedding_dims.extend(grouped_config.embedding_dims())
-        return embedding_dims
+        return list(self._embedding_dist_layout.embedding_dims)
 
     def embedding_names(self) -> List[str]:
-        embedding_names = []
-        for grouped_embedding_configs in self._grouped_embedding_configs_per_node:
-            for grouped_config in grouped_embedding_configs:
-                embedding_names.extend(grouped_config.embedding_names())
-        return embedding_names
+        return [metadata.embedding_name for metadata in self._feature_metadata]
 
     def embedding_names_per_rank(self) -> List[List[str]]:
         raise NotImplementedError
 
     def embedding_shard_metadata(self) -> List[Optional[ShardMetadata]]:
-        embedding_shard_metadata = []
-        for grouped_config in self._grouped_embedding_configs_per_node:
-            for config in grouped_config:
-                embedding_shard_metadata.extend(config.embedding_shard_metadata())
-        return embedding_shard_metadata
+        return [metadata.shard_metadata for metadata in self._feature_metadata]
 
     def feature_names(self) -> List[str]:
-        feature_names = []
-        for grouped_config in self._grouped_embedding_configs_per_node:
-            for config in grouped_config:
-                feature_names.extend(config.feature_names())
-        return feature_names
+        return [metadata.feature_name for metadata in self._feature_metadata]
 
     def _get_feature_hash_sizes(self) -> List[int]:
-        feature_hash_sizes: List[int] = []
-        for grouped_config in self._grouped_embedding_configs_per_node:
-            for config in grouped_config:
-                feature_hash_sizes.extend(config.feature_hash_sizes())
-        return feature_hash_sizes
-
-    def _dim_sum_per_node(self) -> List[int]:
-        dim_sum_per_node = []
-        for grouped_embedding_configs in self._grouped_embedding_configs_per_node:
-            dim_sum = 0
-            for grouped_config in grouped_embedding_configs:
-                dim_sum += grouped_config.dim_sum()
-            dim_sum_per_node.append(dim_sum)
-        return dim_sum_per_node
-
-    def _emb_dim_per_node_per_feature(self) -> List[List[int]]:
-        emb_dim_per_node_per_feature = []
-        for grouped_embedding_configs in self._grouped_embedding_configs_per_node:
-            emb_dim_per_feature = []
-            for grouped_config in grouped_embedding_configs:
-                emb_dim_per_feature += grouped_config.embedding_dims()
-            emb_dim_per_node_per_feature.append(emb_dim_per_feature)
-        return emb_dim_per_node_per_feature
+        return list(self._feature_dist_layout.hash_sizes)
 
     def _features_per_rank(
         self, group: List[List[GroupedEmbeddingConfig]]
@@ -488,61 +642,57 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
 
 class TwRwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
     """
-    Bucketizes sparse features in TWRW fashion and then redistributes with an AlltoAll
-    collective operation.
+    Bucketizes feature IDs and redistributes them with AlltoAll.
 
     Args:
         pg (dist.ProcessGroup): ProcessGroup for AlltoAll communication.
-        intra_pg (dist.ProcessGroup): ProcessGroup within single host group for AlltoAll
-            communication.
-        id_list_features_per_rank (List[int]): number of id list features to send to
-            each rank.
-        id_score_list_features_per_rank (List[int]): number of id score list features to
-            send to each rank.
-        id_list_feature_hash_sizes (List[int]): hash sizes of id list features.
-        id_score_list_feature_hash_sizes (List[int]): hash sizes of id score list
-            features.
+        local_size (int): number of ranks in each TWRW group.
+        features_per_rank (Optional[List[int]]): legacy GRID feature splits,
+            required only when `layout` is not provided.
+        feature_hash_sizes (Optional[List[int]]): legacy GRID hash sizes,
+            required only when `layout` is not provided.
         device (Optional[torch.device]): device on which buffers will be allocated.
         has_feature_processor (bool): existence of a feature processor (ie. position
             weighted features).
+        need_pos (bool): whether to bucketize positions, used in place of
+            `has_feature_processor` once the features carry weights.
+        layout (Optional[TwRwFeatureDistLayout]): hash sizes, shard counts, and
+            AlltoAll ordering. None builds GRID's legacy uniform layout.
 
     Example::
 
-        3 features
-        2 hosts with 2 devices each
+        2 TWRW groups of 2 ranks. Each `(feature, shard)` pair becomes one
+        key in the bucketized KJT, listed under the rank owning that shard.
 
-        Bucketize each feature into 2 buckets
-        Staggered shuffle with feature splits [2, 1]
-        AlltoAll operation
+        Single-group tables: every table sits in one group, so each feature
+        routes to `local_size` = 2 shards in its group. Here f0 and f1 are
+        in group 0, f2 in group 1::
 
-        NOTE: result of staggered shuffle and AlltoAll operation look the same after
-        reordering in AlltoAll
+            rank 0: (f0, 0) (f1, 0)    rank 2: (f2, 0)
+            rank 1: (f0, 1) (f1, 1)    rank 3: (f2, 1)
 
-        Result:
-            host 0 device 0:
-                feature 0 bucket 0
-                feature 1 bucket 0
+        Multi-group table: fb spans both groups, so it is cut into
+        `num_twrw_groups * local_size` = 4 shards, one per rank, while the
+        single-group fa keeps 2::
 
-            host 0 device 1:
-                feature 0 bucket 1
-                feature 1 bucket 1
+            rank 0: (fa, 0) (fb, 0)    rank 2: (fb, 2)
+            rank 1: (fa, 1) (fb, 1)    rank 3: (fb, 3)
 
-            host 1 device 0:
-                feature 2 bucket 0
-
-            host 1 device 1:
-                feature 2 bucket 1
+        `TwRwFeatureDistLayout` orders those pairs by destination rank.
+        Different shard counts use separate bucketize calls because
+        `num_buckets` affects out-of-range ids.
     """
 
     def __init__(
         self,
         pg: dist.ProcessGroup,
         local_size: int,
-        features_per_rank: List[int],
-        feature_hash_sizes: List[int],
+        features_per_rank: Optional[List[int]] = None,
+        feature_hash_sizes: Optional[List[int]] = None,
         device: Optional[torch.device] = None,
         has_feature_processor: bool = False,
         need_pos: bool = False,
+        layout: Optional[TwRwFeatureDistLayout] = None,
     ) -> None:
         super().__init__()
         assert pg.size() % local_size == 0, "currently group granularity must be node"
@@ -550,13 +700,33 @@ class TwRwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         self._world_size: int = pg.size()
         self._local_size: int = local_size
         self._num_cross_nodes: int = self._world_size // self._local_size
+
+        if layout is None:
+            if features_per_rank is None or feature_hash_sizes is None:
+                raise ValueError(
+                    "features_per_rank and feature_hash_sizes are required when "
+                    "layout is not provided"
+                )
+            layout = _uniform_feature_dist_layout(
+                feature_hash_sizes, features_per_rank, local_size
+            )
+        self._shard_count_groups = _shard_count_groups(layout.shard_counts)
+        if not self._shard_count_groups:
+            # Keep the single-call path: KJT.concat cannot build an empty result.
+            self._shard_count_groups = [(local_size, [])]
+
         feature_block_sizes = [
-            math.ceil(hash_size / self._local_size) for hash_size in feature_hash_sizes
+            math.ceil(layout.hash_sizes[feature] / shard_count)
+            for shard_count, features in self._shard_count_groups
+            for feature in features
+        ]
+        self._rank_order_indices: List[int] = list(layout.rank_order_indices)
+        shard_count_group_feature_indices = [
+            feature for _, features in self._shard_count_groups for feature in features
         ]
 
-        self._sf_staggered_shuffle: List[int] = self._staggered_shuffle(
-            features_per_rank
-        )
+        # Not persistent: all three follow from the sharding plan, so a
+        # checkpoint taken under a different one must not restore them.
         self.register_buffer(
             "_feature_block_sizes_tensor",
             torch.tensor(
@@ -564,18 +734,29 @@ class TwRwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
                 device=device,
                 dtype=torch.int32,
             ),
+            persistent=False,
         )
         self.register_buffer(
-            "_sf_staggered_shuffle_tensor",
+            "_rank_order_indices_tensor",
             torch.tensor(
-                self._sf_staggered_shuffle,
+                self._rank_order_indices,
                 device=device,
                 dtype=torch.int32,
             ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_shard_count_group_feature_indices_tensor",
+            torch.tensor(
+                shard_count_group_feature_indices,
+                device=device,
+                dtype=torch.int32,
+            ),
+            persistent=False,
         )
         self._dist = KJTAllToAll(
             pg=pg,
-            splits=features_per_rank,
+            splits=list(layout.features_per_rank),
             stagger=self._num_cross_nodes,
         )
         self._has_feature_processor = has_feature_processor
@@ -589,76 +770,101 @@ class TwRwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         sparse_features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KeyedJaggedTensor]]:
         """
-        Bucketizes sparse feature values into local world size number of buckets,
-        performs staggered shuffle on the sparse features, and then performs AlltoAll
-        operation.
+        Partitions feature IDs by destination shard, orders those partitions by
+        destination rank, and sends them with AlltoAll.
 
         Args:
-            sparse_features (KeyedJaggedTensor): sparse features to bucketize and
-                redistribute.
+            sparse_features (KeyedJaggedTensor): feature IDs to bucketize and
+                redistribute, represented as a KJT.
 
         Returns:
             Awaitable[KeyedJaggedTensor]: awaitable of KeyedJaggedTensor.
         """
 
-        bucketized_features = bucketize_kjt_before_all2all(
+        bucketized_features = self._bucketize(
             sparse_features,
-            num_buckets=self._local_size,
-            # pyrefly: ignore[bad-argument-type]
-            block_sizes=self._feature_block_sizes_tensor,
-            output_permute=False,
             bucketize_pos=(
                 self._has_feature_processor
                 if sparse_features.weights_or_none() is None
                 else self._need_pos
             ),
-        )[0].permute(
-            self._sf_staggered_shuffle,
-            # pyrefly: ignore[bad-argument-type]
-            self._sf_staggered_shuffle_tensor,
         )
 
-        return self._dist(bucketized_features)
+        return self._dist(
+            bucketized_features.permute(
+                self._rank_order_indices,
+                # pyrefly: ignore[bad-argument-type]
+                self._rank_order_indices_tensor,
+            )
+        )
 
-    def _staggered_shuffle(self, features_per_rank: List[int]) -> List[int]:
-        """
-        Reorders sparse data such that data is in contiguous blocks and correctly
-        ordered for global TWRW layout.
-        """
+    def _bucketize(
+        self,
+        sparse_features: KeyedJaggedTensor,
+        bucketize_pos: bool,
+    ) -> KeyedJaggedTensor:
+        """Run one FBGEMM bucketize call per shard count."""
+        feature_block_sizes = cast(torch.Tensor, self._feature_block_sizes_tensor)
+        if len(self._shard_count_groups) == 1:
+            return bucketize_kjt_before_all2all(
+                sparse_features,
+                num_buckets=self._shard_count_groups[0][0],
+                block_sizes=feature_block_sizes,
+                output_permute=False,
+                bucketize_pos=bucketize_pos,
+            )[0]
 
-        nodes = self._world_size // self._local_size
-        features_per_node = [
-            features_per_rank[node * self._local_size] for node in range(nodes)
-        ]
-        node_offsets = [0] + list(itertools.accumulate(features_per_node))
-        num_features = node_offsets[-1]
+        shard_count_group_feature_indices = cast(
+            torch.Tensor, self._shard_count_group_feature_indices_tensor
+        )
+        bucketized_features: List[KeyedJaggedTensor] = []
+        start = 0
+        for shard_count, features in self._shard_count_groups:
+            end = start + len(features)
+            bucketized_features.append(
+                bucketize_kjt_before_all2all(
+                    sparse_features.permute(
+                        features,
+                        shard_count_group_feature_indices[start:end],
+                    ),
+                    num_buckets=shard_count,
+                    block_sizes=feature_block_sizes[start:end],
+                    output_permute=False,
+                    bucketize_pos=bucketize_pos,
+                )[0]
+            )
+            start = end
+        return KeyedJaggedTensor.concat(bucketized_features)
 
-        return [
-            bucket * num_features + feature
-            for node in range(nodes)
-            for bucket in range(self._local_size)
-            for feature in range(node_offsets[node], node_offsets[node + 1])
-        ]
+
+@dataclass
+class _SumSlice:
+    """A contiguous tensor slice added from `src` to `dst`."""
+
+    src: int
+    dst: int
+    length: int
 
 
 class TwRwPooledEmbeddingDist(
     BaseEmbeddingDist[EmbeddingShardingContext, torch.Tensor, torch.Tensor]
 ):
     """
-    Redistributes pooled embedding tensor in TWRW fashion by performing a reduce-scatter
-    operation row wise on the host level and then an AlltoAll operation table wise on
-    the global level.
+    Redistributes pooled embeddings with reduce-scatter inside each TWRW group,
+    followed by AlltoAll across groups.
 
     Args:
         cross_pg (dist.ProcessGroup): global level ProcessGroup for AlltoAll
             communication.
-        intra_pg (dist.ProcessGroup): host level ProcessGroup for reduce-scatter
-            communication.
-        dim_sum_per_node (List[int]): number of features (sum of dimensions) of the
-            embedding for each host.
-        emb_dim_per_node_per_feature (List[List[int]]):
+        intra_pg (dist.ProcessGroup): TWRW-group ProcessGroup for reduce-scatter.
+        dim_sum_per_node (Optional[List[int]]): legacy per-group dimension sums,
+            required only when `layout` is not provided.
+        emb_dim_per_node_per_feature (Optional[List[List[int]]]): legacy
+            dimensions per group, required only when `layout` is not provided.
         device (Optional[torch.device]): device on which buffers will be allocated.
         qcomm_codecs_registry (Optional[Dict[str, QuantizedCommCodecs]]):
+        layout (Optional[TwRwEmbeddingDistLayout]): logical dimensions and the
+            physical partial order produced by each TWRW group.
     """
 
     def __init__(
@@ -666,17 +872,55 @@ class TwRwPooledEmbeddingDist(
         rank: int,
         cross_pg: dist.ProcessGroup,
         intra_pg: dist.ProcessGroup,
-        dim_sum_per_node: List[int],
-        emb_dim_per_node_per_feature: List[List[int]],
+        dim_sum_per_node: Optional[List[int]] = None,
+        emb_dim_per_node_per_feature: Optional[List[List[int]]] = None,
         device: Optional[torch.device] = None,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
+        layout: Optional[TwRwEmbeddingDistLayout] = None,
     ) -> None:
         super().__init__()
+        if layout is None:
+            # Legacy metadata has one physical partial per logical feature;
+            # synthesize its identity layout while preserving caller sizes.
+            if dim_sum_per_node is None or emb_dim_per_node_per_feature is None:
+                raise ValueError(
+                    "dim_sum_per_node and emb_dim_per_node_per_feature are required "
+                    "when layout is not provided"
+                )
+            group_offsets = list(
+                itertools.accumulate(
+                    (len(dimensions) for dimensions in emb_dim_per_node_per_feature),
+                    initial=0,
+                )
+            )
+            layout = TwRwEmbeddingDistLayout(
+                embedding_dims=tuple(
+                    itertools.chain.from_iterable(emb_dim_per_node_per_feature)
+                ),
+                feature_indices_by_twrw_group=tuple(
+                    tuple(range(group_offsets[group], group_offsets[group + 1]))
+                    for group in range(len(emb_dim_per_node_per_feature))
+                ),
+            )
+            embedding_dims_by_group = emb_dim_per_node_per_feature
+            dim_sums_by_group = dim_sum_per_node
+        else:
+            embedding_dims_by_group = [
+                [layout.embedding_dims[index] for index in group]
+                for group in layout.feature_indices_by_twrw_group
+            ]
+            dim_sums_by_group = [
+                sum(dimensions) for dimensions in embedding_dims_by_group
+            ]
         self._rank = rank
+        self._layout = layout
+        self._logical_feature_indices_by_partial: List[int] = list(
+            itertools.chain.from_iterable(layout.feature_indices_by_twrw_group)
+        )
         self._intra_pg: dist.ProcessGroup = intra_pg
         self._cross_pg: dist.ProcessGroup = cross_pg
-        self._dim_sum_per_node = dim_sum_per_node
-        self._emb_dim_per_node_per_feature = emb_dim_per_node_per_feature
+        self._dim_sums_by_twrw_group = dim_sums_by_group
+        self._embedding_dims_by_twrw_group = embedding_dims_by_group
         self._device = device
         self._intra_codecs: Optional[QuantizedCommCodecs] = (
             qcomm_codecs_registry.get(
@@ -699,6 +943,78 @@ class TwRwPooledEmbeddingDist(
             None
         )
 
+    def _combine_callback(
+        self, feature_sizes: List[int]
+    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """Build the physical-partial-to-logical-output sum.
+
+        Returns no callback when every logical feature has exactly one partial.
+        """
+        if len(feature_sizes) == len(self._logical_feature_indices_by_partial):
+            return None
+        slices, destination_size = self._combine_slices(
+            feature_sizes, self._logical_feature_indices_by_partial
+        )
+
+        def _combine(tensor: torch.Tensor) -> torch.Tensor:
+            out = tensor.new_zeros((*tensor.shape[:-1], destination_size))
+            for s in slices:
+                out[..., s.dst : s.dst + s.length] += tensor[
+                    ..., s.src : s.src + s.length
+                ]
+            return out
+
+        return _combine
+
+    def _combine_slices(
+        self, feature_sizes: List[int], feature_indices: List[int]
+    ) -> Tuple[List[_SumSlice], int]:
+        """Coalesce adjacent partials with contiguous destinations."""
+        feature_offsets = list(itertools.accumulate(feature_sizes, initial=0))
+        source_sizes = [feature_sizes[index] for index in feature_indices]
+        source_offsets = list(itertools.accumulate(source_sizes, initial=0))
+        slices: List[_SumSlice] = []
+        for position, feature_index in enumerate(feature_indices):
+            src = source_offsets[position]
+            dst = feature_offsets[feature_index]
+            length = source_sizes[position]
+            if slices and dst == slices[-1].dst + slices[-1].length:
+                slices[-1].length += length
+            else:
+                slices.append(_SumSlice(src, dst, length))
+        return slices, feature_offsets[-1]
+
+    def _variable_batch_combine(
+        self, batch_size_per_feature: List[int]
+    ) -> Tuple[List[int], Optional[Callable[[torch.Tensor], torch.Tensor]]]:
+        """Prepare variable-batch metadata and output reconstruction.
+
+        Repeat each logical feature's batch size for every TWRW group that
+        emits that feature. The callback then sums the per-group pooled results
+        for the same logical feature. Each result occupies
+        `batch_size * embedding_dim` values in the flattened tensor.
+        """
+        if len(batch_size_per_feature) != len(self._layout.embedding_dims):
+            raise ValueError(
+                f"expected {len(self._layout.embedding_dims)} feature batch sizes, "
+                f"got {len(batch_size_per_feature)}"
+            )
+        if len(batch_size_per_feature) == len(self._logical_feature_indices_by_partial):
+            return batch_size_per_feature, None
+        feature_sizes = [
+            batch_size * embedding_dim
+            for batch_size, embedding_dim in zip(
+                batch_size_per_feature, self._layout.embedding_dims
+            )
+        ]
+        return (
+            [
+                batch_size_per_feature[index]
+                for index in self._logical_feature_indices_by_partial
+            ],
+            self._combine_callback(feature_sizes),
+        )
+
     @EventLoggingHandler.event_logger(
         TorchrecComponent.OUTPUT_DIST, n=1000, add_wait_counter=True
     )
@@ -708,11 +1024,11 @@ class TwRwPooledEmbeddingDist(
         sharding_ctx: Optional[EmbeddingShardingContext] = None,
     ) -> Awaitable[torch.Tensor]:
         """
-        Performs reduce-scatter pooled operation on pooled embeddings tensor followed by
-        AlltoAll pooled operation.
+        Reduce-scatters physical pooled partials within each TWRW group, then
+        exchanges the group results with AlltoAll.
 
         Args:
-            local_embs (torch.Tensor): pooled embeddings tensor to distribute.
+            local_embs (torch.Tensor): physical pooled partials to distribute.
 
         Returns:
             Awaitable[torch.Tensor]: awaitable of pooled embeddings tensor.
@@ -720,7 +1036,7 @@ class TwRwPooledEmbeddingDist(
         if self._intra_dist is None or self._cross_dist is None:
             self._create_output_dist_modules(sharding_ctx)
         local_rank = self._rank % self._intra_pg.size()
-        current_node = self._rank // self._intra_pg.size()
+        current_group = self._rank // self._intra_pg.size()
         if sharding_ctx is not None and sharding_ctx.variable_batch_per_feature:
             (
                 batch_size_per_rank_per_feature_by_cross_group,
@@ -735,17 +1051,23 @@ class TwRwPooledEmbeddingDist(
             )(
                 local_embs,
                 batch_size_per_rank_per_feature=batch_size_per_feature_sum_by_cross_group,
-                embedding_dims=self._emb_dim_per_node_per_feature[current_node],
+                embedding_dims=self._embedding_dims_by_twrw_group[current_group],
             ).wait()
-            return cast(
+            batch_size_per_partial, combine_callback = self._variable_batch_combine(
+                sharding_ctx.batch_size_per_feature_pre_a2a
+            )
+            awaitable = cast(
                 VariableBatchPooledEmbeddingsAllToAll, self._variable_cross_dist
             )(
                 rs_result,
                 batch_size_per_rank_per_feature=batch_size_per_rank_per_feature_by_cross_group[
                     local_rank
                 ],
-                batch_size_per_feature_pre_a2a=sharding_ctx.batch_size_per_feature_pre_a2a,
+                batch_size_per_feature_pre_a2a=batch_size_per_partial,
             )
+            if combine_callback is not None:
+                awaitable.callbacks.append(combine_callback)
+            return awaitable
         elif (
             sharding_ctx is not None and len(set(sharding_ctx.batch_size_per_rank)) > 1
         ):
@@ -840,20 +1162,25 @@ class TwRwPooledEmbeddingDist(
             )
             self._variable_cross_dist = VariableBatchPooledEmbeddingsAllToAll(
                 pg=self._cross_pg,
-                emb_dim_per_rank_per_feature=self._emb_dim_per_node_per_feature,
+                emb_dim_per_rank_per_feature=self._embedding_dims_by_twrw_group,
                 device=self._device,
-                callbacks=None,  # don't pass permute callback, handle in LazyAwaitable
+                # Bound per step in `forward`, since offsets are batch dependent.
+                callbacks=None,
                 codecs=self._cross_codecs,
             )
         self._intra_dist = PooledEmbeddingsReduceScatter(
             pg=self._intra_pg,
             codecs=self._intra_codecs,
         )
+        # Fixed batch sizes make slice widths layout-only, so this callback can
+        # be reused across steps.
+        combine_callback = self._combine_callback(list(self._layout.embedding_dims))
         self._cross_dist = PooledEmbeddingsAllToAll(
             pg=self._cross_pg,
-            dim_sum_per_rank=self._dim_sum_per_node,
+            dim_sum_per_rank=self._dim_sums_by_twrw_group,
             device=self._device,
             codecs=self._cross_codecs,
+            callbacks=[combine_callback] if combine_callback is not None else None,
         )
 
 
@@ -869,20 +1196,15 @@ class TwRwPooledEmbeddingSharding(
     def create_input_dist(
         self, device: Optional[torch.device] = None
     ) -> BaseSparseFeaturesDist[KeyedJaggedTensor]:
-        features_per_rank = self._features_per_rank(
-            self._grouped_embedding_configs_per_rank
-        )
-        feature_hash_sizes = self._get_feature_hash_sizes()
         assert self._pg is not None
         assert self._intra_pg is not None
         return TwRwSparseFeaturesDist(
             pg=self._pg,
             local_size=self._intra_pg.size(),
-            features_per_rank=features_per_rank,
-            feature_hash_sizes=feature_hash_sizes,
             device=device if device is not None else self._device,
             has_feature_processor=self._has_feature_processor,
             need_pos=self._need_pos,
+            layout=self._feature_dist_layout,
         )
 
     def create_lookup(
@@ -908,8 +1230,7 @@ class TwRwPooledEmbeddingSharding(
             rank=self._rank,
             cross_pg=cast(dist.ProcessGroup, self._cross_pg),
             intra_pg=cast(dist.ProcessGroup, self._intra_pg),
-            dim_sum_per_node=self._dim_sum_per_node(),
-            emb_dim_per_node_per_feature=self._emb_dim_per_node_per_feature(),
             device=device if device is not None else self._device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
+            layout=self._embedding_dist_layout,
         )
