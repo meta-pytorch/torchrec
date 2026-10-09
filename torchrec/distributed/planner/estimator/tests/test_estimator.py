@@ -83,6 +83,7 @@ def create_test_context(
     world_size: int = 8,
     local_world_size: int = 4,
     intra_group_size: Optional[int] = None,
+    table_num_twrw_groups: int = 1,
     device_bw: float = HBM_MEM_BW,
     is_pooled: bool = True,
     is_weighted: bool = False,
@@ -102,6 +103,7 @@ def create_test_context(
         world_size=world_size,
         local_world_size=local_world_size,
         intra_group_size=intra_group_size,
+        table_num_twrw_groups=table_num_twrw_groups,
         device_bw=device_bw,
         hbm_to_ddr_mem_bw=device_bw,
         is_pooled=is_pooled,
@@ -263,29 +265,48 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
         self.evaluator = TableRowWiseEvaluator()
         self.config = HardwarePerfConfig()
 
-    def test_batch_inputs_divisor_is_intra_group_size(self) -> None:
-        """Test that TABLE_ROW_WISE divides batch inputs by intra_group_size."""
-        with self.subTest("pod_size_1"):
-            ctx = create_test_context(world_size=8, local_world_size=4)
-            self.assertEqual(self.evaluator.get_batch_inputs_divisor(ctx), 4)
-        with self.subTest("pod_size_gt_1"):
-            # GB200-like: lws=2, igs=4 (pod_size=2)
-            ctx = create_test_context(
-                world_size=64, local_world_size=2, intra_group_size=4
-            )
-            # Must use intra_group_size (4), not local_world_size (2)
-            self.assertEqual(self.evaluator.get_batch_inputs_divisor(ctx), 4)
+    def test_batch_inputs_divisor_uses_all_row_shards(self) -> None:
+        for name, table_num_twrw_groups, expected in (
+            ("single_group", 1, 4),
+            ("two_groups", 2, 8),
+        ):
+            with self.subTest(name):
+                ctx = create_test_context(
+                    world_size=64,
+                    local_world_size=2,
+                    intra_group_size=4,
+                    table_num_twrw_groups=table_num_twrw_groups,
+                )
+                self.assertEqual(self.evaluator.get_batch_inputs_divisor(ctx), expected)
 
-    def test_prefetch_divisor_is_intra_group_size(self) -> None:
-        """Test that TABLE_ROW_WISE prefetch divisor is intra_group_size."""
-        with self.subTest("pod_size_1"):
-            ctx = create_test_context(world_size=8, local_world_size=4)
-            self.assertEqual(self.evaluator.get_prefetch_divisor(ctx), 4)
-        with self.subTest("pod_size_gt_1"):
-            ctx = create_test_context(
-                world_size=64, local_world_size=2, intra_group_size=4
-            )
-            self.assertEqual(self.evaluator.get_prefetch_divisor(ctx), 4)
+    def test_prefetch_divisor_uses_all_row_shards(self) -> None:
+        ctx = create_test_context(
+            world_size=8,
+            local_world_size=2,
+            intra_group_size=4,
+            table_num_twrw_groups=2,
+        )
+        self.assertEqual(self.evaluator.get_prefetch_divisor(ctx), 8)
+
+    def test_multi_group_changes_compute_and_communication_costs(self) -> None:
+        single_group = self.evaluator.compute_perf(
+            create_test_context(
+                sharding_type=ShardingType.TABLE_ROW_WISE.value,
+                table_num_twrw_groups=1,
+            ),
+            self.config,
+        )
+        two_groups = self.evaluator.compute_perf(
+            create_test_context(
+                sharding_type=ShardingType.TABLE_ROW_WISE.value,
+                table_num_twrw_groups=2,
+            ),
+            self.config,
+        )
+
+        self.assertLess(two_groups.fwd_compute, single_group.fwd_compute)
+        self.assertGreater(two_groups.fwd_comms, single_group.fwd_comms)
+        self.assertGreater(two_groups.bwd_comms, single_group.bwd_comms)
 
     def test_compute_perf_returns_perf_object(self) -> None:
         """Test that compute_perf returns a Perf object."""
@@ -303,7 +324,7 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
             )
             perf = self.evaluator.compute_perf(ctx, self.config)
             self.assertIsNotNone(perf)
-            # Verify num_twrw_groups is used (16 groups of 4, not 32 groups of 2)
+            # The topology has 16 groups of 4, not 32 groups of 2.
             self.assertEqual(ctx.num_twrw_groups, 16)
             self.assertEqual(ctx.num_hosts, 32)
 
@@ -540,12 +561,14 @@ class EvaluatorPrefetchTest(unittest.TestCase):
         self.assertEqual(divisor, 8)
 
     def test_prefetch_divisor_applied_for_table_row_wise(self) -> None:
-        """Test that prefetch divisor is applied for TABLE_ROW_WISE (local_world_size)."""
+        """TABLE_ROW_WISE prefetch divides across every row shard."""
         evaluator = TableRowWiseEvaluator()
-        ctx = create_test_context(world_size=8, local_world_size=4)
+        ctx = create_test_context(
+            world_size=8, local_world_size=4, table_num_twrw_groups=2
+        )
 
         divisor = evaluator.get_prefetch_divisor(ctx)
-        self.assertEqual(divisor, 4)
+        self.assertEqual(divisor, 8)
 
     def test_prefetch_divisor_one_for_table_wise(self) -> None:
         """Test that prefetch divisor is 1 for TABLE_WISE (no division)."""

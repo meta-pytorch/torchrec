@@ -49,6 +49,11 @@ from torchrec.types import CopyMixIn
 logger: logging.Logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _MAX_WEIGHT_CHUNKS: int = 16
+_TWRW_MULTI_GROUP_JK: str = "pytorch/torchrec:enable_twrw_multi_group"
+
+
+def is_twrw_multi_group_enabled() -> bool:
+    return torch._utils_internal.justknobs_check(_TWRW_MULTI_GROUP_JK)
 
 
 @dataclass(frozen=True)
