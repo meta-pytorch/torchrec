@@ -25,6 +25,7 @@ from torch.autograd.profiler import record_function
 from torch.distributed.algorithms.ddp_comm_hooks import (
     default_hooks as ddp_default_hooks,
 )
+from torch.distributed.device_mesh import BackendConfig
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.distributed.remote_device import _remote_device
 from torch.distributed.tensor import DeviceMesh
@@ -1163,6 +1164,8 @@ class DMPCollection(DistributedModelParallel):
                 register a forward hook that ensures reduce-scatter completion and weight resize when
                 using FULLY_SHARDED strategy. Useful to avoid peak memory pressure prior to the selected
                 module's forward pass.
+            device_mesh_backend_override (Optional[Tuple[BackendConfig, ...]]): Backend override for
+                the device mesh.
 
 
     Example::
@@ -1194,6 +1197,8 @@ class DMPCollection(DistributedModelParallel):
         m.apply(init_weights)
     """
 
+    MESH_DIM_NAMES: Tuple[str, str] = ("replicate", "shard")
+
     def __init__(
         self,
         module: nn.Module,
@@ -1213,6 +1218,7 @@ class DMPCollection(DistributedModelParallel):
         submodule_configs: Optional[List[DMPCollectionConfig]] = None,
         rs_awaitable_hook_module: Optional[str] = None,
         use_sharded_relay: bool = False,
+        device_mesh_backend_override: Optional[Tuple[BackendConfig, ...]] = None,
     ) -> None:
         assert (
             device.type == "cuda" or device.type == "mtia"
@@ -1241,6 +1247,7 @@ class DMPCollection(DistributedModelParallel):
             node_group_size=node_group_size,
             use_inter_host_allreduce=use_inter_host_allreduce,
             sharding_strategy=sharding_strategy,
+            device_mesh_backend_override=device_mesh_backend_override,
         )
 
         self._submodule_ctxs: List[DMPCollectionContext] = []
@@ -1253,6 +1260,7 @@ class DMPCollection(DistributedModelParallel):
                         sharding_group_size=submodule_config.sharding_group_size,
                         use_inter_host_allreduce=submodule_config.use_inter_host_allreduce,
                         sharding_strategy=submodule_config.sharding_strategy,
+                        device_mesh_backend_override=submodule_config.device_mesh_backend_override,
                     )
                 )
 
@@ -1271,6 +1279,7 @@ class DMPCollection(DistributedModelParallel):
                 world_size=world_size,
                 local_size=ctx.sharding_group_size,
                 use_inter_host_allreduce=ctx.use_inter_host_allreduce,
+                device_mesh_backend_override=ctx.device_mesh_backend_override,
             )
 
             ctx.device_mesh = device_mesh
@@ -1817,6 +1826,7 @@ class DMPCollection(DistributedModelParallel):
         world_size: int,
         local_size: int,
         use_inter_host_allreduce: bool = False,
+        device_mesh_backend_override: Optional[Tuple[BackendConfig, ...]] = None,
     ) -> Tuple[DeviceMesh, dist.ProcessGroup, dist.ProcessGroup]:
         """
         Creates process groups for sharding and replication, the process groups
@@ -1826,6 +1836,8 @@ class DMPCollection(DistributedModelParallel):
             global_rank (int): The global rank of the current process.
             world_size (int): The total number of ranks.
             local_size (int): The number of ranks per sharding group.
+            device_mesh_backend_override (Optional[Tuple[BackendConfig, ...]]):
+                Backend override for the device mesh.
 
         Returns:
             Tuple[DeviceMesh, dist.ProcessGroup, dist.ProcessGroup]: A tuple containing the device mesh,
@@ -1852,7 +1864,8 @@ class DMPCollection(DistributedModelParallel):
         mesh = DeviceMesh(
             device_type=self._device.type,
             mesh=peer_matrix,
-            mesh_dim_names=("replicate", "shard"),
+            mesh_dim_names=self.MESH_DIM_NAMES,
+            backend_override=device_mesh_backend_override,
         )
 
         logger.warning(f"[Connection] 2D Device Mesh created: {mesh}")
