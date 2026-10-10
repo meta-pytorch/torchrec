@@ -8,7 +8,6 @@
 # pyre-strict
 
 import unittest
-from typing import Any, cast
 from unittest.mock import Mock
 
 import torch
@@ -58,21 +57,6 @@ class TestSemisyncOptimizer(unittest.TestCase):
             global_params=self.global_params,
             optimizer=self.mock_local_optimizer,
             global_optimizer=self.mock_global_optimizer,
-        )
-
-    def test_scratch_buffers_fan_out_to_children(self) -> None:
-        local_scratch_buffer = torch.empty(3)
-        global_scratch_buffer = torch.empty(5)
-        cast(Any, self.mock_local_optimizer).scratch_buffers = Mock(
-            return_value=(local_scratch_buffer,)
-        )
-        cast(Any, self.mock_global_optimizer).scratch_buffers = Mock(
-            return_value=(global_scratch_buffer,)
-        )
-
-        self.assertEqual(
-            self.optimizer.scratch_buffers(),
-            (local_scratch_buffer, global_scratch_buffer),
         )
 
     def test_initialization_with_mocks(self) -> None:

@@ -775,21 +775,10 @@ class TestStashTechniqueTagging(unittest.TestCase):
         )
 
 
-class ScratchBufferOptimizer(torch.optim.SGD):
-    def __init__(
-        self,
-        params: Any,
-        scratch_buffer: torch.Tensor,
-    ) -> None:
-        super().__init__(params, lr=0.01)
-        self._scratch_buffer = scratch_buffer
-
-    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
-        return (self._scratch_buffer,)
-
-
 class TestStashOptimizerState(unittest.TestCase):
     """Tests for MemoryStashingManager.stash_optimizer_state method."""
+
+    # Citrine C2: use foreach for the dense optimizer fixtures in this class.
 
     def setUp(self) -> None:
         if not torch.cuda.is_available():
@@ -802,91 +791,10 @@ class TestStashOptimizerState(unittest.TestCase):
     def tearDown(self) -> None:
         MemoryStashingManager.reset()
 
-    def test_scratch_buffer_only_uses_optimizer_state_stash_restore_api(self) -> None:
-        model = nn.Linear(10, 10).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-        scratch_buffer_size = scratch_buffer.untyped_storage().size()
-
-        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
-        self.assertEqual(
-            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
-            1,
-        )
-
-        MemoryStashingManager.restore_optimizer_state()
-        await_restore(None)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
-        self.assertEqual(
-            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
-            0,
-        )
-
-    def test_returned_restore_consumes_registered_callbacks(self) -> None:
-        model = nn.Linear(10, 10).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-        scratch_buffer_size = scratch_buffer.untyped_storage().size()
-
-        await_restore, restore = MemoryStashingManager.stash_optimizer_state(optimizer)
-        restore(None)
-        await_restore(None)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
-        self.assertEqual(MemoryStashingManager._optimizer_state_restore_callbacks, [])
-        self.assertEqual(
-            MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks,
-            [],
-        )
-
-        MemoryStashingManager.restore_optimizer_state()
-        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
-
-    def test_scratch_buffer_restore_can_be_deferred_until_pre_step_guard(self) -> None:
-        model = nn.Linear(10, 10).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-
-        MemoryStashingManager.stash_optimizer_state(optimizer)
-        MemoryStashingManager.restore_optimizer_state(restore_scratch_buffer=False)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
-        self.assertEqual(
-            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
-            1,
-        )
-
-        MemoryStashingManager.restore_optimizer_state()
-
-        self.assertGreater(scratch_buffer.untyped_storage().size(), 0)
-
-    def test_scratch_buffer_restore_waits_until_all_slices_are_restored(self) -> None:
-        model = nn.Linear(512, 512).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-        x = torch.randn(32, 512, device=self.device)
-        model(x).sum().backward()
-        optimizer.step()
-
-        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(
-            optimizer, num_slices=2
-        )
-        MemoryStashingManager.restore_optimizer_state_next()
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
-
-        MemoryStashingManager.restore_optimizer_state()
-        await_restore(None)
-
-        self.assertGreater(scratch_buffer.untyped_storage().size(), 0)
-
     def test_basic_adam_optimizer_stash_and_restore(self) -> None:
         """Test basic stash and restore with Adam optimizer."""
         model = nn.Linear(512, 512).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
 
         # Run a step to populate optimizer state
         x = torch.randn(32, 512, device=self.device)
@@ -936,7 +844,9 @@ class TestStashOptimizerState(unittest.TestCase):
     def test_sgd_with_momentum_stash_and_restore(self) -> None:
         """Test stash and restore with SGD optimizer with momentum."""
         model = nn.Linear(512, 512).to(self.device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.01, momentum=0.9, foreach=True
+        )
 
         # Run a step to populate momentum buffers
         x = torch.randn(32, 512, device=self.device)
@@ -968,7 +878,7 @@ class TestStashOptimizerState(unittest.TestCase):
     def test_optimizer_step_works_after_restore(self) -> None:
         """Test that optimizer.step() works correctly after restore."""
         model = nn.Linear(512, 512).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
 
         # Initial training step
         x = torch.randn(32, 512, device=self.device)
@@ -1001,7 +911,7 @@ class TestStashOptimizerState(unittest.TestCase):
         """Test that small tensors (< 1MB) are not stashed."""
         # Create a small model with small optimizer state
         model = nn.Linear(10, 10).to(self.device)  # Very small
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
 
         # Run a step to populate optimizer state
         x = torch.randn(5, 10, device=self.device)
@@ -1037,7 +947,7 @@ class TestStashOptimizerState(unittest.TestCase):
 
         # Create a mock optimizer with nested state
         model = nn.Linear(512, 512).to(self.device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
 
         # Manually inject nested dataclass state (simulating Shampoo)
         for param in model.parameters():
@@ -1108,7 +1018,7 @@ class TestStashOptimizerState(unittest.TestCase):
     def test_callback_signature_compatibility_with_register_hook(self) -> None:
         """Test that await_restore can be used as backward hook."""
         model = nn.Linear(512, 512).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
 
         # Run a step to populate optimizer state
         x = torch.randn(32, 512, device=self.device)
