@@ -11,15 +11,17 @@ import json
 import logging
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Protocol,
     runtime_checkable,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -34,7 +36,11 @@ from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
 )
-from torchrec.distributed.logging_handlers import log_ems_event
+from torchrec.distributed.logging_handlers import (
+    log_ems_config,
+    log_ems_event,
+    log_oms_config,
+)
 from torchrec.distributed.logging_utils import OptimizationTechnique
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -1706,3 +1712,126 @@ def _collect_cuda_tensors_from_value(
             tensors.extend(_collect_cuda_tensors_from_value(attr_value, min_size_bytes))
 
     return tensors
+
+
+@dataclass(frozen=True)
+class StashingConfig:
+    """One stashing technique a pipeline asked for, and whether it will run.
+
+    Attributes:
+        technique: ``OptimizationTechnique.EMS`` or ``OptimizationTechnique.OMS``.
+        enabled: Whether the technique will actually stash. False when it was
+            requested but turned off.
+        disabled_reason: Why a requested technique is off. Required when
+            ``enabled`` is False.
+        restore_fqns: Modules whose backward hooks restore the stashed state.
+        hook_position: Which parameter inside each restore module is hooked.
+        stash_chunk_size_mb: Chunk size of the device-to-host copy.
+        restore_chunk_size_mb: Chunk size of the host-to-device copy.
+        extra: Settings only this pipeline has, logged under their own keys.
+    """
+
+    technique: OptimizationTechnique
+    enabled: bool
+    disabled_reason: Optional[str] = None
+    restore_fqns: Sequence[str] = ()
+    hook_position: Optional[float] = None
+    stash_chunk_size_mb: Optional[int] = None
+    restore_chunk_size_mb: Optional[int] = None
+    extra: Mapping[str, object] = field(default_factory=dict)
+
+
+def log_memory_stashing_config(
+    pipeline_type: str,
+    configs: Sequence[StashingConfig],
+    model: Optional[nn.Module] = None,
+) -> None:
+    """Log one ``ems_config`` / ``oms_config`` event per requested technique.
+
+    A technique that is off is logged under ``OptimizationTechnique.NONE``, so
+    adoption counts keyed on the technique only see jobs that stash. Pass the
+    sharded ``model`` to add the embedding tables this rank stashes. Never
+    raises: a logging failure must not fail pipeline construction.
+    """
+    for config in configs:
+        try:
+            _log_stashing_config(pipeline_type, config, model)
+        except Exception:
+            logger.warning(
+                "Failed to log %s memory stashing config",
+                config.technique.value,
+                exc_info=True,
+            )
+
+
+def _log_stashing_config(
+    pipeline_type: str, config: StashingConfig, model: Optional[nn.Module]
+) -> None:
+    metadata: Dict[str, str] = {
+        "pipeline_type": pipeline_type,
+        "enabled": str(config.enabled),
+        "restore_fqns": json.dumps([str(fqn) for fqn in config.restore_fqns]),
+    }
+    if not config.enabled:
+        metadata["disabled_reason"] = config.disabled_reason or "unspecified"
+    for key, value in (
+        ("hook_position", config.hook_position),
+        ("stash_chunk_size_mb", config.stash_chunk_size_mb),
+        ("restore_chunk_size_mb", config.restore_chunk_size_mb),
+    ):
+        if value is not None:
+            metadata[key] = str(value)
+    for key, value in config.extra.items():
+        metadata[key] = (
+            json.dumps(value) if isinstance(value, (list, tuple, dict)) else str(value)
+        )
+    if config.technique == OptimizationTechnique.EMS and model is not None:
+        # The event is still worth logging without the table summary.
+        try:
+            metadata.update(_stashed_embedding_tables(model))
+        except Exception:
+            logger.warning("Failed to read the stashed embedding tables", exc_info=True)
+
+    technique = config.technique if config.enabled else OptimizationTechnique.NONE
+    if config.technique == OptimizationTechnique.EMS:
+        log_ems_config(metadata, technique=technique)
+    elif config.technique == OptimizationTechnique.OMS:
+        log_oms_config(metadata, technique=technique)
+    else:
+        raise ValueError(f"not a memory stashing technique: {config.technique}")
+
+
+def _stashed_embedding_tables(model: nn.Module) -> Dict[str, str]:
+    """The embedding tables this rank stashes, and the HBM bytes they free.
+
+    Read from the sharded lookups, because ``stash_weights`` is resolved at
+    sharding time and can be set on the sharded tables afterwards. The
+    unsharded table configs do not reflect either.
+    """
+    names: List[str] = []
+    num_bytes = 0
+    for module in model.modules():
+        # ``_lookups`` is a plain list, so ``modules()`` never visits it.
+        for lookup in getattr(module, "_lookups", None) or []:
+            inner = lookup.module if hasattr(lookup, "module") else lookup
+            for emb_module in getattr(inner, "_emb_modules", None) or []:
+                config = getattr(emb_module, "_config", None)
+                tables = [
+                    table
+                    for table in getattr(config, "embedding_tables", None) or []
+                    if getattr(table, "stash_weights", False)
+                ]
+                if not tables:
+                    continue
+                names.extend(table.name for table in tables)
+                # Matches stash_embedding_weights: the whole group is stashed.
+                weights = getattr(
+                    getattr(emb_module, "_emb_module", None), "weights_dev", None
+                )
+                if weights is not None and weights.is_cuda:
+                    num_bytes += weights.numel() * weights.element_size()
+    return {
+        "num_stash_tables": str(len(names)),
+        "stash_table_names": ",".join(names),
+        "stash_bytes_rank": str(num_bytes),
+    }

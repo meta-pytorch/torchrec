@@ -29,7 +29,12 @@ from typing import (
 import torch
 from torch.autograd.profiler import record_function
 from torchrec.distributed.logger import one_time_rank0_logger
-from torchrec.distributed.memory_stashing import MemoryStashingManager
+from torchrec.distributed.logging_utils import OptimizationTechnique
+from torchrec.distributed.memory_stashing import (
+    log_memory_stashing_config,
+    MemoryStashingManager,
+    StashingConfig,
+)
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.train_pipeline.backward_injection import (
     FirstGradTensorFinder,
@@ -67,20 +72,11 @@ from torchrec.distributed.types import LazyNoWait, ShardingType
 from torchrec.sparse.jagged_tensor import KeyedTensor
 
 try:
-    from torchrec.distributed.logging_handlers import (
-        log_ems_config,
-        log_inplace_copy_batch,
-    )
-    from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
+    from torchrec.distributed.logging_handlers import log_inplace_copy_batch
 except Exception:
     torch._C._log_api_usage_once(
         "torchrec.distributed.train_pipeline.experimental_pipelines.import_failure.logging_handlers"
     )
-
-    DATA_TYPE_NUM_BITS: dict = {}  # type: ignore[no-redef]
-
-    def log_ems_config(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
-        pass
 
     def log_inplace_copy_batch(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
         pass
@@ -1016,6 +1012,20 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
             self._memcpy_stream,  # pyrefly: ignore[bad-argument-type]
             torch.cuda.Stream(device=device),
         )
+        log_memory_stashing_config(
+            type(self).__name__,
+            [
+                StashingConfig(
+                    technique=OptimizationTechnique.OMS,
+                    enabled=True,
+                    restore_fqns=[site_fqn],
+                    extra={
+                        "optimizer": type(optimizer).__name__,
+                        "sharding_type": sharding_type.value,
+                    },
+                )
+            ],
+        )
         self._await_restore: Callable[..., None] = lambda: None
         self._stash_future: Optional[
             Future[Tuple[Callable[..., None], Callable[..., None]]]
@@ -1185,42 +1195,22 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         if delay_stash:
             MemoryStashingManager.set_delay_stash(True)
 
-        self._log_ems_config()
-
-    def _log_ems_config(self) -> None:
-        """Emit an ems_config event with table-level stash info."""
-        try:
-            stash_table_names: list[str] = []
-            total_stash_bytes_unsharded: int = 0
-            base_model = self._model
-            if isinstance(base_model, DistributedModelParallel):
-                base_model = base_model.module
-            for module in base_model.modules():
-                embedding_configs = getattr(module, "embedding_configs", None)
-                if embedding_configs is not None:
-                    for ec in embedding_configs:
-                        if getattr(ec, "stash_weights", False):
-                            stash_table_names.append(ec.name)
-                            bits = DATA_TYPE_NUM_BITS.get(ec.data_type)
-                            if bits is not None:
-                                total_stash_bytes_unsharded += (
-                                    ec.num_embeddings * ec.embedding_dim * bits // 8
-                                )
-                            else:
-                                logger.warning(
-                                    f"Skipping stash bytes calculation for {ec.name}: "
-                                    f"unknown data_type {ec.data_type}"
-                                )
-            log_ems_config(
-                metadata={
-                    "num_stash_tables": str(len(stash_table_names)),
-                    "stash_table_names": ",".join(stash_table_names),
-                    "total_stash_bytes_unsharded": str(total_stash_bytes_unsharded),
-                    "pipeline_type": type(self).__name__,
-                },
-            )
-        except Exception:
-            logger.debug("EMS config logging failed", exc_info=True)
+        log_memory_stashing_config(
+            type(self).__name__,
+            [
+                StashingConfig(
+                    technique=OptimizationTechnique.EMS,
+                    enabled=True,
+                    restore_fqns=[self._injection_site.fqn],
+                    hook_position=self._injection_site.hook_position,
+                    extra={
+                        "delay_stash": delay_stash,
+                        "stash_site_fqn": stash_site_fqn or "",
+                    },
+                )
+            ],
+            model=self._model,
+        )
 
     def _try_hook_stash(self) -> None:
         """Register a forward pre-hook on ``stash_site_fqn`` to execute
