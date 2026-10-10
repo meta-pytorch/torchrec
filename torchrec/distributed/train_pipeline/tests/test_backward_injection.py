@@ -8,7 +8,9 @@
 # pyre-strict
 
 import copy
+import gc
 import unittest
+import weakref
 from typing import cast, List, Optional, Tuple
 
 import torch
@@ -222,6 +224,181 @@ class InjectionSiteTest(unittest.TestCase):
         model.zero_grad()
         model(torch.randn(2, 4)).sum().backward()
         self.assertEqual(grad_shapes[-1], torch.Size([4]))
+        handle.remove()
+
+    def test_forward_marker_survives_parameter_swap(self) -> None:
+        """FORWARD_MARKER still fires after the parameter objects are replaced,
+        which is what SimpleFSDP's swap_dtensor_with_tensor does every forward
+        and what silently disables a PARAM_GRAD hook."""
+        model = SimpleModel()
+        grad_shapes: List[torch.Size] = []
+
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.FORWARD_MARKER,
+            hook_position=0.0,
+        )
+        handle = register_backward_hook(
+            site,
+            model,
+            lambda grad: grad_shapes.append(grad.shape),
+        )
+
+        for module in model.modules():
+            for name, param in list(module.named_parameters(recurse=False)):
+                module._parameters[name] = nn.Parameter(param.detach().clone())
+
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(grad_shapes, [torch.Size([2, 4])])
+
+        # Under compile the trigger must survive as a node in the backward
+        # graph; plain Python in a backward would run at trace time instead.
+        grad_shapes.clear()
+        torch.compile(model, backend="aot_eager")(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(grad_shapes, [torch.Size([2, 4])])
+
+        handle.remove()
+
+    def test_forward_marker_reregister_reuses_compiled_graph(self) -> None:
+        """detach/attach re-registers the marker; the compiled backward still
+        carries the old key as a constant, so it must resolve to the new
+        callback instead of raising KeyError."""
+        model = SimpleModel()
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.FORWARD_MARKER,
+            hook_position=0.0,
+        )
+        compiled = torch.compile(model, backend="aot_eager")
+        first: List[torch.Size] = []
+        handle = register_backward_hook(site, model, lambda g: first.append(g.shape))
+        compiled(torch.randn(2, 4)).sum().backward()
+        handle.remove()
+
+        second: List[torch.Size] = []
+        handle = register_backward_hook(site, model, lambda g: second.append(g.shape))
+        compiled(torch.randn(2, 4)).sum().backward()
+        handle.remove()
+
+        self.assertEqual(first, [torch.Size([2, 4])])
+        self.assertEqual(second, [torch.Size([2, 4])])
+
+    def test_forward_marker_multiple_hooks_same_site(self) -> None:
+        """Registrations sharing an owner all fire, in registration order, and
+        removing one (even repeatedly) leaves the others in place."""
+        model = SimpleModel()
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.FORWARD_MARKER,
+            hook_position=0.0,
+        )
+        calls: List[str] = []
+        first = register_backward_hook(site, model, lambda g: calls.append("a"))
+        second = register_backward_hook(site, model, lambda g: calls.append("b"))
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(calls, ["a", "b"])
+
+        first.remove()
+        first.remove()
+        calls.clear()
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(calls, ["b"])
+
+        second.remove()
+        calls.clear()
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(calls, [])
+
+    def test_forward_marker_stale_remove_spares_new_registration(self) -> None:
+        """A handle removed again after detach/attach must not drop the
+        registration that replaced it."""
+        model = SimpleModel()
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.FORWARD_MARKER,
+            hook_position=0.0,
+        )
+        calls: List[str] = []
+        old = register_backward_hook(site, model, lambda g: calls.append("old"))
+        old.remove()
+        new = register_backward_hook(site, model, lambda g: calls.append("new"))
+        old.remove()
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(calls, ["new"])
+        new.remove()
+
+    def test_forward_marker_removed_before_outstanding_backward(self) -> None:
+        """Removing the last handle between forward and backward runs no
+        callback rather than raising."""
+        model = SimpleModel()
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.FORWARD_MARKER,
+            hook_position=0.0,
+        )
+        calls: List[str] = []
+        handle = register_backward_hook(site, model, lambda g: calls.append("a"))
+        loss = model(torch.randn(2, 4)).sum()
+        handle.remove()
+        loss.backward()
+        self.assertEqual(calls, [])
+
+    def test_forward_marker_unremoved_registration_is_collectible(self) -> None:
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.FORWARD_MARKER,
+            hook_position=0.0,
+        )
+
+        def register_and_drop() -> "weakref.ref[SimpleModel]":
+            model = SimpleModel()
+
+            # Callback closes over the model, as the pipeline's hook_fn does.
+            def hook_fn(grad: torch.Tensor) -> None:
+                _ = model
+
+            register_backward_hook(site, model, hook_fn)
+            return weakref.ref(model)
+
+        model_ref = register_and_drop()
+        gc.collect()
+        self.assertIsNone(model_ref())
+
+    def test_param_grad_does_not_survive_parameter_swap(self) -> None:
+        """Negative control for FORWARD_MARKER: PARAM_GRAD silently stops firing
+        once the parameter objects are replaced, because the hook lives on the
+        old object. This is the premise the marker path exists to work around."""
+        model = SimpleModel()
+        calls: List[torch.Size] = []
+
+        site = InjectionSite(
+            fqn="layer_b",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=0.0,
+        )
+        handle = register_backward_hook(
+            site,
+            model,
+            lambda grad: calls.append(grad.shape),
+        )
+
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(len(calls), 1)
+
+        for module in model.modules():
+            for name, param in list(module.named_parameters(recurse=False)):
+                module._parameters[name] = nn.Parameter(param.detach().clone())
+
+        model.zero_grad()
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(len(calls), 1)  # did not fire again
         handle.remove()
 
     def test_hook_position_no_trainable_params_raises(self) -> None:

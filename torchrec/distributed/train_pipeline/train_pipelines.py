@@ -1020,7 +1020,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self,
         site: InjectionSite,
         work: BackwardHookWork,
-    ) -> None:
+    ) -> torch.utils.hooks.RemovableHandle:
         """
         Registers work to execute during backward pass of an EC/EBC.
 
@@ -1038,6 +1038,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                   )
             work: Callable that receives the pipeline instance.
                   Executed sequentially with other work at same site.
+
+        Returns:
+            A handle; call ``.remove()`` to unregister. Callers that re-register
+            (``detach()``/``attach()`` re-runs ``_pipeline_model``) must remove
+            the previous one, or hooks stack up on the same module.
 
         Example:
             pipeline.register_backward_hook(
@@ -1062,7 +1067,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             with record_function(f"## backward_hook {site} ##"):
                 work(self)
 
-        register_backward_hook(site, model, hook_fn)
+        return register_backward_hook(site, model, hook_fn)
 
     def copy_batch_to_gpu(
         self,
