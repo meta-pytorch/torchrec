@@ -22,8 +22,10 @@ import itertools
 import json
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any, cast, List, Optional, Tuple
+import random
+import time
+from dataclasses import dataclass, replace
+from typing import Any, cast, Iterator, List, Optional, Tuple
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ from torchrec.distributed.train_pipeline import (
     GradientAccumulationWrapper,
     TrainPipeline,
 )
-from torchrec.distributed.types import DeviceToHostTensorAwaitable
+from torchrec.distributed.types import DeviceToHostTensorAwaitable, ShardingStrategy
 from torchrec.distributed.utils import _group_sharded_modules
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.metric_module import RecMetricModule
@@ -123,6 +125,14 @@ class RunOptions(BenchFuncConfig):
         expected_cache_size_bytes (Optional[int]): Expected total FBGEMM cache
             allocation for each enforce_hbm setting. When set, the benchmark validates
             the instantiated FBGEMM allocation before timing.
+        dataloader_delay_ms (float): Simulated per-batch dataloader latency, paid
+            inside ``next(dataloader_iter)``. Default 0 (in-memory batches, no
+            stall).
+        dataloader_delay_ms_per_gb (float): Additional simulated latency per GB of
+            the batch's input size, so larger per-rank inputs stall longer.
+        dataloader_delay_jitter_ms (float): Uniform random extra latency in
+            [0, jitter) per batch, seeded per rank, so ranks stall unevenly and
+            collectives wait on the slowest rank.
     """
 
     world_size: int = 2
@@ -142,6 +152,16 @@ class RunOptions(BenchFuncConfig):
     sync_batch: bool = False
     profile_model_init: bool = False
     expected_cache_size_bytes: Optional[int] = None
+    dataloader_delay_ms: float = 0.0
+    dataloader_delay_ms_per_gb: float = 0.0
+    dataloader_delay_jitter_ms: float = 0.0
+
+    def has_dataloader_delay(self) -> bool:
+        return (
+            self.dataloader_delay_ms > 0
+            or self.dataloader_delay_ms_per_gb > 0
+            or self.dataloader_delay_jitter_ms > 0
+        )
 
 
 def _validate_cache_sizes(
@@ -192,6 +212,21 @@ def _maybe_validate_cache_sizes(
     )
 
 
+def _delayed_dataloader(
+    batches: Iterator[ModelInput], run_option: RunOptions, rank: int
+) -> Iterator[ModelInput]:
+    # time.sleep releases the GIL, like a dataloader blocked on remote reads.
+    rng = random.Random(rank)
+    for batch in batches:
+        delay_ms = (
+            run_option.dataloader_delay_ms
+            + run_option.dataloader_delay_ms_per_gb * batch.size_in_bytes() / 1024**3
+            + rng.uniform(0, run_option.dataloader_delay_jitter_ms)
+        )
+        time.sleep(delay_ms / 1000)
+        yield batch
+
+
 @dataclass
 class _InitializedModel:
     unsharded_model: nn.Module
@@ -223,6 +258,22 @@ class _InitializedModel:
                 table_related_configs.mc_configs if table_related_configs else None
             ),
         )
+        if sharding_config.sharding_group_size is not None:
+            # 2D shards within each group, so plan for the group, not the world.
+            planner_config = replace(
+                planner_config, world_size=sharding_config.sharding_group_size
+            )
+            if (
+                sharding_config.sharding_strategy
+                == ShardingStrategy.FULLY_SHARDED.value
+            ):
+                # DMPCollection.sync() does not skip FULLY_SHARDED modules, so
+                # turn off the pipeline's periodic sync, as APS does for FS2D.
+                pipeline_config = replace(
+                    pipeline_config,
+                    kwargs=pipeline_config.kwargs
+                    | {"dmp_collection_sync_interval_batches": None},
+                )
         planner = planner_config.generate_planner(tables=tables + weighted_tables)
         sharded_model, optimizer = sharding_config.generate_sharded_model_and_optimizer(
             model=unsharded_model,
@@ -412,6 +463,8 @@ def runner(
                     )
                 else:
                     dataloader = iter(bench_inputs)
+                if run_option.has_dataloader_delay():
+                    dataloader = _delayed_dataloader(dataloader, run_option, rank)
 
                 not_nan_awaitable: Optional[DeviceToHostTensorAwaitable] = None
                 while True:
