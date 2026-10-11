@@ -181,6 +181,58 @@ class TrainPipelineBaseTest(unittest.TestCase):
             # If both were on GPU, the results will be exactly the same
             self.assertTrue(torch.isclose(pred_gpu.cpu(), pred))
 
+    def test_new_dataloader_iterator_resets_pipeline(self) -> None:
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        model.eval()
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelineBase(model, optimizer, device)
+        first_batch = ModelInputSimple(
+            float_features=torch.zeros(10),
+            label=torch.zeros(1),
+        )
+        second_batch = ModelInputSimple(
+            float_features=torch.ones(10),
+            label=torch.ones(1),
+        )
+        first_dataloader = iter([first_batch])
+
+        pipeline.progress(first_dataloader)
+        with self.assertRaises(StopIteration):
+            pipeline.progress(first_dataloader)
+
+        output = pipeline.progress(iter([second_batch]))
+        expected_output = model(second_batch.to(device, non_blocking=False))[1]
+        self.assertTrue(torch.equal(output, expected_output))
+
+    def test_new_dataloader_iterator_preserves_prefetched_batch(self) -> None:
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        model.eval()
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelineBase(model, optimizer, device)
+        prefetched_batch = ModelInputSimple(
+            float_features=torch.zeros(10),
+            label=torch.zeros(1),
+        )
+        old_dataloader = iter([prefetched_batch, prefetched_batch])
+        new_batch = ModelInputSimple(
+            float_features=torch.ones(10),
+            label=torch.ones(1),
+        )
+        new_dataloader = iter([new_batch])
+
+        pipeline.progress(old_dataloader)
+        prefetched_output = pipeline.progress(new_dataloader)
+        new_output = pipeline.progress(new_dataloader)
+
+        expected_prefetched_output = model(
+            prefetched_batch.to(device, non_blocking=False)
+        )[1]
+        expected_new_output = model(new_batch.to(device, non_blocking=False))[1]
+        self.assertTrue(torch.equal(prefetched_output, expected_prefetched_output))
+        self.assertTrue(torch.equal(new_output, expected_new_output))
+
 
 class TrainPipelinePT2Test(unittest.TestCase):
     def setUp(self) -> None:
