@@ -1280,6 +1280,11 @@ class Shard:
     storage: Optional[Storage] = None
     perf: Optional[Perf] = None
     rank: Optional[int] = None
+    # Populated only for FUSED_UVM_CACHING. For each table, estimated cache bytes
+    # are round(num_rows * embedding_dim * element_size * cache_load_factor), or
+    # cached row slots times row size. They are apportioned by shard size, except
+    # that data-parallel shards each contain the full cache.
+    cache_weight_bytes: int = 0
 
     def __hash__(self) -> int:
         return hash(
@@ -1289,6 +1294,7 @@ class Shard:
                 self.storage,
                 self.perf,
                 self.rank,
+                self.cache_weight_bytes,
             )
         )
 

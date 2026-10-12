@@ -1457,6 +1457,54 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
 
             self.assertEqual(estimates, expected_storage)
 
+    def test_hbm_cache_storage_returns_per_shard_cache_bytes(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name=f"table_{index}",
+                feature_names=[f"feature_{index}"],
+                data_type=DataType.FP32,
+            )
+            for index in range(2)
+        ]
+        constraints = {
+            table.name: ParameterConstraints(
+                sharding_types=[ShardingType.TABLE_WISE.value],
+                compute_kernels=[EmbeddingComputeKernel.FUSED_UVM_CACHING.value],
+                cache_params=CacheParams(load_factor=0.5),
+            )
+            for table in tables
+        }
+        topology = Topology(world_size=1, compute_device="cuda")
+        with patch(
+            "torchrec.distributed.planner.shard_estimators.compute_storage_usage",
+            wraps=compute_storage_usage,
+        ) as storage_usage:
+            options = EmbeddingEnumerator(
+                topology=topology,
+                batch_size=BATCH_SIZE,
+                estimator=EmbeddingStorageEstimator(topology=topology),
+                constraints=constraints,
+            ).enumerate(
+                module=TestSparseNN(tables=tables, weighted_tables=[]),
+                sharders=[
+                    cast(
+                        ModuleSharder[torch.nn.Module],
+                        TestEBCSharder(
+                            sharding_type=ShardingType.TABLE_WISE.value,
+                            kernel_type=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+                        ),
+                    )
+                ],
+            )
+
+        self.assertEqual(len(tables), storage_usage.call_count)
+        self.assertEqual(
+            [50 * 10 * 4] * len(tables),
+            [option.shards[0].cache_weight_bytes for option in options],
+        )
+
     @patch(
         "torchrec.distributed.planner.shard_estimators._calculate_shard_io_sizes",
         return_value=([1024], [3333]),
