@@ -5,8 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 
 import unittest
 from unittest.mock import patch
@@ -15,8 +13,10 @@ import torch
 import torch.utils._pytree as pytree
 from torch.fx._pytree import tree_flatten_spec
 from torch.testing import FileCheck
+from torchrec.distributed import dist_data
 from torchrec.fx import symbolic_trace
 from torchrec.sparse.jagged_tensor import (
+    _cuda_to_cpu_safe,
     _safe_tolist,
     ComputeJTDictToKJT,
     JaggedTensor,
@@ -1627,6 +1627,84 @@ class TestJaggedTensorTracing(unittest.TestCase):
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
     )
+    def test_cuda_to_cpu_safe_uses_pinned_destination(self) -> None:
+        tensor = torch.tensor([3, 5, 7, 2], device="cuda")
+
+        with patch("torch._utils_internal.justknobs_check", return_value=True):
+            result = _cuda_to_cpu_safe(tensor)
+
+        self.assertTrue(result.is_pinned())
+        self.assertEqual(result.tolist(), [3, 5, 7, 2])
+
+    @unittest.skipIf(torch.cuda.device_count() <= 0, "CUDA is not available")
+    def test_cuda_to_cpu_safe_shared_knob_controls_staging(self) -> None:
+        tensor = torch.tensor([[3, 5], [7, 2]], device="cuda").t()
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                with patch(
+                    "torch._utils_internal.justknobs_check", return_value=enabled
+                ):
+                    result = _cuda_to_cpu_safe(tensor)
+                self.assertEqual(result.is_pinned(), enabled)
+                self.assertEqual(result.dtype, tensor.dtype)
+                self.assertEqual(result.shape, tensor.shape)
+                self.assertEqual(result.tolist(), [[3, 7], [5, 2]])
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_cuda_to_cpu_safe_preserves_non_default_stream_order(self) -> None:
+        stream = torch.cuda.Stream()
+
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                with patch(
+                    "torch._utils_internal.justknobs_check", return_value=enabled
+                ), torch.cuda.stream(stream):
+                    tensor = torch.arange(1024, device="cuda") * 3
+                    result = _cuda_to_cpu_safe(tensor)
+                self.assertEqual(result.is_pinned(), enabled)
+                self.assertEqual(result.tolist(), [i * 3 for i in range(1024)])
+
+    @unittest.skipIf(torch.cuda.device_count() <= 0, "CUDA is not available")
+    def test_cuda_to_cpu_safe_empty_tensor_in_both_modes(self) -> None:
+        tensor = torch.empty((0, 2), dtype=torch.int64, device="cuda")
+        for enabled in (False, True):
+            with patch("torch._utils_internal.justknobs_check", return_value=enabled):
+                result = _cuda_to_cpu_safe(tensor)
+            self.assertEqual(result.shape, tensor.shape)
+            self.assertEqual(result.dtype, tensor.dtype)
+            self.assertEqual(result.tolist(), [])
+
+    @unittest.skipUnless(
+        getattr(torch._utils_internal, "IS_FBSOURCE", False),
+        "Meta-only configuration failure check",
+    )
+    @unittest.skipIf(torch.cuda.device_count() <= 0, "CUDA is not available")
+    def test_cuda_to_cpu_safe_unavailable_configuration_defaults_on(self) -> None:
+        jk = getattr(torch._utils_internal, "justknobs", None)
+        assert jk is not None
+        name = "pytorch/sparsenn:enable_gpu_preproc_pinned_d2h_readback"
+        with self.assertRaises((RuntimeError, SystemError)):
+            jk.check(name)
+        result = _cuda_to_cpu_safe(torch.tensor([3, 5], device="cuda"))
+        self.assertTrue(result.is_pinned())
+        self.assertEqual(result.tolist(), [3, 5])
+
+    @unittest.skipIf(torch.cuda.device_count() <= 0, "CUDA is not available")
+    def test_cuda_to_cpu_safe_propagates_allocation_error(self) -> None:
+        tensor = torch.tensor([3, 5, 7, 2], device="cuda")
+        with patch("torch._utils_internal.justknobs_check", return_value=True), patch(
+            "torch.empty", side_effect=RuntimeError("allocation failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+                _cuda_to_cpu_safe(tensor)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
     def test_cuda_tolist_empty_tensor(self) -> None:
         tensor = torch.tensor([], dtype=torch.int64, device="cuda")
         result = _safe_tolist(tensor)
@@ -1640,3 +1718,88 @@ class TestJaggedTensorTracing(unittest.TestCase):
         tensor = torch.tensor([42], device="cuda")
         result = _safe_tolist(tensor)
         self.assertEqual(result, [42])
+
+
+@unittest.skipUnless(
+    getattr(torch._utils_internal, "IS_FBSOURCE", False),
+    "Meta-only real JustKnobs integration",
+)
+@unittest.skipIf(torch.cuda.device_count() <= 0, "CUDA is not available")
+class PinnedReadbackGateTest(unittest.TestCase):
+    _shared_knob = "pytorch/sparsenn:enable_gpu_preproc_pinned_d2h_readback"
+    _safe_list_knob = "pytorch/torchrec:killswitch_safe_tolist"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        # Access the Meta adapter's existing pyjk module, keeping the public
+        # test module importable with the OSS adapter as well.
+        jk = getattr(torch._utils_internal, "justknobs", None)
+        assert jk is not None
+        cls._patcher = jk.PyPatchJustKnobs()
+        cls.enterClassContext(cls._patcher.patch(cls._shared_knob, True))
+        cls.enterClassContext(cls._patcher.patch(cls._safe_list_knob, True))
+        cls.enterClassContext(patch("torch._utils_internal.DISABLE_JUSTKNOBS", False))
+
+    def test_safe_tolist_shared_knob_matrix(self) -> None:
+        tensor = torch.tensor([3, 5, 7, 2], device="cuda")
+        for safe_enabled, shared_enabled in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            with self.subTest(safe=safe_enabled, shared=shared_enabled):
+                with self._patcher.patch(
+                    self._safe_list_knob, safe_enabled
+                ), self._patcher.patch(self._shared_knob, shared_enabled), patch(
+                    "torchrec.sparse.jagged_tensor._cuda_to_cpu_safe",
+                    wraps=_cuda_to_cpu_safe,
+                ) as helper:
+                    result = _safe_tolist(tensor)
+                self.assertEqual(result, [3, 5, 7, 2])
+                self.assertEqual(helper.call_count, int(safe_enabled))
+
+    def test_safe_tolist_2d_shared_knob_matrix(self) -> None:
+        tensor = torch.tensor([[3, 5], [7, 2]], device="cuda")
+        for safe_enabled, shared_enabled in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            with self.subTest(safe=safe_enabled, shared=shared_enabled):
+                with self._patcher.patch(
+                    self._safe_list_knob, safe_enabled
+                ), self._patcher.patch(self._shared_knob, shared_enabled), patch(
+                    "torchrec.distributed.dist_data._cuda_to_cpu_safe",
+                    wraps=_cuda_to_cpu_safe,
+                ) as helper:
+                    result = dist_data._safe_tolist_2d(tensor)
+                self.assertEqual(result, [[3, 5], [7, 2]])
+                self.assertEqual(helper.call_count, int(safe_enabled))
+
+    def test_safe_tolist_shared_knob_live_flips(self) -> None:
+        tensor = torch.tensor([3, 5, 7, 2], device="cuda")
+        for enabled in (True, False, True):
+            with self._patcher.patch(self._shared_knob, enabled):
+                result = _cuda_to_cpu_safe(tensor)
+            self.assertEqual(result.is_pinned(), enabled)
+            self.assertEqual(result.tolist(), [3, 5, 7, 2])
+
+    def test_safe_tolist_2d_fake_cuda_tensor_during_pt2_export(self) -> None:
+        fake_mode = torch._subclasses.FakeTensorMode()
+        tensor = fake_mode.fake_tensor_converter.from_real_tensor(
+            fake_mode,
+            # Empty metadata has a concrete list without reading fake scalars.
+            torch.empty((0, 2), dtype=torch.int64),
+            make_constant=True,
+        )
+        tensor.fake_device = torch.device("cuda")
+        with patch(
+            "torchrec.distributed.dist_data.is_torchdynamo_compiling",
+            return_value=True,
+        ), patch("torch._utils_internal.justknobs_check") as check_knob:
+            result = dist_data._safe_tolist_2d(tensor)
+        self.assertEqual(result, [])
+        check_knob.assert_not_called()
