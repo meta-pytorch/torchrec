@@ -30,6 +30,7 @@ from torchrec.distributed.planner.estimator.estimator import (
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Perf,
+    Shard,
     SharderData,
     SharderDataMap,
     ShardEstimator,
@@ -258,33 +259,37 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     sharding_option.name,
                 )
             try:
-                shard_storages = calculate_shard_storages(
-                    sharder_data=sharder_data,
-                    sharding_type=sharding_option.sharding_type,
-                    tensor=sharding_option.tensor,
-                    compute_device=self._topology.compute_device,
-                    compute_kernel=sharding_option.compute_kernel,
-                    shard_sizes=[shard.size for shard in sharding_option.shards],
-                    batch_sizes=batch_sizes,
-                    world_size=self._topology.world_size,
-                    local_world_size=self._topology.intra_group_size,
-                    input_lengths=sharding_option.input_lengths,
-                    num_poolings=num_poolings,
-                    caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
-                    is_pooled=sharding_option.is_pooled,
-                    input_data_type_size=input_data_type_size,
-                    output_data_type_size=output_data_type_size,
-                    pipeline_type=self._pipeline_type,
-                    count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
-                    is_inference=self._is_inference,
-                    multipass_prefetch_max_pass=(
-                        mpp_conf.num_passes if mpp_conf else None
-                    ),
-                    key_value_params=key_value_params,
-                    kv_cache_load_factor=kv_cache_load_factor,
-                    use_virtual_table=use_virtual_table,
-                    weight_init_on_cpu=weight_init_on_cpu,
-                    quantized_weight_dtype=quantized_weight_dtype,
+                shard_storages, cache_weight_sizes = (
+                    _calculate_shard_storages_and_cache_sizes(
+                        sharder_data=sharder_data,
+                        sharding_type=sharding_option.sharding_type,
+                        tensor=sharding_option.tensor,
+                        compute_device=self._topology.compute_device,
+                        compute_kernel=sharding_option.compute_kernel,
+                        shard_sizes=[shard.size for shard in sharding_option.shards],
+                        batch_sizes=batch_sizes,
+                        world_size=self._topology.world_size,
+                        local_world_size=self._topology.intra_group_size,
+                        input_lengths=sharding_option.input_lengths,
+                        num_poolings=num_poolings,
+                        caching_ratio=(
+                            caching_ratio if caching_ratio else UVM_CACHING_RATIO
+                        ),
+                        is_pooled=sharding_option.is_pooled,
+                        input_data_type_size=input_data_type_size,
+                        output_data_type_size=output_data_type_size,
+                        pipeline_type=self._pipeline_type,
+                        count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
+                        is_inference=self._is_inference,
+                        multipass_prefetch_max_pass=(
+                            mpp_conf.num_passes if mpp_conf else None
+                        ),
+                        key_value_params=key_value_params,
+                        kv_cache_load_factor=kv_cache_load_factor,
+                        use_virtual_table=use_virtual_table,
+                        weight_init_on_cpu=weight_init_on_cpu,
+                        quantized_weight_dtype=quantized_weight_dtype,
+                    )
                 )
             except ZeroDivisionError as e:
                 raise ValueError(
@@ -295,8 +300,13 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     f"sharding_type='{sharding_option.sharding_type}', "
                     f"compute_kernel='{sharding_option.compute_kernel}'"
                 ) from e
-            for shard, storage in zip(sharding_option.shards, shard_storages):
+            for shard, storage, cache_weight_size in zip(
+                sharding_option.shards,
+                shard_storages,
+                cache_weight_sizes,
+            ):
                 shard.storage = storage
+                shard.cache_weight_bytes = cache_weight_size
 
 
 def calculate_pipeline_io_cost(
@@ -374,6 +384,61 @@ def calculate_shard_storages(
     Like calculate_shard_storages but takes a SharderData snapshot instead of a live
     ModuleSharder, enabling picklability.
     """
+    storages, _ = _calculate_shard_storages_and_cache_sizes(
+        sharder_data=sharder_data,
+        sharding_type=sharding_type,
+        tensor=tensor,
+        compute_device=compute_device,
+        compute_kernel=compute_kernel,
+        shard_sizes=shard_sizes,
+        batch_sizes=batch_sizes,
+        world_size=world_size,
+        local_world_size=local_world_size,
+        input_lengths=input_lengths,
+        num_poolings=num_poolings,
+        caching_ratio=caching_ratio,
+        is_pooled=is_pooled,
+        input_data_type_size=input_data_type_size,
+        output_data_type_size=output_data_type_size,
+        pipeline_type=pipeline_type,
+        count_ephemeral_storage_cost=count_ephemeral_storage_cost,
+        is_inference=is_inference,
+        multipass_prefetch_max_pass=multipass_prefetch_max_pass,
+        key_value_params=key_value_params,
+        kv_cache_load_factor=kv_cache_load_factor,
+        use_virtual_table=use_virtual_table,
+        weight_init_on_cpu=weight_init_on_cpu,
+        quantized_weight_dtype=quantized_weight_dtype,
+    )
+    return storages
+
+
+def _calculate_shard_storages_and_cache_sizes(
+    sharder_data: SharderData,
+    sharding_type: str,
+    tensor: torch.Tensor,
+    compute_device: str,
+    compute_kernel: str,
+    shard_sizes: List[List[int]],
+    batch_sizes: List[int],
+    world_size: int,
+    local_world_size: int,
+    input_lengths: List[float],
+    num_poolings: List[float],
+    caching_ratio: float,
+    is_pooled: bool,
+    input_data_type_size: float,
+    output_data_type_size: float,
+    pipeline_type: PipelineType = PipelineType.NONE,
+    count_ephemeral_storage_cost: bool = False,
+    is_inference: bool = False,
+    multipass_prefetch_max_pass: Optional[int] = None,
+    key_value_params: Optional[KeyValueParams] = None,
+    kv_cache_load_factor: float = KV_CACHING_RATIO,
+    use_virtual_table: bool = False,
+    weight_init_on_cpu: bool = False,
+    quantized_weight_dtype: Optional[DataType] = None,
+) -> Tuple[List[Storage], List[int]]:
     input_sizes, output_sizes = _calculate_shard_io_sizes(
         sharding_type=sharding_type,
         batch_sizes=batch_sizes,
@@ -397,6 +462,15 @@ def calculate_shard_storages(
     table_cached = _is_table_cached(compute_kernel)
     if table_cached:
         hbm_storage = round(ddr_storage * caching_ratio)
+
+    cache_weight_sizes = [0] * len(shard_sizes)
+    if compute_kernel == EmbeddingComputeKernel.FUSED_UVM_CACHING.value:
+        cache_weight_sizes = _calculate_tensor_sizes(
+            storage=hbm_storage,
+            shape=tensor.shape,
+            shard_sizes=shard_sizes,
+            sharding_type=sharding_type,
+        )
 
     optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
 
@@ -527,7 +601,7 @@ def calculate_shard_storages(
         for ssd_specific_size in ssd_specific_sizes
     ]
 
-    return [
+    storages = [
         Storage(
             hbm=hbm_size,
             ddr=ddr_size,
@@ -535,6 +609,7 @@ def calculate_shard_storages(
         )
         for hbm_size, ddr_size, ssd_size in zip(hbm_sizes, ddr_sizes, ssd_sizes)
     ]
+    return storages, cache_weight_sizes
 
 
 def _is_table_cached(
