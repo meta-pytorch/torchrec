@@ -1549,8 +1549,6 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             exhausting dataloader iterator.
         apply_jit (bool): apply torch.jit.script to non-pipelined (unsharded) modules.
         TODO: pipeline_postproc, custom_model_fwd, strict
-        use_emb_lookuo_stream (bool): if true invoke the compute_and_output_dist
-            (for batch i+1) using a new stream, else re-using the data_dist stream
         embedding_lookup_before_optimizer (bool): if true, issue batch i+1's
             embedding lookup between the backward and the dense optimizer step,
             instead of batch i's at the top of ``progress()``. The lookup for
@@ -1567,6 +1565,12 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         defer_dp_lookup (bool): holds each sharded embedding collection's
             data-parallel lookup until the swapped runtime forward consumes the
             embedding result. This is independent of lookup placement.
+        emb_lookup_stream (str): stream used for embedding lookup. Supports `new`,
+            `current`, `data_dist`, and `new_for:<module FQN>`. The last option
+            moves only the named pipelined module to a new stream.
+        defer_pipeline_stream_fences (bool): defer whole-stream waits by recording
+            per-module lookup completion events and keeping produced tensors alive
+            on their consuming streams.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -1585,7 +1589,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
         strict: bool = False,
-        emb_lookup_stream: str = "data_dist",  # new, current, data_dist (default)
+        emb_lookup_stream: str = "data_dist",
         embedding_lookup_after_data_dist: bool = False,
         enable_inplace_copy_batch: bool = False,
         enqueue_batch_after_forward: bool = False,
@@ -1593,6 +1597,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         clear_data_dist_inputs: bool = False,
         embedding_lookup_before_optimizer: bool = False,
         defer_dp_lookup: bool = False,
+        defer_pipeline_stream_fences: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1613,13 +1618,33 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             embedding_lookup_after_data_dist,
             embedding_lookup_before_optimizer,
         )
+        self._defer_pipeline_stream_fences = defer_pipeline_stream_fences
+        self._context.defer_pipeline_stream_fences = defer_pipeline_stream_fences
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
 
         self._defer_dp_lookup = defer_dp_lookup
         self._deferred_dp_module_context_names: Optional[List[str]] = None
+        self._selective_emb_lookup_module_name: Optional[str] = None
+        self._selective_emb_lookup_stream: Optional[torch.Stream] = None
+        self._selective_emb_lookup_module: Optional[ShardedModule] = None
+        self._selective_emb_lookup_modules: Optional[List[ShardedModule]] = None
+        self._emb_lookup_stream: Optional[torch.Stream]
 
-        if emb_lookup_stream == "new":
-            self._emb_lookup_stream: Optional[torch.Stream] = (
+        if emb_lookup_stream.startswith("new_for:"):
+            module_name = emb_lookup_stream.removeprefix("new_for:")
+            if not module_name:
+                raise RuntimeError(
+                    "Expected a module FQN after emb_lookup_stream='new_for:'"
+                )
+            self._emb_lookup_stream = self._data_dist_stream
+            self._selective_emb_lookup_module_name = module_name
+            self._selective_emb_lookup_stream = (
+                (torch.get_device_module(device).Stream())
+                if device.type in ["cuda", "mtia"]
+                else None
+            )
+        elif emb_lookup_stream == "new":
+            self._emb_lookup_stream = (
                 (torch.get_device_module(device).Stream())
                 if device.type in ["cuda", "mtia"]
                 else None
@@ -1664,12 +1689,64 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         context = cast(EmbeddingTrainPipelineContext, self.contexts[batch_index])
         self.start_embedding_lookup(self.batches[batch_index], context)
 
+    def _create_context(self) -> TrainPipelineContext:
+        context = super()._create_context()
+        context.defer_pipeline_stream_fences = self._defer_pipeline_stream_fences
+        return context
+
+    def reset(self) -> None:
+        super().reset()
+        self._context.defer_pipeline_stream_fences = self._defer_pipeline_stream_fences
+
+    def _record_embedding_lookup_event(
+        self,
+        module: ShardedModule,
+        context: EmbeddingTrainPipelineContext,
+    ) -> None:
+        if not context.defer_pipeline_stream_fences:
+            return
+        name = getattr(module.forward, "name", None)
+        if not isinstance(name, str):
+            raise RuntimeError("Pipelined module is missing its forward name")
+        if name in context.embedding_lookup_events:
+            raise RuntimeError(f"Duplicate lookup completion event for {name}")
+        event = torch.get_device_module(self._device).Event()
+        event.record()
+        context.embedding_lookup_events[name] = event
+
     def wait_embedding_lookup(self) -> None:
         """
         Waits on the embedding lookup requests to get the embedding lookup tensors requests
         """
         current_stream = torch.get_device_module(self._device).current_stream()
         current_stream.wait_stream(self._emb_lookup_stream)
+        if self._selective_emb_lookup_stream is not None:
+            current_stream.wait_stream(self._selective_emb_lookup_stream)
+
+    def _validate_selective_emb_lookup_module(self) -> None:
+        module_name = self._selective_emb_lookup_module_name
+        if (
+            module_name is None
+            or self._selective_emb_lookup_modules is self._pipelined_modules
+        ):
+            return
+
+        matches = [
+            module
+            for module in self._pipelined_modules
+            if getattr(module.forward, "name", None) == module_name
+        ]
+        if len(matches) != 1:
+            available_modules = [
+                getattr(module.forward, "name", "unknown")
+                for module in self._pipelined_modules
+            ]
+            raise RuntimeError(
+                f"Expected exactly one pipelined module named {module_name!r}, "
+                f"found {len(matches)}; available modules: {available_modules}"
+            )
+        self._selective_emb_lookup_module = matches[0]
+        self._selective_emb_lookup_modules = self._pipelined_modules
 
     def _mark_dp_lookups_deferred(self, context: EmbeddingTrainPipelineContext) -> None:
         """Marks supported module contexts for deferred DP lookup.
@@ -1706,9 +1783,29 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         with record_function(f"## start_embedding_lookup {context.index} ##"):
             current_stream = torch.get_device_module(self._device).current_stream()
-            # pyrefly: ignore [bad-argument-type]
-            with self._stream_context(self._emb_lookup_stream):
-                for module in self._pipelined_modules:
+            if self._selective_emb_lookup_module_name is None:
+                # pyrefly: ignore [bad-argument-type]
+                with self._stream_context(self._emb_lookup_stream):
+                    for module in self._pipelined_modules:
+                        _start_embedding_lookup(
+                            module,
+                            context,
+                            source_stream=self._data_dist_stream,
+                            target_stream=current_stream,
+                            stream_context=self._stream_context,
+                        )
+                        self._record_embedding_lookup_event(module, context)
+                return
+
+            self._validate_selective_emb_lookup_module()
+            for module in self._pipelined_modules:
+                lookup_stream = (
+                    self._selective_emb_lookup_stream
+                    if module is self._selective_emb_lookup_module
+                    else self._emb_lookup_stream
+                )
+                # pyrefly: ignore [bad-argument-type]
+                with self._stream_context(lookup_stream):
                     _start_embedding_lookup(
                         module,
                         context,
@@ -1716,6 +1813,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
                         target_stream=current_stream,
                         stream_context=self._stream_context,
                     )
+                    self._record_embedding_lookup_event(module, context)
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True

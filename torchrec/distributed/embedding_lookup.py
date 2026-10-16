@@ -400,6 +400,11 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                     )
                     #  attribute `prefetch_pipeline`.
                     and not emb_op.emb_module.prefetch_pipeline
+                    and not getattr(
+                        emb_op.emb_module,
+                        "direct_backend_gather_enabled",
+                        False,
+                    )
                 ):
                     logging.error(
                         f"Invalid setting on {type(emb_op.emb_module)} modules. prefetch_pipeline must be set to True.\n"
@@ -980,8 +985,8 @@ class GroupedPooledEmbeddingsLookup(
                 ],
             ]
         """
-        # Citrine C3: allocate directly on the target device.
         # Pre-allocates 1D output tensor to avoid expensive merging.
+        # Citrine C3: allocate directly on the target device to avoid a copy.
         vbe_output = torch.empty(
             sum([sum(split) for split in vbe_splits]),
             dtype=self._vbe_output_dtype(),

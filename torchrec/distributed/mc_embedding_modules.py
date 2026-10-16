@@ -124,9 +124,14 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                 env=env,
                 device=device,
                 embedding_shardings=embedding_shardings,
+                # Sharded EC has already resolved the global
+                # get_ec_index_dedup() policy and performs that input dedup
+                # upstream. MCC must mirror the resulting per-module contract:
+                # enabling another dedup here changes remapping semantics,
+                # while forcing it off would diverge when EC dedup is enabled.
                 use_index_dedup=(
-                    e_sharder._use_index_dedup
-                    if isinstance(e_sharder, EmbeddingCollectionSharder)
+                    self._embedding_module.use_index_dedup()
+                    if isinstance(self._embedding_module, ShardedEmbeddingCollection)
                     else False
                 ),
             )

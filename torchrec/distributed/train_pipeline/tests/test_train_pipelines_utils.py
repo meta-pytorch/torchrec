@@ -61,8 +61,10 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Multistreamable
+
+_UTILS_LOGGER_NAME: str = "torchrec.distributed.train_pipeline.utils"
 
 
 class ModelType(enum.Enum):
@@ -82,6 +84,19 @@ def enrich_hstu_features(
     if kjt._weights is not None:
         kjt._weights *= hstu_factor
     return kjt
+
+
+@torch.fx.has_side_effect
+@torch.fx.wrap
+def _hidden_ebc_lookup(ebc: torch.nn.Module, kjt: KeyedJaggedTensor) -> KeyedTensor:
+    """
+    Performs an embedding lookup from inside an fx-wrapped function.
+
+    fx does not trace into a wrapped function: it emits a single `call_function`
+    node that carries `ebc` as a constant argument. `_rewrite_model` only scans
+    `call_module` nodes, so a sharded module invoked this way is invisible to it.
+    """
+    return ebc(kjt)
 
 
 class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
@@ -464,6 +479,98 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         missing_keys, unexpected_keys = sharded_model.load_state_dict(state_dict)
         self.assertEqual(missing_keys, [])
         self.assertEqual(unexpected_keys, [])
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_rewrite_model_sharded_module_hidden_in_fx_wrap(self) -> None:
+        """A sharded module called from inside an fx-wrapped function is emitted
+        as a `call_function` node holding the module as a constant argument, not
+        as a `call_module` node. `_rewrite_model` only rewrites `call_module`
+        nodes, so such a module is neither pipelined nor reported as
+        non-pipelined -- it is silently skipped.
+
+        ARM A calls the EBC through an fx-wrapped function (the production bug).
+        ARM B calls the exact same EBC directly with the same KJT (the fix).
+        """
+        sharding_type = ShardingType.TABLE_WISE.value
+        kernel_type = EmbeddingComputeKernel.FUSED.value
+
+        class TestModel(TestSparseNN):
+            call_ebc_directly: bool = False
+
+            def forward(
+                self,
+                input: ModelInput,
+            ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                kjt = cast(KeyedJaggedTensor, input.idlist_features)
+                # pyre-ignore[29]: `sparse` is a Module attribute, not a Tensor
+                # pyrefly: ignore[missing-attribute]
+                ebc = cast(torch.nn.Module, self.sparse.ebc)
+                if (type(self)).call_ebc_directly:
+                    ebc_out = ebc(kjt)
+                else:
+                    ebc_out = _hidden_ebc_lookup(ebc, kjt)
+                # pyrefly: ignore[bad-argument-type]
+                return self.dense_forward(input, ebc_out)
+
+        model = TestModel(
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            dense_device=self.device,
+            sparse_device=torch.device("meta"),
+        )
+        sharded_model, _optim = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, {}
+        )
+        # pyrefly: ignore[missing-attribute]
+        ebc: torch.nn.Module = sharded_model.module.sparse.ebc
+
+        # ARM A: lookup hidden behind @torch.fx.wrap -- not pipelined, silently.
+        TestModel.call_ebc_directly = False
+        with self.assertLogs(_UTILS_LOGGER_NAME, level="INFO") as arm_a_logs:
+            pipelined_a, _, _, _, non_pipelined_a = _rewrite_model(
+                model=sharded_model,
+                batch=None,
+                context=TrainPipelineContext(),
+                dist_stream=None,
+                pipeline_postproc=True,
+            )
+        arm_a_output = "\n".join(arm_a_logs.output)
+        # guards the assertNotIn checks below from passing vacuously
+        self.assertIn("pipeline_postproc is enabled", arm_a_output)
+        self.assertNotIsInstance(
+            ebc.forward,
+            PipelinedForward,
+            "EBC hidden inside an fx-wrapped function must not be pipelined",
+        )
+        self.assertEqual(pipelined_a, [])
+        # The bug is silent: the module shows up in neither of the two warnings
+        # that _rewrite_model emits for modules it refuses to pipeline.
+        self.assertNotIn("sparse.ebc", non_pipelined_a)
+        self.assertNotIn("will NOT be pipelined", arm_a_output)
+        self.assertNotIn("Sharded modules were not pipelined", arm_a_output)
+        self.assertNotIn("sparse.ebc", arm_a_output)
+
+        # ARM B: same model, same KJT, module called directly -- pipelined.
+        TestModel.call_ebc_directly = True
+        with self.assertLogs(_UTILS_LOGGER_NAME, level="INFO") as arm_b_logs:
+            pipelined_b, _, _, _, non_pipelined_b = _rewrite_model(
+                model=sharded_model,
+                batch=None,
+                context=TrainPipelineContext(),
+                dist_stream=None,
+                pipeline_postproc=True,
+            )
+        arm_b_output = "\n".join(arm_b_logs.output)
+        diagnostics = (
+            f"non_pipelined_sharded_modules={non_pipelined_b}, logs:\n{arm_b_output}"
+        )
+        self.assertIsInstance(ebc.forward, PipelinedForward, diagnostics)
+        self.assertIn(ebc, pipelined_b, diagnostics)
+        self.assertNotIn("sparse.ebc", non_pipelined_b, diagnostics)
+        self.assertIn("Module 'sparse.ebc' will be pipelined", arm_b_output)
 
 
 # ~50ms on a modern GPU: long enough that a consumer on an unordered stream

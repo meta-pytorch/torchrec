@@ -363,6 +363,21 @@ class EmbeddingCollectionTest(unittest.TestCase):
                 embedding_names=["item"],
             )
 
+    def test_index_dedup_inherits_enabled_default(self) -> None:
+        ec = EmbeddingCollection(tables=[])
+
+        self.assertTrue(ec.use_index_dedup(default=True))
+
+    def test_index_dedup_can_override_enabled_default(self) -> None:
+        ec = EmbeddingCollection(tables=[], use_index_dedup=False)
+
+        self.assertFalse(ec.use_index_dedup(default=True))
+
+    def test_index_dedup_can_override_disabled_default(self) -> None:
+        ec = EmbeddingCollection(tables=[], use_index_dedup=True)
+
+        self.assertTrue(ec.use_index_dedup(default=False))
+
     def test_forward(self) -> None:
         tb1_config = EmbeddingConfig(
             name="t1",

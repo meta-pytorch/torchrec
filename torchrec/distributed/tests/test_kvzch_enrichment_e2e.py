@@ -31,11 +31,11 @@ to the enrichment-enabled path.
 """
 
 import time
-import unittest
-from typing import List, Optional
+from typing import Any, cast, List, Optional
 
 import torch
 import torch.nn as nn
+from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.tbe.ssd.ssd_config import (
     EnrichmentPolicy,
     EnrichmentResponseFormat,
@@ -69,7 +69,6 @@ EMBEDDING_DIM = 8
 NUM_EMBEDDINGS = 8000
 TOTAL_NUM_BUCKETS = 20
 FEATURE_NAME = "feature_0"
-TABLE_NAME = "table_0"
 PROVIDER_NAME = "test_in_memory_test_only"
 CLIENT_ID = "test_kvzch_enrichment_e2e"
 
@@ -107,9 +106,21 @@ def _read_rows(
     sharded_model: DistributedModelParallel, kjt: KeyedJaggedTensor
 ) -> torch.Tensor:
     """Run the model forward and flatten the per-feature output to [N, dim]."""
+    return _read_rows_by_feature(sharded_model, kjt, [FEATURE_NAME])[0]
+
+
+def _read_rows_by_feature(
+    sharded_model: DistributedModelParallel,
+    kjt: KeyedJaggedTensor,
+    feature_names: list[str],
+) -> list[torch.Tensor]:
+    """Run forward and flatten each requested feature output to [N, dim]."""
     out = sharded_model(kjt)
-    values = out[FEATURE_NAME].to_dense()
-    return torch.cat(list(values)) if isinstance(values, list) else values
+    rows = []
+    for feature_name in feature_names:
+        values = out[feature_name].to_dense()
+        rows.append(torch.cat(list(values)) if isinstance(values, list) else values)
+    return rows
 
 
 def _wait_for_cache_fill(
@@ -139,6 +150,33 @@ def _wait_for_cache_fill(
         time.sleep(poll_interval_s)
 
 
+def _wait_for_multi_feature_cache_fill(
+    sharded_model: DistributedModelParallel,
+    kjt: KeyedJaggedTensor,
+    feature_names: list[str],
+    timeout_s: float = 30.0,
+) -> list[torch.Tensor]:
+    """Poll until every row in every lookup group has been enriched."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        rows_by_feature = _read_rows_by_feature(sharded_model, kjt, feature_names)
+        if all(
+            bool(torch.all(rows.float().abs().sum(dim=1) > 1e-6).item())
+            for rows in rows_by_feature
+        ):
+            return rows_by_feature
+        if time.monotonic() > deadline:
+            populated = [
+                int((rows.float().abs().sum(dim=1) > 1e-6).sum().item())
+                for rows in rows_by_feature
+            ]
+            raise AssertionError(
+                f"Enrichment cache did not fill within {timeout_s}s; "
+                f"populated rows by feature: {populated}"
+            )
+        time.sleep(0.5)
+
+
 def _build_write_kjt(
     hashed_ids: List[int], unhashed_ids: List[int], device: torch.device
 ) -> KeyedJaggedTensor:
@@ -148,28 +186,65 @@ def _build_write_kjt(
     weights are the unhashed IDs bit-cast to float32 pairs, shape [N, 2].
     """
     assert len(hashed_ids) == len(unhashed_ids)
-    unhashed_tensor = torch.tensor(unhashed_ids, dtype=torch.int64)
+    # Citrine C3: construct test inputs directly on their target CUDA device.
+    unhashed_tensor = torch.tensor(unhashed_ids, dtype=torch.int64, device=device)
     # Lossless reinterpret_cast: each int64 -> two float32 columns.
     weights = unhashed_tensor.view(torch.float32).reshape(-1, 2)
     return KeyedJaggedTensor.from_lengths_sync(
         keys=[FEATURE_NAME],
-        values=torch.tensor(hashed_ids, dtype=torch.int64),
-        lengths=torch.tensor([1] * len(hashed_ids), dtype=torch.int32),
+        values=torch.tensor(hashed_ids, dtype=torch.int64, device=device),
+        lengths=torch.tensor([1] * len(hashed_ids), dtype=torch.int32, device=device),
         weights=weights,
-    ).to(device)
+    )
+
+
+def _build_multi_feature_kjt(
+    ids_by_feature: list[list[int]],
+    device: torch.device,
+    unhashed_ids_by_feature: Optional[list[list[int]]] = None,
+) -> KeyedJaggedTensor:
+    """Build a feature-major KJT for multiple singleton lookup groups."""
+    feature_names = [f"feature_{index}" for index in range(len(ids_by_feature))]
+    flattened_ids = [value for ids in ids_by_feature for value in ids]
+    lengths = torch.ones(len(flattened_ids), dtype=torch.int32, device=device)
+    weights = None
+    if unhashed_ids_by_feature is not None:
+        assert len(unhashed_ids_by_feature) == len(ids_by_feature)
+        flattened_unhashed_ids = [
+            value for ids in unhashed_ids_by_feature for value in ids
+        ]
+        assert len(flattened_unhashed_ids) == len(flattened_ids)
+        # Citrine C3: construct test inputs directly on their target CUDA device.
+        weights = torch.tensor(
+            flattened_unhashed_ids, dtype=torch.int64, device=device
+        ).view(torch.float32)
+        weights = weights.reshape(-1, 2)
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=feature_names,
+        values=torch.tensor(flattened_ids, dtype=torch.int64, device=device),
+        lengths=lengths,
+        weights=weights,
+    )
 
 
 def _build_sharded_model(
-    ctx: MultiProcessContext, world_size: int, local_size: Optional[int]
+    ctx: MultiProcessContext,
+    world_size: int,
+    local_size: Optional[int],
+    direct_backend_gather: bool = False,
+    owner_local_cache: bool = False,
+    owner_local_cache_read_populate: bool = False,
+    owner_local_cache_read_populate_max_lookups: Optional[int] = None,
+    prefetch_pipeline: bool = False,
+    num_lookup_groups: int = 1,
 ) -> DistributedModelParallel:
-    """Construct a sharded EC with one virtual KVZCH table backed by the
-    IN_MEMORY_TEST_ONLY enrichment provider."""
+    """Build row-wise virtual tables backed by the test enrichment provider."""
     tables = [
         EmbeddingConfig(
             num_embeddings=NUM_EMBEDDINGS,
             embedding_dim=EMBEDDING_DIM,
-            name=TABLE_NAME,
-            feature_names=[FEATURE_NAME],
+            name=f"table_{index}",
+            feature_names=[f"feature_{index}"],
             total_num_buckets=TOTAL_NUM_BUCKETS,
             use_virtual_table=True,
             enable_embedding_update=True,
@@ -177,13 +252,20 @@ def _build_sharded_model(
                 training_id_eviction_trigger_count=10_000_000,
                 eviction_ttl_mins=60,
             ),
-        ),
+        )
+        for index in range(num_lookup_groups)
     ]
     model = TestECModel(tables=tables, device=ctx.device)
-
     fused_params = {
         "embedding_cache_mode": True,
-        "l2_cache_size": 1,  # GB, plenty for the test
+        "l2_cache_size": 1,
+        "prefetch_pipeline": prefetch_pipeline,
+        "use_one_tbe_per_table": num_lookup_groups > 1,
+        "output_dtype": (
+            SparseType.BF16
+            if direct_backend_gather or owner_local_cache
+            else SparseType.FP32
+        ),
         "kvzch_tbe_config": KVZCHTBEConfig(
             enrichment_policy=EnrichmentPolicy(
                 enrichment_type=EnrichmentType.IN_MEMORY_TEST_ONLY,
@@ -191,16 +273,23 @@ def _build_sharded_model(
                 client_id=CLIENT_ID,
                 enrichment_dim=EMBEDDING_DIM,
                 response_format=EnrichmentResponseFormat.THRIFT_FLOAT,
+                direct_backend_gather=(direct_backend_gather or owner_local_cache),
+                owner_cache_size_mb=1 if owner_local_cache else 0,
+                owner_cache_read_populate=owner_local_cache_read_populate,
+                owner_cache_read_populate_max_lookups=(
+                    owner_local_cache_read_populate_max_lookups or 0
+                ),
             ),
         ),
     }
     sharder = EmbeddingCollectionSharder(fused_params=fused_params)
-    sharding_plan = construct_module_sharding_plan(
+    kvzch_sharding_plan = construct_module_sharding_plan(
         model.ec,
         per_param_sharding={
-            TABLE_NAME: row_wise(
+            table.name: row_wise(
                 compute_kernel=EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value
-            ),
+            )
+            for table in tables
         },
         local_size=local_size,
         world_size=world_size,
@@ -208,19 +297,17 @@ def _build_sharded_model(
         # pyrefly: ignore[bad-argument-type]
         sharder=sharder,
     )
-
     set_propogate_device(True)
     pg = ctx.pg
     assert pg is not None
-    sharded_model = DistributedModelParallel(
+    return DistributedModelParallel(
         model,
         env=ShardingEnv.from_process_group(pg),
-        plan=ShardingPlan({"ec": sharding_plan}),
+        plan=ShardingPlan({"ec": kvzch_sharding_plan}),
         # pyrefly: ignore[bad-argument-type]
         sharders=[sharder],
         device=ctx.device,
     )
-    return sharded_model
 
 
 def _run_round_trip(
@@ -228,42 +315,48 @@ def _run_round_trip(
     world_size: int,
     backend: str,
     local_size: Optional[int] = None,
+    direct_backend_gather: bool = False,
+    owner_local_cache: bool = False,
+    owner_local_cache_read_populate: bool = False,
+    owner_local_cache_read_populate_max_lookups: Optional[int] = None,
 ) -> None:
-    """Body of the multi-process test, called per rank.
-
-    1. Cold read with the hashed IDs - expect zeros (cache miss, no enrichment
-       has been triggered yet).
-    2. Call EC.write() with values=hashed, weights=encoded(unhashed) - this
-       triggers the async fake enrichment fetch.
-    3. Poll-read until the cache fills - assert each row equals the
-       deterministic fake formula evaluated at its unhashed ID. This proves
-       the write API plumbing landed an enrichment-driven fill in the cache.
-    """
+    """Verify enrichment writes and subsequent reads through the selected path."""
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         assert ctx.pg is not None
-        sharded_model = _build_sharded_model(ctx, world_size, local_size)
+        sharded_model = _build_sharded_model(
+            ctx,
+            world_size,
+            local_size,
+            direct_backend_gather=direct_backend_gather,
+            owner_local_cache=owner_local_cache,
+            owner_local_cache_read_populate=owner_local_cache_read_populate,
+            owner_local_cache_read_populate_max_lookups=(
+                owner_local_cache_read_populate_max_lookups
+            ),
+        )
 
-        # (hashed, unhashed) pairs. The fake formula operates on the unhashed
-        # ID; the cache stores the result keyed by the hashed ID.
         hashed_ids = [101, 202, 303, 404]
         unhashed_ids = [1010, 2020, 3030, 4040]
         read_kjt = _build_input_kjt(hashed_ids, ctx.device)
 
-        # Phase 1 - cold read returns zeros.
         cold_rows = _read_rows(sharded_model, read_kjt)
-        self_check_zero = cold_rows.float().abs().sum().item()
+        cold_sum = cold_rows.float().abs().sum().item()
         assert (
-            self_check_zero < 1e-6
-        ), f"Expected cold read to return zeros; got nonzero sum {self_check_zero}"
+            cold_sum < 1e-6
+        ), f"Expected cold read to return zeros; got nonzero sum {cold_sum}"
 
-        # Phase 2 - write triggers the async fake fetch.
         write_kjt = _build_write_kjt(hashed_ids, unhashed_ids, ctx.device)
         # pyrefly: ignore[missing-attribute]
         sharded_model.write(write_kjt)
         torch.cuda.synchronize()
 
-        # Phase 3 - poll until the cache fills, then assert per-row values.
         filled_rows = _wait_for_cache_fill(sharded_model, read_kjt, len(hashed_ids))
+        if owner_local_cache and not owner_local_cache_read_populate:
+            # The next write cadence publishes the prior completed Laser rows.
+            sharded_model.write(write_kjt)
+            torch.cuda.synchronize()
+        if direct_backend_gather or owner_local_cache:
+            assert filled_rows.dtype == torch.bfloat16
 
         expected = torch.stack(
             [_expected_fake_row(uid, EMBEDDING_DIM) for uid in unhashed_ids]
@@ -274,13 +367,568 @@ def _run_round_trip(
             rtol=1e-2,
             atol=1e-2,
         )
+        if owner_local_cache:
+            cached_rows = _read_rows(sharded_model, read_kjt)
+            torch.testing.assert_close(
+                cached_rows.float().cpu(),
+                expected,
+                rtol=1e-2,
+                atol=1e-2,
+            )
+            owner_cache = _owner_local_cache(sharded_model)
+            hits, queries = owner_cache.last_hit_counts()
+            if rank == 0:
+                assert queries > 0
+            if owner_local_cache_read_populate_max_lookups is None:
+                assert hits == queries
+            else:
+                assert hits == 0
+                assert isinstance(owner_cache._read_populate_lookup_count, torch.Tensor)
+                assert owner_cache._read_populate_lookup_count.device == ctx.device
+
+
+def _run_direct_backend_round_trip(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    _run_round_trip(
+        rank,
+        world_size,
+        backend,
+        local_size,
+        direct_backend_gather=True,
+    )
+
+
+def _run_direct_backend_prefetch_round_trip(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        assert ctx.pg is not None
+        sharded_model = _build_sharded_model(
+            ctx,
+            world_size,
+            local_size,
+            direct_backend_gather=True,
+            prefetch_pipeline=True,
+            num_lookup_groups=2,
+        )
+
+        feature_names = ["feature_0", "feature_1"]
+        hashed_ids_by_feature = [
+            [101, 202, 303, 404],
+            [501, 602, 703, 804],
+        ]
+        unhashed_ids_by_feature = [
+            [1010, 2020, 3030, 4040],
+            [5010, 6020, 7030, 8040],
+        ]
+        read_kjt = _build_multi_feature_kjt(hashed_ids_by_feature, ctx.device)
+        write_kjt = _build_multi_feature_kjt(
+            hashed_ids_by_feature,
+            ctx.device,
+            unhashed_ids_by_feature,
+        )
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(write_kjt)
+        torch.cuda.synchronize()
+        filled_rows = _wait_for_multi_feature_cache_fill(
+            sharded_model, read_kjt, feature_names
+        )
+        expected_rows = [
+            torch.stack(
+                [_expected_fake_row(uid, EMBEDDING_DIM) for uid in unhashed_ids]
+            )
+            for unhashed_ids in unhashed_ids_by_feature
+        ]
+        for rows, expected in zip(filled_rows, expected_rows):
+            torch.testing.assert_close(
+                rows.float().cpu(), expected, rtol=1e-2, atol=1e-2
+            )
+
+        sharded_ec = cast(Any, sharded_model.module.ec)
+        grouped_lookup = sharded_ec._lookups[0]
+        enrichment_caches = [
+            emb_module
+            for emb_module in grouped_lookup._emb_modules
+            if getattr(emb_module, "direct_backend_gather_enabled", False)
+        ]
+        assert len(enrichment_caches) == 2
+        tbes = [enrichment_cache.emb_module for enrichment_cache in enrichment_caches]
+        assert all(tbe.prefetch_pipeline for tbe in tbes)
+        initial_steps = [tbe.step for tbe in tbes]
+        generic_queue_sizes = [
+            (len(tbe.timesteps_prefetched), len(tbe.ssd_prefetch_data)) for tbe in tbes
+        ]
+        locking_counters = [tbe.lxu_cache_locking_counter.clone() for tbe in tbes]
+        assert all(counter.numel() > 0 for counter in locking_counters)
+
+        reversed_read_kjt = _build_multi_feature_kjt(
+            [list(reversed(ids)) for ids in hashed_ids_by_feature], ctx.device
+        )
+        reversed_expected_rows = [
+            torch.flip(expected, dims=(0,)) for expected in expected_rows
+        ]
+        read_batches = [read_kjt, reversed_read_kjt]
+        expected_batches = [expected_rows, reversed_expected_rows]
+        prefetch_stream = torch.cuda.Stream(device=ctx.device)
+        consumer_stream = torch.cuda.Stream(device=ctx.device)
+        queued_outputs: list[list[torch.Tensor]] = []
+        queued_expected: list[list[torch.Tensor]] = []
+        for cycle in range(4):
+            batch_index = cycle % len(read_batches)
+            with torch.cuda.stream(prefetch_stream):
+                grouped_lookup.prefetch(
+                    read_batches[batch_index], forward_stream=consumer_stream
+                )
+            assert all(
+                cache.emb_module._prefetched_direct_backend_output is not None
+                for cache in enrichment_caches
+            )
+            with torch.cuda.stream(consumer_stream):
+                consumer_stream.wait_stream(prefetch_stream)
+                torch.cuda._sleep(50_000_000)
+                queued_outputs.append(
+                    _read_rows_by_feature(
+                        sharded_model, read_batches[batch_index], feature_names
+                    )
+                )
+            assert all(
+                cache.emb_module._prefetched_direct_backend_output is None
+                for cache in enrichment_caches
+            )
+            queued_expected.append(expected_batches[batch_index])
+
+        consumer_done = torch.cuda.Event()
+        consumer_done.record(consumer_stream)
+        consumer_done.synchronize()
+        for actual_by_feature, expected_by_feature in zip(
+            queued_outputs, queued_expected
+        ):
+            for actual, expected in zip(actual_by_feature, expected_by_feature):
+                torch.testing.assert_close(
+                    actual.float().cpu(), expected, rtol=1e-2, atol=1e-2
+                )
+        assert generic_queue_sizes == [
+            (len(tbe.timesteps_prefetched), len(tbe.ssd_prefetch_data)) for tbe in tbes
+        ]
+        for tbe, locking_counter in zip(tbes, locking_counters):
+            torch.testing.assert_close(
+                tbe.lxu_cache_locking_counter,
+                locking_counter,
+            )
+        actual_steps = [tbe.step for tbe in tbes]
+        expected_steps = [step + 4 for step in initial_steps]
+        assert actual_steps == expected_steps, (initial_steps, actual_steps)
+
+        # A prefetched result belongs only to the exact values storage prepared
+        # for it. Leaving a pipeline must not make the next plain forward return
+        # rows (or a row count) from the pipeline's look-ahead batch.
+        fallback_read_kjt = _build_multi_feature_kjt(
+            [ids[:2] for ids in hashed_ids_by_feature], ctx.device
+        )
+        fallback_expected = [expected[:2] for expected in expected_rows]
+        before_stale_fallback = [tbe.step for tbe in tbes]
+        with torch.cuda.stream(prefetch_stream):
+            grouped_lookup.prefetch(read_kjt, forward_stream=consumer_stream)
+        with torch.cuda.stream(consumer_stream):
+            consumer_stream.wait_stream(prefetch_stream)
+            fallback_rows = _read_rows_by_feature(
+                sharded_model, fallback_read_kjt, feature_names
+            )
+            fallback_done = torch.cuda.Event()
+            fallback_done.record()
+        fallback_done.synchronize()
+        for actual, expected in zip(fallback_rows, fallback_expected):
+            torch.testing.assert_close(
+                actual.float().cpu(), expected, rtol=1e-2, atol=1e-2
+            )
+        assert [tbe.step for tbe in tbes] == [
+            step + 2 for step in before_stale_fallback
+        ]
+
+        # A rebuilt pipeline may prefetch before consuming the previous
+        # pipeline's look-ahead. The second prefetch replaces that stale result
+        # and is then consumed normally.
+        before_replacement = [tbe.step for tbe in tbes]
+        with torch.cuda.stream(prefetch_stream):
+            grouped_lookup.prefetch(read_kjt, forward_stream=consumer_stream)
+            grouped_lookup.prefetch(fallback_read_kjt, forward_stream=consumer_stream)
+        with torch.cuda.stream(consumer_stream):
+            consumer_stream.wait_stream(prefetch_stream)
+            replacement_rows = _read_rows_by_feature(
+                sharded_model, fallback_read_kjt, feature_names
+            )
+            replacement_done = torch.cuda.Event()
+            replacement_done.record()
+        replacement_done.synchronize()
+        for actual, expected in zip(replacement_rows, fallback_expected):
+            torch.testing.assert_close(
+                actual.float().cpu(), expected, rtol=1e-2, atol=1e-2
+            )
+        assert [tbe.step for tbe in tbes] == [step + 2 for step in before_replacement]
+
+
+def _run_owner_local_cache_round_trip(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    _run_round_trip(
+        rank,
+        world_size,
+        backend,
+        local_size,
+        owner_local_cache=True,
+    )
+
+
+def _run_owner_local_cache_cross_stream_writes(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        assert ctx.pg is not None
+        sharded_model = _build_sharded_model(
+            ctx,
+            world_size,
+            local_size,
+            owner_local_cache=True,
+        )
+        enrichment_cache = _enrichment_cache(sharded_model)
+        owner_cache = _owner_local_cache(sharded_model)
+
+        slot_count = owner_cache.cache_state.numel()
+        used_slots: set[int] = set()
+        hashed_ids: list[int] = []
+        candidate = 100
+        while len(hashed_ids) < 16:
+            slot = int(torch.ops.fbgemm.lxu_cache_slot(candidate, slot_count))
+            if slot not in used_slots:
+                used_slots.add(slot)
+                hashed_ids.append(candidate)
+            candidate += 1
+        hashed_batches = [hashed_ids[offset : offset + 4] for offset in range(0, 16, 4)]
+        unhashed_batches = [
+            [hashed_id * 10 for hashed_id in batch] for batch in hashed_batches
+        ]
+        read_kjts = [_build_input_kjt(batch, ctx.device) for batch in hashed_batches]
+        write_kjts = [
+            _build_write_kjt(hashed, unhashed, ctx.device)
+            for hashed, unhashed in zip(hashed_batches, unhashed_batches)
+        ]
+
+        # Populate the host backend first; this setup synchronization is outside
+        # the cross-stream lifetime stress sequence below.
+        for read_kjt, write_kjt, unhashed in zip(
+            read_kjts, write_kjts, unhashed_batches
+        ):
+            # pyrefly: ignore[missing-attribute]
+            sharded_model.write(write_kjt)
+            torch.cuda.synchronize()
+            rows = _wait_for_cache_fill(sharded_model, read_kjt, len(unhashed))
+            expected = torch.stack(
+                [_expected_fake_row(uid, EMBEDDING_DIM) for uid in unhashed]
+            )
+            torch.testing.assert_close(
+                rows.float().cpu(), expected, rtol=1e-2, atol=1e-2
+            )
+
+        enrichment_cache.emb_module.reset_enrichment_cache()
+
+        # Prime one pending query, then perform three updates on a distinct
+        # stream. There is intentionally no per-write synchronization: each
+        # update consumes the prior query's IDs while the next query can reuse
+        # allocator storage on the enrichment stream.
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(write_kjts[0])
+        update_stream = torch.cuda.Stream(device=ctx.device)
+        update_stream.wait_stream(torch.cuda.current_stream())
+        update_done = torch.cuda.Event()
+        with torch.cuda.stream(update_stream):
+            for write_kjt in write_kjts[1:]:
+                # pyrefly: ignore[missing-attribute]
+                sharded_model.write(write_kjt)
+            update_done.record()
+        update_done.synchronize()
+        enrichment_cache.emb_module.enrichment_query_stream.synchronize()
+
+        # The first three batches were consumed by later write cadences; all
+        # must now be owner-cache hits with the correct corresponding rows.
+        for read_kjt, unhashed in zip(read_kjts[:-1], unhashed_batches[:-1]):
+            rows = _read_rows(sharded_model, read_kjt)
+            expected = torch.stack(
+                [_expected_fake_row(uid, EMBEDDING_DIM) for uid in unhashed]
+            )
+            torch.testing.assert_close(
+                rows.float().cpu(), expected, rtol=1e-2, atol=1e-2
+            )
+            hits, queries = owner_cache.last_hit_counts()
+            assert hits == queries == len(unhashed)
+
+
+def _run_owner_local_cache_cross_stream_collision(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    """Keep a prefetched hit stable while another stream replaces its slot."""
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        assert ctx.pg is not None
+        sharded_model = _build_sharded_model(
+            ctx,
+            world_size,
+            local_size,
+            owner_local_cache=True,
+            prefetch_pipeline=True,
+        )
+        owner_cache = _owner_local_cache(sharded_model)
+
+        first_key_by_slot: dict[int, int] = {}
+        hit_key = -1
+        replacement_key = -1
+        cache_sets = owner_cache.cache_state.size(0)
+        for key in range(NUM_EMBEDDINGS):
+            slot = int(torch.ops.fbgemm.lxu_cache_slot(key, cache_sets))
+            if slot in first_key_by_slot:
+                hit_key = first_key_by_slot[slot]
+                replacement_key = key
+                break
+            first_key_by_slot[slot] = key
+        assert hit_key >= 0
+        assert replacement_key >= 0
+
+        hit_unhashed_id = hit_key + 100_000
+        replacement_unhashed_id = replacement_key + 200_000
+        expected_hit = _expected_fake_row(hit_unhashed_id, EMBEDDING_DIM)
+        expected_replacement = _expected_fake_row(
+            replacement_unhashed_id, EMBEDDING_DIM
+        )
+        owner_cache.populate_from_write(
+            torch.tensor([hit_key], dtype=torch.int64, device=ctx.device),
+            expected_hit.to(device=ctx.device, dtype=owner_cache.cache_weights.dtype)[
+                None
+            ],
+        )
+        torch.cuda.synchronize()
+
+        replacement_read_kjt = _build_input_kjt([replacement_key], ctx.device)
+        replacement_write_kjt = _build_write_kjt(
+            [replacement_key], [replacement_unhashed_id], ctx.device
+        )
+        # Prime one pending write-fill for the colliding replacement key.
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(replacement_write_kjt)
+        torch.cuda.synchronize()
+        _wait_for_cache_fill(sharded_model, replacement_read_kjt, 1)
+
+        miss_ids = [
+            key
+            for key in range(NUM_EMBEDDINGS)
+            if key not in (hit_key, replacement_key)
+        ]
+        prefetched_kjt = _build_input_kjt([hit_key, *miss_ids], ctx.device)
+        sharded_ec = cast(Any, sharded_model.module.ec)
+        grouped_lookup = sharded_ec._lookups[0]
+        prefetch_stream = torch.cuda.Stream(device=ctx.device)
+        update_stream = torch.cuda.Stream(device=ctx.device)
+        consumer_stream = torch.cuda.Stream(device=ctx.device)
+        source_stream = torch.cuda.current_stream()
+        step_before_prefetch = _enrichment_cache(sharded_model).emb_module.step
+        prefetch_stream.wait_stream(source_stream)
+        update_stream.wait_stream(source_stream)
+
+        with torch.cuda.stream(prefetch_stream):
+            # Keep lookup pending while update is enqueued so the write-side
+            # wait on prefetch_complete_event is exercised deterministically.
+            torch.cuda._sleep(50_000_000)
+            grouped_lookup.prefetch(
+                prefetched_kjt,
+                forward_stream=consumer_stream,
+            )
+        with torch.cuda.stream(update_stream):
+            # This consumes the pending replacement fill on a stream distinct
+            # from the prefetch. There is intentionally no synchronization in
+            # between; TBE cache events provide the required ordering.
+            # pyrefly: ignore[missing-attribute]
+            sharded_model.write(replacement_write_kjt)
+            update_done = torch.cuda.Event()
+            update_done.record()
+        with torch.cuda.stream(consumer_stream):
+            consumer_stream.wait_stream(prefetch_stream)
+            prefetched_rows = _read_rows(sharded_model, prefetched_kjt)
+            consumer_done = torch.cuda.Event()
+            consumer_done.record()
+
+        update_done.synchronize()
+        consumer_done.synchronize()
+        assert (
+            _enrichment_cache(sharded_model).emb_module.step == step_before_prefetch + 1
+        )
+        torch.testing.assert_close(
+            prefetched_rows[0].float().cpu(),
+            expected_hit,
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        replacement_rows = _read_rows(sharded_model, replacement_read_kjt)
+        torch.testing.assert_close(
+            replacement_rows[0].float().cpu(),
+            expected_replacement,
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+        # Mirror the ordering: enqueue a delayed pending insert first, then a
+        # lookup. Synchronizing the lookup consumer must also complete the
+        # source-stream event that the insert waits on, proving the lookup
+        # observed the newly recorded insert-complete event.
+        mirror_step = _enrichment_cache(sharded_model).emb_module.step
+        mirror_update_done = torch.cuda.Event()
+        with torch.cuda.stream(update_stream):
+            torch.cuda._sleep(200_000_000)
+            # pyrefly: ignore[missing-attribute]
+            sharded_model.write(replacement_write_kjt)
+            mirror_update_done.record()
+        with torch.cuda.stream(prefetch_stream):
+            grouped_lookup.prefetch(
+                replacement_read_kjt,
+                forward_stream=consumer_stream,
+            )
+        with torch.cuda.stream(consumer_stream):
+            consumer_stream.wait_stream(prefetch_stream)
+            mirror_rows = _read_rows(sharded_model, replacement_read_kjt)
+            mirror_consumer_done = torch.cuda.Event()
+            mirror_consumer_done.record()
+        mirror_consumer_done.synchronize()
+        assert mirror_update_done.query()
+        assert _enrichment_cache(sharded_model).emb_module.step == mirror_step + 1
+        torch.testing.assert_close(
+            mirror_rows[0].float().cpu(),
+            expected_replacement,
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+
+def _run_owner_local_cache_read_populate_round_trip(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    _run_round_trip(
+        rank,
+        world_size,
+        backend,
+        local_size,
+        owner_local_cache=True,
+        owner_local_cache_read_populate=True,
+    )
+
+
+def _run_owner_local_cache_bounded_read_populate_round_trip(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    _run_round_trip(
+        rank,
+        world_size,
+        backend,
+        local_size,
+        owner_local_cache=True,
+        owner_local_cache_read_populate=True,
+        owner_local_cache_read_populate_max_lookups=1,
+    )
+
+
+def _enrichment_cache(sharded_model: DistributedModelParallel) -> Any:
+    sharded_ec = cast(Any, sharded_model.module.ec)
+    for lookup in sharded_ec._lookups:
+        for embedding_module in lookup._emb_modules:
+            if hasattr(embedding_module, "direct_backend_gather_enabled"):
+                return embedding_module
+    raise AssertionError("enrichment cache was not created")
+
+
+def _owner_local_cache(sharded_model: DistributedModelParallel) -> Any:
+    owner_cache = _enrichment_cache(sharded_model).emb_module._direct_enrichment_cache
+    if owner_cache is not None:
+        return owner_cache
+    raise AssertionError("owner-local cache was not created")
+
+
+def _run_reduced_lookup_equivalence(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        sharded_model = _build_sharded_model(ctx, world_size, local_size)
+        unique_hashed_ids = [101, 202, 303, 404]
+        unique_unhashed_ids = [1010, 2020, 3030, 4040]
+        unique_kjt = _build_input_kjt(unique_hashed_ids, ctx.device)
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(
+            _build_write_kjt(unique_hashed_ids, unique_unhashed_ids, ctx.device)
+        )
+        torch.cuda.synchronize()
+        _wait_for_cache_fill(sharded_model, unique_kjt, len(unique_hashed_ids))
+
+        duplicated_ids = torch.tensor(
+            [303, 101, 303, 202, 101, 404],
+            dtype=torch.int64,
+            device=ctx.device,
+        )
+        full_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=[FEATURE_NAME],
+            values=duplicated_ids,
+            lengths=torch.ones(
+                duplicated_ids.numel(), dtype=torch.int32, device=ctx.device
+            ),
+        )
+        full_rows = sharded_model(full_kjt)[FEATURE_NAME].values()
+
+        _, inverse, counts = torch.unique(
+            duplicated_ids,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        _, sorted_inverse = torch.sort(inverse, stable=True)
+        starts = torch.zeros_like(counts)
+        starts[1:] = torch.cumsum(counts, dim=0)[:-1]
+        first_occurrence = sorted_inverse[starts]
+        reduced_ids = duplicated_ids.index_select(0, first_occurrence)
+        reduced_lengths = torch.zeros_like(duplicated_ids, dtype=torch.int32)
+        reduced_lengths[: reduced_ids.numel()] = 1
+        reduced_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=[FEATURE_NAME],
+            values=reduced_ids,
+            lengths=reduced_lengths,
+        )
+        reduced_rows = sharded_model(reduced_kjt)[FEATURE_NAME].values()
+
+        torch.testing.assert_close(
+            reduced_rows,
+            full_rows.index_select(0, first_occurrence),
+        )
 
 
 class TestKvzchEnrichmentE2E(MultiProcessTestBase):
-    """End-to-end test of the KVZCH enrichment read+write round trip.
-
-    Disabled in OSS: depends on Meta-internal fbgemm fb/ enrichment headers.
-    """
+    """End-to-end coverage for KVZCH enrichment reads, writes, and caching."""
 
     def _gpu_check(self, world_size: int) -> None:
         if torch.cuda.device_count() < world_size:
@@ -289,14 +937,84 @@ class TestKvzchEnrichmentE2E(MultiProcessTestBase):
             )
 
     def test_enrichment_round_trip_disabled_in_oss_compatibility(self) -> None:
-        WORLD_SIZE = 2
-        self._gpu_check(WORLD_SIZE)
+        world_size = 2
+        self._gpu_check(world_size)
         self._run_multi_process_test(
             callable=_run_round_trip,
-            world_size=WORLD_SIZE,
+            world_size=world_size,
             backend="nccl",
         )
 
+    def test_direct_backend_gather_preserves_enrichment_round_trip(self) -> None:
+        world_size = 2
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_direct_backend_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_direct_backend_gather_prefetches_the_forward_result(self) -> None:
+        world_size = 1
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_direct_backend_prefetch_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_owner_local_direct_cache_populates_from_completed_writes(self) -> None:
+        world_size = 2
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_owner_local_write_warming_preserves_cross_stream_ids(self) -> None:
+        world_size = 1
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_cross_stream_writes,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_owner_local_write_cannot_replace_an_inflight_prefetched_hit(
+        self,
+    ) -> None:
+        world_size = 1
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_cross_stream_collision,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_owner_local_direct_cache_populates_from_reads(self) -> None:
+        world_size = 2
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_read_populate_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_owner_local_direct_cache_bounds_read_population(self) -> None:
+        world_size = 2
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_bounded_read_populate_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_reduced_lookup_preserves_row_wise_output_order(self) -> None:
+        world_size = 2
+        self._gpu_check(world_size)
+        self._run_multi_process_test(
+            callable=_run_reduced_lookup_equivalence,
+            world_size=world_size,
+            backend="nccl",
+        )

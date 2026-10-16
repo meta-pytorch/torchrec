@@ -48,7 +48,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SparseType,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.tbe.config import (
+from fbgemm_gpu.tbe.config import (  # @manual=//deeplearning/fbgemm/fbgemm_gpu:ssd_split_table_batched_embeddings_ops
     EmbeddingLocation as SSDEmbeddingLocation,
     PoolingMode as SSDPoolingMode,
 )
@@ -2712,6 +2712,17 @@ class ZeroCollisionEmbeddingEnrichmentCache(ZeroCollisionKeyValueEmbedding):
             backend_type,
             True,  # embedding_cache_mode
         )
+
+    @property
+    def direct_backend_gather_enabled(self) -> bool:
+        return self.emb_module.direct_backend_gather_enabled
+
+    def owner_local_cache_last_hit_counts(self) -> Optional[Tuple[int, int]]:
+        return self.emb_module.owner_local_cache_last_hit_counts()
+
+    def purge(self) -> None:
+        super().purge()
+        self.emb_module.reset_enrichment_cache()
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         # in the case of embedding_cache_mode, we don't need backward pass, so call forward in no_grad mode

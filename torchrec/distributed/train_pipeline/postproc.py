@@ -125,6 +125,21 @@ class PipelinedPostproc(torch.nn.Module):
             # When processing postproc_b, we cache value of postproc_a(input)
             # so when processing postproc_c, we can reuse postproc_a(input)
             res = self._context.postproc_fwd_results[self._fqn]
+            if self._context.defer_pipeline_stream_fences:
+                if self._dist_stream is None:
+                    raise RuntimeError(
+                        "Deferred postprocessor fences require a distribution stream"
+                    )
+                event = self._context.postproc_ready_events.get(self._fqn)
+                if event is None:
+                    raise RuntimeError(
+                        f"Missing ready event for pipelined postprocessor {self._fqn}"
+                    )
+                current_stream = torch.get_device_module(
+                    self._dist_stream.device
+                ).current_stream()
+                current_stream.wait_event(event)
+                PipelinedPostproc.recursive_record_stream(res, current_stream)
             return res
 
         # Everything below should only be called during _start_data_dist stage
@@ -144,8 +159,21 @@ class PipelinedPostproc(torch.nn.Module):
             with self._stream_context(self._dist_stream):
                 res = self._postproc_module(*args, **kwargs)
 
+            if self._context.defer_pipeline_stream_fences:
+                if self._dist_stream is None:
+                    raise RuntimeError(
+                        "Deferred postprocessor fences require a distribution stream"
+                    )
+                event = torch.get_device_module(self._dist_stream.device).Event()
+                # Record on the actual producer stream. The outer sparse-data-dist
+                # context normally already selects it, but keep this local invariant
+                # explicit for direct and nested postprocessor calls.
+                # pyrefly: ignore[bad-argument-type]
+                with self._stream_context(self._dist_stream):
+                    event.record()
+                self._context.postproc_ready_events[self._fqn] = event
             # Ensure postproc modules output is safe to use from default stream later
-            if self._default_stream and self._dist_stream:
+            elif self._default_stream and self._dist_stream:
                 self._default_stream.wait_stream(self._dist_stream)
 
                 if isinstance(res, (torch.Tensor, Pipelineable, Iterable, Dict)):

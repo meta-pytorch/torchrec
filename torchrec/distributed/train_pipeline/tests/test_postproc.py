@@ -22,6 +22,7 @@ from torchrec.distributed.test_utils.test_model import (
     TestPositionWeightedPreprocModule,
 )
 from torchrec.distributed.test_utils.test_sharding import copy_state_dict
+from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
@@ -40,6 +41,57 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 class RewriteModelWithPostProcTest(unittest.TestCase):
     pass
+
+
+class DeferredPostprocFenceTest(unittest.TestCase):
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_cached_result_waits_only_for_its_context_ready_event(self) -> None:
+        device = torch.device("cuda:0")
+        default_stream = torch.cuda.current_stream(device)
+        dist_stream = torch.cuda.Stream(device=device)
+        first_context = TrainPipelineContext()
+        first_context.defer_pipeline_stream_fences = True
+        second_context = TrainPipelineContext()
+        second_context.defer_pipeline_stream_fences = True
+
+        class TensorPostproc(nn.Module):
+            def forward(self) -> torch.Tensor:
+                return torch.ones(1, device=device)
+
+        postproc = PipelinedPostproc(
+            postproc_module=TensorPostproc(),
+            fqn="postproc",
+            args=CallArgs(args=[], kwargs={}),
+            context=first_context,
+            default_stream=default_stream,
+            dist_stream=dist_stream,
+        )
+        postproc(object())
+        first_ready = first_context.postproc_ready_events["postproc"]
+
+        with torch.cuda.stream(dist_stream):
+            torch.cuda._sleep(1_000_000_000)
+        postproc.set_context(second_context)
+        postproc(object())
+        second_ready = second_context.postproc_ready_events["postproc"]
+
+        postproc.set_context(first_context)
+        consumer_done = torch.cuda.Event()
+        postproc(object())
+        consumer_done.record()
+        consumer_done.synchronize()
+
+        self.assertTrue(first_ready.query())
+        self.assertFalse(second_ready.query())
+        self.assertIs(
+            first_ready,
+            first_context.postproc_ready_events["postproc"],
+        )
+        self.assertIsNot(first_ready, second_ready)
+        dist_stream.synchronize()
 
 
 class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):

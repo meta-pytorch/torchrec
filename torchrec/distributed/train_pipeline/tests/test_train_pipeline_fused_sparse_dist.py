@@ -35,13 +35,22 @@ from torchrec.distributed.test_utils.test_sharding import copy_state_dict
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
 )
+from torchrec.distributed.train_pipeline.runtime_forwards import (
+    InSyncEmbeddingPipelinedForward,
+)
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import (
     TrainPipelineFusedSparseDist,
 )
-from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
+from torchrec.distributed.train_pipeline.types import CallArgs
+from torchrec.distributed.types import (
+    ModuleSharder,
+    ShardedModule,
+    ShardingEnv,
+    ShardingType,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -74,6 +83,79 @@ class _DPShardedEmbeddingTrainModel(torch.nn.Module):
             (sequence_embeddings + pooled_embeddings) * self.dense_weight
         )
         return prediction.square(), prediction
+
+
+class PerModuleLookupFenceTest(unittest.TestCase):
+    def _forward(
+        self,
+        context: EmbeddingTrainPipelineContext,
+        stream: torch.Stream,
+    ) -> InSyncEmbeddingPipelinedForward:
+        return InSyncEmbeddingPipelinedForward(
+            name="first",
+            args=CallArgs(args=[], kwargs={}),
+            module=cast(ShardedModule, MagicMock()),
+            context=context,
+            stream=stream,
+        )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_first_consumer_does_not_wait_for_second_lookup_tail(self) -> None:
+        device = torch.device("cuda:0")
+        lookup_stream = torch.cuda.Stream(device=device)
+        consumer_stream = torch.cuda.Stream(device=device)
+        first_ready = torch.cuda.Event()
+        second_ready = torch.cuda.Event()
+        consumer_done = torch.cuda.Event()
+        context = EmbeddingTrainPipelineContext()
+        context.defer_pipeline_stream_fences = True
+        context.embedding_lookup_events["first"] = first_ready
+
+        with torch.cuda.stream(lookup_stream):
+            first_ready.record()
+            torch.cuda._sleep(1_000_000_000)
+            second_ready.record()
+
+        with torch.cuda.stream(consumer_stream):
+            self._forward(context, lookup_stream)._wait_for_lookup_stream(
+                consumer_stream
+            )
+            consumer_done.record()
+
+        consumer_done.synchronize()
+        self.assertTrue(first_ready.query())
+        self.assertFalse(second_ready.query())
+        self.assertNotIn("first", context.embedding_lookup_events)
+        lookup_stream.synchronize()
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_default_mode_waits_for_the_complete_lookup_stream(self) -> None:
+        device = torch.device("cuda:0")
+        lookup_stream = torch.cuda.Stream(device=device)
+        consumer_stream = torch.cuda.Stream(device=device)
+        lookup_done = torch.cuda.Event()
+        consumer_done = torch.cuda.Event()
+        context = EmbeddingTrainPipelineContext()
+
+        with torch.cuda.stream(lookup_stream):
+            torch.cuda._sleep(1_000_000_000)
+            lookup_done.record()
+
+        with torch.cuda.stream(consumer_stream):
+            self._forward(context, lookup_stream)._wait_for_lookup_stream(
+                consumer_stream
+            )
+            consumer_done.record()
+
+        consumer_done.synchronize()
+        self.assertTrue(lookup_done.query())
+        lookup_stream.synchronize()
 
 
 class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
@@ -364,6 +446,16 @@ class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    def test_deferred_stream_fences_equal_to_non_pipelined(self) -> None:
+        self._assert_equal_to_non_pipelined(
+            sharding_type=ShardingType.TABLE_WISE.value,
+            defer_pipeline_stream_fences=True,
+        )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     # 8 combinations of the axes below; sample all of them so coverage does not
     # depend on which examples hypothesis happens to draw.
     @settings(max_examples=8, deadline=None)
@@ -392,3 +484,67 @@ class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             embedding_lookup_after_data_dist=embedding_lookup_after_data_dist,
         )
+
+
+class TrainPipelineFusedSparseDistSelectiveStreamTest(TrainPipelineSparseDistTestBase):
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @patch("torch._utils_internal.justknobs_check", return_value=True)
+    def test_selective_new_stream_matches_non_pipelined(
+        self, _mock_justknobs_check: MagicMock
+    ) -> None:
+        data = self._generate_data(num_batches=12, batch_size=32)
+        dataloader = iter(data)
+        fused_params = {"stochastic_rounding": False}
+
+        model = self._setup_model()
+        sharded_model, optimizer = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            fused_params,
+        )
+        (
+            sharded_model_pipelined,
+            optimizer_pipelined,
+        ) = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            fused_params,
+        )
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        pipeline = TrainPipelineFusedSparseDist(
+            model=sharded_model_pipelined,
+            optimizer=optimizer_pipelined,
+            device=self.device,
+            execute_all_batches=True,
+            enqueue_batch_after_forward=True,
+            emb_lookup_stream="new_for:sparse.ebc",
+        )
+
+        for batch in data[:-2]:
+            batch = batch.to(self.device)
+            optimizer.zero_grad()
+            loss, prediction = sharded_model(batch)
+            loss.backward()
+            optimizer.step()
+
+            pipeline_prediction = pipeline.progress(dataloader)
+            torch.testing.assert_close(prediction, pipeline_prediction)
+
+        selected_module = pipeline._selective_emb_lookup_module
+        self.assertIsNotNone(selected_module)
+        if selected_module is not None:
+            self.assertEqual(
+                getattr(selected_module.forward, "name", None), "sparse.ebc"
+            )
+        self.assertIsNot(
+            pipeline._selective_emb_lookup_stream, pipeline._data_dist_stream
+        )
+        self.assertGreater(len(pipeline._pipelined_modules), 1)
