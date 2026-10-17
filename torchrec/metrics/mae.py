@@ -86,7 +86,7 @@ class MAEMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for MAEMetricComputation update"
             )
         states = self._get_mae_states(labels, predictions, weights)
-        num_samples = predictions.shape[-1]
+        num_samples = self._window_num_samples(predictions, kwargs)
         for state_name, state_value in states.items():
             state = getattr(self, state_name)
             state += state_value

@@ -115,7 +115,7 @@ class XAUCMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for XAUCMetricComputation update"
             )
         states = self._get_xauc_states(labels, predictions, weights)
-        num_samples = predictions.shape[-1]
+        num_samples = self._window_num_samples(predictions, kwargs)
         for state_name, state_value in states.items():
             state = getattr(self, state_name)
             state += state_value

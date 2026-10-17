@@ -144,7 +144,7 @@ class NEPositiveMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for NEMetricComputation update"
             )
         states = self._get_ne_positive_states(labels, predictions, weights, self.eta)
-        num_samples = predictions.shape[-1]
+        num_samples = self._window_num_samples(predictions, kwargs)
 
         for state_name, state_value in states.items():
             state = getattr(self, state_name)

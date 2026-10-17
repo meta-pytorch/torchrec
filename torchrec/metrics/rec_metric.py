@@ -471,6 +471,18 @@ class RecMetricComputation(Metric, abc.ABC):
             getattr(self, window_state_name), curr_state=state, size=num_samples
         )
 
+    @staticmethod
+    def _window_num_samples(predictions: torch.Tensor, kwargs: Dict[str, Any]) -> int:
+        """Samples this update spends of the window budget.
+
+        Defaults to the batch width. A caller whose inputs carry zero-weight pad
+        columns passes the real column count as ``num_samples``: pad columns add
+        nothing to any weighted state, so counting them only shrinks how many real
+        samples the window holds.
+        """
+        num_samples = kwargs.get("num_samples")
+        return predictions.shape[-1] if num_samples is None else num_samples
+
     def _maybe_compile(self, fn: Callable) -> Callable:
         """Wrap ``fn`` with ``torch.compile`` when PT2 compilation is enabled."""
         if self._enable_pt2_compile:
