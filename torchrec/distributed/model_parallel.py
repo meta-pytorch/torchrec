@@ -31,6 +31,7 @@ from torch.distributed.remote_device import _remote_device
 from torch.distributed.tensor import DeviceMesh
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils._python_dispatch import _disable_current_modes
 from torchrec.distributed.collective_utils import (
     create_on_rank_and_share_result,
     init_collective_validation,
@@ -696,18 +697,26 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
     def _init_parameters(self, module: nn.Module) -> None:
         @torch.no_grad()
         def init_parameters(module: nn.Module) -> None:
-            # Allocate parameters and buffers if over 'meta' device.
-            has_meta_param = False
-            for name, param in module._parameters.items():
-                if isinstance(param, torch.Tensor) and param.device.type == "meta":
-                    module._parameters[name] = nn.Parameter(
-                        torch.empty_like(param, device=self.device),
-                        requires_grad=param.requires_grad,
-                    )
-                    has_meta_param = True
-            for name, buffer in module._buffers.items():
-                if isinstance(buffer, torch.Tensor) and buffer.device.type == "meta":
-                    module._buffers[name] = torch.zeros_like(buffer, device=self.device)
+            # Disable TorchDispatch modes: a leaked FakeTensorMode would turn
+            # empty_like/zeros_like into silent FakeTensor factories.
+            with _disable_current_modes():
+                # Allocate parameters and buffers if over 'meta' device.
+                has_meta_param = False
+                for name, param in module._parameters.items():
+                    if isinstance(param, torch.Tensor) and param.device.type == "meta":
+                        module._parameters[name] = nn.Parameter(
+                            torch.empty_like(param, device=self.device),
+                            requires_grad=param.requires_grad,
+                        )
+                        has_meta_param = True
+                for name, buffer in module._buffers.items():
+                    if (
+                        isinstance(buffer, torch.Tensor)
+                        and buffer.device.type == "meta"
+                    ):
+                        module._buffers[name] = torch.zeros_like(
+                            buffer, device=self.device
+                        )
 
             # Init parameters if at least one parameter is over 'meta' device.
             if has_meta_param and hasattr(module, "reset_parameters"):
