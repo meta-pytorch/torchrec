@@ -10,6 +10,7 @@
 from typing import Any, cast, Dict, List, Optional, TypeVar
 
 import torch
+from torch.fx._symbolic_trace import is_fx_tracing
 from torchrec.distributed.embedding_lookup import GroupedPooledEmbeddingsLookup
 from torchrec.distributed.embedding_sharding import (
     BaseEmbeddingDist,
@@ -151,13 +152,25 @@ class DpSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         """
         No-op as sparse features are already distributed in data-parallel fashion.
 
+        Computes and caches `length_per_key` of the features, which the data-parallel
+        lookup needs to split them by group. Reading it here means the device-to-host
+        copy waits only for the work that produced the lengths; a pipelined train loop
+        runs input dist on its data-dist stream. Left to the lookup, which runs on the
+        compute stream, the same read blocks the host until the compute stream drains
+        (for example the previous step's backward).
+
         Args:
             sparse_features (SparseFeatures): input sparse features.
 
         Returns:
             Awaitable[Awaitable[SparseFeatures]]: awaitable of awaitable of SparseFeatures.
         """
-
+        if not (
+            torch.compiler.is_compiling() or is_fx_tracing()
+        ) and torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_dp_input_dist_length_per_key"
+        ):
+            sparse_features.length_per_key()
         return NoWait(cast(Awaitable[KeyedJaggedTensor], NoWait(sparse_features)))
 
 
