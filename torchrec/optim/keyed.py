@@ -198,9 +198,33 @@ class KeyedOptimizer(optim.Optimizer):
         ret: Dict[str, object] = {"state": ret_state}
         if self.defaults["_save_param_groups"]:
             ret["param_groups"] = ret_groups
+        metadata = self.get_checkpoint_metadata()
+        if metadata:
+            ret["checkpoint_metadata"] = metadata
         return ret
 
+    def get_checkpoint_metadata(self) -> Dict[str, Any]:
+        """Optional optimizer-specific compatibility data, outside parameter state.
+
+        Implementations must also override validate_checkpoint_metadata. Values
+        must be checkpoint-serializable; use rank-qualified Tensor leaves for
+        rank-local data that must survive distributed checkpoint deduplication.
+        Compatibility metadata must be available before the first optimizer step.
+        The empty default preserves the existing keyed checkpoint format.
+        """
+        return {}
+
+    def validate_checkpoint_metadata(self, metadata: Mapping[str, Any]) -> None:
+        """Validate before copying any parameter state, without changing state."""
+        if metadata:
+            raise ValueError("Unexpected optimizer checkpoint metadata")
+
     def post_load_state_dict(self) -> None:
+        """Finish restoring optimizer state.
+
+        Wrapper composition may call this more than once per load, so
+        implementations must be idempotent.
+        """
         pass
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
@@ -218,6 +242,7 @@ class KeyedOptimizer(optim.Optimizer):
               optimizer.load_state_dict(sd)  # replace param_groups
         """
 
+        self.validate_checkpoint_metadata(state_dict.get("checkpoint_metadata", {}))
         new_state = state_dict["state"]
         state = self.state
         params = self.params
@@ -409,6 +434,23 @@ class CombinedOptimizer(KeyedOptimizer):
         for _, opt in self._optims:
             opt.post_load_state_dict()
 
+    def get_checkpoint_metadata(self) -> Dict[str, Any]:
+        # Include position as well as prefix: anonymous optimizers may share an
+        # empty prefix while owning disjoint parameter names.
+        result = {}
+        for index, (key, opt) in enumerate(self._optims):
+            metadata = opt.get_checkpoint_metadata()
+            if metadata:
+                result[f"{index}:{key}"] = metadata
+        return result
+
+    def validate_checkpoint_metadata(self, metadata: Mapping[str, Any]) -> None:
+        if set(metadata) != set(self.get_checkpoint_metadata()):
+            raise ValueError("Optimizer checkpoint metadata does not match components")
+        # Validate every child before KeyedOptimizer copies state for any child.
+        for index, (key, opt) in enumerate(self._optims):
+            opt.validate_checkpoint_metadata(metadata.get(f"{index}:{key}", {}))
+
     def save_param_groups(self, save: bool) -> None:
         self.defaults["_save_param_groups"] = save
         for _, opt in self._optims:
@@ -443,6 +485,52 @@ class KeyedOptimizerWrapper(KeyedOptimizer):
         # pyrefly: ignore[bad-argument-type]
         self._optimizer: optim.Optimizer = optim_factory(pass_params)
         super().__init__(params, self._optimizer.state, self._optimizer.param_groups)
+
+    def get_checkpoint_metadata(self) -> Dict[str, Any]:
+        get_metadata = getattr(self._optimizer, "get_checkpoint_metadata", None)
+        if get_metadata is None:
+            return {}
+        metadata = get_metadata()
+        if not metadata:
+            return {}
+        param_to_key = {param: key for key, param in self.params.items()}
+        # Ordering matters for an optimizer whose ownership is assigned by
+        # parameter index, even when the parameter shapes are identical.
+        keys = [
+            [param_to_key[p] for p in group["params"]] for group in self.param_groups
+        ]
+        encoded_keys = json.dumps(keys, ensure_ascii=True).encode("utf-8")
+        return {
+            "optimizer": metadata,
+            "parameter_keys": torch.tensor(
+                list(encoded_keys), dtype=torch.uint8, device="cpu"
+            ),
+        }
+
+    def validate_checkpoint_metadata(self, metadata: Mapping[str, Any]) -> None:
+        expected = self.get_checkpoint_metadata()
+        if not expected:
+            return super().validate_checkpoint_metadata(metadata)
+        if set(metadata) != set(expected):
+            raise ValueError("Missing or incompatible optimizer checkpoint metadata")
+        keys = metadata["parameter_keys"]
+        if (
+            not isinstance(keys, torch.Tensor)
+            or keys.dtype != torch.uint8
+            or not torch.equal(keys.cpu(), expected["parameter_keys"])
+        ):
+            raise ValueError("Optimizer checkpoint parameter names or order changed")
+        validate = getattr(self._optimizer, "validate_checkpoint_metadata", None)
+        if validate is None:
+            raise ValueError("Optimizer checkpoint metadata has no validator")
+        validate(metadata["optimizer"])
+
+    def post_load_state_dict(self) -> None:
+        if not hasattr(self._optimizer, "get_checkpoint_metadata"):
+            return
+        post_load = getattr(self._optimizer, "post_load_state_dict", None)
+        if post_load is not None:
+            post_load()
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         self._optimizer.zero_grad()
@@ -489,6 +577,12 @@ class OptimizerWrapper(KeyedOptimizer):
 
     def state_dict(self) -> Dict[str, Any]:
         return self._optimizer.state_dict()
+
+    def get_checkpoint_metadata(self) -> Dict[str, Any]:
+        return self._optimizer.get_checkpoint_metadata()
+
+    def validate_checkpoint_metadata(self, metadata: Mapping[str, Any]) -> None:
+        self._optimizer.validate_checkpoint_metadata(metadata)
 
     def post_load_state_dict(self) -> None:
         self._optimizer.post_load_state_dict()
