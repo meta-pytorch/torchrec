@@ -390,6 +390,8 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         tables (List[EmbeddingConfig]): list of embedding tables.
         device (Optional[torch.device]): default compute device.
         need_indices (bool): if we need to pass indices to the final lookup dict.
+        use_index_dedup (Optional[bool]): per-module override for index deduplication.
+            None inherits the sharder or process-wide setting.
 
     Example::
 
@@ -442,6 +444,8 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         need_indices: bool = False,
         use_gather_select: bool = False,
         use_gather_select_per_sharding: Optional[Dict[str, bool]] = None,
+        *,
+        use_index_dedup: Optional[bool] = None,
     ) -> None:
         super().__init__()
         torch._C._log_api_usage_once(f"torchrec.modules.{self.__class__.__name__}")
@@ -453,6 +457,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         self._use_gather_select_per_sharding: Optional[Dict[str, bool]] = (
             use_gather_select_per_sharding
         )
+        self._use_index_dedup: Optional[bool] = use_index_dedup
         self._use_sorted_select: bool = False
         self._device: torch.device = (
             device if device is not None else torch.device("cpu")
@@ -596,6 +601,10 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
             in this dict, its value takes precedence over ``use_gather_select()``.
         """
         return self._use_gather_select_per_sharding
+
+    def use_index_dedup(self, default: bool = False) -> bool:
+        """Resolve the per-module index dedup setting against a default."""
+        return default if self._use_index_dedup is None else self._use_index_dedup
 
     def use_sorted_select(self) -> bool:
         """

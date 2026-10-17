@@ -61,6 +61,10 @@ class TrainPipelineContext:
     )
     events: List[torch.Event] = field(default_factory=list)
     postproc_fwd_results: Dict[str, Any] = field(default_factory=dict)
+    defer_pipeline_stream_fences: bool = field(default=False, init=False)
+    postproc_ready_events: Dict[str, torch.Event] = field(
+        default_factory=dict, init=False
+    )
     index: Optional[int] = None
     version: int = (
         0  # 1 is current version, 0 is deprecated but supported for backward compatibility
@@ -100,6 +104,9 @@ class EmbeddingTrainPipelineContext(TrainPipelineContext):
     embedding_tensors: List[List[torch.Tensor]] = field(default_factory=list)
     embedding_features: List[List[Union[str, List[str]]]] = field(default_factory=list)
     detached_embedding_tensors: List[List[torch.Tensor]] = field(default_factory=list)
+    embedding_lookup_events: Dict[str, torch.Event] = field(
+        default_factory=dict, init=False
+    )
 
 
 @dataclass

@@ -162,6 +162,10 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
     This pipeline is used in TrainPipelineSemiSync
     """
 
+    def _wait_for_lookup_stream(self, cur_stream: torch.Stream) -> None:
+        if self._stream is not None:
+            cur_stream.wait_stream(self._stream)
+
     def __call__(
         self,
         *input,
@@ -188,9 +192,7 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
         cur_stream = torch.get_device_module(self._device).current_stream()
 
         if self._stream is not None:
-            torch.get_device_module(self._device).current_stream().wait_stream(
-                self._stream
-            )
+            self._wait_for_lookup_stream(cur_stream)
             ctx.record_stream(cur_stream)
 
         awaitable = self._context.embedding_a2a_requests.pop(self._name)
@@ -210,6 +212,8 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
 
         # pyrefly: ignore[bad-argument-type]
         self.detach_embeddings(embeddings=embeddings, cur_stream=cur_stream)
+        if self._context.defer_pipeline_stream_fences and remapped_kjts is not None:
+            remapped_kjts.record_stream(cur_stream)
 
         if is_mc_module:
             # pyrefly: ignore[bad-argument-type]
@@ -297,13 +301,33 @@ class InSyncEmbeddingPipelinedForward(EmbeddingPipelinedForward):
     This pipeline is used in TrainPipelineFusedSparseDist
     """
 
+    def _wait_for_lookup_stream(self, cur_stream: torch.Stream) -> None:
+        if not self._context.defer_pipeline_stream_fences:
+            super()._wait_for_lookup_stream(cur_stream)
+            return
+        event = self._context.embedding_lookup_events.pop(self._name, None)
+        if event is None:
+            raise RuntimeError(
+                f"Missing lookup completion event for pipelined module {self._name}"
+            )
+        cur_stream.wait_event(event)
+
     def detach_embeddings(
         self,
         embeddings: Union[Dict[str, JaggedTensor], KeyedTensor],
         cur_stream: torch.Stream,
     ) -> None:
-        # doing nothing
-        pass
+        if not self._context.defer_pipeline_stream_fences:
+            return
+        if isinstance(embeddings, dict):
+            for jagged_tensor in embeddings.values():
+                # JaggedTensor's annotation is CUDA-specific, but the tensor
+                # operation dispatches on the actual stream device.
+                # pyrefly: ignore[bad-argument-type]
+                jagged_tensor.record_stream(cur_stream)
+        else:
+            # pyrefly: ignore[bad-argument-type]
+            embeddings.record_stream(cur_stream)
 
 
 class PECPipelinedForward(InSyncEmbeddingPipelinedForward):

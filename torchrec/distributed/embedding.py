@@ -527,7 +527,9 @@ class ShardedEmbeddingCollection(
         # output parameters as DTensor in state dict
         self._output_dtensor: bool = env.output_dtensor
         # TODO get rid of get_ec_index_dedup global flag
-        self._use_index_dedup: bool = use_index_dedup or get_ec_index_dedup()
+        self._use_index_dedup: bool = module.use_index_dedup(
+            use_index_dedup or get_ec_index_dedup()
+        )
         if use_packed_jagged_tensor and not self._use_index_dedup:
             raise ValueError(
                 "Packed JaggedTensor outputs require EmbeddingCollection index dedup"
@@ -659,6 +661,10 @@ class ShardedEmbeddingCollection(
             ),
             None,
         )
+
+    def use_index_dedup(self) -> bool:
+        """Return whether this sharded collection deduplicates input indices."""
+        return self._use_index_dedup
 
     def init_data_parallel(self) -> None:
         """
