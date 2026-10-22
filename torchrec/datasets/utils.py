@@ -200,9 +200,7 @@ class Limit(IterDataPipe):
         self.limit = limit
 
     def __iter__(self) -> Iterator[Any]:
-        for idx, data in enumerate(self.datapipe):
-            if idx >= self.limit:
-                break
+        for _, data in zip(range(self.limit), self.datapipe):
             yield data
 
 
