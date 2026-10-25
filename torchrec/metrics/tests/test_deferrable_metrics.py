@@ -18,6 +18,7 @@ from torchrec.metrics.deferrable_metrics import (
     _get_metric_dtoh_stream,
     DeferrableMetrics,
     device_supports_async,
+    EventType,
     transfer_tensors_to_cpu,
 )
 
@@ -327,6 +328,70 @@ class TestDeferrableMetrics(unittest.TestCase):
         resolved = dm.resolve()
         self.assertEqual(resolved["b"].item(), 2.0)
         self.assertEqual(resolved["name"], "task1")
+
+
+class FailureCaptureTest(unittest.TestCase):
+    """Verifies INFO-event capture for deferred failures from Future-backed instances."""
+
+    def setUp(self) -> None:
+        DeferrableMetrics._warned = False
+        self._log = patch(
+            "torchrec.metrics.deferrable_metrics.EventLoggingHandler.log_event"
+        )
+        self.mock_log = self._log.start()
+        self.addCleanup(self._log.stop)
+
+    def test_pre_resolved_dict_emits_nothing(self) -> None:
+        DeferrableMetrics({"a": 1}).resolve()
+        self.assertEqual(self.mock_log.call_count, 0)
+
+    def test_future_success_emits_nothing(self) -> None:
+        # Success is captured by the enclosing RecMetricModule.compute
+        # decorator's SUCCESS event; we only emit on the failure path.
+        f: Future[dict] = Future()
+        DeferrableMetrics(f)
+        f.set_result({"a": 1})
+        self.assertEqual(self.mock_log.call_count, 0)
+
+    def test_future_failure_emits_info_event_with_payload(self) -> None:
+        f: Future[dict] = Future()
+        dm = DeferrableMetrics(f)
+        f.set_exception(RuntimeError("metric blew up"))
+        with self.assertRaisesRegex(RuntimeError, "metric blew up"):
+            dm.resolve()
+        self.assertEqual(self.mock_log.call_count, 1)
+        kwargs = self.mock_log.call_args.kwargs
+        self.assertEqual(kwargs["event_name"], "DeferrableMetrics.deferred_failure")
+        self.assertEqual(kwargs["event_type"], EventType.INFO)
+        self.assertEqual(kwargs["metadata"]["exception_type"], "RuntimeError")
+        self.assertEqual(kwargs["error_message"], "metric blew up")
+        self.assertTrue(kwargs["stack_trace"])
+
+    def test_future_failure_via_subscribe_path(self) -> None:
+        f: Future[dict] = Future()
+        dm = DeferrableMetrics(f)
+        errors: list[Exception] = []
+        dm.subscribe(lambda d: None, on_error=errors.append)
+        f.set_exception(RuntimeError("subscribe path"))
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(self.mock_log.call_count, 1)
+
+    def test_unobserved_future_failure_still_emits(self) -> None:
+        # Future-backed DeferrableMetrics constructed and the reference
+        # dropped; Future raises. The done-callback runs unconditionally.
+        f: Future[dict] = Future()
+        DeferrableMetrics(f)
+        f.set_exception(RuntimeError("orphaned"))
+        self.assertEqual(self.mock_log.call_count, 1)
+
+    def test_telemetry_failure_does_not_raise(self) -> None:
+        # log_event itself raising must never propagate into the caller.
+        self.mock_log.side_effect = RuntimeError("scuba down")
+        f: Future[dict] = Future()
+        dm = DeferrableMetrics(f)
+        f.set_exception(ValueError("metric error"))
+        with self.assertRaisesRegex(ValueError, "metric error"):
+            dm.resolve()
 
 
 class TransferTensorsToCpuTest(unittest.TestCase):
