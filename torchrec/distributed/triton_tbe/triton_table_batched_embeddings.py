@@ -862,7 +862,7 @@ def table_batched_embedding_bag_forward_weighted_kernel(
         tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BAGS_PER_PROGRAM"])
 # Triton TR001: BLOCK_SIZE is fixed by the embedding width.
 def table_batched_embedding_bag_forward_weighted_capped_kernel(  # noqa: TR001
     output_ptr,
@@ -880,7 +880,9 @@ def table_batched_embedding_bag_forward_weighted_capped_kernel(  # noqa: TR001
     B,
     total_B,
     BLOCK_SIZE: tl.constexpr,
-    BAGS_PER_PROGRAM: tl.constexpr,
+    # Keep this runtime: online batch sizes vary, and specializing it creates a
+    # new kernel for every bags-per-program value.
+    BAGS_PER_PROGRAM,
     vbe: tl.constexpr = False,
     info_B_num_bits=0,
     info_B_mask=0,
@@ -1328,7 +1330,7 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
         tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BAGS_PER_PROGRAM"])
 # Triton TR001: BLOCK_SIZE is fixed by the embedding width.
 def table_batched_embedding_bag_forward_unweighted_capped_kernel(  # noqa: TR001
     output_ptr,
@@ -1347,7 +1349,9 @@ def table_batched_embedding_bag_forward_unweighted_capped_kernel(  # noqa: TR001
     B,
     T: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    BAGS_PER_PROGRAM: tl.constexpr,
+    # Keep this runtime: online batch sizes vary, and specializing it creates a
+    # new kernel for every bags-per-program value.
+    BAGS_PER_PROGRAM,
     vbe: tl.constexpr = False,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
     ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
@@ -1432,7 +1436,7 @@ def table_batched_embedding_bag_forward_unweighted_capped_kernel(  # noqa: TR001
         tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BAGS_PER_PROGRAM"])
 # Triton TR001: BLOCK_SIZE is fixed by the embedding width.
 def table_batched_embedding_bag_forward_unweighted_parallel_bags_kernel(  # noqa: TR001
     output_ptr,
@@ -1449,7 +1453,9 @@ def table_batched_embedding_bag_forward_unweighted_parallel_bags_kernel(  # noqa
     BLOCK_SIZE: tl.constexpr,
     FEATURE_START: tl.constexpr,
     FEATURE_END: tl.constexpr,
-    BAGS_PER_PROGRAM: tl.constexpr,
+    # Keep this runtime: online batch sizes vary, and specializing it creates a
+    # new kernel for every bags-per-program value.
+    BAGS_PER_PROGRAM,
     PARALLEL_BAGS: tl.constexpr,
     ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
 ) -> None:
