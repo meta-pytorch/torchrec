@@ -234,6 +234,23 @@ def _check_int_overflow(
     return False
 
 
+def _int32_tensor_on(values: List[int], device: Optional[torch.device]) -> torch.Tensor:
+    """``torch.tensor(values, device=device, dtype=torch.int32)`` without blocking.
+
+    Built straight on a CUDA device, the list is copied up from pageable memory,
+    which synchronizes the host with the current stream. Staging through pinned
+    memory lets the copy be non-blocking; the pinned allocator records the copy's
+    stream, so the staging buffer is not reused before the copy lands.
+    """
+    if device is None or device.type != "cuda" or is_torchdynamo_compiling():
+        return torch.tensor(values, device=device, dtype=torch.int32)
+    return (
+        torch.tensor(values, dtype=torch.int32)
+        .pin_memory()
+        .to(device, non_blocking=True)
+    )
+
+
 def _get_recat_data(
     local_split: int,
     num_splits: int,
@@ -249,7 +266,7 @@ def _get_recat_data(
         i + j * local_split for i in range(local_split) for j in feature_order
     )
     try:
-        recat_tensor = torch.tensor(recat, device=device, dtype=torch.int32)
+        recat_tensor = _int32_tensor_on(list(recat), device)
     except RuntimeError as e:
         recat_sample = recat if len(recat) <= 16 else recat[:8] + recat[-8:]
         logger.error(
@@ -333,16 +350,8 @@ def _apply_variable_batch_per_rank_if_needed(
     )
 
     try:
-        input_offset_tensor = torch.tensor(
-            input_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
-        )
-        output_offset_tensor = torch.tensor(
-            output_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
-        )
+        input_offset_tensor = _int32_tensor_on(input_offset, recat_tensor.device)
+        output_offset_tensor = _int32_tensor_on(output_offset, recat_tensor.device)
     except RuntimeError as e:
         logger.error(
             f"_get_recat: int32 tensor creation failed: {e}. "
@@ -704,10 +713,18 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
-        input_list = _safe_tolist_2d(self._input_tensor.view(self.num_workers, -1).T)
-        # Strip tag row from input_list so overflow checks operate on real data
-        if self._tag_appended:
-            input_list = input_list[: self._num_original_tensors]
+        # input_list feeds nothing but _check_int_overflow, which returns
+        # immediately unless TORCHREC_OVERFLOW_DEBUG=1. Reading it is not free:
+        # .T is non-contiguous, so _safe_tolist_2d costs a device copy, a D2H
+        # and a current-stream synchronize on every input_dist.
+        input_list: List[List[int]] = []
+        if _TORCHREC_OVERFLOW_DEBUG:
+            input_list = _safe_tolist_2d(
+                self._input_tensor.view(self.num_workers, -1).T
+            )
+            # Strip tag row from input_list so overflow checks operate on real data
+            if self._tag_appended:
+                input_list = input_list[: self._num_original_tensors]
         if input_list:
             _check_int_overflow(
                 "SplitsAllToAllAwaitable",
