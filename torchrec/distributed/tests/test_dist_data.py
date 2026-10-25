@@ -11,6 +11,7 @@ import contextlib
 import itertools
 import os
 import random
+import tempfile
 import unittest
 import unittest.mock
 from typing import (
@@ -32,6 +33,7 @@ import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
 import torchrec.distributed.collective_utils as cu
+import torchrec.distributed.dist_data as dist_data
 import torchrec.distributed.embedding_sharding as embedding_sharding
 from hypothesis import given, settings
 from pyre_extensions import none_throws
@@ -2206,6 +2208,55 @@ class GetRecatOverflowTest(unittest.TestCase):
                 unittest.mock.call(2, 4, 1, torch.device("cuda", 1)),
             ],
         )
+
+
+class SplitsAllToAllOverflowDebugGatingTest(unittest.TestCase):
+    """`SplitsAllToAllAwaitable._wait_impl` reads back two tensors.
+
+    The output read is load-bearing (it is the awaitable's return value). The
+    input read exists only to feed `_check_int_overflow`, which returns
+    immediately unless `TORCHREC_OVERFLOW_DEBUG=1`. Counting
+    `_safe_tolist_2d` calls pins that asymmetry: on CUDA each call is a device
+    copy (`.T` is non-contiguous) plus a D2H plus a current-stream
+    synchronize, so the second one must not happen on the default path.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        dist.init_process_group(
+            backend="gloo",
+            store=dist.FileStore(os.path.join(tmpdir.name, "store"), 1),
+            rank=0,
+            world_size=1,
+        )
+        self.addCleanup(dist.destroy_process_group)
+
+    def _count_reads(self, overflow_debug: bool) -> int:
+        real = dist_data._safe_tolist_2d
+        calls = 0
+
+        def counting(tensor: torch.Tensor) -> List[List[int]]:
+            nonlocal calls
+            calls += 1
+            return real(tensor)
+
+        with patch.object(dist_data, "_safe_tolist_2d", counting), patch.object(
+            dist_data, "_TORCHREC_OVERFLOW_DEBUG", overflow_debug
+        ):
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=[torch.tensor([3], dtype=torch.int64)],
+                pg=none_throws(dist.group.WORLD),
+            )
+            self.assertEqual(awaitable.wait(), [[3]])
+        return calls
+
+    def test_input_not_read_back_when_overflow_debug_off(self) -> None:
+        self.assertEqual(self._count_reads(overflow_debug=False), 1)
+
+    def test_input_read_back_when_overflow_debug_on(self) -> None:
+        self.assertEqual(self._count_reads(overflow_debug=True), 2)
 
 
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):

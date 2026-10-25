@@ -704,10 +704,18 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
-        input_list = _safe_tolist_2d(self._input_tensor.view(self.num_workers, -1).T)
-        # Strip tag row from input_list so overflow checks operate on real data
-        if self._tag_appended:
-            input_list = input_list[: self._num_original_tensors]
+        # input_list feeds nothing but _check_int_overflow, which returns
+        # immediately unless TORCHREC_OVERFLOW_DEBUG=1. Reading it is not free:
+        # .T is non-contiguous, so _safe_tolist_2d costs a device copy, a D2H
+        # and a current-stream synchronize on every input_dist.
+        input_list: List[List[int]] = []
+        if _TORCHREC_OVERFLOW_DEBUG:
+            input_list = _safe_tolist_2d(
+                self._input_tensor.view(self.num_workers, -1).T
+            )
+            # Strip tag row from input_list so overflow checks operate on real data
+            if self._tag_appended:
+                input_list = input_list[: self._num_original_tensors]
         if input_list:
             _check_int_overflow(
                 "SplitsAllToAllAwaitable",
