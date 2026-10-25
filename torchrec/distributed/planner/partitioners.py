@@ -24,6 +24,7 @@ from torchrec.distributed.planner.types import (
     PerfModel,
     PlannerError,
     PlannerErrorType,
+    Shard,
     ShardingOption,
     Storage,
     Topology,
@@ -32,6 +33,9 @@ from torchrec.distributed.planner.utils import (
     bytes_to_gb,
     mb_to_bytes,
     reset_shard_rank,
+)
+from torchrec.distributed.planner.zero_perf_shard_placement import (
+    should_place_zero_perf_shards_by_storage,
 )
 from torchrec.distributed.types import ShardingType
 
@@ -78,6 +82,12 @@ def _apply_shards_assignment(
     for sharding_option, assignment in zip(sharding_options, assignment_per_option):
         for shard_id, rank in enumerate(assignment):
             sharding_option.shards[shard_id].rank = rank
+
+
+def _place_shard_on_device(shard: Shard, device: DeviceHardware) -> None:
+    shard.rank = device.rank
+    device.storage -= cast(Storage, shard.storage)
+    device.perf += cast(Perf, shard.perf)
 
 
 @dataclass
@@ -173,6 +183,39 @@ class OrderedDeviceHardware:
         )
 
 
+def _place_zero_perf_shard_by_free_hbm(
+    shard: Shard,
+    sharding_option: ShardingOption,
+    minheap_devices: List[OrderedDeviceHardware],
+) -> None:
+    storage = cast(Storage, shard.storage)
+    available_devices = [
+        ordered_device
+        for ordered_device in minheap_devices
+        if storage.fits_in(ordered_device.device.storage)
+    ]
+    if not available_devices:
+        raise PlannerError(
+            error_type=PlannerErrorType.PARTITION,
+            message=(
+                f"Device partition failed. Couldn't find a rank for zero-perf shard {shard} "
+                f"of table {sharding_option.name}, largest device storage: "
+                f"{max(ordered_device.device.storage for ordered_device in minheap_devices)}"
+            ),
+        )
+    _place_shard_on_device(
+        shard,
+        max(
+            available_devices,
+            key=lambda ordered_device: (
+                ordered_device.device.storage.hbm,
+                -(ordered_device.device.rank % ordered_device.local_world_size),
+                -ordered_device.device.rank,
+            ),
+        ).device,
+    )
+
+
 class GreedyPerfPartitioner(Partitioner):
     """Greedy Partitioner.
 
@@ -185,7 +228,9 @@ class GreedyPerfPartitioner(Partitioner):
     """
 
     def __init__(
-        self, sort_by: SortBy = SortBy.STORAGE, balance_modules: bool = False
+        self,
+        sort_by: SortBy = SortBy.STORAGE,
+        balance_modules: bool = False,
     ) -> None:
         self._sort_by = sort_by
         self._balance_modules = balance_modules
@@ -403,9 +448,7 @@ class GreedyPerfPartitioner(Partitioner):
 
                 if storage.fits_in(device.storage):
                     # Successfully place the shard
-                    shard.rank = device.rank
-                    device.storage -= storage
-                    device.perf += cast(Perf, shard.perf)
+                    _place_shard_on_device(shard, device)
                     used_ranks.add(device.rank)
                     found_device = True
                     break
@@ -431,15 +474,22 @@ class GreedyPerfPartitioner(Partitioner):
     ) -> None:
         pushlimit = len(minheap_devices) * bulk_heapify_threshold
         for shard in sharding_option.shards:
+            if (
+                not cast(Perf, shard.perf).total
+                and cast(Storage, shard.storage).hbm
+                and should_place_zero_perf_shards_by_storage()
+            ):
+                _place_zero_perf_shard_by_free_hbm(
+                    shard, sharding_option, minheap_devices
+                )
+                continue
             tmp_heap = []
             while minheap_devices:
                 ordered_device = minheap_devices[0]
                 device = ordered_device.device
                 storage = cast(Storage, shard.storage)
                 if storage.fits_in(device.storage):
-                    shard.rank = device.rank
-                    device.storage -= cast(Storage, shard.storage)
-                    device.perf += cast(Perf, shard.perf)
+                    _place_shard_on_device(shard, device)
                     heapq.heapreplace(minheap_devices, ordered_device)
                     break
                 else:
