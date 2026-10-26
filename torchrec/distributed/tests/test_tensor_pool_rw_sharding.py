@@ -8,8 +8,10 @@
 # pyre-strict
 
 import unittest
+from typing import Callable, List, Tuple
 
 import torch
+from torchrec.distributed.sharding.rw_pool_sharding import InferRwObjectPoolInputDist
 from torchrec.distributed.sharding.rw_tensor_pool_sharding import (
     InferRwTensorPoolSharding,
     TensorPoolRwSharding,
@@ -20,6 +22,30 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessTestBase,
 )
 from torchrec.distributed.types import ShardingEnv
+
+
+class _UpdateModule(torch.nn.Module):
+    """Calls the ids dist's `update` from `forward`, so it can be FX traced the
+    way the publish flow traces `update_embedding_cache`."""
+
+    def __init__(self, ids_dist: InferRwObjectPoolInputDist) -> None:
+        super().__init__()
+        self.ids_dist = ids_dist
+
+    def forward(
+        self, ids: torch.Tensor, values: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+        return self.ids_dist.update(ids, values)
+
+
+_Update = Callable[
+    [torch.Tensor, torch.Tensor],
+    Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor],
+]
+
+
+def _update_variants(ids_dist: InferRwObjectPoolInputDist) -> List[_Update]:
+    return [ids_dist.update, torch.fx.symbolic_trace(_UpdateModule(ids_dist))]
 
 
 class TestTensorPoolRwSharding(MultiProcessTestBase):
@@ -541,3 +567,99 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
             device=device,
         )
         torch.testing.assert_close(merged_values, expected_merged)
+
+    def test_lookup_ids_dist_splits_ids_per_rank(self) -> None:
+        class MockShardingEnv:
+            def __init__(self, world_size: int, rank: int) -> None:
+                self.world_size = world_size
+                self.rank = rank
+                self.process_group = None
+
+        sharding = InferRwTensorPoolSharding(
+            pool_size=1000,
+            # pyrefly: ignore[bad-argument-type]
+            env=MockShardingEnv(world_size=3, rank=0),
+            device=torch.device("cpu"),
+            memory_capacity_per_rank=[600, 200, 200],
+        )
+        ids = torch.tensor([5, 700, 650, 900, 10, 999])
+        # Rank-local offsets: rank 1 starts at row 600, rank 2 at row 800.
+        expected_dist_ids = [
+            torch.tensor([5, 10]),
+            torch.tensor([100, 50]),
+            torch.tensor([100, 199]),
+        ]
+        expected_dist_values = [
+            torch.tensor([5.0, 10.0]),
+            torch.tensor([700.0, 650.0]),
+            torch.tensor([900.0, 999.0]),
+        ]
+
+        for split_by_lengths in (False, True):
+            lookup_ids_dist = sharding.create_lookup_ids_dist()
+            lookup_ids_dist._split_by_lengths = split_by_lengths
+            for dist in (
+                lookup_ids_dist,
+                torch.fx.symbolic_trace(lookup_ids_dist),
+                torch.jit.script(lookup_ids_dist),
+            ):
+                with self.subTest(split_by_lengths=split_by_lengths, dist=type(dist)):
+                    dist_ids, unbucketize_permute, _, bucketized_lengths = dist(ids)
+                    self.assertEqual(len(dist_ids), 3)
+                    for actual, expected in zip(dist_ids, expected_dist_ids):
+                        torch.testing.assert_close(actual, expected)
+                    torch.testing.assert_close(
+                        bucketized_lengths, torch.tensor([2, 2, 2])
+                    )
+                    torch.testing.assert_close(
+                        torch.cat(dist_ids)[unbucketize_permute],
+                        torch.tensor([5, 100, 50, 100, 10, 199]),
+                    )
+
+            for update in _update_variants(lookup_ids_dist):
+                with self.subTest(split_by_lengths=split_by_lengths, update=update):
+                    dist_ids, dist_values, _ = update(ids, ids.float())
+                    for actual, expected in zip(dist_ids, expected_dist_ids):
+                        torch.testing.assert_close(actual, expected)
+                    for actual, expected in zip(dist_values, expected_dist_values):
+                        torch.testing.assert_close(actual, expected)
+
+    def test_lookup_ids_dist_empty_ids(self) -> None:
+        class MockShardingEnv:
+            def __init__(self, world_size: int, rank: int) -> None:
+                self.world_size = world_size
+                self.rank = rank
+                self.process_group = None
+
+        sharding = InferRwTensorPoolSharding(
+            pool_size=1000,
+            # pyrefly: ignore[bad-argument-type]
+            env=MockShardingEnv(world_size=3, rank=0),
+            device=torch.device("cpu"),
+            memory_capacity_per_rank=[600, 200, 200],
+        )
+        ids = torch.empty(0, dtype=torch.int64)
+
+        for split_by_lengths in (False, True):
+            lookup_ids_dist = sharding.create_lookup_ids_dist()
+            lookup_ids_dist._split_by_lengths = split_by_lengths
+            for dist in (
+                lookup_ids_dist,
+                torch.fx.symbolic_trace(lookup_ids_dist),
+                torch.jit.script(lookup_ids_dist),
+            ):
+                with self.subTest(split_by_lengths=split_by_lengths, dist=type(dist)):
+                    dist_ids, unbucketize_permute, _, bucketized_lengths = dist(ids)
+                    self.assertEqual([t.numel() for t in dist_ids], [0, 0, 0])
+                    self.assertEqual(unbucketize_permute.numel(), 0)
+                    torch.testing.assert_close(
+                        bucketized_lengths, torch.zeros(3, dtype=torch.int64)
+                    )
+
+            for update in _update_variants(lookup_ids_dist):
+                with self.subTest(split_by_lengths=split_by_lengths, update=update):
+                    dist_ids, dist_values, _ = update(ids, torch.empty(0, 4))
+                    self.assertEqual([t.numel() for t in dist_ids], [0, 0, 0])
+                    self.assertEqual(
+                        [tuple(t.shape) for t in dist_values], [(0, 4)] * 3
+                    )
