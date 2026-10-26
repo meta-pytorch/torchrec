@@ -346,17 +346,19 @@ class ShardedKeyedJaggedTensorPool(
                         self._permute_feature.append(j)
 
         valid_input = values.permute(self._permute_feature)
-        # can disable below check if expensive
-        max_elements, _max_indices = (
-            valid_input.lengths()
-            .reshape(len(self._feature_max_lengths.keys()), -1)
-            .max(dim=1)
-        )
+        # can disable below check if expensive. A rank with no rows still joins
+        # the update's collectives, and max() has nothing to reduce for it.
+        if valid_input.lengths().numel() > 0:
+            max_elements, _max_indices = (
+                valid_input.lengths()
+                .reshape(len(self._feature_max_lengths.keys()), -1)
+                .max(dim=1)
+            )
 
-        # pyrefly: ignore[no-matching-overload]
-        assert torch.all(
-            max_elements <= self._feature_max_lengths_t
-        ).item(), "input KJT has a feature that exceeds specified max lengths"
+            # pyrefly: ignore[no-matching-overload]
+            assert torch.all(
+                max_elements <= self._feature_max_lengths_t
+            ).item(), "input KJT has a feature that exceeds specified max lengths"
 
         return valid_input
 
