@@ -4142,7 +4142,8 @@ class TritonTBE(torch.autograd.Function):
                 {}
                 if _use_amd
                 else {
-                    "ENABLE_TRITON_TBE_OPTIMIZATIONS": enable_triton_tbe_optimizations
+                    "ENABLE_TRITON_TBE_OPTIMIZATIONS": enable_triton_tbe_optimizations,
+                    "BUFFER_SIZE": cfg.short_run_buffer_size_weighted,
                 }
             )
             for _b, _bucket_bs in enumerate(
@@ -4190,7 +4191,6 @@ class TritonTBE(torch.autograd.Function):
                     STOCHASTIC_ROUNDING=stochastic_rounding,
                     stochastic_rounding_seed=stochastic_rounding_seed,
                     vbe=vbe,
-                    BUFFER_SIZE=cfg.short_run_buffer_size_weighted,
                     **short_run_weighted_kwargs,
                 )
             use_fused_clc_long_run = use_clc and (
@@ -4332,7 +4332,8 @@ class TritonTBE(torch.autograd.Function):
                 {}
                 if _use_amd
                 else {
-                    "ENABLE_TRITON_TBE_OPTIMIZATIONS": enable_triton_tbe_optimizations
+                    "ENABLE_TRITON_TBE_OPTIMIZATIONS": enable_triton_tbe_optimizations,
+                    "BUFFER_SIZE": cfg.short_run_buffer_size_unweighted,
                 }
             )
             for _b, _bucket_bs in enumerate(
@@ -4379,7 +4380,6 @@ class TritonTBE(torch.autograd.Function):
                     STOCHASTIC_ROUNDING=stochastic_rounding,
                     stochastic_rounding_seed=stochastic_rounding_seed,
                     vbe=vbe,
-                    BUFFER_SIZE=cfg.short_run_buffer_size_unweighted,
                     **short_run_unweighted_kwargs,
                 )
             use_fused_clc_long_run = use_clc and (
