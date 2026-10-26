@@ -191,7 +191,7 @@ def group_batches_by_unique(
     indices: jax.Array,
     num_features: int,
     batch_size: int,
-):
+) -> tuple[jax.Array, jax.Array]:
     """
     Gets a mapping from unique bags to which gradient it corresponds to.
 

@@ -250,7 +250,10 @@ class BatchIndexSelectTest(unittest.TestCase):
 
         torch.testing.assert_close(actual, inputs.grad)
 
-    @parameterized.expand(CASES)
+    @parameterized.expand(
+        [(*case, False) for case in CASES]
+        + [("compiled_two_features", 16, [2, 2], [16, 16], "modulo", True)]
+    )
     def test_sparse_core_matches_fbgemm_cpu(
         self,
         _name: str,
@@ -258,6 +261,7 @@ class BatchIndexSelectTest(unittest.TestCase):
         input_rows: list[int],
         input_columns: list[int],
         pattern: str,
+        compile_op: bool,
     ) -> None:
         _setup_tpu()
         input_num_indices = [batch_size] * len(input_columns)
@@ -271,7 +275,10 @@ class BatchIndexSelectTest(unittest.TestCase):
         )
 
         tpu_inputs = inputs.detach().to("tpu").requires_grad_()
-        actual = torch.ops.fbgemm.batch_index_select_dim0(
+        op = torch.ops.fbgemm.batch_index_select_dim0
+        if compile_op:
+            op = torch.compile(op, backend="aot_eager", fullgraph=True)
+        actual = op(
             tpu_inputs,
             indices.to("tpu"),
             input_num_indices,
@@ -288,6 +295,46 @@ class BatchIndexSelectTest(unittest.TestCase):
         actual.backward(grad_output.to("tpu"))
         assert tpu_inputs.grad is not None
         assert inputs.grad is not None
+        torch.testing.assert_close(tpu_inputs.grad.cpu(), inputs.grad)
+
+    @parameterized.expand(
+        [
+            ("unaligned_batch", 15, [16, 32], True),
+            ("unaligned_columns", 16, [18, 32], True),
+            ("feature_major", 16, [16, 32], False),
+        ]
+    )
+    def test_cpu_fallback_matches_fbgemm_cpu(
+        self,
+        _name: str,
+        batch_size: int,
+        input_columns: list[int],
+        permute_output_dim_0_1: bool,
+    ) -> None:
+        _setup_tpu()
+        input_rows = [2, 3]
+        indices = _make_case(batch_size, input_rows, "modulo")
+        inputs = torch.randn(
+            sum(r * c for r, c in zip(input_rows, input_columns)),
+            generator=torch.Generator().manual_seed(2),
+        ).requires_grad_()
+        tpu_inputs = inputs.detach().to("tpu").requires_grad_()
+        args = ([batch_size] * len(input_rows), input_rows, input_columns)
+        expected = torch.ops.fbgemm.batch_index_select_dim0(
+            inputs, indices, *args, permute_output_dim_0_1
+        )
+        actual = torch.ops.fbgemm.batch_index_select_dim0(
+            tpu_inputs, indices.to("tpu"), *args, permute_output_dim_0_1
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected)
+        grad_output = torch.randn(
+            expected.shape, generator=torch.Generator().manual_seed(0)
+        )
+        expected.backward(grad_output)
+        actual.backward(grad_output.to("tpu"))
+        self.assertIsNotNone(tpu_inputs.grad)
+        self.assertIsNotNone(inputs.grad)
         torch.testing.assert_close(tpu_inputs.grad.cpu(), inputs.grad)
 
     @parameterized.expand(CASES)
@@ -308,7 +355,9 @@ class BatchIndexSelectTest(unittest.TestCase):
             grad_output, indices, batch_size, input_rows, input_columns
         )
 
-        actual = torch.ops.torchrec.batch_index_select_dim0_backward_tpu_impl(
+        from torchrec.experimental.torch_tpu.pallas import impl
+
+        actual = impl.batch_index_select_dim0_backward_tpu_impl(
             grad_output.to("tpu"),
             indices.to("tpu"),
             input_rows,

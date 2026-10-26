@@ -233,7 +233,7 @@ def batch_index_select_dim0_tpu(
     input_num_indices,
     input_rows,
     input_columns,
-    permute_output_dim_0_1,
+    permute_output_dim_0_1=False,
 ):
     batch_size = input_num_indices[0]
     if (
@@ -253,7 +253,7 @@ def batch_index_select_dim0_tpu(
                 f"Instead it is {input_num_indices}."
             )
 
-        return torch.ops.torchrec.batch_index_select_dim0(
+        return impl.batch_index_select_dim0_tpu(
             inputs, indices, input_rows, input_columns
         )
 
@@ -280,4 +280,5 @@ lib.impl(
 lib.impl("segment_sum_csr", segment_sum_csr_tpu, "TPU")
 lib.impl("asynchronous_complete_cumsum", asynchronous_complete_cumsum_tpu, "TPU")
 lib.impl("batch_index_select_dim0", batch_index_select_dim0_tpu, "TPU")
+lib.impl("batch_index_select_dim0", batch_index_select_dim0_tpu, "AutogradPrivateUse1")
 _ = impl

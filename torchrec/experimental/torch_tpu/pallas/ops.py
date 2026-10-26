@@ -60,18 +60,110 @@ lib.define(
     "Tensor grad_out, Tensor offset_dim_list, Tensor permute_list"
     ") -> Tensor"
 )
-lib.define(
-    "batch_index_select_dim0("
-    "Tensor inputs, Tensor indices, int[] input_rows, int[] input_columns"
-    ") -> Tensor"
-)
-lib.define(
-    "batch_index_select_dim0_backward_tpu_impl("
-    "Tensor grad_output, Tensor indices, int[] input_rows, int[] input_columns, "
-    "int input_numel) -> Tensor"
-)
 
 
+################
+# META KERNELS #
+################
+@torch.library.register_fake("torchrec::embedding_lookup")
+def _embedding_lookup_meta(indices, weights, emb_dim):
+    return weights.new_empty((indices.numel(), emb_dim))
+
+
+@torch.library.register_fake("torchrec::embedding_lookup_backward")
+def _embedding_lookup_backward_meta(grad_out, indices, num_rows, emb_dim):
+    return grad_out.new_empty((num_rows, emb_dim))
+
+
+@torch.library.register_fake("torchrec::embedding_pooled_lookup")
+def _embedding_pooled_lookup_meta(
+    idx: torch.Tensor, table: torch.Tensor, pool: int
+) -> torch.Tensor:
+    return table.new_empty((idx.numel() // pool, table.shape[1]))
+
+
+@torch.library.register_fake("torchrec::embedding_pooled_lookup_backward")
+def _embedding_pooled_lookup_backward_meta(
+    grad_out: torch.Tensor,
+    idx: torch.Tensor,
+    pool: int,
+    num_rows: int,
+    emb_dim: int,
+) -> torch.Tensor:
+    return grad_out.new_empty((num_rows, emb_dim))
+
+
+@torch.library.register_fake("torchrec::embedding_pooled_lookup_offset")
+def _embedding_pooled_lookup_offset_meta(
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    weights: torch.Tensor,
+    emb_dim: int,
+) -> torch.Tensor:
+    return weights.new_empty((offsets.numel() - 1, emb_dim))
+
+
+@torch.library.register_fake("torchrec::embedding_pooled_batched_lookup_offset")
+def _embedding_pooled_batched_lookup_offset_meta(
+    indices, offsets, weights, row_offsets, emb_dim
+):
+    return weights.new_empty((offsets.numel() - 1, emb_dim))
+
+
+@torch.library.register_fake("torchrec::embedding_pooled_lookup_offset_backward")
+def _embedding_pooled_lookup_offset_backward_meta(
+    grad_out, indices, offsets, num_rows, emb_dim
+):
+    return grad_out.new_empty((num_rows, emb_dim))
+
+
+@torch.library.register_fake(
+    "torchrec::embedding_pooled_batched_lookup_offset_backward"
+)
+def _embedding_pooled_batched_lookup_offset_backward_meta(
+    grad_out: torch.Tensor,
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    row_offsets: torch.Tensor,
+    num_rows: int,
+    emb_dim: int,
+    flat_weights: bool = False,
+) -> torch.Tensor:
+    shape = (num_rows * emb_dim,) if flat_weights else (num_rows, emb_dim)
+    return grad_out.new_empty(shape)
+
+
+@torch.library.register_fake(
+    "torchrec::embedding_pooled_batched_lookup_offset_fused_adagrad"
+)
+def _embedding_pooled_batched_lookup_offset_fused_adagrad_meta(
+    indices, offsets, weights, row_offsets, momentum, lr, eps, emb_dim
+):
+    return weights.new_empty((offsets.numel() - 1, emb_dim))
+
+
+@torch.library.register_fake(
+    "torchrec::embedding_pooled_batched_lookup_offset_adagrad_update"
+)
+def _embedding_pooled_batched_lookup_offset_adagrad_update_meta(
+    grad_out, indices, offsets, row_offsets, weights, momentum, lr, eps
+):
+    return None  # In-place update
+
+
+@torch.library.register_fake("torchrec::permute_pooled_embs")
+def _permute_pooled_fake(pooled_embs, offset_dim_list, permute_list):
+    return pooled_embs.new_empty(pooled_embs.shape)
+
+
+@torch.library.register_fake("torchrec::permute_pooled_embs_backward")
+def _permute_pooled_backward_fake(grad_out, offset_dim_list, permute_list):
+    return grad_out.new_empty(grad_out.shape)
+
+
+###############
+# CPU KERNELS #
+###############
 def embedding_lookup_cpu(
     indices: torch.Tensor, weights: torch.Tensor, emb_dim: int
 ) -> torch.Tensor:
@@ -85,10 +177,6 @@ def embedding_lookup_backward_cpu(
     return grad_out.new_zeros((num_rows, emb_dim)).index_add_(
         0, indices.long(), grad_out
     )
-
-
-lib.impl("embedding_lookup", embedding_lookup_cpu, "CPU")
-lib.impl("embedding_lookup_backward", embedding_lookup_backward_cpu, "CPU")
 
 
 def embedding_pooled_lookup_cpu(
@@ -241,38 +329,6 @@ def embedding_pooled_batched_lookup_offset_adagrad_update_cpu(
     momentum.index_copy_(0, unique_rows, updated_momentum)
 
 
-lib.impl("embedding_pooled_lookup", embedding_pooled_lookup_cpu, "CPU")
-lib.impl(
-    "embedding_pooled_lookup_backward", embedding_pooled_lookup_backward_cpu, "CPU"
-)
-lib.impl("embedding_pooled_lookup_offset", embedding_pooled_lookup_offset_cpu, "CPU")
-lib.impl(
-    "embedding_pooled_lookup_offset_backward",
-    embedding_pooled_lookup_offset_backward_cpu,
-    "CPU",
-)
-lib.impl(
-    "embedding_pooled_batched_lookup_offset",
-    embedding_pooled_batched_lookup_offset_cpu,
-    "CPU",
-)
-lib.impl(
-    "embedding_pooled_batched_lookup_offset_backward",
-    embedding_pooled_batched_lookup_offset_backward_cpu,
-    "CPU",
-)
-lib.impl(
-    "embedding_pooled_batched_lookup_offset_fused_adagrad",
-    embedding_pooled_batched_lookup_offset_fused_adagrad_cpu,
-    "CPU",
-)
-lib.impl(
-    "embedding_pooled_batched_lookup_offset_adagrad_update",
-    embedding_pooled_batched_lookup_offset_adagrad_update_cpu,
-    "CPU",
-)
-
-
 def _permute_col_indices(
     offset_dim_list: torch.Tensor,
     permute_list: torch.Tensor,
@@ -320,10 +376,45 @@ def permute_pooled_embs_backward_cpu(
     )
 
 
+lib.impl("embedding_pooled_lookup", embedding_pooled_lookup_cpu, "CPU")
+lib.impl(
+    "embedding_pooled_lookup_backward", embedding_pooled_lookup_backward_cpu, "CPU"
+)
+lib.impl("embedding_pooled_lookup_offset", embedding_pooled_lookup_offset_cpu, "CPU")
+lib.impl(
+    "embedding_pooled_lookup_offset_backward",
+    embedding_pooled_lookup_offset_backward_cpu,
+    "CPU",
+)
+lib.impl(
+    "embedding_pooled_batched_lookup_offset",
+    embedding_pooled_batched_lookup_offset_cpu,
+    "CPU",
+)
+lib.impl(
+    "embedding_pooled_batched_lookup_offset_backward",
+    embedding_pooled_batched_lookup_offset_backward_cpu,
+    "CPU",
+)
+lib.impl(
+    "embedding_pooled_batched_lookup_offset_fused_adagrad",
+    embedding_pooled_batched_lookup_offset_fused_adagrad_cpu,
+    "CPU",
+)
+lib.impl(
+    "embedding_pooled_batched_lookup_offset_adagrad_update",
+    embedding_pooled_batched_lookup_offset_adagrad_update_cpu,
+    "CPU",
+)
+lib.impl("embedding_lookup", embedding_lookup_cpu, "CPU")
+lib.impl("embedding_lookup_backward", embedding_lookup_backward_cpu, "CPU")
 lib.impl("permute_pooled_embs", permute_pooled_embs_cpu, "CPU")
 lib.impl("permute_pooled_embs_backward", permute_pooled_embs_backward_cpu, "CPU")
 
 
+################
+## BWD KERNELS #
+################
 def _setup_context(ctx, inputs, output) -> None:
     _ = output
     indices, weights, emb_dim = inputs
@@ -338,11 +429,6 @@ def _backward(ctx, grad_out: torch.Tensor):
         grad_out.contiguous(), indices, ctx.num_rows, ctx.emb_dim
     )
     return None, grad_weights, None
-
-
-torch.library.register_autograd(
-    "torchrec::embedding_lookup", _backward, setup_context=_setup_context
-)
 
 
 def _setup_pooled_context(ctx, inputs, output) -> None:
@@ -442,6 +528,9 @@ def _permute_backward(ctx, grad_out: torch.Tensor):
 
 
 torch.library.register_autograd(
+    "torchrec::embedding_lookup", _backward, setup_context=_setup_context
+)
+torch.library.register_autograd(
     "torchrec::embedding_pooled_lookup",
     _pooled_backward,
     setup_context=_setup_pooled_context,
@@ -465,32 +554,4 @@ torch.library.register_autograd(
     "torchrec::permute_pooled_embs",
     _permute_backward,
     setup_context=_permute_setup_context,
-)
-
-
-def _batch_index_select_setup_context(ctx, inputs, output) -> None:
-    _ = output
-    input_tensor, indices, input_rows, input_columns = inputs
-    ctx.save_for_backward(indices)
-    ctx.input_rows = input_rows
-    ctx.input_columns = input_columns
-    ctx.input_numel = input_tensor.numel()
-
-
-def _batch_index_select_backward(ctx, grad_out: torch.Tensor):
-    (indices,) = ctx.saved_tensors
-    grad_inputs = torch.ops.torchrec.batch_index_select_dim0_backward_tpu_impl(
-        grad_out.contiguous(),
-        indices,
-        ctx.input_rows,
-        ctx.input_columns,
-        ctx.input_numel,
-    )
-    return grad_inputs, None, None, None
-
-
-torch.library.register_autograd(
-    "torchrec::batch_index_select_dim0",
-    _batch_index_select_backward,
-    setup_context=_batch_index_select_setup_context,
 )
