@@ -73,6 +73,32 @@ _batch_index_select_sc_bwd = pallas.jax_op(
     "torchrec_pallas::batch_index_select_dim0_backward",
     batch_index.batch_index_select_bwd_sc,
 )
+
+
+def _batch_index_select_setup_context(ctx, inputs, output) -> None:
+    _ = output
+    input_tensor, indices, input_rows, input_columns, _total_columns = inputs
+    ctx.save_for_backward(indices, input_rows, input_columns)
+    ctx.input_numel = input_tensor.numel()
+
+
+def _batch_index_select_backward(ctx, grad_output: torch.Tensor):
+    indices, input_rows, input_columns = ctx.saved_tensors
+    grad_inputs = _batch_index_select_sc_bwd(
+        grad_output=grad_output.contiguous(),
+        indices=indices,
+        input_rows=input_rows,
+        input_columns=input_columns,
+        permute_output_dim_0_1=True,
+        output_size=ctx.input_numel,
+    )
+    return grad_inputs, None, None, None, None
+
+
+_batch_index_select_sc.register_autograd(
+    _batch_index_select_backward, setup_context=_batch_index_select_setup_context
+)
+
 _segment_sum_csr_sc = pallas.jax_op(
     "torchrec_pallas::segment_sum_csr",
     segment_csr.segment_sum_csr_sc,
@@ -288,12 +314,4 @@ lib.impl(
 )
 lib.impl("permute_pooled_embs", permute_pooled_embs_tpu, "TPU")
 lib.impl("permute_pooled_embs_backward", permute_pooled_embs_backward_tpu, "TPU")
-lib.impl("batch_index_select_dim0", batch_index_select_dim0_tpu, "TPU")
-lib.impl(
-    "batch_index_select_dim0_backward_tpu_impl",
-    batch_index_select_dim0_backward_tpu_impl,
-    "TPU",
-)
-
-
 _ = ops
