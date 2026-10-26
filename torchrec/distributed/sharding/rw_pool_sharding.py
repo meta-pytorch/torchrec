@@ -154,6 +154,21 @@ def _get_unbucketize_permute_index(
     return index
 
 
+@torch.fx.wrap
+def _split_by_lengths(
+    values: torch.Tensor, lengths: torch.Tensor
+) -> List[torch.Tensor]:
+    if values.size(0) == 0:
+        return [values for _ in range(lengths.size(0))]
+    split_sizes: List[int] = lengths.tolist()
+    return list(torch.split(values, split_sizes))
+
+
+@torch.fx.wrap
+def _split_like(values: torch.Tensor, splits: List[torch.Tensor]) -> List[torch.Tensor]:
+    return list(torch.split(values, [t.size(0) for t in splits]))
+
+
 class InferRwObjectPoolInputDist(torch.nn.Module):
     """
     Redistribute torch.Tensor values containing IDs for sharded object pools for inference
@@ -168,6 +183,8 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
         block_bucketize_row_pos (torch.Tensor]): tensor containing shard/row offsets for each
             rank in case of uneven sharding of the tensor pool across ranks. If not provided,
             then block_size will be used to permute the IDs across ranks.
+        split_by_lengths (bool): split the bucketized IDs per rank with a single
+            ``torch.split`` instead of slicing each rank's range out of the offsets.
 
     Example:
         device = torch.device("cpu")
@@ -188,6 +205,7 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
         device: torch.device,
         block_size: torch.Tensor,
         block_bucketize_row_pos: Optional[list[torch.Tensor]] = None,
+        split_by_lengths: bool = False,
     ) -> None:
         super().__init__()
         self._world_size = env.world_size
@@ -196,6 +214,18 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
         self._block_bucketize_row_pos: list[torch.Tensor] = (
             [] if block_bucketize_row_pos is None else block_bucketize_row_pos
         )
+        self._split_by_lengths: bool = split_by_lengths
+
+    def _split_per_rank(
+        self, values: torch.Tensor, lengths: torch.Tensor
+    ) -> List[torch.Tensor]:
+        if self._split_by_lengths:
+            return _split_by_lengths(values, lengths)
+        offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        return [
+            values[offsets[rank] : offsets[rank + 1]]
+            for rank in range(self._world_size)
+        ]
 
     def forward(
         self,
@@ -239,12 +269,10 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
             return_bucket_mapping=True,
         )
 
-        id_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(bucketized_lengths)
+        ids_per_rank = self._split_per_rank(bucketized_indices, bucketized_lengths)
         dist_ids = []
         for rank in range(self._world_size):
-            offset = id_offsets[rank]
-            next_offset = id_offsets[rank + 1]
-            ids_for_rank = bucketized_indices[offset:next_offset]
+            ids_for_rank = ids_per_rank[rank]
             dist_ids.append(
                 ids_for_rank
                 if self._device == torch.device("cpu")
@@ -299,17 +327,15 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
             ),
         )
 
-        id_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(bucketized_lengths)
-
         index = _get_unbucketize_permute_index(unbucketize_permute)
         unbucketize_values = values[index]
+        ids_per_rank = self._split_per_rank(bucketized_indices, bucketized_lengths)
+        values_per_rank = _split_like(unbucketize_values, ids_per_rank)
         dist_ids = []
         dist_values = []
         for rank in range(self._world_size):
-            offset = id_offsets[rank]
-            next_offset = id_offsets[rank + 1]
-            ids_for_rank = bucketized_indices[offset:next_offset]
-            values_for_rank = unbucketize_values[offset:next_offset]
+            ids_for_rank = ids_per_rank[rank]
+            values_for_rank = values_per_rank[rank]
             dist_ids.append(
                 ids_for_rank
                 if self._device == torch.device("cpu")
