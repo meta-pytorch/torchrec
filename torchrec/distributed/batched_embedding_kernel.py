@@ -55,7 +55,17 @@ from fbgemm_gpu.tbe.config import (  # @manual=//deeplearning/fbgemm/fbgemm_gpu:
     EmbeddingLocation as SSDEmbeddingLocation,
     PoolingMode as SSDPoolingMode,
 )
-from fbgemm_gpu.tbe.ssd import ASSOC, SSDTableBatchedEmbeddingBags
+from fbgemm_gpu.tbe.ssd import SSDTableBatchedEmbeddingBags
+
+try:
+    from fbgemm_gpu.tbe.ssd import get_cache_assoc
+except ImportError:
+    from fbgemm_gpu.tbe.ssd import ASSOC
+
+    def get_cache_assoc(device: torch.device | int | None = None) -> int:
+        del device
+        return ASSOC
+
 
 try:
     from fbgemm_gpu.tbe.ssd import BackendType, EvictionPolicy, KVZCHParams
@@ -398,11 +408,19 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
     return (enable_raw_embedding_streaming, res_params)
 
 
-def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
+def _populate_ssd_tbe_params(  # noqa: C901
+    config: GroupedEmbeddingConfig,
+    device: torch.device | None = None,
+) -> Tuple[Dict[str, Any], torch.device | None]:
     """
     Construct SSD TBE params dict from config and fused params dict.
     """
     fused_params = config.fused_params or {}
+    configured_device = device if device is not None else fused_params.get("device")
+    if isinstance(configured_device, int):
+        device = torch.device("cuda", configured_device)
+    elif configured_device is not None:
+        device = torch.device(configured_device)
     logger.info(f"Populate_ssd_tbe_params with {fused_params=}")
 
     ssd_tbe_params: Dict[str, Any] = {}
@@ -416,6 +434,8 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
     for key, value in fused_params.items():
         if key not in ssd_tbe_signature:
             invalid_keys.append(key)
+        elif key == "device":
+            continue
         else:
             ssd_tbe_params[key] = value
     if len(invalid_keys) > 0:
@@ -435,9 +455,10 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
             cache_load_factor = 0.2
 
         local_rows_sum: int = sum(table.local_rows for table in config.embedding_tables)
+        cache_assoc = get_cache_assoc(device)
         ssd_tbe_params["cache_sets"] = max(
             # pyrefly: ignore [unsupported-operation]
-            int(cache_load_factor * local_rows_sum / ASSOC),
+            int(cache_load_factor * local_rows_sum / cache_assoc),
             1,
         )
 
@@ -480,7 +501,7 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
         max_dim: int = max(table.local_cols for table in config.embedding_tables)
         weight_precision_bytes = ssd_tbe_params["weights_precision"].bit_rate() / 8
         max_cache_sets = (
-            l1_cache_size / ASSOC / weight_precision_bytes / max_dim
+            l1_cache_size / get_cache_assoc(device) / weight_precision_bytes / max_dim
         )  # 100MB
 
         if ssd_tbe_params["cache_sets"] > int(max_cache_sets):
@@ -499,7 +520,7 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
     ssd_tbe_params["res_params"] = res_params
     ssd_tbe_params[ENABLE_RAW_EMBEDDING_STREAMING_STR] = enable_res
 
-    return ssd_tbe_params
+    return ssd_tbe_params, device
 
 
 def _generate_init_range_for_virtual_tables(
@@ -2153,7 +2174,7 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         ), "Currently we expect all tables in SSD TBE to have the same embedding dimension."
         _assert_local_cols_divisible_by_4(config)
 
-        ssd_tbe_params = _populate_ssd_tbe_params(config)
+        ssd_tbe_params, device = _populate_ssd_tbe_params(config, device)
         compute_kernel = config.embedding_tables[0].compute_kernel
         embedding_location = compute_kernel_to_embedding_location(compute_kernel)
 
@@ -2163,8 +2184,9 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
             ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
             pooling_mode=SSDPoolingMode.NONE,
             pg=pg,
+            device=device,
             **ssd_tbe_params,
-        ).to(device)
+        )
 
         logger.info(
             f"tbe_unique_id:{self._emb_module.tbe_unique_id} => table name to count dict:{self.table_name_to_count}"
@@ -2353,7 +2375,7 @@ class ZeroCollisionKeyValueEmbedding(
         )
         _assert_local_cols_divisible_by_4(config)
 
-        ssd_tbe_params = _populate_ssd_tbe_params(config)
+        ssd_tbe_params, device = _populate_ssd_tbe_params(config, device)
         self._bucket_spec: List[Tuple[int, int, int]] = (
             _get_sharded_local_buckets_for_zero_collision(
                 self._config.embedding_tables, self._pg
@@ -2393,8 +2415,9 @@ class ZeroCollisionKeyValueEmbedding(
             # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
+            device=device,
             **ssd_tbe_params,
-        ).to(device)
+        )
 
         logger.info(
             f"tbe_unique_id:{self._emb_module.tbe_unique_id} => table name to count dict:{self.table_name_to_count}"
@@ -3600,7 +3623,7 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         ), "Expected to see at least one table in SSD TBE, but found 0."
         _assert_local_cols_divisible_by_4(config)
 
-        ssd_tbe_params = _populate_ssd_tbe_params(config)
+        ssd_tbe_params, device = _populate_ssd_tbe_params(config, device)
         compute_kernel = config.embedding_tables[0].compute_kernel
         embedding_location = compute_kernel_to_embedding_location(compute_kernel)
 
@@ -3610,8 +3633,9 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
             ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
             pooling_mode=SSDPoolingMode(self._pooling.value),
             pg=pg,
+            device=device,
             **ssd_tbe_params,
-        ).to(device)
+        )
 
         logger.info(
             f"tbe_unique_id:{self._emb_module.tbe_unique_id} => table name to count dict:{self.table_name_to_count}"
@@ -3797,7 +3821,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
 
         _assert_local_cols_divisible_by_4(config)
 
-        ssd_tbe_params = _populate_ssd_tbe_params(config)
+        ssd_tbe_params, device = _populate_ssd_tbe_params(config, device)
         self._bucket_spec: List[Tuple[int, int, int]] = (
             _get_sharded_local_buckets_for_zero_collision(
                 self._config.embedding_tables, self._pg
@@ -3829,8 +3853,9 @@ class ZeroCollisionKeyValueEmbeddingBag(
             # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
+            device=device,
             **ssd_tbe_params,
-        ).to(device)
+        )
 
         logger.info(
             f"tbe_unique_id:{self._emb_module.tbe_unique_id} => table name to count dict:{self.table_name_to_count}"
