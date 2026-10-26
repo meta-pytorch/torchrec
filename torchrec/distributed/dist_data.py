@@ -29,6 +29,7 @@ from torchrec.distributed.comm_ops import (
     AllToAllSingle,
     fold_row_permute_into_seq_decode,
     get_gradient_division,
+    is_fake_pg,
     pg_name,
     precompute_seq_a2a_send,
     reduce_scatter_base_pooled,
@@ -557,7 +558,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
             with record_function("## all2all_data:kjt splits ##"):
                 input_tensor = torch.stack(input_tensors, dim=1).flatten()
                 self._input_tensor = input_tensor
-                if pg._get_backend_name() == "custom":
+                if is_fake_pg(pg):
                     self._output_tensor = torch.empty(
                         [self.num_workers * len(input_tensors)],
                         device=input_tensors[0].device,
@@ -858,7 +859,7 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
                 # TODO(ivankobzarev) Remove this dynamo condition once dynamo functional collectives remapping does not emit copy_
                 # https://github.com/pytorch/pytorch/issues/122788
                 with record_function(f"## all2all_data:kjt {label} ##"):
-                    if self._pg._get_backend_name() == "custom":
+                    if is_fake_pg(self._pg):
                         if input_tensor.dim() == 2:
                             output_size = [sum(output_split), input_tensor.size(1)]
                         else:

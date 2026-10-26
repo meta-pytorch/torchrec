@@ -704,6 +704,18 @@ def pg_name(pg: dist.ProcessGroup) -> str:
     return dist._functional_collectives._resolve_group_name(pg, "")
 
 
+@torch.compiler.assume_constant_result
+def is_fake_pg(pg: dist.ProcessGroup) -> bool:
+    # FakeProcessGroup reports backend name "custom", but so do real custom
+    # backends (e.g. nccl2), so check the registered backend instead.
+    if pg._get_backend_name() != "custom":
+        return False
+    try:
+        return dist.get_backend(pg) == "fake"
+    except ValueError:
+        return False
+
+
 def all2all_pooled_sync(
     pg: dist.ProcessGroup, a2ai: All2AllPooledInfo, input_embeddings: Tensor
 ) -> Tensor:
@@ -959,7 +971,7 @@ def variable_batch_all2all_pooled_sync(
         ]
 
     with record_function("## variable_batch_all2all_pooled ##"):
-        if pg._get_backend_name() == "custom":
+        if is_fake_pg(pg):
             sharded_output_embeddings = torch.empty(
                 sum(output_split_sizes),
                 device=sharded_input_embeddings.device,
