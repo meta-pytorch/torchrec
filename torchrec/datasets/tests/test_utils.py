@@ -35,6 +35,17 @@ class TestLimit(unittest.TestCase):
         datapipe = _DummyDataReader(100).limit(10)
         self.assertEqual(len(list(datapipe)), 10)
 
+    def test_does_not_read_past_limit(self) -> None:
+        for limit in (-1, 0, 1, 3, 5, 2**64):
+            with self.subTest(limit=limit):
+                read_sample = Mock(side_effect=lambda sample: sample)
+                datapipe = _DummyDataReader(3).map(read_sample).limit(limit)
+                expected_count = min(3, max(0, limit))
+                self.assertEqual(
+                    list(datapipe), [(idx, "") for idx in range(expected_count)]
+                )
+                self.assertEqual(read_sample.call_count, expected_count)
+
 
 class TestIdxSplitTrainVal(unittest.TestCase):
     def test_even_split(self) -> None:
