@@ -127,6 +127,7 @@ from torchrec.modules.embedding_configs import (
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingBagCollectionInterface,
+    get_embedding_names_by_table,
     should_skip_data_parallel_grad_sync,
 )
 from torchrec.optim.fused import EmptyFusedOptimizer, FusedOptimizerModule
@@ -673,6 +674,7 @@ class ShardedEmbeddingBagCollection(
 
         self._table_names: List[str] = []
         self._pooling_type_to_rs_features: Dict[str, List[str]] = defaultdict(list)
+        self._rs_mean_table_names: Set[str] = set()
         self._table_name_to_config: Dict[str, EmbeddingBagConfig] = {}
 
         for config in self._embedding_bag_configs:
@@ -686,6 +688,8 @@ class ShardedEmbeddingBagCollection(
                 self._pooling_type_to_rs_features[config.pooling.value].extend(
                     config.feature_names
                 )
+                if config.pooling == PoolingType.MEAN:
+                    self._rs_mean_table_names.add(config.name)
 
         EventLoggingHandler.log_event(
             component=TorchrecComponent.SHARDER.value,
@@ -783,6 +787,7 @@ class ShardedEmbeddingBagCollection(
         self._kjt_key_indices: Dict[str, int] = {}
         self._kjt_inverse_order: Optional[torch.Tensor] = None
         self._kt_key_ordering: Optional[torch.Tensor] = None
+        self._rs_mean_embedding_mask: Optional[torch.Tensor] = None
         # to support the FP16 hook
         self._create_output_dist()
 
@@ -1716,6 +1721,24 @@ class ShardedEmbeddingBagCollection(
             keyed_tensor_ordering.append(self._kjt_key_indices[key])
         self._kt_key_ordering = torch.tensor(keyed_tensor_ordering, device=self._device)
 
+        # One entry per output embedding (KeyedTensor key): only RW / TWRW MEAN
+        # embeddings are pooled as SUM by the lookup and need the divisor.
+        embedding_name_to_table: Dict[str, str] = {}
+        for config, names in zip(
+            self._embedding_bag_configs,
+            get_embedding_names_by_table(self._embedding_bag_configs),
+        ):
+            for name in names:
+                embedding_name_to_table[name] = config.name
+        self._rs_mean_embedding_mask = torch.tensor(
+            [
+                embedding_name_to_table[name] in self._rs_mean_table_names
+                for name in self._embedding_names
+            ],
+            dtype=torch.bool,
+            device=self._device,
+        )
+
         if inverse_indices:
             key_to_inverse_index = {
                 name: i for i, name in enumerate(inverse_indices[0])
@@ -1921,6 +1944,7 @@ class ShardedEmbeddingBagCollection(
                     kt_key_ordering=self._kt_key_ordering,
                     inverse_indices=ctx.inverse_indices,
                     weights=features.weights_or_none(),
+                    rs_mean_embedding_mask=self._rs_mean_embedding_mask,
                 )
 
             features_by_shards = features.split(
@@ -2704,7 +2728,18 @@ def _create_mean_pooling_divisor(
     kt_key_ordering: torch.Tensor,
     inverse_indices: Optional[Tuple[List[str], torch.Tensor]] = None,
     weights: Optional[torch.Tensor] = None,
+    rs_mean_embedding_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Builds the divisor that `_apply_mean_pooling` applies to the whole output
+    KeyedTensor. Only RW / TWRW MEAN embeddings are pooled as SUM by the lookup
+    and get their bag length (or summed weights); every other embedding gets 1.
+
+    `rs_mean_embedding_mask` has one entry per output embedding, in
+    `embedding_names` order, so a feature shared by tables of different sharding
+    or pooling types gets the right divisor for each of its embeddings. Without
+    it, the divisor falls back to one value per feature.
+    """
     with record_function("## ebc create mean pooling callback ##"):
         batch_size = (
             none_throws(inverse_indices)[1].size(dim=1)
@@ -2736,19 +2771,29 @@ def _create_mean_pooling_divisor(
             indices = (inverse_indices_t + offsets).flatten()
             lengths = torch.index_select(input=lengths, dim=0, index=indices)
 
-        # only convert the sum pooling features to be 1 lengths
-        lengths = lengths.clone()
-        for feature in pooling_type_to_rs_features[PoolingType.SUM.value]:
-            feature_index = kjt_key_indices[feature]
-            feature_index = feature_index * batch_size
-            lengths[feature_index : feature_index + batch_size] = 1
-
-        if len(embedding_names) != len(keys):
+        if rs_mean_embedding_mask is not None:
+            # [num_embeddings, batch_size]; a shared feature's rows are identical,
+            # so its first occurrence stands in for every embedding it feeds.
             lengths = torch.index_select(
-                lengths.reshape(-1, batch_size),
-                0,
-                kt_key_ordering,
+                lengths.reshape(-1, batch_size), 0, kt_key_ordering
+            )
+            lengths = torch.where(
+                rs_mean_embedding_mask.unsqueeze(1), lengths, torch.ones_like(lengths)
             ).reshape(-1)
+        else:
+            lengths = lengths.clone()
+            rs_mean_features = set(pooling_type_to_rs_features[PoolingType.MEAN.value])
+            for feature, feature_index in kjt_key_indices.items():
+                if feature not in rs_mean_features:
+                    start = feature_index * batch_size
+                    lengths[start : start + batch_size] = 1
+
+            if len(embedding_names) != len(keys):
+                lengths = torch.index_select(
+                    lengths.reshape(-1, batch_size),
+                    0,
+                    kt_key_ordering,
+                ).reshape(-1)
 
         # transpose to align features with keyed tensor dim_per_key
         lengths = lengths.reshape(-1, batch_size).T  # [batch_size, num_features]
