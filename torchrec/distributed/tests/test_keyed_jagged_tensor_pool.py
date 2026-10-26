@@ -190,6 +190,81 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
         )
 
     @staticmethod
+    def _test_update_with_empty_rank(
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        with MultiProcessContext(
+            rank, world_size, backend, local_size=world_size
+        ) as ctx:
+            keyed_jagged_tensor_pool = KeyedJaggedTensorPool(
+                pool_size=4,
+                feature_max_lengths={"f1": 2, "f2": 4},
+                values_dtype=torch.int64,
+                device=torch.device("meta"),
+            )
+            sharded_keyed_jagged_tensor_pool: (
+                ShardedKeyedJaggedTensorPool
+                # pyrefly: ignore[bad-assignment]
+            ) = KeyedJaggedTensorPoolSharder().shard(
+                keyed_jagged_tensor_pool,
+                plan=ObjectPoolShardingPlan(
+                    sharding_type=ObjectPoolShardingType.ROW_WISE
+                ),
+                device=ctx.device,
+                # pyrefly: ignore[bad-argument-type]
+                env=ShardingEnv.from_process_group(ctx.pg),
+            )
+
+            # rank 0 writes ids 2 and 0
+            #         2      0
+            # "f1"   [1]     [3,3]
+            # "f2"   [11]    [13,13,13]
+            # rank 1 has nothing to write but still joins the update
+            ids = torch.tensor(
+                [2, 0] if ctx.rank == 0 else [], dtype=torch.int, device=ctx.device
+            )
+            values = KeyedJaggedTensor.from_lengths_sync(
+                keys=["f1", "f2"],
+                values=torch.tensor(
+                    [1, 3, 3, 11, 13, 13, 13] if ctx.rank == 0 else [],
+                    dtype=torch.int64,
+                    device=ctx.device,
+                ),
+                lengths=torch.tensor(
+                    [1, 2, 1, 3] if ctx.rank == 0 else [],
+                    dtype=torch.int,
+                    device=ctx.device,
+                ),
+            )
+            sharded_keyed_jagged_tensor_pool.update(ids=ids, values=values)
+
+            # every rank reads back exactly what rank 0 wrote
+            kjt = sharded_keyed_jagged_tensor_pool.lookup(
+                torch.tensor([2, 0], dtype=torch.int, device=ctx.device)
+            )
+            torch.testing.assert_close(
+                kjt.values().cpu(),
+                torch.tensor([1, 3, 3, 11, 13, 13, 13], dtype=torch.int64),
+            )
+            torch.testing.assert_close(
+                kjt.lengths().cpu(),
+                torch.tensor([1, 2, 1, 3], dtype=torch.int),
+            )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_update_with_empty_rank(self) -> None:
+        self._run_multi_process_test(
+            callable=self._test_update_with_empty_rank,
+            world_size=2,
+            backend="nccl",
+        )
+
+    @staticmethod
     def _test_input_permute(
         rank: int,
         world_size: int,
