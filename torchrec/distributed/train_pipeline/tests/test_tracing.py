@@ -23,6 +23,10 @@ from torchrec.distributed.train_pipeline.tracing import (
     NodeArgsHelper,
     Tracer,
 )
+from torchrec.distributed.train_pipeline.types import (
+    PipeliningDiagnostic,
+    PipeliningDiagnosticReason,
+)
 from torchrec.distributed.types import NullShardedModuleContext, ShardedModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -113,6 +117,58 @@ class TestNodeArg(unittest.TestCase):
 
         # Weights is call_module node, so we should only find 2 args unmodified
         self.assertEqual(num_found, len(kjt_args) - 1)
+
+    def test_diagnostics_are_scoped_to_the_callers_list(self) -> None:
+        graph = torch.fx.Graph()
+        # `call_method` with a target other than `get` is unhandled.
+        unhandled = torch.fx.Node(graph, "unhandled", "call_method", "size", (), {})
+        failing_node = torch.fx.Node(
+            graph, "ebc_a", "call_module", "ebc_a", (unhandled,), {}
+        )
+        features = torch.fx.Node(
+            graph, "features", "placeholder", "torch.Tensor", (), {}
+        )
+        succeeding_node = torch.fx.Node(
+            graph, "ebc_b", "call_module", "ebc_b", (features,), {}
+        )
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), False)
+
+        failing_diagnostics: List[PipeliningDiagnostic] = []
+        _, num_found = node_args_helper.get_node_args(
+            failing_node, diagnostics=failing_diagnostics
+        )
+        self.assertEqual(num_found, 0)
+        self.assertEqual(
+            failing_diagnostics,
+            [
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_FX_UNTRACEABLE,
+                    fx_node="unhandled",
+                )
+            ],
+        )
+
+        succeeding_diagnostics: List[PipeliningDiagnostic] = []
+        _, num_found = node_args_helper.get_node_args(
+            succeeding_node, diagnostics=succeeding_diagnostics
+        )
+        self.assertEqual(num_found, 1)
+        self.assertEqual(succeeding_diagnostics, [])
+        self.assertEqual(len(failing_diagnostics), 1)
+
+    def test_second_positional_arg_is_still_for_postproc_module(self) -> None:
+        graph = torch.fx.Graph()
+        node = torch.fx.Node(graph, "ebc", "call_module", "ebc", (None,), {})
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), False)
+
+        # A `None` arg resolves only outside a postproc walk.
+        _, num_found = node_args_helper.get_node_args(node)
+        self.assertEqual(num_found, 1)
+
+        _, num_found = node_args_helper.get_node_args(node, True)
+        self.assertEqual(num_found, 0)
 
 
 class DummyShardedModule(
