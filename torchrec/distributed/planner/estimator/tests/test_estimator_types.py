@@ -418,6 +418,15 @@ class ShardPerfContextTest(unittest.TestCase):
         )
         self.assertEqual(ctx.batch_inputs, 1600.0)
 
+    def test_batch_lengths_property(self) -> None:
+        """One length per pooling of each sample, whatever the ids per sample."""
+        ctx = ShardPerfContext(
+            input_lengths=[10.0, 20.0],
+            num_poolings=[1.0, 2.0],
+            batch_sizes=[32, 32],
+        )
+        self.assertEqual(ctx.batch_lengths, 96.0)
+
     def test_batch_outputs_property_pooled(self) -> None:
         """Test batch_outputs for pooled embeddings."""
         ctx = ShardPerfContext(

@@ -1680,8 +1680,60 @@ class ParameterConstraints:
             full-precision weights are charged to DDR and the weights at this dtype
             are charged to HBM. When unset, the full-precision weights stay charged
             to HBM as well. Must be a float dtype no wider than the table's dtype.
-        num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span. `None` and
-            1 preserve the single-group placement.
+        num_twrw_groups (Optional[int]): number of TWRW groups N to spread this
+            TABLE_ROW_WISE table over ("multi-group" when N > 1). A TWRW group
+            is `intra_group_size` (R) ranks joined by fast links (one host, or
+            one NVLink pod). By default (`None` or 1) the table sits on one
+            group. With N, its rows are split over N * R ranks, so each rank
+            holds 1/N as many rows and handles 1/N as many ids as with one
+            group. Only placement changes; the model and the optimizer updates
+            are unchanged up to floating-point summation order. N must be at
+            most world_size / R. Pooled tables (EmbeddingBagCollection) only;
+            not supported with 2D parallelism; the planner ignores it (one
+            group) when `is_twrw_multi_group_enabled` is off.
+
+            Unlike ROW_WISE, whose pooled outputs are summed in one
+            reduce-scatter over all ranks, TABLE_ROW_WISE sums them with a
+            reduce-scatter inside each group, then sends one partial per group
+            between groups (all-to-all).
+
+            GRID_SHARD over N groups instead splits the table's D columns into
+            N blocks, one per group, each split by rows over its group's R
+            ranks. Compared with one group, both layouts cut each rank's
+            weights and lookup bytes by N, but each repeats a different part of
+            the work N times. With pooling factor P (the average number of ids
+            per sample per feature, `pooling_factors`):
+
+            - Between groups, per sample per feature. Multi-group sends each id
+              to one group, but every group returns its own full-width partial
+              sum of the pooled embedding and gets its gradient back:
+              D * (forward + backward all-to-all bytes per value) per group.
+              GRID_SHARD returns D/N columns from each group, so outputs and
+              gradients cross once, but every group needs every id: P * id
+              bytes per group, plus P * weight bytes for weighted features.
+              Multi-group sends less when this per-group id traffic exceeds
+              D * (forward + backward all-to-all bytes per value). For D = 256
+              and 8-byte unweighted ids, that is P > 256 with 4-byte values
+              (the default) and P > 128 with 2-byte values.
+            - Inside each group, the same split as GPU work. A GRID_SHARD rank
+              handles N times as many ids as a multi-group rank: each lookup is
+              D/N wide, so lookup bytes are equal, but the per-id work (reading
+              each id and looking up its row) is N times larger. A multi-group
+              rank writes and reduce-scatters full-width partial outputs and
+              all-gathers their gradients, N times as wide as a GRID_SHARD
+              rank's. So here too, many ids per sample favor multi-group and
+              wide embeddings favor GRID_SHARD, at a different break-even.
+            - Optimizer. With a row-wise optimizer, GRID_SHARD keeps a separate
+              optimizer state per column block, which changes the updates and
+              can change model quality; multi-group leaves them unchanged.
+
+            The planner prices the work inside groups and multi-group's
+            repeated outputs. It charges sending GRID_SHARD's repeated ids only
+            to `Perf.input_dist_comms`, which `Perf.total` leaves out, and
+            charges no weight traffic at all. Without `pooling_factors` it
+            assumes P = 1, which understates every per-id cost when the real P
+            is larger. So a plan can rank GRID_SHARD cheaper than it is. The
+            planner does not model the optimizer difference.
     """
 
     sharding_types: Optional[List[str]] = None
