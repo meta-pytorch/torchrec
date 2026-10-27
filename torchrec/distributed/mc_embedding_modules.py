@@ -79,6 +79,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
         # TODO - maybe we need this to manage unsharded/sharded consistency/state consistency
         env: ShardingEnv,
         device: torch.device,
+        module_fqn: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -95,6 +96,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                 table_name_to_parameter_sharding,
                 env=env,
                 device=device,
+                module_fqn=module_fqn,
             )
         else:
             assert isinstance(e_sharder, EmbeddingCollectionSharder)
@@ -107,15 +109,20 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                 table_name_to_parameter_sharding,
                 env=env,
                 device=device,
+                module_fqn=module_fqn,
             )
         # TODO: This is a hack since _embedding_module doesn't need input
         # dist, so eliminating it so all fused a2a will ignore it.
         self._embedding_module._has_uninitialized_input_dist = False
-        embedding_shardings = (
-            self._embedding_module._embedding_shardings
-            if isinstance(self._embedding_module, ShardedEmbeddingBagCollection)
-            else list(self._embedding_module._sharding_type_to_sharding.values())
-        )
+        if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+            embedding_shardings = self._embedding_module._embedding_shardings
+            sharding_types = self._embedding_module._sharding_types
+        else:
+            sharding_type_to_sharding = (
+                self._embedding_module._sharding_type_to_sharding
+            )
+            embedding_shardings = list(sharding_type_to_sharding.values())
+            sharding_types = list(sharding_type_to_sharding.keys())
         self._managed_collision_collection: ShardedManagedCollisionCollection = (
             mc_sharder.shard(
                 module._managed_collision_collection,
@@ -133,6 +140,8 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                     if isinstance(self._embedding_module, ShardedEmbeddingCollection)
                     else False
                 ),
+                module_fqn=module_fqn,
+                sharding_types=sharding_types,
             )
         )
         if not self.bagged:

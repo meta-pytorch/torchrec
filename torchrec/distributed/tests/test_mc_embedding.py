@@ -10,6 +10,7 @@
 import copy
 import unittest
 from typing import Any, Dict, List, Optional
+from unittest.mock import MagicMock
 
 import torch
 import torch.nn as nn
@@ -55,6 +56,8 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_modules import EmbeddingCollection
+from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingCollection
 from torchrec.modules.mc_modules import ManagedCollisionCollection
 from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
 from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
@@ -1644,8 +1647,6 @@ class TestMCModuleUtilityFunctions(unittest.TestCase):
         self.assertIn("b", result)
 
     def test_create_mc_sharding_unsupported(self) -> None:
-        from unittest.mock import MagicMock
-
         with self.assertRaises(ValueError):
             create_mc_sharding(
                 sharding_type=ShardingType.TABLE_WISE.value,
@@ -1680,8 +1681,6 @@ class TestMCModuleSharder(unittest.TestCase):
         self.assertEqual(sharder.module_type, ManagedCollisionCollection)
 
     def test_shardable_parameters_raises(self) -> None:
-        from unittest.mock import MagicMock
-
         sharder = ManagedCollisionCollectionSharder()
 
         with self.assertRaises(NotImplementedError):
@@ -1906,3 +1905,40 @@ class TestMccInputDistFxTracing(unittest.TestCase):
         results = gm(kjt)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].keys(), ["f0"])
+
+
+class ManagedCollisionEmbeddingCollectionModuleFqnTest(unittest.TestCase):
+    """Mirror of the bagged case: the unbagged branch derives `sharding_types`
+    from the sharding map's keys rather than from `_sharding_types`."""
+
+    @staticmethod
+    def _mock_instance_of(cls: type) -> MagicMock:
+        mock = MagicMock()
+        mock.__class__ = cls
+        return mock
+
+    def test_module_fqn_reaches_both_sharders(self) -> None:
+        module = self._mock_instance_of(ManagedCollisionEmbeddingCollection)
+        module._embedding_module.__class__ = EmbeddingCollection
+        ec_sharder = self._mock_instance_of(EmbeddingCollectionSharder)
+        sharded_ec = ec_sharder.shard.return_value
+        sharded_ec.__class__ = ShardedEmbeddingCollection
+        sharded_ec._sharding_type_to_sharding = {"row_wise": MagicMock()}
+        mc_sharder = self._mock_instance_of(ManagedCollisionCollectionSharder)
+
+        ShardedManagedCollisionEmbeddingCollection(
+            module,
+            {},
+            ec_sharder=ec_sharder,
+            mc_sharder=mc_sharder,
+            env=MagicMock(),
+            device=torch.device("cpu"),
+            module_fqn="sparse.mc_ec",
+        )
+
+        self.assertEqual(
+            ec_sharder.shard.call_args.kwargs["module_fqn"], "sparse.mc_ec"
+        )
+        mc_kwargs = mc_sharder.shard.call_args.kwargs
+        self.assertEqual(mc_kwargs["module_fqn"], "sparse.mc_ec")
+        self.assertEqual(mc_kwargs["sharding_types"], ["row_wise"])
