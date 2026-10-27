@@ -16,12 +16,21 @@ from torchrec.distributed.sharding.rw_tensor_pool_sharding import (
     InferRwTensorPoolSharding,
     TensorPoolRwSharding,
 )
+from torchrec.distributed.tensor_pool import (
+    ShardedInferenceTensorPool,
+    TensorPoolSharder,
+)
 from torchrec.distributed.tensor_sharding import TensorPoolRwShardingContext
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.distributed.types import ShardingEnv
+from torchrec.distributed.types import (
+    ObjectPoolShardingPlan,
+    ObjectPoolShardingType,
+    ShardingEnv,
+)
+from torchrec.modules.tensor_pool import TensorPool
 
 
 class _UpdateModule(torch.nn.Module):
@@ -575,13 +584,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
                 self.rank = rank
                 self.process_group = None
 
-        sharding = InferRwTensorPoolSharding(
-            pool_size=1000,
-            # pyrefly: ignore[bad-argument-type]
-            env=MockShardingEnv(world_size=3, rank=0),
-            device=torch.device("cpu"),
-            memory_capacity_per_rank=[600, 200, 200],
-        )
         ids = torch.tensor([5, 700, 650, 900, 10, 999])
         # Rank-local offsets: rank 1 starts at row 600, rank 2 at row 800.
         expected_dist_ids = [
@@ -596,8 +598,14 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         ]
 
         for split_by_lengths in (False, True):
-            lookup_ids_dist = sharding.create_lookup_ids_dist()
-            lookup_ids_dist._split_by_lengths = split_by_lengths
+            lookup_ids_dist = InferRwTensorPoolSharding(
+                pool_size=1000,
+                # pyrefly: ignore[bad-argument-type]
+                env=MockShardingEnv(world_size=3, rank=0),
+                device=torch.device("cpu"),
+                memory_capacity_per_rank=[600, 200, 200],
+                split_by_lengths=split_by_lengths,
+            ).create_lookup_ids_dist()
             for dist in (
                 lookup_ids_dist,
                 torch.fx.symbolic_trace(lookup_ids_dist),
@@ -631,18 +639,17 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
                 self.rank = rank
                 self.process_group = None
 
-        sharding = InferRwTensorPoolSharding(
-            pool_size=1000,
-            # pyrefly: ignore[bad-argument-type]
-            env=MockShardingEnv(world_size=3, rank=0),
-            device=torch.device("cpu"),
-            memory_capacity_per_rank=[600, 200, 200],
-        )
         ids = torch.empty(0, dtype=torch.int64)
 
         for split_by_lengths in (False, True):
-            lookup_ids_dist = sharding.create_lookup_ids_dist()
-            lookup_ids_dist._split_by_lengths = split_by_lengths
+            lookup_ids_dist = InferRwTensorPoolSharding(
+                pool_size=1000,
+                # pyrefly: ignore[bad-argument-type]
+                env=MockShardingEnv(world_size=3, rank=0),
+                device=torch.device("cpu"),
+                memory_capacity_per_rank=[600, 200, 200],
+                split_by_lengths=split_by_lengths,
+            ).create_lookup_ids_dist()
             for dist in (
                 lookup_ids_dist,
                 torch.fx.symbolic_trace(lookup_ids_dist),
@@ -663,3 +670,23 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
                     self.assertEqual(
                         [tuple(t.shape) for t in dist_values], [(0, 4)] * 3
                     )
+
+    def test_sharder_passes_split_ids_by_lengths(self) -> None:
+        for split_ids_by_lengths in (False, True):
+            with self.subTest(split_ids_by_lengths=split_ids_by_lengths):
+                sharded_pool = TensorPoolSharder(
+                    split_ids_by_lengths=split_ids_by_lengths
+                ).shard(
+                    module=TensorPool(pool_size=10, dim=4, dtype=torch.float32),
+                    plan=ObjectPoolShardingPlan(
+                        sharding_type=ObjectPoolShardingType.ROW_WISE,
+                        inference=True,
+                    ),
+                    env=ShardingEnv.from_local(world_size=2, rank=0),
+                    device=torch.device("cpu"),
+                )
+                self.assertIsInstance(sharded_pool, ShardedInferenceTensorPool)
+                self.assertEqual(
+                    sharded_pool._lookup_ids_dist_impl._split_by_lengths,
+                    split_ids_by_lengths,
+                )

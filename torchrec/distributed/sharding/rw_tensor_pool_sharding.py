@@ -263,8 +263,10 @@ class InferRwTensorPoolSharding(InferObjectPoolSharding):
         env: ShardingEnv,
         device: torch.device,
         memory_capacity_per_rank: Optional[list[int]] = None,
+        split_by_lengths: bool = False,
     ) -> None:
         super().__init__(pool_size, env, device, memory_capacity_per_rank)
+        self._split_by_lengths = split_by_lengths
 
     def create_lookup_ids_dist(self) -> InferRwObjectPoolInputDist:
         return InferRwObjectPoolInputDist(
@@ -272,6 +274,7 @@ class InferRwTensorPoolSharding(InferObjectPoolSharding):
             device=self._device,
             block_size=self._block_size_t,
             block_bucketize_row_pos=self._block_bucketize_row_pos,
+            split_by_lengths=self._split_by_lengths,
         )
 
     def create_lookup_values_dist(
