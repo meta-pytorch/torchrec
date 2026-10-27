@@ -335,6 +335,7 @@ class ShardedInferenceTensorPool(
         plan: ObjectPoolShardingPlan,
         module: TensorPool,
         device: Optional[torch.device] = None,
+        split_ids_by_lengths: bool = False,
     ) -> None:
         super().__init__()
 
@@ -362,6 +363,7 @@ class ShardedInferenceTensorPool(
                     if self._sharding_plan.memory_capacity_per_rank is not None
                     else None
                 ),
+                split_by_lengths=split_ids_by_lengths,
             )
         else:
             raise NotImplementedError(
@@ -574,8 +576,15 @@ class ShardedInferenceTensorPool(
 
 
 class TensorPoolSharder(ModuleSharder[TensorPool]):
-    def __init__(self) -> None:
+    """
+    Args:
+        split_ids_by_lengths (bool): for inference sharding, pass
+            ``split_by_lengths`` to each pool's ``InferRwObjectPoolInputDist``.
+    """
+
+    def __init__(self, split_ids_by_lengths: bool = False) -> None:
         super().__init__()
+        self._split_ids_by_lengths = split_ids_by_lengths
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     # pyrefly: ignore[bad-param-name-override]
@@ -596,6 +605,7 @@ class TensorPoolSharder(ModuleSharder[TensorPool]):
                 plan=plan,
                 device=device,
                 module=module,
+                split_ids_by_lengths=self._split_ids_by_lengths,
             )
         return ShardedTensorPool(
             env=env,
