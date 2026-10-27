@@ -305,7 +305,8 @@ class EmbeddingShardingPerfEvaluator(ABC):
         where divisor depends on sharding type:
         - TABLE_WISE: 1 (each device handles all lookups for its tables)
         - ROW_WISE: world_size (lookups split across all devices)
-        - TABLE_ROW_WISE: local_world_size (lookups split within host)
+        - TABLE_ROW_WISE: intra_group_size * table_num_twrw_groups (lookups split
+          over the table's row shards)
 
         Args:
             ctx: Shard performance context
@@ -653,7 +654,7 @@ class EmbeddingShardingPerfEvaluator(ABC):
         OLD behavior (TrainingHardwareEmbeddingPerfEstimator):
         - TABLE_WISE: input_read_size = batch_inputs * world_size (count of indices)
         - ROW_WISE: input_read_size = (batch_inputs/world_size) * world_size * input_data_type_size (bytes)
-        - TABLE_ROW_WISE: input_read_size = (batch_inputs/local_world_size) * world_size * input_data_type_size (bytes)
+        - TABLE_ROW_WISE: input_read_size = (batch_inputs/(intra_group_size * table_num_twrw_groups)) * world_size * input_data_type_size (bytes)
         - For ALL types: if is_weighted, input_read_size *= 2
 
         Default implementation (TABLE_WISE-like):
@@ -722,7 +723,7 @@ class EmbeddingShardingPerfEvaluator(ABC):
             prefetch_compute = prefetch_bytes / hbm_to_ddr_mem_bw
 
         For ROW_WISE: expected_cache_fetches /= world_size
-        For TABLE_ROW_WISE: expected_cache_fetches /= local_world_size
+        For TABLE_ROW_WISE: expected_cache_fetches /= intra_group_size * table_num_twrw_groups
 
         Args:
             ctx: Shard performance context
@@ -755,7 +756,7 @@ class EmbeddingShardingPerfEvaluator(ABC):
         - Prefetch divisor by sharding type:
             - TABLE_WISE/COLUMN_WISE: 1 (no division)
             - ROW_WISE: world_size
-            - TABLE_ROW_WISE: local_world_size
+            - TABLE_ROW_WISE: intra_group_size * table_num_twrw_groups
 
         FB Hardware Extensions (via flags in context):
         - use_batch_inputs_for_expected_cache_fetches: Use batch_inputs instead of
@@ -775,7 +776,7 @@ class EmbeddingShardingPerfEvaluator(ABC):
         - OLD TrainingHardwareEmbeddingPerfEstimator computes input_read_size per sharding type:
           - TABLE_WISE: batch_inputs * world_size (count of indices)
           - ROW_WISE: (batch_inputs/world_size) * world_size * input_data_type_size (bytes)
-          - TABLE_ROW_WISE: (batch_inputs/local_world_size) * world_size * input_data_type_size (bytes)
+          - TABLE_ROW_WISE: (batch_inputs/(intra_group_size * table_num_twrw_groups)) * world_size * input_data_type_size (bytes)
         - For weighted features, input_read_size is DOUBLED (is_weighted *= 2)
         - This method delegates to get_expected_lookups_for_prefetch() for sharding-specific logic
 
@@ -854,7 +855,7 @@ class EmbeddingShardingPerfEvaluator(ABC):
         # Apply prefetch divisor (matches OSS behavior per sharding type)
         # - TABLE_WISE/COLUMN_WISE: no division (divisor = 1)
         # - ROW_WISE: / world_size
-        # - TABLE_ROW_WISE: / local_world_size
+        # - TABLE_ROW_WISE: / (intra_group_size * table_num_twrw_groups)
         # =========================================================================
         if prefetch_divisor > 0:
             expected_cache_fetches = expected_cache_fetches / prefetch_divisor
@@ -1030,16 +1031,27 @@ class EmbeddingShardingPerfEvaluator(ABC):
         """
         Default input distribution communication formula.
 
-        This is the same for TABLE_WISE, ROW_WISE, and TABLE_ROW_WISE sharding.
-        Only DATA_PARALLEL overrides this to return 0.0.
+        For the global batch, each shard receives:
+        - the ids that fall into its rows: the global ids divided by
+          `get_batch_inputs_divisor`, the number of ranks the rows are cut
+          over (1 for TABLE_WISE and each COLUMN_WISE or TABLE_COLUMN_WISE
+          shard, world_size for ROW_WISE, intra_group_size *
+          table_num_twrw_groups for TABLE_ROW_WISE, and intra_group_size for
+          GRID_SHARD, whose column blocks each receive all of the table's ids);
+        - one length per sample per feature (times `num_poolings`), whatever
+          the row split: bucketization sends each shard the lengths of all
+          samples, zero where the shard gets none of a sample's ids. Lengths
+          count at the id size.
+        Weights of weighted features (one per id) are not counted.
+        DATA_PARALLEL overrides this to return 0.0.
 
-        Formula from OSS _input_dist_expected_latency:
-        - input_read_size = batch_inputs * world_size * input_data_type_size
+        `Perf.total` leaves this term out, so only planners and objectives that
+        read `input_dist_comms` use it.
+
+        Formula:
+        - input_read_size = (batch_inputs / divisor + batch_lengths)
+          * world_size * input_data_type_size
         - Return input_read_size / comms_bw (using ALL_TO_ALL collective)
-
-        Note: OSS has the is_weighted logic in the function but callers DON'T
-        pass is_weighted, so it defaults to False. We match this behavior by
-        NOT applying the weighted multiplier here.
 
         Args:
             ctx: Shard performance context
@@ -1049,15 +1061,13 @@ class EmbeddingShardingPerfEvaluator(ABC):
             Input distribution communication time in seconds
         """
 
-        # Calculate input_read_size WITHOUT the weighted multiplier
-        # (matches OLD estimator _input_dist_expected_latency which is called
-        # without is_weighted parameter, so it defaults to False)
-        #
         # NOTE: input_dist_comms always uses BYTES since it's about actual data
         # transfer over the network. The use_bytes_for_input_read_size annotation
         # only affects compute formulas (fwd_compute, bwd_compute).
         input_read_size = math.ceil(
-            ctx.batch_inputs * ctx.world_size * ctx.input_data_type_size
+            (ctx.batch_inputs / self.get_batch_inputs_divisor(ctx) + ctx.batch_lengths)
+            * ctx.world_size
+            * ctx.input_data_type_size
         )
 
         assert ctx.comms_bandwidths is not None
@@ -1329,6 +1339,12 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
     - Backward: All-to-all (inter) + All-gather (intra) + batched_copy
     - Prefetch divided by the same
 
+    With table_num_twrw_groups = N > 1, each shard's comms equal a single-group
+    shard's, inside its group (reduce-scatter forward, all-gather backward) and
+    between groups (its own partial in the all-to-all and that partial's
+    gradient). The table has N times as many shards, so its total traffic,
+    inside groups and between them, grows N times.
+
     Note: intra_group_size = pod_size * local_world_size. For pod_size=1,
     this equals local_world_size. For pod_size>1 (e.g. GB200_HP), the TWRW
     group spans multiple physical nodes within the NVSwitch domain.
@@ -1443,17 +1459,15 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
             local_world_size=intra_local_world_size,
         )
 
-        # Inter-group: all-to-all across TWRW groups. Each of the
-        # `table_num_twrw_groups` groups produces one partial pooled result, so the
-        # all-to-all carries that many slots per feature for the consumer to
-        # sum.
+        # Inter-group: all-to-all across TWRW groups. Each shard sends only its
+        # group's partial for its slice of the batch, as with one group, so
+        # there is no `table_num_twrw_groups` factor.
         num_groups = ctx.num_twrw_groups
         inter_comms = 0.0
         if num_groups > 1:
             inter_group_fwd_output_write_size = (
                 ctx.batch_outputs
                 * num_groups
-                * ctx.table_num_twrw_groups
                 * ctx.emb_dim
                 * ctx.fwd_a2a_comm_data_type_size
             )
@@ -1475,15 +1489,15 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
             ctx, self._get_comm_data_type_size(ctx, is_fwd=False)
         )
 
-        # Inter-group: all-to-all across TWRW groups, carrying the same
-        # `table_num_twrw_groups` partials per feature as the forward pass.
+        # Inter-group: all-to-all across TWRW groups. Each shard receives the
+        # gradient of its own group's partial for its slice of the batch, the
+        # same per-shard volume as the forward pass.
         num_groups = ctx.num_twrw_groups
         inter_comms = 0.0
         if num_groups > 1:
             inter_group_bwd_output_write_size = (
                 ctx.batch_outputs
                 * num_groups
-                * ctx.table_num_twrw_groups
                 * ctx.emb_dim
                 * ctx.bwd_a2a_comm_data_type_size
             )
@@ -1621,8 +1635,14 @@ class TableColumnWiseEvaluator(TableWiseEvaluator):
 
 
 class GridShardEvaluator(TableRowWiseEvaluator):
-
-    pass
+    """
+    Evaluator for GRID_SHARD. A table of dim D cut into N column blocks is
+    costed as N single-group TABLE_ROW_WISE tables (table_num_twrw_groups = 1,
+    emb_dim = D/N): each block receives all of the table's ids, while its
+    pooled outputs are only D/N wide. See `ParameterConstraints.num_twrw_groups`
+    for the trade-off against TABLE_ROW_WISE over N groups and what this
+    costing leaves out.
+    """
 
 
 # =============================================================================
