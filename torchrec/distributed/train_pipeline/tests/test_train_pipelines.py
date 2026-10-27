@@ -3055,6 +3055,34 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
         self.assertEqual(pipeline.progress(next_iter).item(), 8)
         self.assertRaises(StopIteration, pipeline.progress, next_iter)
 
+    def test_first_batch_input_dist_started_once(self) -> None:
+        mock_model = MagicMock(side_effect=lambda item: (None, item))
+
+        class MockPipeline(EvalPipelineSparseDist):
+            init_context: Optional[TrainPipelineContext] = None
+
+            # pyrefly: ignore[bad-param-name-override]
+            def _init_pipelined_modules(
+                self,
+                item: Pipelineable,
+                context: TrainPipelineContext,
+                pipelined_forward: Type[PipelinedForward],
+            ) -> None:
+                # Like the real implementation, this starts the input dist.
+                self.init_context = context
+                self.start_sparse_data_dist(item, context)
+
+        pipeline = MockPipeline(mock_model, MagicMock(), torch.device("cpu"))
+        data_iter = iter([torch.tensor([0]), torch.tensor([1])])
+
+        with patch.object(pipeline, "start_sparse_data_dist") as start:
+            pipeline.progress(data_iter)
+
+        first_batch_starts = [
+            c for c in start.call_args_list if c.args[1] is pipeline.init_context
+        ]
+        self.assertEqual(len(first_batch_starts), 1)
+
 
 class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
     @unittest.skipIf(
