@@ -12,17 +12,24 @@ import multiprocessing
 import unittest
 from collections import OrderedDict
 from typing import Any, Dict, Final, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
 from hypothesis import given, settings, strategies as st
 from torchrec.distributed.embedding_lookup import EmbeddingComputeKernel
-from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
+from torchrec.distributed.embeddingbag import (
+    EmbeddingBagCollectionSharder,
+    ShardedEmbeddingBagCollection,
+)
 from torchrec.distributed.mc_embeddingbag import (
     ManagedCollisionEmbeddingBagCollectionSharder,
     ShardedManagedCollisionEmbeddingBagCollection,
 )
-from torchrec.distributed.mc_modules import ShardedManagedCollisionCollection
+from torchrec.distributed.mc_modules import (
+    ManagedCollisionCollectionSharder,
+    ShardedManagedCollisionCollection,
+)
 from torchrec.distributed.shard import _shard_modules
 from torchrec.distributed.sharding_plan import construct_module_sharding_plan, row_wise
 from torchrec.distributed.test_utils.multi_process import (
@@ -852,3 +859,62 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             torch.tensor(expected_global_loss),
             msg=f"Unsharded global loss {global_loss.item()} does not match averaged sharded losses {expected_global_loss}",
         )
+
+
+class ManagedCollisionEmbeddingBagModuleFqnTest(unittest.TestCase):
+    """`module_fqn` must reach both annotation sources: the inner EBC sharder
+    (lookup, output dist) and the MC collection sharder (input dist)."""
+
+    @staticmethod
+    def _mock_instance_of(cls: type) -> MagicMock:
+        # Lets the mock satisfy the `isinstance` checks in the MC base class
+        # while still accepting the instance attributes it reads.
+        mock = MagicMock()
+        mock.__class__ = cls
+        return mock
+
+    def test_module_fqn_reaches_both_sharders(self) -> None:
+        module = self._mock_instance_of(ManagedCollisionEmbeddingBagCollection)
+        module._embedding_module.__class__ = EmbeddingBagCollection
+        ebc_sharder = self._mock_instance_of(EmbeddingBagCollectionSharder)
+        # The base class branches on the sharded type, and only the bagged
+        # branch reads `_sharding_types`.
+        sharded_ebc = ebc_sharder.shard.return_value
+        sharded_ebc.__class__ = ShardedEmbeddingBagCollection
+        sharded_ebc._sharding_types = ["row_wise"]
+        mc_sharder = self._mock_instance_of(ManagedCollisionCollectionSharder)
+
+        ShardedManagedCollisionEmbeddingBagCollection(
+            module,
+            {},
+            ebc_sharder=ebc_sharder,
+            mc_sharder=mc_sharder,
+            env=MagicMock(),
+            device=torch.device("cpu"),
+            module_fqn="sparse.mc_ebc",
+        )
+
+        self.assertEqual(
+            ebc_sharder.shard.call_args.kwargs["module_fqn"], "sparse.mc_ebc"
+        )
+        mc_kwargs = mc_sharder.shard.call_args.kwargs
+        self.assertEqual(mc_kwargs["module_fqn"], "sparse.mc_ebc")
+        # A falsy sharding type suppresses the annotation just as a falsy FQN
+        # does, so the value matters, not merely its presence.
+        self.assertEqual(mc_kwargs["sharding_types"], ["row_wise"])
+
+    def test_sharder_forwards_module_fqn(self) -> None:
+        sharder = ManagedCollisionEmbeddingBagCollectionSharder()
+
+        with patch(
+            "torchrec.distributed.mc_embeddingbag.ShardedManagedCollisionEmbeddingBagCollection"
+        ) as mock_sharded:
+            sharder.shard(
+                MagicMock(),
+                {},
+                env=MagicMock(),
+                device=torch.device("cpu"),
+                module_fqn="sparse.mc_ebc",
+            )
+
+        self.assertEqual(mock_sharded.call_args.kwargs["module_fqn"], "sparse.mc_ebc")
