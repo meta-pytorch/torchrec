@@ -759,6 +759,135 @@ class TestHashPlannerContextInputsRounding(unittest.TestCase):
         )
 
 
+class TestHashPlannerContextInputsIntraGroupSize(unittest.TestCase):
+    """intra_group_size belongs in the key only when it can change the plan.
+
+    It carries pod_size, which MAST resolves per placement on an NVL72 SKU.
+    """
+
+    def _enumerator(self, *sharding_types: str) -> MagicMock:
+        enumerator = MagicMock()
+        enumerator.last_stored_search_space = [
+            MagicMock(
+                fqn=f"table_{i}",
+                sharding_type=st,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                shards=(),
+                cache_params=None,
+            )
+            for i, st in enumerate(sharding_types)
+        ]
+        return enumerator
+
+    def _topology(self, pod_size: Optional[int]) -> Topology:
+        return Topology(
+            world_size=64,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024,
+            local_world_size=2,
+            pod_size=pod_size,
+        )
+
+    def _hash(
+        self,
+        enumerator: MagicMock,
+        pod_size: Optional[int],
+        canonicalize: bool = True,
+    ) -> int:
+        topology = self._topology(pod_size)
+        storage_reservation = MagicMock()
+        # Same job, so the same pod_size.
+        storage_reservation.last_reserved_topology = topology
+        return hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+            canonicalize_intra_group_size=canonicalize,
+        )
+
+    def test_column_wise_only_is_immune_to_pod_size(self) -> None:
+        # The production case: nothing reads intra_group_size, so a plan built
+        # under one placement is valid under another.
+        cw = self._enumerator(
+            ShardingType.COLUMN_WISE.value, ShardingType.COLUMN_WISE.value
+        )
+        self.assertEqual(self._hash(cw, pod_size=2), self._hash(cw, pod_size=16))
+        self.assertEqual(self._hash(cw, pod_size=None), self._hash(cw, pod_size=8))
+
+    def test_table_row_wise_still_distinguishes_pod_size(self) -> None:
+        # TWRW shards over the intra-group, so two pod sizes are two plans.
+        twrw = self._enumerator(ShardingType.TABLE_ROW_WISE.value)
+        self.assertNotEqual(self._hash(twrw, pod_size=2), self._hash(twrw, pod_size=16))
+
+    def test_grid_shard_still_distinguishes_pod_size(self) -> None:
+        # GRID_SHARD derives its column geometry from intra_group_size.
+        grid = self._enumerator(ShardingType.GRID_SHARD.value)
+        self.assertNotEqual(self._hash(grid, pod_size=2), self._hash(grid, pod_size=16))
+
+    def test_row_wise_still_distinguishes_pod_size(self) -> None:
+        # Inert today (PGO-gated), kept sensitive so enabling PGO cannot
+        # silently start cross-serving plans.
+        rw = self._enumerator(ShardingType.ROW_WISE.value)
+        self.assertNotEqual(self._hash(rw, pod_size=2), self._hash(rw, pod_size=16))
+
+    def test_one_sensitive_table_is_enough(self) -> None:
+        # A single TWRW candidate is enough to move the solve.
+        mixed = self._enumerator(
+            ShardingType.COLUMN_WISE.value, ShardingType.TABLE_ROW_WISE.value
+        )
+        self.assertNotEqual(
+            self._hash(mixed, pod_size=2), self._hash(mixed, pod_size=16)
+        )
+
+    def test_gate_off_hashes_intra_group_size_verbatim(self) -> None:
+        # The kill switch: with the JustKnob off, even a search space that cannot
+        # read intra_group_size still hashes it, so turning the knob off restores
+        # every pre-change digest exactly.
+        cw = self._enumerator(ShardingType.COLUMN_WISE.value)
+        self.assertNotEqual(
+            self._hash(cw, pod_size=2, canonicalize=False),
+            self._hash(cw, pod_size=16, canonicalize=False),
+        )
+        # And the gate is the only thing that changes: on, the same two match.
+        self.assertEqual(
+            self._hash(cw, pod_size=2, canonicalize=True),
+            self._hash(cw, pod_size=16, canonicalize=True),
+        )
+
+    def test_gate_does_not_change_a_sensitive_search_space(self) -> None:
+        # A TWRW space is priced off intra_group_size either way, so the knob must
+        # be a no-op there -- ramping it cannot start cross-serving those plans.
+        twrw = self._enumerator(ShardingType.TABLE_ROW_WISE.value)
+        for pod in (1, 2, 16):
+            with self.subTest(pod_size=pod):
+                self.assertEqual(
+                    self._hash(twrw, pod_size=pod, canonicalize=False),
+                    self._hash(twrw, pod_size=pod, canonicalize=True),
+                )
+
+    def test_canonical_value_cannot_collide_across_sensitivity(self) -> None:
+        # Both produce topology slots (2, 2) -- one canonicalised from pod 8,
+        # one genuinely pod 1. They still differ because the flag is a function
+        # of the search space, which is hashed too.
+        insensitive = self._hash(
+            self._enumerator(ShardingType.COLUMN_WISE.value), pod_size=8
+        )
+        sensitive = self._hash(
+            self._enumerator(ShardingType.TABLE_ROW_WISE.value), pod_size=1
+        )
+        self.assertNotEqual(insensitive, sensitive)
+
+    def test_pod_size_one_keeps_its_existing_digest(self) -> None:
+        # pod_size 1 keeps its pre-change digest, confining the one-time re-key
+        # to the pod_size > 1 population.
+        cw = self._enumerator(ShardingType.COLUMN_WISE.value)
+        twrw = self._enumerator(ShardingType.TABLE_ROW_WISE.value)
+        self.assertEqual(self._hash(cw, pod_size=1), self._hash(cw, pod_size=None))
+        self.assertEqual(self._hash(twrw, pod_size=1), self._hash(twrw, pod_size=None))
+
+
 class TestHashPlannerContextInputsWithConstraints(unittest.TestCase):
     """Tests for hash_planner_context_inputs with ParameterConstraints."""
 
