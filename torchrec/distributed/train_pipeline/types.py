@@ -9,7 +9,7 @@
 import abc
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class BaseArgInfoStep(abc.ABC):
@@ -162,3 +162,37 @@ class PipelinePhase(Enum):
 
     # the optimizer step usually only includes the dense module weights
     DENSE_OPTIMIZER_STEP = "dense_optimizer_step"
+
+
+@unique
+class PipeliningDiagnosticReason(str, Enum):
+    """
+    Why a sharded module was refused by the sparse data dist pipeline.
+
+    The values are the vocabulary of the `non_pipelined_reasons` key of the
+    `pipeline_module_summary` event.
+    """
+
+    def __str__(self) -> str:
+        return self.value
+
+    # the postproc module ahead of the sharded module has trainable params
+    POSTPROC_TRAINABLE_PARAMS = "postproc_trainable_params"
+
+    # an fx node on the path from the train batch cannot be replayed
+    POSTPROC_FX_UNTRACEABLE = "postproc_fx_untraceable"
+
+    # inputs were not resolved but no failure site recorded a reason
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class PipeliningDiagnostic:
+    """
+    One failure recorded while walking a sharded module's input args.
+    """
+
+    reason: PipeliningDiagnosticReason
+
+    # name of the fx node that triggered the failure, when there is one
+    fx_node: Optional[str] = None
