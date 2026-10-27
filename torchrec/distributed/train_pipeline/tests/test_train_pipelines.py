@@ -3049,6 +3049,12 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
 
         self.assertRaises(StopIteration, pipeline.progress, data_iter)
 
+        # A new iterator after exhaustion starts a fresh pass.
+        next_iter = iter([torch.tensor([7]), torch.tensor([8])])
+        self.assertEqual(pipeline.progress(next_iter).item(), 7)
+        self.assertEqual(pipeline.progress(next_iter).item(), 8)
+        self.assertRaises(StopIteration, pipeline.progress, next_iter)
+
 
 class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
     @unittest.skipIf(
