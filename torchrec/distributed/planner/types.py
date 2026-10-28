@@ -2288,6 +2288,16 @@ class PlannerConfig:
     # (Appended last to preserve positional construction of the pre-existing
     # fields.)
     num_parallel_worlds: Optional[int] = None
+    # Grid-sharding row width; None means the model is not grid-sharded. Like
+    # num_parallel_worlds this shapes the topology rather than any one solver: for a
+    # grid-sharded model the planner's intra-host boundary is the row, not the
+    # machine, so an offline topology that ignores it models a different host width
+    # than the trainer and produces a plan neither reusable nor correctly priced.
+    # Also absent from the request_hash() field list, folded in by
+    # request_hash_extension() instead, so requests that leave it unset keep their
+    # existing digest. (Appended last to preserve positional construction of the
+    # pre-existing fields.)
+    grid_rowwise_shards: Optional[int] = None
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
