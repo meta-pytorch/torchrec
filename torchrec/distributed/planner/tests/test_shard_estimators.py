@@ -9,7 +9,7 @@
 
 import math
 import unittest
-from typing import cast, Dict, List, Optional, Tuple
+from typing import Any, cast, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -37,6 +37,7 @@ from torchrec.distributed.planner.shard_estimators import (
     _maybe_charge_weights_to_ddr,
     _validate_io_sizes,
     _validate_perf,
+    calculate_shard_storages,
     EmbeddingOffloadStats,
     EmbeddingStorageEstimator,
 )
@@ -67,7 +68,9 @@ from torchrec.distributed.types import (
     ShardingType,
     StorageUsageType,
 )
+from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import (
+    data_type_to_sparse_type,
     DataType,
     EmbeddingBagConfig,
     EmbeddingConfig,
@@ -1512,9 +1515,9 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
                 embedding_dim=10,
                 name=f"table_{index}",
                 feature_names=[f"feature_{index}"],
-                data_type=DataType.FP32,
+                data_type=data_type,
             )
-            for index in range(2)
+            for index, data_type in enumerate((DataType.FP32, DataType.BF16))
         ]
         constraints = {
             table.name: ParameterConstraints(
@@ -1549,8 +1552,181 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
 
         self.assertEqual(len(tables), storage_usage.call_count)
         self.assertEqual(
-            [50 * 10 * 4] * len(tables),
+            [50 * 10 * 4, 50 * 10 * 2],
             [option.shards[0].cache_weight_bytes for option in options],
+        )
+
+    def _enumerate_uvm_cached_options(
+        self,
+        precisions_by_name: Dict[str, Tuple[DataType, Optional[DataType]]],
+        fused_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, ShardingOption]:
+        """Enumerate table-wise UVM-cached options keyed by table name.
+
+        ``precisions_by_name`` maps each table to its weight data type and its
+        table-level cache precision.
+        """
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name=name,
+                feature_names=[f"feature_{name}"],
+                data_type=data_type,
+            )
+            for name, (data_type, _) in precisions_by_name.items()
+        ]
+        constraints = {
+            name: ParameterConstraints(
+                sharding_types=[ShardingType.TABLE_WISE.value],
+                compute_kernels=[EmbeddingComputeKernel.FUSED_UVM_CACHING.value],
+                cache_params=CacheParams(load_factor=0.5, precision=cache_precision),
+            )
+            for name, (_, cache_precision) in precisions_by_name.items()
+        }
+        topology = Topology(world_size=1, compute_device="cuda")
+        options = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=BATCH_SIZE,
+            estimator=EmbeddingStorageEstimator(topology=topology),
+            constraints=constraints,
+        ).enumerate(
+            module=TestSparseNN(
+                tables=tables,
+                weighted_tables=[],
+                sparse_device=torch.device("meta"),
+            ),
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    TestEBCSharder(
+                        sharding_type=ShardingType.TABLE_WISE.value,
+                        kernel_type=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+                        fused_params=fused_params,
+                    ),
+                )
+            ],
+        )
+        return {option.name: option for option in options}
+
+    @patch(
+        "torchrec.distributed.planner.shard_estimators._cache_precision_hbm_estimate_enabled",
+        return_value=True,
+    )
+    def test_hbm_cache_storage_uses_effective_cache_precision(
+        self, _cache_precision_enabled: MagicMock
+    ) -> None:
+        options = self._enumerate_uvm_cached_options(
+            {
+                "global_nfp8": (DataType.FP32, None),
+                "table_nfp8": (DataType.FP32, DataType.NFP8),
+                "table_fp16": (DataType.FP32, DataType.FP16),
+                "table_fp32": (DataType.FP32, DataType.FP32),
+                "table_bf16": (DataType.FP32, DataType.BF16),
+            },
+            fused_params={"cache_precision": data_type_to_sparse_type(DataType.NFP8)},
+        )
+
+        self.assertEqual(
+            {
+                "global_nfp8": 50 * 10 * 2,
+                "table_nfp8": 50 * 10 * 2,
+                "table_fp16": 50 * 10 * 2,
+                "table_fp32": 50 * 10 * 4,
+                "table_bf16": 50 * 10 * 2,
+            },
+            {
+                name: option.shards[0].cache_weight_bytes
+                for name, option in options.items()
+            },
+        )
+        hbm = {
+            name: none_throws(option.shards[0].storage).hbm
+            for name, option in options.items()
+        }
+        self.assertEqual(hbm["global_nfp8"], hbm["table_nfp8"])
+        self.assertEqual(hbm["table_fp16"], hbm["table_nfp8"])
+        self.assertEqual(hbm["table_fp16"], hbm["table_bf16"])
+        self.assertEqual(50 * 10 * (4 - 2), hbm["table_fp32"] - hbm["table_fp16"])
+
+    @patch(
+        "torchrec.distributed.planner.shard_estimators._cache_precision_hbm_estimate_enabled",
+        return_value=False,
+    )
+    def test_hbm_cache_storage_uses_weight_dtype_when_cache_precision_disabled(
+        self, _cache_precision_enabled: MagicMock
+    ) -> None:
+        options = self._enumerate_uvm_cached_options(
+            {"table_fp16_cache": (DataType.FP32, DataType.FP16)}
+        )
+
+        self.assertEqual(
+            {"table_fp16_cache": 50 * 10 * 4},
+            {
+                name: option.shards[0].cache_weight_bytes
+                for name, option in options.items()
+            },
+        )
+
+    def _uvm_cached_shard_hbm(
+        self,
+        tensor: torch.Tensor,
+        cache_precision: Optional[DataType],
+        cache_precision_enabled: bool,
+    ) -> int:
+        with patch(
+            "torchrec.distributed.planner.shard_estimators._cache_precision_hbm_estimate_enabled",
+            return_value=cache_precision_enabled,
+        ):
+            (storage,) = calculate_shard_storages(
+                sharder_data=SharderData(
+                    fused_params={},
+                    qcomm_dtype_sizes={},
+                    storage_usage_type=StorageUsageType.BASE,
+                ),
+                sharding_type=ShardingType.TABLE_WISE.value,
+                tensor=tensor,
+                compute_device="cuda",
+                compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+                shard_sizes=[list(tensor.shape)],
+                batch_sizes=[BATCH_SIZE],
+                world_size=1,
+                local_world_size=1,
+                input_lengths=[1.0],
+                num_poolings=[1.0],
+                caching_ratio=0.5,
+                is_pooled=True,
+                input_data_type_size=8,
+                output_data_type_size=4,
+                cache_precision=cache_precision,
+            )
+        return storage.hbm
+
+    def test_calculate_shard_storages_uses_cache_precision(self) -> None:
+        fp32_weights = torch.empty(100, 10, dtype=torch.float32, device="meta")
+
+        self.assertEqual(
+            50 * 10 * (4 - 2),
+            self._uvm_cached_shard_hbm(fp32_weights, DataType.FP32, True)
+            - self._uvm_cached_shard_hbm(fp32_weights, DataType.FP16, True),
+        )
+        self.assertEqual(
+            self._uvm_cached_shard_hbm(fp32_weights, DataType.FP32, True),
+            self._uvm_cached_shard_hbm(fp32_weights, None, True),
+        )
+        self.assertEqual(
+            self._uvm_cached_shard_hbm(fp32_weights, DataType.FP32, True),
+            self._uvm_cached_shard_hbm(fp32_weights, DataType.FP16, False),
+        )
+
+    def test_calculate_shard_storages_sizes_nfp8_weight_cache_as_fp16(self) -> None:
+        nfp8_weights = torch.empty(100, 10, dtype=torch.float8_e4m3fn, device="meta")
+
+        # Without a cache precision, FBGEMM caches NFP8 weights as FP16.
+        self.assertEqual(
+            50 * 10 * (2 - 1),
+            self._uvm_cached_shard_hbm(nfp8_weights, None, True)
+            - self._uvm_cached_shard_hbm(nfp8_weights, None, False),
         )
 
     @patch(
