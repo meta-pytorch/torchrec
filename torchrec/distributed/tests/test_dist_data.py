@@ -51,6 +51,8 @@ from torchrec.distributed.dist_data import (
     _check_pg_for_nccl_error,
     _get_recat,
     _get_recat_data_cached,
+    _local_length_per_key,
+    _per_key_length_rows,
     JaggedTensorAllToAll,
     KJTAllToAll,
     KJTAllToAllSplitsAwaitable,
@@ -3239,3 +3241,40 @@ class FusedKJTListSplitsAwaitableAnnotationTest(unittest.TestCase):
                 ("exit",),
             ],
         )
+
+
+class PerKeyLengthRowsTest(unittest.TestCase):
+    """The per-key length rows added to the KJT splits AlltoAll.
+
+    Simulates the exchange on host lists: every receiver must recover, for each
+    of its keys, the sum over source ranks of that key's value count.
+    """
+
+    def test_round_trip_matches_true_length_per_key(self) -> None:
+        g = torch.Generator().manual_seed(0)
+        splits = [2, 0, 3]  # uneven, including a rank that owns no keys
+        world = len(splits)
+        starts = [0] + list(itertools.accumulate(splits))
+        keys = [f"f{i}" for i in range(sum(splits))]
+        stride = 4
+        sources = [
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=keys,
+                values=torch.zeros(0, dtype=torch.long),
+                lengths=torch.randint(0, 5, (len(keys) * stride,), generator=g),
+            )
+            for _ in range(world)
+        ]
+        sent = [_per_key_length_rows(kjt, splits) for kjt in sources]
+        for r in range(world):
+            received = [
+                [sent[s][j][r] for s in range(world)] for j in range(len(sent[0]))
+            ]
+            expected = [
+                sum(kjt.length_per_key()[starts[r] + j] for kjt in sources)
+                for j in range(splits[r])
+            ]
+            self.assertEqual(_local_length_per_key(received, splits[r]), expected)
+
+    def test_missing_rows_fall_back(self) -> None:
+        self.assertIsNone(_local_length_per_key([], 2))

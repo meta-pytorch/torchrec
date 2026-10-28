@@ -31,6 +31,25 @@ except ImportError:
         return False
 
 
+# Same older-export concern. Without these helpers no per-key length rows are
+# sent, and the receiving side falls back to reading them from the device.
+try:
+    from torchrec.distributed.dist_data import _int_tensor_on, _per_key_length_rows
+except ImportError:
+
+    def _int_tensor_on(  # type: ignore[misc]
+        values: List[int],
+        device: Optional[torch.device],
+        dtype: torch.dtype = torch.int32,
+    ) -> torch.Tensor:
+        return torch.tensor(values, device=device, dtype=dtype)
+
+    def _per_key_length_rows(  # type: ignore[misc]
+        input: "KeyedJaggedTensor", splits: List[int]
+    ) -> List[List[int]]:
+        return []
+
+
 from torchrec.distributed.embedding_sharding import KJTSplitsAllToAllMeta
 from torchrec.distributed.model_parallel import ShardedModule
 
@@ -515,12 +534,18 @@ class KJTAllToAllForward:
             input_splits = input.dist_splits(self._splits)
             device = input.values().device
             splits_tensors = [
-                torch.tensor(splits, device=device) for splits in input_splits
+                _int_tensor_on(splits, device, torch.int64) for splits in input_splits
             ]
             if not input.variable_stride_per_key():
                 input_stride = input.stride()
                 splits_tensors.append(
-                    torch.tensor([input_stride] * self._pg.size(), device=device)
+                    _int_tensor_on(
+                        [input_stride] * self._pg.size(), device, torch.int64
+                    )
+                )
+                splits_tensors.extend(
+                    _int_tensor_on(row, device, torch.int64)
+                    for row in _per_key_length_rows(input, self._splits)
                 )
                 # Log corrupted input stride before it enters the
                 # AllToAll pipeline.
