@@ -2722,8 +2722,10 @@ def _create_mean_pooling_divisor(
             device = inverse_indices[1].device
             # pyrefly: ignore [unsupported-operation]
             inverse_indices_t = inverse_indices[1]
+            # `keys` are in sharding order after the input dist permute, while
+            # the inverse indices stay in the input KJT's key order.
             # pyrefly: ignore [unsupported-operation]
-            if len(keys) != len(inverse_indices[0]):
+            if keys != inverse_indices[0]:
                 inverse_indices_t = torch.index_select(
                     # pyrefly: ignore [unsupported-operation]
                     inverse_indices[1],
