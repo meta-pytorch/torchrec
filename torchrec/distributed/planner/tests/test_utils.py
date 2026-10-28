@@ -17,20 +17,54 @@ from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
     BaseQuantEmbeddingSharder,
 )
-from torchrec.distributed.planner.types import Perf, Shard, ShardingOption, Storage
+from torchrec.distributed.planner.types import (
+    Perf,
+    Shard,
+    SharderData,
+    ShardingOption,
+    Storage,
+)
 from torchrec.distributed.planner.utils import (
     _find_imbalance_tables,
     BinarySearchPredicate,
     build_sharder_data,
+    is_prefetch_pipelined_for_table,
     LuusJaakolaSearch,
     reset_shard_rank,
 )
 from torchrec.distributed.types import (
+    CacheParams,
     CommOp,
     ModuleSharder,
     ShardingType,
     StorageUsageType,
 )
+
+
+class TestIsPrefetchPipelinedForTable(unittest.TestCase):
+    def test_table_setting_overrides_global_setting(self) -> None:
+        cases = [
+            (None, False, False),
+            (None, True, True),
+            (CacheParams(prefetch_pipeline=None), True, True),
+            (CacheParams(prefetch_pipeline=False), True, False),
+            (CacheParams(prefetch_pipeline=True), False, True),
+        ]
+        for cache_params, global_prefetch, expected in cases:
+            with self.subTest(
+                cache_params=cache_params,
+                global_prefetch=global_prefetch,
+            ):
+                sharding_option = MagicMock(spec=ShardingOption)
+                sharding_option.cache_params = cache_params
+                sharder_data = MagicMock(spec=SharderData)
+                sharder_data.fused_params = {
+                    "prefetch_pipeline": global_prefetch,
+                }
+                self.assertEqual(
+                    expected,
+                    is_prefetch_pipelined_for_table(sharding_option, sharder_data),
+                )
 
 
 class TestFindImbalanceTables(unittest.TestCase):

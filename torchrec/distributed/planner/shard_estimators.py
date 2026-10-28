@@ -11,10 +11,11 @@ import hashlib
 import logging
 import math
 import sys
-from typing import cast, Dict, List, Optional, Sequence, Set, Tuple, Type
+from typing import Any, cast, Dict, List, Optional, Sequence, Set, Tuple, Type
 
 import torch
 import torchrec.optim as trec_optim
+from fbgemm_gpu.split_embedding_configs import SparseType
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import (
@@ -30,6 +31,7 @@ from torchrec.distributed.planner.estimator.estimator import (
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Perf,
+    Shard,
     SharderData,
     SharderDataMap,
     ShardEstimator,
@@ -45,7 +47,11 @@ from torchrec.distributed.types import (
     PipelineType,
     ShardingType,
 )
-from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
+from torchrec.modules.embedding_configs import (
+    DATA_TYPE_NUM_BITS,
+    data_type_to_sparse_type,
+)
+from torchrec.types import DataType
 
 try:
     # This is a safety measure against torch package issues for when
@@ -68,6 +74,61 @@ except Exception:
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _cache_precision_hbm_estimate_enabled() -> bool:
+    return torch._utils_internal.justknobs_check(
+        "pytorch/torchrec:enable_planner_uvm_cache_precision_hbm_estimate",
+        default=False,
+    )
+
+
+# FBGEMM allocates NFP8 caches as FP16. Other cache precisions are not supported
+# by the training TBE, so they keep the weight element size.
+_CACHE_ELEMENT_SIZE_BYTES: Dict[SparseType, int] = {
+    SparseType.FP32: 4,
+    SparseType.FP16: 2,
+    SparseType.BF16: 2,
+    SparseType.NFP8: 2,
+}
+
+
+def _get_cache_element_size_bytes(
+    tensor: torch.Tensor,
+    compute_kernel: str,
+    fused_params: Dict[str, Any],
+    table_cache_precision: Optional[DataType] = None,
+) -> int:
+    """Return the HBM bytes per element of a table's UVM cache.
+
+    Mirrors the runtime: a table-level precision overrides the sharder's
+    ``cache_precision`` fused param, and an unset precision falls back to the
+    weights precision. Tables that are not ``FUSED_UVM_CACHING``, and all tables
+    while the cache-precision estimate is disabled, use the weight element size.
+    """
+    if (
+        compute_kernel != EmbeddingComputeKernel.FUSED_UVM_CACHING.value
+        or not _cache_precision_hbm_estimate_enabled()
+    ):
+        return tensor.element_size()
+
+    cache_precision: object = (
+        table_cache_precision
+        if table_cache_precision is not None
+        else fused_params.get("cache_precision")
+    )
+    if cache_precision is None:
+        try:
+            sparse_type = SparseType.from_dtype(tensor.dtype)
+        except ValueError:
+            return tensor.element_size()
+    elif isinstance(cache_precision, DataType):
+        sparse_type = data_type_to_sparse_type(cache_precision)
+    elif isinstance(cache_precision, SparseType):
+        sparse_type = cache_precision
+    else:
+        raise ValueError(f"Unsupported cache precision {cache_precision!r}")
+    return _CACHE_ELEMENT_SIZE_BYTES.get(sparse_type, tensor.element_size())
 
 
 class EmbeddingPerfEstimator(ShardEstimator):
@@ -257,34 +318,49 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     "the weights are quantized to before reaching the device.",
                     sharding_option.name,
                 )
+            cache_element_size_bytes = _get_cache_element_size_bytes(
+                tensor=sharding_option.tensor,
+                compute_kernel=sharding_option.compute_kernel,
+                fused_params=sharder_data.fused_params,
+                table_cache_precision=(
+                    sharding_option.cache_params.precision
+                    if sharding_option.cache_params is not None
+                    else None
+                ),
+            )
             try:
-                shard_storages = calculate_shard_storages(
-                    sharder_data=sharder_data,
-                    sharding_type=sharding_option.sharding_type,
-                    tensor=sharding_option.tensor,
-                    compute_device=self._topology.compute_device,
-                    compute_kernel=sharding_option.compute_kernel,
-                    shard_sizes=[shard.size for shard in sharding_option.shards],
-                    batch_sizes=batch_sizes,
-                    world_size=self._topology.world_size,
-                    local_world_size=self._topology.intra_group_size,
-                    input_lengths=sharding_option.input_lengths,
-                    num_poolings=num_poolings,
-                    caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
-                    is_pooled=sharding_option.is_pooled,
-                    input_data_type_size=input_data_type_size,
-                    output_data_type_size=output_data_type_size,
-                    pipeline_type=self._pipeline_type,
-                    count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
-                    is_inference=self._is_inference,
-                    multipass_prefetch_max_pass=(
-                        mpp_conf.num_passes if mpp_conf else None
-                    ),
-                    key_value_params=key_value_params,
-                    kv_cache_load_factor=kv_cache_load_factor,
-                    use_virtual_table=use_virtual_table,
-                    weight_init_on_cpu=weight_init_on_cpu,
-                    quantized_weight_dtype=quantized_weight_dtype,
+                shard_storages, cache_weight_sizes = (
+                    _calculate_shard_storages_and_cache_sizes(
+                        sharder_data=sharder_data,
+                        sharding_type=sharding_option.sharding_type,
+                        tensor=sharding_option.tensor,
+                        compute_device=self._topology.compute_device,
+                        compute_kernel=sharding_option.compute_kernel,
+                        shard_sizes=[shard.size for shard in sharding_option.shards],
+                        batch_sizes=batch_sizes,
+                        world_size=self._topology.world_size,
+                        local_world_size=self._topology.intra_group_size,
+                        input_lengths=sharding_option.input_lengths,
+                        num_poolings=num_poolings,
+                        caching_ratio=(
+                            caching_ratio if caching_ratio else UVM_CACHING_RATIO
+                        ),
+                        is_pooled=sharding_option.is_pooled,
+                        input_data_type_size=input_data_type_size,
+                        output_data_type_size=output_data_type_size,
+                        pipeline_type=self._pipeline_type,
+                        count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
+                        is_inference=self._is_inference,
+                        multipass_prefetch_max_pass=(
+                            mpp_conf.num_passes if mpp_conf else None
+                        ),
+                        key_value_params=key_value_params,
+                        kv_cache_load_factor=kv_cache_load_factor,
+                        use_virtual_table=use_virtual_table,
+                        weight_init_on_cpu=weight_init_on_cpu,
+                        quantized_weight_dtype=quantized_weight_dtype,
+                        cache_element_size_bytes=cache_element_size_bytes,
+                    )
                 )
             except ZeroDivisionError as e:
                 raise ValueError(
@@ -295,8 +371,13 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     f"sharding_type='{sharding_option.sharding_type}', "
                     f"compute_kernel='{sharding_option.compute_kernel}'"
                 ) from e
-            for shard, storage in zip(sharding_option.shards, shard_storages):
+            for shard, storage, cache_weight_size in zip(
+                sharding_option.shards,
+                shard_storages,
+                cache_weight_sizes,
+            ):
                 shard.storage = storage
+                shard.cache_weight_bytes = cache_weight_size
 
 
 def calculate_pipeline_io_cost(
@@ -367,13 +448,78 @@ def calculate_shard_storages(
     use_virtual_table: bool = False,
     weight_init_on_cpu: bool = False,
     quantized_weight_dtype: Optional[DataType] = None,
+    cache_precision: Optional[DataType] = None,
 ) -> List[Storage]:
     """
     Calculates estimated storage sizes for each sharded tensor using SharderData.
 
     Like calculate_shard_storages but takes a SharderData snapshot instead of a live
-    ModuleSharder, enabling picklability.
+    ModuleSharder, enabling picklability. ``cache_precision`` is the table-level
+    UVM cache precision, which overrides the sharder's ``cache_precision`` fused
+    param.
     """
+    storages, _ = _calculate_shard_storages_and_cache_sizes(
+        sharder_data=sharder_data,
+        sharding_type=sharding_type,
+        tensor=tensor,
+        compute_device=compute_device,
+        compute_kernel=compute_kernel,
+        shard_sizes=shard_sizes,
+        batch_sizes=batch_sizes,
+        world_size=world_size,
+        local_world_size=local_world_size,
+        input_lengths=input_lengths,
+        num_poolings=num_poolings,
+        caching_ratio=caching_ratio,
+        is_pooled=is_pooled,
+        input_data_type_size=input_data_type_size,
+        output_data_type_size=output_data_type_size,
+        pipeline_type=pipeline_type,
+        count_ephemeral_storage_cost=count_ephemeral_storage_cost,
+        is_inference=is_inference,
+        multipass_prefetch_max_pass=multipass_prefetch_max_pass,
+        key_value_params=key_value_params,
+        kv_cache_load_factor=kv_cache_load_factor,
+        use_virtual_table=use_virtual_table,
+        weight_init_on_cpu=weight_init_on_cpu,
+        quantized_weight_dtype=quantized_weight_dtype,
+        cache_element_size_bytes=_get_cache_element_size_bytes(
+            tensor=tensor,
+            compute_kernel=compute_kernel,
+            fused_params=sharder_data.fused_params,
+            table_cache_precision=cache_precision,
+        ),
+    )
+    return storages
+
+
+def _calculate_shard_storages_and_cache_sizes(
+    sharder_data: SharderData,
+    sharding_type: str,
+    tensor: torch.Tensor,
+    compute_device: str,
+    compute_kernel: str,
+    shard_sizes: List[List[int]],
+    batch_sizes: List[int],
+    world_size: int,
+    local_world_size: int,
+    input_lengths: List[float],
+    num_poolings: List[float],
+    caching_ratio: float,
+    is_pooled: bool,
+    input_data_type_size: float,
+    output_data_type_size: float,
+    cache_element_size_bytes: int,
+    pipeline_type: PipelineType = PipelineType.NONE,
+    count_ephemeral_storage_cost: bool = False,
+    is_inference: bool = False,
+    multipass_prefetch_max_pass: Optional[int] = None,
+    key_value_params: Optional[KeyValueParams] = None,
+    kv_cache_load_factor: float = KV_CACHING_RATIO,
+    use_virtual_table: bool = False,
+    weight_init_on_cpu: bool = False,
+    quantized_weight_dtype: Optional[DataType] = None,
+) -> Tuple[List[Storage], List[int]]:
     input_sizes, output_sizes = _calculate_shard_io_sizes(
         sharding_type=sharding_type,
         batch_sizes=batch_sizes,
@@ -397,6 +543,29 @@ def calculate_shard_storages(
     table_cached = _is_table_cached(compute_kernel)
     if table_cached:
         hbm_storage = round(ddr_storage * caching_ratio)
+
+    weight_dtype_cache_sizes = [0] * len(shard_sizes)
+    cache_weight_sizes = [0] * len(shard_sizes)
+    if compute_kernel == EmbeddingComputeKernel.FUSED_UVM_CACHING.value:
+        # For cached tables, `hbm_storage` is only the HBM cache portion of the
+        # weights, not the full HBM budget, i.e. round(ddr_storage * caching_ratio).
+        weight_dtype_cache_sizes = _calculate_tensor_sizes(
+            storage=hbm_storage,
+            shape=tensor.shape,
+            shard_sizes=shard_sizes,
+            sharding_type=sharding_type,
+        )
+        cache_weight_sizes = _calculate_tensor_sizes(
+            storage=round(
+                ddr_storage
+                * caching_ratio
+                * cache_element_size_bytes
+                / tensor.element_size()
+            ),
+            shape=tensor.shape,
+            shard_sizes=shard_sizes,
+            sharding_type=sharding_type,
+        )
 
     optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
 
@@ -527,7 +696,7 @@ def calculate_shard_storages(
         for ssd_specific_size in ssd_specific_sizes
     ]
 
-    return [
+    storages = [
         Storage(
             hbm=hbm_size,
             ddr=ddr_size,
@@ -535,6 +704,13 @@ def calculate_shard_storages(
         )
         for hbm_size, ddr_size, ssd_size in zip(hbm_sizes, ddr_sizes, ssd_sizes)
     ]
+    for storage, weight_dtype_cache_size, cache_weight_size in zip(
+        storages,
+        weight_dtype_cache_sizes,
+        cache_weight_sizes,
+    ):
+        storage.hbm += cache_weight_size - weight_dtype_cache_size
+    return storages, cache_weight_sizes
 
 
 def _is_table_cached(
