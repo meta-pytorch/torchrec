@@ -969,6 +969,37 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
                 self.assertIn(expected_msg, logs.output[0])
                 self.assertIn("cache_params", logs.output[0])
 
+    def test_cache_params_ignored_warning_logged_when_set_in_sharder_fused_params(
+        self,
+    ) -> None:
+        for sharding_type, compute_kernel, expected_msg in (
+            (
+                ShardingType.DATA_PARALLEL,
+                EmbeddingComputeKernel.DENSE,
+                "Sharding Type is data_parallel",
+            ),
+            (
+                ShardingType.TABLE_WISE,
+                EmbeddingComputeKernel.DENSE,
+                "Compute Kernel is dense",
+            ),
+        ):
+            with self.subTest(sharding_type=sharding_type):
+                parameter_sharding = ParameterSharding(
+                    sharding_type=sharding_type.value,
+                    compute_kernel=compute_kernel.value,
+                    ranks=[0],
+                )
+                with self.assertLogs(
+                    "torchrec.distributed.utils", level="WARNING"
+                ) as logs:
+                    add_params_from_parameter_sharding(
+                        {"cache_load_factor": 0.2}, parameter_sharding
+                    )
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(expected_msg, logs.output[0])
+                self.assertIn("fused_params", logs.output[0])
+
     def test_cache_params_ignored_warning_not_logged_without_cache_params(
         self,
     ) -> None:
