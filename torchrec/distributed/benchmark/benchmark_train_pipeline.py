@@ -43,6 +43,8 @@ from torchrec.distributed.benchmark.base import (
     CPUMemoryStats,
     GPUMemoryStats,
 )
+from torchrec.distributed.planner.planners import EmbeddingShardingPlanner
+from torchrec.distributed.planner.types import ShardingOption
 from torchrec.distributed.test_utils.input_config import ModelInputConfig
 from torchrec.distributed.test_utils.metric_config import RecMetricConfig
 from torchrec.distributed.test_utils.model_config import (
@@ -68,7 +70,11 @@ from torchrec.distributed.train_pipeline import (
     GradientAccumulationWrapper,
     TrainPipeline,
 )
-from torchrec.distributed.types import DeviceToHostTensorAwaitable, ShardingStrategy
+from torchrec.distributed.types import (
+    DeviceToHostTensorAwaitable,
+    ShardingPlanner,
+    ShardingStrategy,
+)
 from torchrec.distributed.utils import _group_sharded_modules
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.metric_module import RecMetricModule
@@ -124,7 +130,7 @@ class RunOptions(BenchFuncConfig):
             profiling iteration. Requires profiling-only mode.
         expected_cache_size_bytes (Optional[int]): Expected total FBGEMM cache
             allocation for each enforce_hbm setting. When set, the benchmark validates
-            the instantiated FBGEMM allocation before timing.
+            both planner and FBGEMM allocations before timing.
         dataloader_delay_ms (float): Simulated per-batch dataloader latency, paid
             inside ``next(dataloader_iter)``. Default 0 (in-memory batches, no
             stall).
@@ -164,7 +170,63 @@ class RunOptions(BenchFuncConfig):
         )
 
 
+def _option_storage_key(
+    option: ShardingOption,
+) -> tuple[
+    int,
+    bool | None,
+    tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
+]:
+    return (
+        option.storage_hash(),
+        option.enforce_hbm,
+        tuple((tuple(shard.size), tuple(shard.offset)) for shard in option.shards),
+    )
+
+
+def _planned_cache_bytes(planner: EmbeddingShardingPlanner) -> dict[bool, int]:
+    unpadded_by_key: dict[
+        tuple[
+            int,
+            bool | None,
+            tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
+        ],
+        ShardingOption,
+    ] = {}
+    search_space = planner.get_search_space()
+    if search_space is None:
+        raise RuntimeError("Planner search space is unavailable")
+    for option in search_space:
+        key = _option_storage_key(option)
+        if key in unpadded_by_key:
+            raise RuntimeError(f"Duplicate unpadded sharding option for {option.fqn}")
+        unpadded_by_key[key] = option
+
+    planned_bytes = {False: 0, True: 0}
+    for option in planner.get_selected_options():
+        unpadded_option = unpadded_by_key.get(_option_storage_key(option))
+        if unpadded_option is None:
+            raise RuntimeError(f"No unpadded sharding option for {option.fqn}")
+        selected_hbm = 0
+        unpadded_hbm = 0
+        for shard, unpadded_shard in zip(
+            option.shards, unpadded_option.shards, strict=True
+        ):
+            if shard.storage is None or unpadded_shard.storage is None:
+                raise RuntimeError(f"Missing shard storage for {option.fqn}")
+            selected_hbm += shard.storage.hbm
+            unpadded_hbm += unpadded_shard.storage.hbm
+        padding_bytes = selected_hbm - unpadded_hbm
+        if padding_bytes < 0:
+            raise RuntimeError(f"Selected HBM is below unpadded HBM for {option.fqn}")
+        planned_bytes[option.enforce_hbm is True] += (
+            sum(shard.cache_weight_bytes for shard in option.shards) + padding_bytes
+        )
+    return planned_bytes
+
+
 def _validate_cache_sizes(
+    planner: EmbeddingShardingPlanner,
     sharded_model: nn.Module,
     expected_cache_size_bytes: int,
 ) -> None:
@@ -172,6 +234,8 @@ def _validate_cache_sizes(
         False: expected_cache_size_bytes,
         True: expected_cache_size_bytes,
     }
+    planned_bytes = _planned_cache_bytes(planner)
+
     actual_bytes = {False: 0, True: 0}
     tbe_counts = {False: 0, True: 0}
     for module in _group_sharded_modules(sharded_model):
@@ -186,18 +250,24 @@ def _validate_cache_sizes(
         )
         tbe_counts[enforce_hbm] += 1
 
+    if planned_bytes != expected_bytes:
+        raise RuntimeError(
+            f"Planner cache sizes {planned_bytes} did not match expected sizes "
+            f"{expected_bytes}"
+        )
     if actual_bytes != expected_bytes:
         raise RuntimeError(
             f"FBGEMM cache sizes {actual_bytes} did not match expected sizes "
             f"{expected_bytes}; TBE counts by enforce_hbm: {tbe_counts}"
         )
     logger.info(
-        "Validated FBGEMM cache sizes by enforce_hbm: %s",
+        "Validated planner and FBGEMM cache sizes by enforce_hbm: %s",
         expected_bytes,
     )
 
 
 def _maybe_validate_cache_sizes(
+    planner: ShardingPlanner,
     sharded_model: nn.Module,
     run_option: RunOptions,
 ) -> None:
@@ -206,7 +276,10 @@ def _maybe_validate_cache_sizes(
         return
     if run_option.world_size != 1:
         raise ValueError("Cache-size validation currently requires world_size=1")
+    if not isinstance(planner, EmbeddingShardingPlanner):
+        raise TypeError("Cache-size validation requires EmbeddingShardingPlanner")
     _validate_cache_sizes(
+        planner,
         sharded_model,
         expected_cache_size_bytes,
     )
@@ -282,7 +355,7 @@ class _InitializedModel:
             device=ctx.device,
             planner=planner,
         )
-        _maybe_validate_cache_sizes(sharded_model, run_option)
+        _maybe_validate_cache_sizes(planner, sharded_model, run_option)
         metric_module = metric_config.generate_metric_module(
             batch_size=run_option.batch_size,
             world_size=run_option.world_size,
