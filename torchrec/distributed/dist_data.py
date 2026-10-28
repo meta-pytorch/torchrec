@@ -48,7 +48,7 @@ from torchrec.distributed.types import (
     rank_device,
 )
 from torchrec.fx.utils import fx_marker
-from torchrec.pt2.checks import is_torchdynamo_compiling
+from torchrec.pt2.checks import is_pt2_compiling, is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 # _safe_tolist and _cuda_to_cpu_safe were added in D101235037 / D101269943.
@@ -235,6 +235,23 @@ def _check_int_overflow(
     return False
 
 
+def _int32_tensor_on(values: List[int], device: Optional[torch.device]) -> torch.Tensor:
+    """``torch.tensor(values, device=device, dtype=torch.int32)`` without blocking.
+
+    Built straight on a CUDA device, the list is copied up from pageable memory,
+    which synchronizes the host with the current stream. Staging through pinned
+    memory lets the copy be non-blocking; the pinned allocator records the copy's
+    stream, so the staging buffer is not reused before the copy lands.
+    """
+    if device is None or device.type != "cuda" or is_pt2_compiling():
+        return torch.tensor(values, device=device, dtype=torch.int32)
+    return (
+        torch.tensor(values, dtype=torch.int32)
+        .pin_memory()
+        .to(device, non_blocking=True)
+    )
+
+
 def _get_recat_data(
     local_split: int,
     num_splits: int,
@@ -250,7 +267,7 @@ def _get_recat_data(
         i + j * local_split for i in range(local_split) for j in feature_order
     )
     try:
-        recat_tensor = torch.tensor(recat, device=device, dtype=torch.int32)
+        recat_tensor = _int32_tensor_on(list(recat), device)
     except RuntimeError as e:
         recat_sample = recat if len(recat) <= 16 else recat[:8] + recat[-8:]
         logger.error(
@@ -272,7 +289,11 @@ def _get_recat_data_cached(
     stagger: int,
     device: Optional[torch.device],
 ) -> Tuple[Tuple[int, ...], torch.Tensor]:
-    return _get_recat_data(local_split, num_splits, stagger, device)
+    recat, recat_tensor = _get_recat_data(local_split, num_splits, stagger, device)
+    # Cached across streams: wait for the non-blocking copy once, at creation.
+    if recat_tensor.is_cuda and not is_pt2_compiling():
+        torch.cuda.current_stream(recat_tensor.device).synchronize()
+    return recat, recat_tensor
 
 
 def _normalize_recat_device(
@@ -334,16 +355,8 @@ def _apply_variable_batch_per_rank_if_needed(
     )
 
     try:
-        input_offset_tensor = torch.tensor(
-            input_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
-        )
-        output_offset_tensor = torch.tensor(
-            output_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
-        )
+        input_offset_tensor = _int32_tensor_on(input_offset, recat_tensor.device)
+        output_offset_tensor = _int32_tensor_on(output_offset, recat_tensor.device)
     except RuntimeError as e:
         logger.error(
             f"_get_recat: int32 tensor creation failed: {e}. "
