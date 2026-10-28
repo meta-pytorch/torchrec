@@ -705,21 +705,25 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
-        input_list = _safe_tolist_2d(self._input_tensor.view(self.num_workers, -1).T)
-        # Strip tag row from input_list so overflow checks operate on real data
-        if self._tag_appended:
-            input_list = input_list[: self._num_original_tensors]
-        if input_list:
-            _check_int_overflow(
-                "SplitsAllToAllAwaitable",
-                input_list[-1],
-                "AllToAll input last_row (stride_per_rank)",
-                target_dtype=torch.int32,
-                num_workers=self.num_workers,
-                num_tensors=len(input_list),
-                input_tensor_shape=list(self._input_tensor.shape),
-                input_tensor_dtype=self._input_tensor.dtype,
+        input_list: List[List[int]] = []
+        if _TORCHREC_OVERFLOW_DEBUG:
+            input_list = _safe_tolist_2d(
+                self._input_tensor.view(self.num_workers, -1).T
             )
+            # Strip tag row from input_list so overflow checks operate on real data
+            if self._tag_appended:
+                input_list = input_list[: self._num_original_tensors]
+            if input_list:
+                _check_int_overflow(
+                    "SplitsAllToAllAwaitable",
+                    input_list[-1],
+                    "AllToAll input last_row (stride_per_rank)",
+                    target_dtype=torch.int32,
+                    num_workers=self.num_workers,
+                    num_tensors=len(input_list),
+                    input_tensor_shape=list(self._input_tensor.shape),
+                    input_tensor_dtype=self._input_tensor.dtype,
+                )
 
         # Check for int32 overflow in AllToAll output. Although the output
         # tensor may be int64, stride_per_rank values flow downstream to
