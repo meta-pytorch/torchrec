@@ -232,6 +232,32 @@ def _hbm_by_table(options: list[ShardingOption]) -> dict[str, list[int]]:
     }
 
 
+ShardKey = tuple[str, tuple[int, ...], tuple[int, ...], int | None]
+
+
+def _shard_key(table_name: str, shard: Shard) -> ShardKey:
+    return table_name, tuple(shard.size), tuple(shard.offset), shard.rank
+
+
+def _hbm_by_shard(options: list[ShardingOption]) -> dict[ShardKey, int]:
+    return {
+        _shard_key(option.name, shard): none_throws(shard.storage).hbm
+        for option in options
+        for shard in option.shards
+    }
+
+
+def _hbm_delta_by_shard(
+    padded: list[ShardingOption],
+    unpadded: list[ShardingOption],
+) -> dict[ShardKey, int]:
+    padded_hbm = _hbm_by_shard(padded)
+    unpadded_hbm = _hbm_by_shard(unpadded)
+    if padded_hbm.keys() != unpadded_hbm.keys():
+        raise AssertionError("Padded and unpadded plans have different shard layouts")
+    return {key: value - unpadded_hbm[key] for key, value in padded_hbm.items()}
+
+
 class MockPlanLoader(PlanLoader):
     def __init__(
         self,
