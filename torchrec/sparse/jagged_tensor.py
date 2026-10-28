@@ -3453,7 +3453,10 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         recat: Optional[torch.Tensor],
         stride_per_rank: Optional[List[int]],
         stagger: int = 1,
+        length_per_key: Optional[List[int]] = None,
     ) -> "KeyedJaggedTensor":
+        # length_per_key: per-key value counts the caller already knows on the host
+        # (fixed-stride path only). With it, the sync() below reads nothing back.
         assert len(tensors) in [2, 3, 4]
         lengths = tensors[0]
         values = tensors[1]
@@ -3585,6 +3588,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 weights=weights,
                 lengths=lengths,
                 stride=sum(stride_per_rank),
+                length_per_key=length_per_key,
             )
             return kjt.sync()
 

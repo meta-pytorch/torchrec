@@ -48,7 +48,7 @@ from torchrec.distributed.types import (
     rank_device,
 )
 from torchrec.fx.utils import fx_marker
-from torchrec.pt2.checks import is_torchdynamo_compiling
+from torchrec.pt2.checks import is_pt2_compiling, is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 # _safe_tolist and _cuda_to_cpu_safe were added in D101235037 / D101269943.
@@ -235,6 +235,80 @@ def _check_int_overflow(
     return False
 
 
+def _int_tensor_on(
+    values: List[int],
+    device: Optional[torch.device],
+    dtype: torch.dtype = torch.int32,
+) -> torch.Tensor:
+    """``torch.tensor(values, device=device, dtype=dtype)`` without blocking.
+
+    Built straight on a CUDA device, the list is copied up from pageable memory,
+    which synchronizes the host with the current stream. Staging through pinned
+    memory lets the copy be non-blocking; the pinned allocator records the copy's
+    stream, so the staging buffer is not reused before the copy lands.
+    """
+    if device is None or device.type != "cuda" or is_pt2_compiling():
+        return torch.tensor(values, device=device, dtype=dtype)
+    return torch.tensor(values, dtype=dtype).pin_memory().to(device, non_blocking=True)
+
+
+def _per_key_length_rows(
+    input: KeyedJaggedTensor, splits: List[int]
+) -> List[List[int]]:
+    """Per-key value counts laid out as extra splits rows, one row per key slot.
+
+    Row ``j`` holds, for each destination rank ``r``, the value count of the
+    ``j``-th key sent to ``r`` (0 past that rank's key count). Exchanged with the
+    other splits, it gives every receiver its keys' ``length_per_key`` on the host,
+    which the received KJT would otherwise read back from device lengths.
+    """
+    length_per_key = input.length_per_key()
+    starts = [0] + list(itertools.accumulate(splits))
+    return [
+        [length_per_key[starts[r] + j] if j < n else 0 for r, n in enumerate(splits)]
+        for j in range(max(splits, default=0))
+    ]
+
+
+def _split_stride_and_length_rows(
+    rows: List[List[int]], num_splits: int, key_splits: List[int]
+) -> Tuple[List[List[int]], List[int], List[List[int]]]:
+    """Unpack fixed-stride splits rows into (splits, stride, per-key length rows).
+
+    The per-key rows follow the stride row when the sender included them. Any
+    other layout is parsed as before -- the stride is the last row -- with no
+    per-key rows.
+    """
+    if len(rows) == num_splits + 1 + max(key_splits, default=0):
+        return rows[:num_splits], rows[num_splits], rows[num_splits + 1 :]
+    return rows[:-1], rows[-1], []
+
+
+def _local_length_per_key(
+    rows: List[List[int]], num_local_keys: int
+) -> Optional[List[int]]:
+    """Sum the received per-key rows over source ranks for this rank's keys.
+
+    None when the sender did not include them (e.g. an older frozen copy of this
+    module), so the caller falls back to reading them from the device.
+    """
+    if len(rows) < num_local_keys:
+        return None
+    return [sum(rows[j]) for j in range(num_local_keys)]
+
+
+_SPLITS_READBACK_STREAMS: Dict[int, torch.cuda.Stream] = {}
+
+
+def _splits_readback_stream(device: torch.device) -> torch.cuda.Stream:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SPLITS_READBACK_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _SPLITS_READBACK_STREAMS[index] = stream
+    return stream
+
+
 def _get_recat_data(
     local_split: int,
     num_splits: int,
@@ -250,7 +324,7 @@ def _get_recat_data(
         i + j * local_split for i in range(local_split) for j in feature_order
     )
     try:
-        recat_tensor = torch.tensor(recat, device=device, dtype=torch.int32)
+        recat_tensor = _int_tensor_on(list(recat), device)
     except RuntimeError as e:
         recat_sample = recat if len(recat) <= 16 else recat[:8] + recat[-8:]
         logger.error(
@@ -272,7 +346,11 @@ def _get_recat_data_cached(
     stagger: int,
     device: Optional[torch.device],
 ) -> Tuple[Tuple[int, ...], torch.Tensor]:
-    return _get_recat_data(local_split, num_splits, stagger, device)
+    recat, recat_tensor = _get_recat_data(local_split, num_splits, stagger, device)
+    # Cached across streams: wait for the non-blocking copy once, at creation.
+    if recat_tensor.is_cuda and not is_pt2_compiling():
+        torch.cuda.current_stream(recat_tensor.device).synchronize()
+    return recat, recat_tensor
 
 
 def _normalize_recat_device(
@@ -334,16 +412,8 @@ def _apply_variable_batch_per_rank_if_needed(
     )
 
     try:
-        input_offset_tensor = torch.tensor(
-            input_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
-        )
-        output_offset_tensor = torch.tensor(
-            output_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
-        )
+        input_offset_tensor = _int_tensor_on(input_offset, recat_tensor.device)
+        output_offset_tensor = _int_tensor_on(output_offset, recat_tensor.device)
     except RuntimeError as e:
         logger.error(
             f"_get_recat: int32 tensor creation failed: {e}. "
@@ -518,6 +588,8 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         self._collective_tag = collective_tag
         self._collective_tag_parts = collective_tag_parts
         self._num_original_tensors = len(input_tensors)
+        self._host_output: Optional[torch.Tensor] = None
+        self._readback_event: Optional[torch.cuda.Event] = None
 
         # Append tag tensor for collective mismatch validation.
         # Requires non-empty input_tensors to inherit device/dtype.
@@ -539,10 +611,8 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     f"(max={torch.iinfo(dtype).max}). "
                     f"Splits tensors should be int32 or int64."
                 )
-            tag_tensor = torch.tensor(
-                [collective_tag] * self.num_workers,
-                device=input_tensors[0].device,
-                dtype=dtype,
+            tag_tensor = _int_tensor_on(
+                [collective_tag] * self.num_workers, input_tensors[0].device, dtype
             )
             input_tensors = input_tensors + [tag_tensor]
             self._tag_appended = True
@@ -597,6 +667,24 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     group=pg,
                     async_op=not is_torchdynamo_compiling(),
                 )
+            # Queue the readback right behind the collective on a stream of its own.
+            # wait() then blocks on the collective alone; reading the output on the
+            # stream wait() runs on would also drain everything queued there.
+            if self._output_tensor.is_cuda and isinstance(
+                self._splits_awaitable, dist.Work
+            ):
+                stream = _splits_readback_stream(self._output_tensor.device)
+                self._output_tensor.record_stream(stream)
+                with torch.cuda.stream(stream):
+                    self._splits_awaitable.wait()
+                    self._host_output = torch.empty(
+                        self._output_tensor.shape,
+                        dtype=self._output_tensor.dtype,
+                        pin_memory=True,
+                    )
+                    self._host_output.copy_(self._output_tensor, non_blocking=True)
+                    self._readback_event = torch.cuda.Event()
+                    self._readback_event.record(stream)
 
     def _log_mismatch_event(
         self,
@@ -649,7 +737,13 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         if isinstance(self._splits_awaitable, dist.Work):
             self._splits_awaitable.wait()
 
-        ret = _safe_tolist_2d(self._output_tensor.view(self.num_workers, -1).T)
+        output = self._output_tensor
+        readback_event = self._readback_event
+        host_output = self._host_output
+        if readback_event is not None and host_output is not None:
+            readback_event.synchronize()
+            output = host_output
+        ret = _safe_tolist_2d(output.view(self.num_workers, -1).T)
 
         # After .tolist() the CPU has blocked on the GPU.  If a prior
         # collective timed out the watchdog will have flagged the PG by now.
@@ -705,21 +799,25 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
-        input_list = _safe_tolist_2d(self._input_tensor.view(self.num_workers, -1).T)
-        # Strip tag row from input_list so overflow checks operate on real data
-        if self._tag_appended:
-            input_list = input_list[: self._num_original_tensors]
-        if input_list:
-            _check_int_overflow(
-                "SplitsAllToAllAwaitable",
-                input_list[-1],
-                "AllToAll input last_row (stride_per_rank)",
-                target_dtype=torch.int32,
-                num_workers=self.num_workers,
-                num_tensors=len(input_list),
-                input_tensor_shape=list(self._input_tensor.shape),
-                input_tensor_dtype=self._input_tensor.dtype,
+        input_list: List[List[int]] = []
+        if _TORCHREC_OVERFLOW_DEBUG:
+            input_list = _safe_tolist_2d(
+                self._input_tensor.view(self.num_workers, -1).T
             )
+            # Strip tag row from input_list so overflow checks operate on real data
+            if self._tag_appended:
+                input_list = input_list[: self._num_original_tensors]
+            if input_list:
+                _check_int_overflow(
+                    "SplitsAllToAllAwaitable",
+                    input_list[-1],
+                    "AllToAll input last_row (stride_per_rank)",
+                    target_dtype=torch.int32,
+                    num_workers=self.num_workers,
+                    num_tensors=len(input_list),
+                    input_tensor_shape=list(self._input_tensor.shape),
+                    input_tensor_dtype=self._input_tensor.dtype,
+                )
 
         # Check for int32 overflow in AllToAll output. Although the output
         # tensor may be int64, stride_per_rank values flow downstream to
@@ -782,6 +880,7 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         device: torch.device,
         stagger: int,
         stride_per_rank: Optional[List[int]],
+        length_per_key: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         self._workers: int = pg.size()
@@ -789,6 +888,7 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         self._device: torch.device = device
         self._input = input
         self._splits = splits
+        self._length_per_key = length_per_key
         self._input_splits_list = input_splits
         self._output_splits_list = output_splits
         self._input_splits: Dict[str, List[int]] = dict(zip(labels, input_splits))
@@ -971,6 +1071,11 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
             recat=self.__recat,
             stride_per_rank=self._stride_per_rank,
             stagger=self._stagger,
+            **(
+                {"length_per_key": self._length_per_key}
+                if self._length_per_key is not None
+                else {}
+            ),
         )
 
 
@@ -1016,6 +1121,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
         self._keys = keys
         self._stagger = stagger
         self._output_splits: List[List[int]] = self._input_splits
+        self._length_per_key: Optional[List[int]] = None
         self._stride_per_rank: Optional[List[int]] = (
             None
             if self._input.variable_stride_per_key()
@@ -1039,11 +1145,15 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
             return
 
         input_tensors = [
-            torch.tensor(splits, device=device) for splits in self._input_splits
+            _int_tensor_on(splits, device, torch.int64) for splits in self._input_splits
         ]
         if not self._input.variable_stride_per_key():
             input_tensors.append(
-                torch.tensor([input.stride()] * self._workers, device=device)
+                _int_tensor_on([input.stride()] * self._workers, device, torch.int64)
+            )
+            input_tensors.extend(
+                _int_tensor_on(row, device, torch.int64)
+                for row in _per_key_length_rows(input, splits)
             )
 
         # Log all input split tensors being sent into the AllToAll.
@@ -1103,8 +1213,16 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
             if self._input.variable_stride_per_key():
                 self._output_splits = output_list
             else:
-                self._output_splits = output_list[:-1]
-                self._stride_per_rank = output_list[-1]
+                (
+                    self._output_splits,
+                    self._stride_per_rank,
+                    length_rows,
+                ) = _split_stride_and_length_rows(
+                    output_list, len(self._input_splits), self._splits
+                )
+                self._length_per_key = _local_length_per_key(
+                    length_rows, len(self._keys)
+                )
 
             # Log stride_per_rank right after AllToAll to detect corrupted
             # batch sizes at the earliest point.
@@ -1144,6 +1262,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
             device=self._device,
             stagger=self._stagger,
             stride_per_rank=self._stride_per_rank,
+            length_per_key=self._length_per_key,
         )
 
 

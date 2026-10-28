@@ -11,6 +11,7 @@ import contextlib
 import itertools
 import os
 import random
+import tempfile
 import unittest
 import unittest.mock
 from typing import (
@@ -32,6 +33,7 @@ import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
 import torchrec.distributed.collective_utils as cu
+import torchrec.distributed.dist_data as dist_data
 import torchrec.distributed.embedding_sharding as embedding_sharding
 from hypothesis import given, settings
 from pyre_extensions import none_throws
@@ -49,6 +51,8 @@ from torchrec.distributed.dist_data import (
     _check_pg_for_nccl_error,
     _get_recat,
     _get_recat_data_cached,
+    _local_length_per_key,
+    _per_key_length_rows,
     JaggedTensorAllToAll,
     KJTAllToAll,
     KJTAllToAllSplitsAwaitable,
@@ -2208,6 +2212,47 @@ class GetRecatOverflowTest(unittest.TestCase):
         )
 
 
+class SplitsAllToAllOverflowDebugGatingTest(unittest.TestCase):
+    """`_wait_impl` reads the input splits back only when `TORCHREC_OVERFLOW_DEBUG` is on."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        dist.init_process_group(
+            backend="gloo",
+            store=dist.FileStore(os.path.join(tmpdir.name, "store"), 1),
+            rank=0,
+            world_size=1,
+        )
+        self.addCleanup(dist.destroy_process_group)
+
+    def _count_reads(self, overflow_debug: bool) -> int:
+        real = dist_data._safe_tolist_2d
+        calls = 0
+
+        def counting(tensor: torch.Tensor) -> List[List[int]]:
+            nonlocal calls
+            calls += 1
+            return real(tensor)
+
+        with patch.object(dist_data, "_safe_tolist_2d", counting), patch.object(
+            dist_data, "_TORCHREC_OVERFLOW_DEBUG", overflow_debug
+        ):
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=[torch.tensor([3], dtype=torch.int64)],
+                pg=none_throws(dist.group.WORLD),
+            )
+            self.assertEqual(awaitable.wait(), [[3]])
+        return calls
+
+    def test_input_not_read_back_when_overflow_debug_off(self) -> None:
+        self.assertEqual(self._count_reads(overflow_debug=False), 1)
+
+    def test_input_read_back_when_overflow_debug_on(self) -> None:
+        self.assertEqual(self._count_reads(overflow_debug=True), 2)
+
+
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
     def __init__(self, methodName: str = "runTest") -> None:
         # Force spawn: forkserver caches the env from when it was first
@@ -3196,3 +3241,40 @@ class FusedKJTListSplitsAwaitableAnnotationTest(unittest.TestCase):
                 ("exit",),
             ],
         )
+
+
+class PerKeyLengthRowsTest(unittest.TestCase):
+    """The per-key length rows added to the KJT splits AlltoAll.
+
+    Simulates the exchange on host lists: every receiver must recover, for each
+    of its keys, the sum over source ranks of that key's value count.
+    """
+
+    def test_round_trip_matches_true_length_per_key(self) -> None:
+        g = torch.Generator().manual_seed(0)
+        splits = [2, 0, 3]  # uneven, including a rank that owns no keys
+        world = len(splits)
+        starts = [0] + list(itertools.accumulate(splits))
+        keys = [f"f{i}" for i in range(sum(splits))]
+        stride = 4
+        sources = [
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=keys,
+                values=torch.zeros(0, dtype=torch.long),
+                lengths=torch.randint(0, 5, (len(keys) * stride,), generator=g),
+            )
+            for _ in range(world)
+        ]
+        sent = [_per_key_length_rows(kjt, splits) for kjt in sources]
+        for r in range(world):
+            received = [
+                [sent[s][j][r] for s in range(world)] for j in range(len(sent[0]))
+            ]
+            expected = [
+                sum(kjt.length_per_key()[starts[r] + j] for kjt in sources)
+                for j in range(splits[r])
+            ]
+            self.assertEqual(_local_length_per_key(received, splits[r]), expected)
+
+    def test_missing_rows_fall_back(self) -> None:
+        self.assertIsNone(_local_length_per_key([], 2))

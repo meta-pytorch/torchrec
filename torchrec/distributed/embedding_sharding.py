@@ -9,6 +9,7 @@
 
 import abc
 import copy
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import filterfalse
@@ -54,6 +55,30 @@ except ImportError:
 
     def _check_int_overflow(*args: object, **kwargs: object) -> bool:  # type: ignore[misc]
         return False
+
+
+# Same older-export concern as above. Without these, the per-key lengths are not
+# exchanged and the received KJT reads them back from the device as before.
+try:
+    from torchrec.distributed.dist_data import (
+        _local_length_per_key,
+        _split_stride_and_length_rows,
+        _TORCHREC_OVERFLOW_DEBUG,
+    )
+except ImportError:
+    _TORCHREC_OVERFLOW_DEBUG: bool = (
+        os.environ.get("TORCHREC_OVERFLOW_DEBUG", "0") == "1"
+    )
+
+    def _local_length_per_key(  # type: ignore[misc]
+        rows: List[List[int]], num_local_keys: int
+    ) -> Optional[List[int]]:
+        return None
+
+    def _split_stride_and_length_rows(  # type: ignore[misc]
+        rows: List[List[int]], num_splits: int, key_splits: List[int]
+    ) -> Tuple[List[List[int]], List[int], List[List[int]]]:
+        return rows[:-1], rows[-1], []
 
 
 from torchrec.distributed.embedding_dim_bucketer import (
@@ -1000,7 +1025,9 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
         # Log the stride tensors being sent into the fused AllToAll.
         # These are the input values — if they are already corrupted,
         # the bug is upstream of the collective.
-        if splits_tensors and pg is not None:
+        # Debug only: _check_int_overflow returns at once unless
+        # TORCHREC_OVERFLOW_DEBUG=1, and each _safe_tolist is a device-to-host sync.
+        if _TORCHREC_OVERFLOW_DEBUG and splits_tensors and pg is not None:
             for idx, t in enumerate(splits_tensors):
                 t_list = _safe_tolist(t)
                 _check_int_overflow(
@@ -1083,12 +1110,17 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                 tensors_awaitables.append(awaitable.wait())
                 continue
             assert isinstance(awaitable, KJTSplitsAllToAllMeta)
+            length_per_key: Optional[List[int]] = None
             if awaitable._input.variable_stride_per_key():
                 output_splits = splits
                 stride_per_rank = None
             else:
-                output_splits = splits[:-1]
-                stride_per_rank = splits[-1]
+                output_splits, stride_per_rank, length_rows = (
+                    _split_stride_and_length_rows(
+                        splits, len(awaitable.input_splits), awaitable.splits
+                    )
+                )
+                length_per_key = _local_length_per_key(length_rows, len(awaitable.keys))
 
             # Log corrupted stride_per_rank at the point where splits
             # are unpacked.
@@ -1120,6 +1152,11 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                         device=awaitable.device,
                         stagger=awaitable.stagger,
                         stride_per_rank=stride_per_rank,
+                        **(
+                            {"length_per_key": length_per_key}
+                            if length_per_key is not None
+                            else {}
+                        ),
                     )
                 )
         output = []
