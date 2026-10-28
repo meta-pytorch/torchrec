@@ -46,6 +46,7 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     ShardingPlan,
+    ShardingType,
     StorageUsageType,
 )
 from torchrec.modules.embedding_configs import DataType
@@ -3121,15 +3122,39 @@ def hash_sha256_str(hashable_list: List[Any]) -> str:
     return hash_digest
 
 
+# Sharding types priced off ``Topology.intra_group_size``. ROW_WISE reads it only
+# through the PGO-gated SM-pressure term, inert today; listed because that gate is
+# not visible from here.
+_INTRA_GROUP_SIZE_SENSITIVE_SHARDING_TYPES: Tuple[str, ...] = (
+    ShardingType.TABLE_ROW_WISE.value,
+    ShardingType.GRID_SHARD.value,
+    ShardingType.ROW_WISE.value,
+)
+
+
+def _intra_group_size_affects_plan(search_space: List["ShardingOption"]) -> bool:
+    """Whether any candidate in ``search_space`` is priced off ``intra_group_size``."""
+    return any(
+        so.sharding_type in _INTRA_GROUP_SIZE_SENSITIVE_SHARDING_TYPES
+        for so in search_space
+    )
+
+
 def _topology_hash_components(
     topology: Topology,
     round_unit: int = HUNDRED_GB,
+    intra_group_size_affects_plan: bool = True,
 ) -> List[Any]:
     """Extract hash-stable components from a Topology with storage rounding.
 
     Device memory (HBM/DDR/SSD) is rounded to the nearest ``round_unit``
     (default 100 GB) so that minor driver/OS differences across machines
     do not change the hash.  Every other field is included verbatim.
+
+    ``intra_group_size`` is the exception: it carries ``pod_size``, which MAST
+    resolves per placement on an NVL72 SKU, so hashing it makes the key vary run
+    to run. With ``intra_group_size_affects_plan`` False it is canonicalised to
+    the ``pod_size == 1`` value, which is ``local_world_size``.
 
     This helper is the *single* place where topology normalisation happens.
     Both ``hash_planner_context_inputs`` and ``hash_planner_context_inputs_str``
@@ -3151,7 +3176,13 @@ def _topology_hash_components(
         topology.compute_device,
         rounded_devices,
         topology.local_world_size,
-        topology.intra_group_size,
+        # Repeats local_world_size when False: that is the canonical pod_size == 1
+        # value, so such topologies keep their existing digest.
+        (
+            topology.intra_group_size
+            if intra_group_size_affects_plan
+            else topology.local_world_size
+        ),
         topology.hbm_mem_bw,
         topology.ddr_mem_bw,
         topology.ssd_mem_bw,
@@ -3189,6 +3220,7 @@ def _build_hashable_list(
     enumerator: Enumerator,
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
+    canonicalize_intra_group_size: bool = False,
 ) -> List[Any]:
     """Build the canonical hashable list for planner context inputs.
 
@@ -3216,9 +3248,23 @@ def _build_hashable_list(
     # Previously _last_reserved_topology was included as a raw Topology
     # object, whose __repr__ embedded unrounded device DDR values that
     # vary across machines — causing cache misses on MAST job restarts.
-    hashed_topology = hash_sha256_to_int(_topology_hash_components(topology))
+    #
+    # Both topologies describe one job, so they share the intra_group_size
+    # decision. Ungated, the field is always hashed -- canonicalising is opt-in
+    # so the fb planner can ramp it rather than re-keying the fleet on landing.
+    intra_group_size_affects_plan = not canonicalize_intra_group_size or (
+        _intra_group_size_affects_plan(search_space)
+    )
+    hashed_topology = hash_sha256_to_int(
+        _topology_hash_components(
+            topology, intra_group_size_affects_plan=intra_group_size_affects_plan
+        )
+    )
     hashed_reserved_topology = hash_sha256_to_int(
-        _topology_hash_components(reserved_topology)
+        _topology_hash_components(
+            reserved_topology,
+            intra_group_size_affects_plan=intra_group_size_affects_plan,
+        )
     )
 
     return [
@@ -3260,10 +3306,16 @@ def hash_planner_context_inputs(
     enumerator: Enumerator,
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
+    canonicalize_intra_group_size: bool = False,
     hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
 ) -> int:
     hashable_list = _build_hashable_list(
-        topology, batch_size, enumerator, storage_reservation, constraints
+        topology,
+        batch_size,
+        enumerator,
+        storage_reservation,
+        constraints,
+        canonicalize_intra_group_size,
     )
     return hash_function(hashable_list)
 
@@ -3274,10 +3326,16 @@ def hash_planner_context_inputs_str(
     enumerator: Enumerator,
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
+    canonicalize_intra_group_size: bool = False,
     hash_function: Callable[[List[Any]], str] = hash_sha256_str,
 ) -> str:
     hashable_list = _build_hashable_list(
-        topology, batch_size, enumerator, storage_reservation, constraints
+        topology,
+        batch_size,
+        enumerator,
+        storage_reservation,
+        constraints,
+        canonicalize_intra_group_size,
     )
     return hash_function(hashable_list)
 
