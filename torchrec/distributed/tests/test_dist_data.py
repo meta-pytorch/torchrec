@@ -1934,6 +1934,11 @@ class SideStreamOutputEncodeTest(MultiProcessTestBase):
 
 
 class GetRecatOverflowTest(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        _get_recat_data_cached.cache_clear()
+        self.addCleanup(_get_recat_data_cached.cache_clear)
+
     def test_get_recat_logs_and_raises_on_int32_overflow(self) -> None:
         """Verify that _get_recat raises RuntimeError and logs context when
         batch_size_per_rank contains values that overflow int32."""
@@ -1957,6 +1962,28 @@ class GetRecatOverflowTest(unittest.TestCase):
         self.assertIn(str(overflow_value), logged)
         self.assertIn("input_offset", logged)
         self.assertIn("output_offset", logged)
+
+    def test_cached_get_recat_logs_and_raises_on_int32_overflow(self) -> None:
+        overflow_value = 2_147_483_648  # INT32_MAX + 1
+        with self.assertRaises(RuntimeError) as ctx, self.assertLogs(
+            level="ERROR"
+        ) as log:
+            _get_recat(
+                local_split=2,
+                num_splits=4,
+                stagger=1,
+                device=torch.device("cpu"),
+                batch_size_per_rank=[32, overflow_value, 32, 32],
+                cached=True,
+            )
+
+        self.assertIn("overflow", str(ctx.exception).lower())
+
+        logged = "\n".join(log.output)
+        self.assertIn("_get_recat", logged)
+        self.assertIn("batch_size_per_rank", logged)
+        self.assertIn(str(overflow_value), logged)
+        self.assertIn("max_offset", logged)
 
     def test_get_recat_no_overflow_unchanged_behavior(self) -> None:
         """Verify that _get_recat still returns a valid recat tensor when
@@ -1999,7 +2026,134 @@ class GetRecatOverflowTest(unittest.TestCase):
         )
 
         self.assertIsNot(first, second)
-        self.assertTrue(torch.equal(none_throws(first), none_throws(second)))
+        expected = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], dtype=torch.int32)
+        self.assertTrue(torch.equal(none_throws(first), expected))
+        self.assertTrue(torch.equal(none_throws(second), expected))
+
+    @given(
+        local_split=st.integers(min_value=1, max_value=16),
+        split_config=st.sampled_from(
+            [
+                (num_splits, stagger)
+                for num_splits in range(1, 17)
+                for stagger in range(1, num_splits + 1)
+                if num_splits % stagger != 0
+            ]
+        ),
+    )
+    @settings(max_examples=50, deadline=None)
+    def test_get_recat_nondivisible_stagger_matches_reference(
+        self,
+        local_split: int,
+        split_config: Tuple[int, int],
+    ) -> None:
+        num_splits, stagger = split_config
+        feature_order = [
+            x + num_splits // stagger * y
+            for x in range(num_splits // stagger)
+            for y in range(stagger)
+        ]
+        expected = torch.tensor(
+            [i + j * local_split for i in range(local_split) for j in feature_order],
+            dtype=torch.int32,
+        )
+
+        _get_recat_data_cached.cache_clear()
+        actual = _get_recat(
+            local_split=local_split,
+            num_splits=num_splits,
+            stagger=stagger,
+            device=torch.device("cpu"),
+            cached=True,
+        )
+
+        self.assertTrue(torch.equal(none_throws(actual), expected))
+
+    @given(
+        local_split=st.integers(min_value=1, max_value=16),
+        split_config=st.sampled_from(
+            [
+                (num_splits, stagger)
+                for num_splits in range(1, 17)
+                for stagger in range(1, num_splits + 1)
+                if num_splits % stagger == 0
+            ]
+        ),
+        batch_sizes=st.lists(
+            st.integers(min_value=0, max_value=16), min_size=16, max_size=16
+        ),
+    )
+    @settings(max_examples=50, deadline=None)
+    def test_cached_get_recat_variable_batch_matches_uncached(
+        self,
+        local_split: int,
+        split_config: Tuple[int, int],
+        batch_sizes: List[int],
+    ) -> None:
+        num_splits, stagger = split_config
+        batch_size_per_rank = batch_sizes[:num_splits]
+        _get_recat_data_cached.cache_clear()
+
+        uncached = _get_recat(
+            local_split=local_split,
+            num_splits=num_splits,
+            stagger=stagger,
+            device=torch.device("cpu"),
+            batch_size_per_rank=batch_size_per_rank,
+        )
+        cached = _get_recat(
+            local_split=local_split,
+            num_splits=num_splits,
+            stagger=stagger,
+            device=torch.device("cpu"),
+            batch_size_per_rank=batch_size_per_rank,
+            cached=True,
+        )
+
+        self.assertTrue(torch.equal(none_throws(uncached), none_throws(cached)))
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_cached_get_recat_matches_uncached_cuda(self) -> None:
+        device = torch.device("cuda", torch.cuda.current_device())
+        for local_split, num_splits, stagger, batch_size_per_rank in [
+            (3, 4, 1, None),
+            (3, 4, 2, [8, 8, 8, 8]),
+            (3, 4, 1, [8, 16, 0, 4]),
+            (5, 8, 2, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (5, 8, 4, [0, 7, 0, 7, 3, 3, 9, 1]),
+        ]:
+            with self.subTest(
+                local_split=local_split,
+                num_splits=num_splits,
+                stagger=stagger,
+                batch_size_per_rank=batch_size_per_rank,
+            ):
+                uncached = none_throws(
+                    _get_recat(
+                        local_split=local_split,
+                        num_splits=num_splits,
+                        stagger=stagger,
+                        device=device,
+                        batch_size_per_rank=batch_size_per_rank,
+                    )
+                )
+                cached = none_throws(
+                    _get_recat(
+                        local_split=local_split,
+                        num_splits=num_splits,
+                        stagger=stagger,
+                        device=device,
+                        batch_size_per_rank=batch_size_per_rank,
+                        cached=True,
+                    )
+                )
+
+                self.assertEqual(cached.device, device)
+                self.assertEqual(cached.dtype, torch.int32)
+                self.assertTrue(torch.equal(uncached, cached))
 
     @given(
         local_split=st.integers(min_value=0, max_value=16),
@@ -2066,7 +2220,7 @@ class GetRecatOverflowTest(unittest.TestCase):
     def test_cached_recat_unchanged_after_dist_init(self) -> None:
         _get_recat_data_cached.cache_clear()
         self.addCleanup(_get_recat_data_cached.cache_clear)
-        _, cached_recat = _get_recat_data_cached(
+        cached_recat = _get_recat_data_cached(
             2,
             2,
             1,
@@ -2160,8 +2314,8 @@ class GetRecatOverflowTest(unittest.TestCase):
         with patch(
             "torchrec.distributed.dist_data._get_recat_data_cached",
             side_effect=[
-                ((0,), rank_zero_recat),
-                ((1,), rank_one_recat),
+                rank_zero_recat,
+                rank_one_recat,
             ],
         ) as get_recat_data, patch(
             "torch.cuda.current_device",
