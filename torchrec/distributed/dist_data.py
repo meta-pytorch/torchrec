@@ -265,14 +265,34 @@ def _get_recat_data(
     return recat, recat_tensor
 
 
+def _get_recat_tensor(
+    local_split: int,
+    num_splits: int,
+    stagger: int,
+    device: Optional[torch.device],
+) -> torch.Tensor:
+    # Round down to replicate the _get_recat_data list-comprehension behavior.
+    rounded_num_splits = num_splits // stagger * stagger
+    feature_order = (
+        torch.arange(rounded_num_splits, device=device, dtype=torch.int32)
+        .view(stagger, -1)
+        .transpose(0, 1)
+        .flatten()
+    )
+    return (
+        torch.arange(local_split, device=device, dtype=torch.int32).unsqueeze(1)
+        + feature_order.unsqueeze(0) * local_split
+    ).flatten()
+
+
 @lru_cache(maxsize=128)
 def _get_recat_data_cached(
     local_split: int,
     num_splits: int,
     stagger: int,
     device: Optional[torch.device],
-) -> Tuple[Tuple[int, ...], torch.Tensor]:
-    return _get_recat_data(local_split, num_splits, stagger, device)
+) -> torch.Tensor:
+    return _get_recat_tensor(local_split, num_splits, stagger, device)
 
 
 def _normalize_recat_device(
@@ -363,6 +383,85 @@ def _apply_variable_batch_per_rank_if_needed(
     )
 
 
+def _apply_variable_batch_per_rank_tensor_if_needed(
+    recat_tensor: torch.Tensor,
+    local_split: int,
+    batch_size_per_rank: Optional[List[int]],
+) -> torch.Tensor:
+    if batch_size_per_rank is None or is_torchdynamo_compiling():
+        return recat_tensor
+
+    vb_per_rank_condition = any(
+        bs != batch_size_per_rank[0] for bs in batch_size_per_rank
+    )
+
+    if not vb_per_rank_condition:
+        return recat_tensor
+
+    num_splits = len(batch_size_per_rank)
+    max_offset = sum(batch_size_per_rank) * local_split
+    if min(batch_size_per_rank) < 0 or max_offset > _INT32_MAX:
+        msg = (
+            "_get_recat: int32 tensor creation failed: offset overflow. "
+            f"batch_size_per_rank={batch_size_per_rank}, "
+            f"max_offset={max_offset}"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    _check_int_overflow(
+        "_get_recat",
+        batch_size_per_rank,
+        "batch_size_per_rank",
+        local_split=local_split,
+        num_splits=num_splits,
+    )
+    batch_size_per_feature = torch.tensor(
+        batch_size_per_rank,
+        device=recat_tensor.device,
+        dtype=torch.int32,
+    ).repeat_interleave(
+        local_split,
+        output_size=num_splits * local_split,
+    )
+    permuted_batch_size_per_feature = batch_size_per_feature[recat_tensor]
+    input_offset_tensor = torch.cat(
+        (
+            batch_size_per_feature.new_zeros(1),
+            batch_size_per_feature.cumsum(0, dtype=torch.int32),
+        )
+    )
+    output_offset_tensor = torch.cat(
+        (
+            permuted_batch_size_per_feature.new_zeros(1),
+            permuted_batch_size_per_feature.cumsum(0, dtype=torch.int32),
+        )
+    )
+
+    if _TORCHREC_OVERFLOW_DEBUG:
+        _check_int_overflow(
+            "_get_recat",
+            input_offset_tensor.tolist(),
+            "input_offset",
+            local_split=local_split,
+            num_splits=num_splits,
+        )
+        _check_int_overflow(
+            "_get_recat",
+            output_offset_tensor.tolist(),
+            "output_offset",
+            local_split=local_split,
+            num_splits=num_splits,
+        )
+
+    return torch.ops.fbgemm.expand_into_jagged_permute(
+        recat_tensor,
+        input_offset_tensor,
+        output_offset_tensor,
+        max_offset,
+    )
+
+
 def _get_recat(
     local_split: int,
     num_splits: int,
@@ -405,19 +504,23 @@ def _get_recat(
 
         device = _normalize_recat_device(device)
         if cached:
-            recat, recat_tensor = _get_recat_data_cached(
+            recat_tensor = _get_recat_data_cached(
                 local_split,
                 num_splits,
                 stagger,
                 device,
             )
-        else:
-            recat, recat_tensor = _get_recat_data(
+            return _apply_variable_batch_per_rank_tensor_if_needed(
+                recat_tensor,
                 local_split,
-                num_splits,
-                stagger,
-                device,
+                batch_size_per_rank,
             )
+        recat, recat_tensor = _get_recat_data(
+            local_split,
+            num_splits,
+            stagger,
+            device,
+        )
         return _apply_variable_batch_per_rank_if_needed(
             recat,
             recat_tensor,
