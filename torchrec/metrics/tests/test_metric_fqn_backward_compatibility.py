@@ -77,7 +77,7 @@ from torchrec.metrics.ctr import CTRMetric
 from torchrec.metrics.gauc import GAUCMetric
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
 from torchrec.metrics.mae import MAEMetric
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.metrics.metric_module import OffloadedRecMetricModule, RecMetricModule
 from torchrec.metrics.metrics_config import BatchSizeStage, RecComputeMode, RecTaskInfo
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.multi_label_precision import MultiLabelPrecisionMetric
@@ -582,6 +582,12 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         lambda: CPUCommsRecMetricModule(
             **_module_fixture_kwargs(), throughput_metric=_make_throughput_metric()
         ),
+    ),
+    _GoldenCase(
+        "offloaded_rec_metric_module",
+        OffloadedRecMetricModule,
+        "",
+        lambda: OffloadedRecMetricModule(**_module_fixture_kwargs()),
     ),
     # state_dict() reads the comms tree and load_state_dict() writes the offloaded
     # one, but both carry the same keys, so this pins the shape and not which tree

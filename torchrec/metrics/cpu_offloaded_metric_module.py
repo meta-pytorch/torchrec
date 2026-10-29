@@ -77,7 +77,7 @@ from torchrec.metrics.metric_job_types import (
 from torchrec.metrics.metric_module import (
     _StagedLossDelta,
     MetricsResult,
-    RecMetricModule,
+    OffloadedRecMetricModule,
 )
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.metrics_config import LOSS_DENOM_SUFFIX
@@ -330,7 +330,7 @@ def _foreach_clone_kwargs(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
-class CPUOffloadedRecMetricModule(RecMetricModule):
+class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
     """
     RecMetricModule that offloads metric update() and compute() to CPU using background threads.
 
