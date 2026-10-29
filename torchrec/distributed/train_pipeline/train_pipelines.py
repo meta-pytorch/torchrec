@@ -237,6 +237,14 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def reset(self) -> None:
         """
         Reset the pipeline state. Override in subclasses if custom reset logic is needed.
+
+        Call before switching to a new dataloader iterator when batches already
+        prefetched from the previous iterator must not be consumed, e.g. after a
+        warmup or compile phase. It drops all in-flight batches and their contexts
+        and clears the dataloader-exhausted state, so the next
+        `progress(new_iter)` only yields batches from `new_iter`. Without
+        `reset()`, a mid-stream iterator switch may still yield batches prefetched
+        from the previous iterator.
         """
         pass
 
