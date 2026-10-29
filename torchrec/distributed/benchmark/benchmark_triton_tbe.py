@@ -24,6 +24,9 @@ Example comparing both backends on a custom training workload:
 Use ``triton_tbe`` or ``fbgemm_tbe`` to benchmark one backend. The legacy
 forward-only entry points also support managed-memory, bounded launches, and
 managed-memory cache comparisons.
+
+``tbe_comparison --cute`` adds Triton TBE with the CuTe DSL kernels (Blackwell),
+checked against Triton.
 """
 
 import logging
@@ -159,6 +162,13 @@ class TBEComparisonConfig(BenchFuncConfig):
     vbe_forward_block_limit: int = 0
     uvm_cache_bytes: int = 0
     run_backward: bool = True
+    # tbe_comparison: also run Triton TBE with the CuTe DSL kernels.
+    cute: bool = False
+    # tbe_comparison: include the FBGEMM baseline (off for models whose three
+    # copies don't fit on the GPU).
+    fbgemm: bool = True
+    # Gradient dtype for backward (default: the weights precision).
+    grad_dtype: str = ""
 
 
 @dataclass(frozen=True)
@@ -167,10 +177,14 @@ class TritonTBEKernelSpec:
     uses_managed_memory: bool
     supports_block_limits: bool = False
     supports_cache: bool = False
+    cute_kernels: bool = False
 
 
 _TRITON_TBE_KERNELS: dict[str, TritonTBEKernelSpec] = {
     "triton": TritonTBEKernelSpec(TritonTableBatchedEmbeddingBags, False),
+    "triton_cute": TritonTBEKernelSpec(
+        TritonTableBatchedEmbeddingBags, False, cute_kernels=True
+    ),
     "triton_uvm": TritonTBEKernelSpec(TritonUVMTableBatchedEmbeddingBags, True),
     "triton_uvm_capped": TritonTBEKernelSpec(
         TritonUVMCappedTableBatchedEmbeddingBags,
@@ -433,7 +447,7 @@ def _parse_comparison_workload(config: TBEComparisonConfig) -> TBEComparisonWork
             "batch_size",
         ),
         bag_sizes=_expand_values(
-            _parse_int_list(config.bag_size, "bag_size"),
+            _parse_int_list(config.bag_size, "bag_size", allow_zero=True),
             num_features,
             "bag_size",
         ),
@@ -460,6 +474,8 @@ def _make_triton_tbe(
     weights_precision = SparseType(config.weights_precision)
     output_dtype = SparseType(config.output_dtype)
     module_kwargs: dict[str, Any] = {}
+    if kernel.cute_kernels:
+        module_kwargs["cute_kernels"] = True
     if kernel.uses_managed_memory:
         module_kwargs["uvm_host_mapped"] = uvm_host_mapped
     if kernel.supports_block_limits:
@@ -731,8 +747,13 @@ def _make_benchmark_modules(
     device = torch.device(torch.cuda.current_device())
     modules: dict[str, torch.nn.Module] = {}
     if backend == "comparison":
-        modules["fbgemm"] = _make_fbgemm_tbe(workload, config, device)
+        if config.fbgemm:
+            modules["fbgemm"] = _make_fbgemm_tbe(workload, config, device)
         modules["triton"] = _make_triton_tbe(workload, config, device)
+        if config.cute:
+            modules["triton_cute"] = _make_triton_tbe(
+                workload, config, device, kernel_name="triton_cute"
+            )
     elif backend in _TRITON_TBE_KERNELS:
         modules[backend] = _make_triton_tbe(
             workload,
@@ -759,14 +780,19 @@ def _make_benchmark_modules(
         raise ValueError(f"unsupported backend {backend}")
 
     if backend == "comparison":
-        fbgemm_module = modules["fbgemm"]
         triton_module = modules["triton"]
-        assert isinstance(fbgemm_module, SplitTableBatchedEmbeddingBagsCodegen)
         assert isinstance(triton_module, TritonTableBatchedEmbeddingBags)
-        fbgemm_weight = fbgemm_module.weights_dev
-        assert isinstance(fbgemm_weight, torch.Tensor)
         with torch.no_grad():
-            triton_module.weight.copy_(fbgemm_weight)
+            if "fbgemm" in modules:
+                fbgemm_module = modules["fbgemm"]
+                assert isinstance(fbgemm_module, SplitTableBatchedEmbeddingBagsCodegen)
+                fbgemm_weight = fbgemm_module.weights_dev
+                assert isinstance(fbgemm_weight, torch.Tensor)
+                triton_module.weight.copy_(fbgemm_weight)
+            if "triton_cute" in modules:
+                cute_module = modules["triton_cute"]
+                assert isinstance(cute_module, TritonTableBatchedEmbeddingBags)
+                cute_module.weight.copy_(triton_module.weight)
     return modules
 
 
@@ -780,9 +806,66 @@ def _make_grad_output(
     grad_output = torch.randn_like(output)
     if request.Bs_per_feature_per_rank is None:
         grad_output = grad_output.clamp(min=-10.0, max=10.0).to(
-            SparseType(config.weights_precision).as_dtype()
+            SparseType(config.grad_dtype or config.weights_precision).as_dtype()
         )
     return grad_output
+
+
+class _WithCuteKernels(torch.nn.Module):
+    """The Triton module with cute_kernels on: a second production-size weight
+    copy can fill the GPU and slow both (2.5x on a large shard)."""
+
+    def __init__(self, module: TritonTableBatchedEmbeddingBags) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        """The Triton module's forward (and backward) with the CuTe kernels."""
+        self.module.cute_kernels = True
+        try:
+            return self.module(*args, **kwargs)
+        finally:
+            self.module.cute_kernels = False
+
+
+def _max_diff(x: torch.Tensor, y: torch.Tensor, relative: bool = False) -> float:
+    """max |x - y| (relative to |y| if requested), in chunks: production-size
+    weights are tens of GB, too big for whole-tensor temporaries."""
+    worst = 0.0
+    chunk = 1 << 26
+    for xc, yc in zip(x.reshape(-1).split(chunk), y.reshape(-1).split(chunk)):
+        diff = (xc.float() - yc.float()).abs()
+        if relative:
+            diff /= yc.float().abs().clamp_min(1e-12)
+        worst = max(worst, diff.max().item())
+    return worst
+
+
+def _check_cute(
+    modules: dict[str, torch.nn.Module],
+    outputs: dict[str, torch.Tensor],
+    request: TBERequest,
+    grad_output: torch.Tensor | None,
+) -> None:
+    """Triton TBE with the CuTe kernels vs Triton TBE: pooled output, then
+    weights and momentum after one backward from identical state."""
+    # fp32 sums in another order.
+    d_out = _max_diff(outputs["triton_cute"], outputs["triton"])
+    if grad_output is not None:
+        for name in ("triton", "triton_cute"):
+            _comparison_forward([], modules[name], request).backward(grad_output)
+    triton, cute = modules["triton"], modules["triton_cute"]
+    assert isinstance(triton, TritonTableBatchedEmbeddingBags)
+    assert isinstance(cute, TritonTableBatchedEmbeddingBags)
+    d_w = _max_diff(cute.weight, triton.weight)
+    d_m = _max_diff(cute.momentum, triton.momentum, relative=True)
+    print(
+        f"Triton+CuTe vs Triton: output max|diff| {d_out:.3g}, weight max|diff| "
+        f"{d_w:.3g}, momentum max rel diff {d_m:.3g}"
+    )
+    # Weights may differ by 1 fp16 ulp (|w| <= 2).
+    if d_out > 1e-4 or d_w > 2e-3 or d_m > 1e-4:
+        raise AssertionError("Triton+CuTe TBE does not match Triton TBE")
 
 
 def _run_benchmark_case(
@@ -800,7 +883,7 @@ def _run_benchmark_case(
         name: _comparison_forward([], module, request)
         for name, module in modules.items()
     }
-    if config.check_correctness and backend == "comparison":
+    if config.check_correctness and "fbgemm" in outputs and "triton" in outputs:
         tolerance = 1e-3 if config.weights_precision == "fp32" else 1e-2
         torch.testing.assert_close(
             outputs["triton"],
@@ -810,7 +893,14 @@ def _run_benchmark_case(
         )
         logger.info("FBGEMM and Triton forward outputs match")
     grad_output = _make_grad_output(config, request, next(iter(outputs.values())))
+    if config.check_correctness and "triton_cute" in modules:
+        _check_cute(modules, outputs, request, grad_output)
     del outputs
+    if "triton_cute" in modules:  # time it on the Triton module (_WithCuteKernels)
+        triton_module = modules["triton"]
+        assert isinstance(triton_module, TritonTableBatchedEmbeddingBags)
+        modules["triton_cute"] = _WithCuteKernels(triton_module)
+        torch.cuda.empty_cache()
 
     print(f"Estimated forward traffic: {forward_bytes / 1.0e9:.3f} GB")
     if config.run_backward:

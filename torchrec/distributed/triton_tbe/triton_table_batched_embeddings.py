@@ -77,8 +77,22 @@ from ads_mkl.ops.triton.amd.triton_table_batched_embeddings import (  # noqa: F8
 )
 
 
+def _cute_or(cute_kernels: bool) -> Any:
+    """kernel -> kernel, or with cute_kernels=True the CuTe DSL launcher standing
+    in for it (see cute_tbe_launchers)."""
+    if not cute_kernels:
+        return lambda kernel: kernel
+    # Optional dependency: binaries using cute_kernels=True depend on
+    # //torchrec/distributed/triton_tbe:cute_tbe.
+    from torchrec.distributed.triton_tbe import cute_tbe_launchers  # @manual
+
+    return cute_tbe_launchers.launcher
+
+
 @lru_cache(maxsize=None)
 def _specialize_weight_ptrs(kernel: Any, num_weight_ptrs: int) -> Any:
+    if hasattr(kernel, "specialize_weight_ptrs"):  # CuTe launcher, see _cute_or
+        return kernel.specialize_weight_ptrs(num_weight_ptrs)
     module = sys.modules[__name__]
     name = f"{kernel.__name__}_{num_weight_ptrs}_weight_ptrs"
     specialized_kernel = specialize(
@@ -3046,12 +3060,14 @@ class TritonTBE(torch.autograd.Function):
         enable_triton_tbe_optimizations: bool = False,
         forward_block_limit: int = 0,
         vbe_forward_block_limit: int = 0,
+        cute_kernels: bool = False,
     ) -> torch.Tensor:
         assert weight_ptrs
         assert weight_chunk_starts
         assert weight_chunk_starts_tensor is not None
         assert feature_weight_chunk_ids_tensor is not None
         assert feature_chunk_relative_table_offsets_tensor is not None
+        cute_or = _cute_or(cute_kernels)
 
         # VBE support: use pre-computed metadata if available, otherwise compute
         vbe = batch_size_per_feature_per_rank is not None
@@ -3250,6 +3266,7 @@ class TritonTBE(torch.autograd.Function):
         ctx.bwd_feature_bucket_id = bwd_feature_bucket_id
         ctx.bwd_bucket_rows = bwd_bucket_rows
         ctx.enable_triton_tbe_optimizations = enable_triton_tbe_optimizations
+        ctx.cute_kernels = cute_kernels
         ctx.bwd_bucket_rows_tensor = bwd_bucket_rows_tensor
 
         if hoist_transpose_to_forward:
@@ -3366,7 +3383,7 @@ class TritonTBE(torch.autograd.Function):
                 )
             else:
                 forward_weighted_kernel = _specialize_weight_ptrs(
-                    table_batched_embedding_bag_forward_weighted_kernel,
+                    cute_or(table_batched_embedding_bag_forward_weighted_kernel),
                     len(weight_ptrs),
                 )
                 forward_weighted_kernel[(total_B,)](
@@ -3606,7 +3623,7 @@ class TritonTBE(torch.autograd.Function):
                     for feature_start, feature_end in feature_ranges:
                         if feature_start >= feature_end:
                             continue
-                        table_batched_embedding_bag_forward_unweighted_kernel[
+                        cute_or(table_batched_embedding_bag_forward_unweighted_kernel)[
                             (triton.cdiv(B, bags_per_program),)
                         ](
                             output,
@@ -3831,6 +3848,7 @@ class TritonTBE(torch.autograd.Function):
         weight_chunk_starts = ctx.weight_chunk_starts
         split_weight_row_starts = ctx.split_weight_row_starts
         enable_triton_tbe_optimizations = ctx.enable_triton_tbe_optimizations
+        cute_or = _cute_or(ctx.cute_kernels)
 
         stochastic_rounding = ctx.stochastic_rounding
         vbe = ctx.vbe
@@ -4134,7 +4152,7 @@ class TritonTBE(torch.autograd.Function):
                 _amd_bwd_short_weighted
                 if _use_amd
                 else _specialize_weight_ptrs(
-                    triton_tbe_backward_short_run_weighted,
+                    cute_or(triton_tbe_backward_short_run_weighted),
                     len(weight_ptrs),
                 )
             )
@@ -4289,7 +4307,7 @@ class TritonTBE(torch.autograd.Function):
                     _amd_bwd_long_apply
                     if _use_amd
                     else _specialize_weight_ptrs(
-                        triton_tbe_backward_long_run_apply_unweighted,
+                        cute_or(triton_tbe_backward_long_run_apply_unweighted),
                         len(weight_ptrs),
                     )
                 )
@@ -4324,7 +4342,7 @@ class TritonTBE(torch.autograd.Function):
                 _amd_bwd_short_unweighted
                 if _use_amd
                 else _specialize_weight_ptrs(
-                    triton_tbe_backward_short_run_unweighted,
+                    cute_or(triton_tbe_backward_short_run_unweighted),
                     len(weight_ptrs),
                 )
             )
@@ -4391,7 +4409,7 @@ class TritonTBE(torch.autograd.Function):
                 # CLC Path is exclusive to CUDA B200+.
                 grad_accum_counter = programs_per_long_run.clone()
                 fused_unweighted_kernel = _specialize_weight_ptrs(
-                    triton_tbe_backward_long_run_fused_unweighted,
+                    cute_or(triton_tbe_backward_long_run_fused_unweighted),
                     len(weight_ptrs),
                 )
                 fused_unweighted_kernel[(long_accum_or_fused_grid_size,)](
@@ -4443,7 +4461,7 @@ class TritonTBE(torch.autograd.Function):
                 bwd_long_accum_uw = (
                     _amd_bwd_long_accum_unweighted
                     if _use_amd
-                    else triton_tbe_backward_long_run_grad_accum_unweighted
+                    else cute_or(triton_tbe_backward_long_run_grad_accum_unweighted)
                 )
                 long_run_unweighted_kwargs = (
                     {}
@@ -4481,7 +4499,7 @@ class TritonTBE(torch.autograd.Function):
                     _amd_bwd_long_apply
                     if _use_amd
                     else _specialize_weight_ptrs(
-                        triton_tbe_backward_long_run_apply_unweighted,
+                        cute_or(triton_tbe_backward_long_run_apply_unweighted),
                         len(weight_ptrs),
                     )
                 )
@@ -4556,12 +4574,18 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         bag_size_hints: Optional[List[int]] = None,
         fused_bounds_check: bool = False,
         enable_triton_tbe_optimizations: bool = False,
+        cute_kernels: bool = False,
     ) -> None:
+        """cute_kernels: run the pooled forward and the backward (exact row-wise
+        Adagrad) with the CuTe DSL kernels in cute_tbe (Blackwell only; the binary
+        must depend on //torchrec/distributed/triton_tbe:cute_tbe). Launches they
+        don't cover fall back to the Triton kernels (cute_tbe_launchers)."""
         super().__init__()
         logging.info("TritonTableBatchedEmbeddingBags init args: %s", locals())
         self.embedding_specs = embedding_specs
         self._is_triton_tbe = True
         self.enable_triton_tbe_optimizations = enable_triton_tbe_optimizations
+        self.cute_kernels = cute_kernels
         self.forward_block_limit = 0
         self.vbe_forward_block_limit = 0
         # Initialize event as None; it will be set after forward kernel runs
@@ -4579,6 +4603,8 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
 
         if device is None:
             device = torch.device(torch.cuda.current_device())
+        if cute_kernels and torch.cuda.get_device_capability(device)[0] < 10:
+            raise ValueError("cute_kernels needs a Blackwell (sm_100+) GPU")
 
         # Physical table properties (unchanged for weight storage)
         table_embedding_dims = [spec[1] for spec in embedding_specs]
@@ -4976,6 +5002,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             self.enable_triton_tbe_optimizations,
             self.forward_block_limit,
             self.vbe_forward_block_limit,
+            self.cute_kernels,
         )
 
     def _forward(
