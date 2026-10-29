@@ -685,9 +685,7 @@ def embedding_pooled_batched_lookup_gradient_map_jax(
     positions = jnp.arange(indices.shape[0], dtype=offsets.dtype)
     bag_starts = offsets[:-1]
     bag_markers = jnp.zeros((indices.shape[0],), dtype=offsets.dtype)
-    bag_indices = (
-        jax.lax.associative_scan(jax.lax.add, bag_markers.at[bag_starts].add(1)) - 1
-    )
+    bag_indices = jnp.cumsum(bag_markers.at[bag_starts].add(1), axis=0) - 1
     valid = positions < offsets[-1]
     safe_bag_indices = jnp.minimum(bag_indices, num_bags - 1)
     # Base deltas telescope even when empty bags have the same start.
@@ -695,9 +693,7 @@ def embedding_pooled_batched_lookup_gradient_map_jax(
     base_markers = jnp.zeros((indices.shape[0],), dtype=row_offsets.dtype)
     weight_indices = indices + cast(
         jax.Array,
-        jax.lax.associative_scan(
-            jax.lax.add, base_markers.at[bag_starts].add(base_deltas)
-        ),
+        jnp.cumsum(base_markers.at[bag_starts].add(base_deltas), axis=0),
     )
     safe_weight_indices = jnp.where(valid, weight_indices, 0)
     return safe_weight_indices, safe_bag_indices, valid

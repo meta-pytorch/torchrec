@@ -223,7 +223,7 @@ def group_batches_by_unique(
     # Get the offsets to get the boundaries of the bags
     # e.g. feature-0 becomes [0, 3, 4, 4, 4, 4]
     bag_offsets = jnp.pad(
-        jax.lax.associative_scan(jnp.add, counts, axis=1),
+        jnp.cumsum(counts, axis=1),
         (
             (0, 0),
             (1, 0),
