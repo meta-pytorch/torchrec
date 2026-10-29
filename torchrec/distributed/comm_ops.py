@@ -907,49 +907,23 @@ def variable_batch_all2all_pooled_sync(
 
     sharded_input_embeddings = input_embeddings.view(-1)
     qcomm_ctx = None
-    unpadded_output_split_sizes = output_split_sizes
 
     if a2ai.codecs is not None:
         codecs = none_throws(a2ai.codecs)
         qcomm_ctx = codecs.forward.create_context()
-
-        # For FP8 rowwise quantization, pad each split to be a multiple
-        # of row_dim so that calc_quantized_size does not assert.
-        # Mirrors the padded_size() logic used in the fixed-batch path.
-        if (
-            qcomm_ctx is not None
-            and qcomm_ctx.row_dim > 0
-            # pyrefly: ignore[missing-attribute] - codecs.forward is typed as
-            # QuantizedCommCodec (base) but at runtime is the fbgemm concrete
-            # class which has _comm_precision.
-            and codecs.forward._comm_precision == SparseType.FP8
-            and _is_fp8_rowwise_padding_enabled()
-        ):
-            row_dim = qcomm_ctx.row_dim
-            unpadded_input_split_sizes = list(input_split_sizes)
-            input_split_sizes = [
-                split + (row_dim - split % row_dim) % row_dim
-                for split in unpadded_input_split_sizes
-            ]
-            unpadded_output_split_sizes = list(output_split_sizes)
-            output_split_sizes = [
-                split + (row_dim - split % row_dim) % row_dim
-                for split in output_split_sizes
-            ]
-            if any(
-                p > o for p, o in zip(input_split_sizes, unpadded_input_split_sizes)
-            ):
-                chunks = sharded_input_embeddings.split(unpadded_input_split_sizes)
-                sharded_input_embeddings = torch.cat(
-                    [
-                        torch.nn.functional.pad(chunk, (0, p - o))
-                        for chunk, p, o in zip(
-                            chunks,
-                            input_split_sizes,
-                            unpadded_input_split_sizes,
-                        )
-                    ]
-                )
+        padded_input_split_sizes = _fp8_rowwise_padded_splits(
+            codecs.forward, qcomm_ctx, input_split_sizes
+        )
+        if padded_input_split_sizes is not None:
+            sharded_input_embeddings = _pad_splits(
+                sharded_input_embeddings, input_split_sizes, padded_input_split_sizes
+            )
+            input_split_sizes = padded_input_split_sizes
+        padded_output_split_sizes = _fp8_rowwise_padded_splits(
+            codecs.forward, qcomm_ctx, output_split_sizes
+        )
+        if padded_output_split_sizes is not None:
+            output_split_sizes = padded_output_split_sizes
 
         sharded_input_embeddings = codecs.forward.encode(
             sharded_input_embeddings,
@@ -997,24 +971,11 @@ def variable_batch_all2all_pooled_sync(
             sharded_output_embeddings,
             qcomm_ctx,
         )
-        if (
-            qcomm_ctx is not None
-            and qcomm_ctx.row_dim > 0
-            # pyrefly: ignore[missing-attribute]
-            and codecs.forward._comm_precision == SparseType.FP8
-            and _is_fp8_rowwise_padding_enabled()
-        ):
-            row_dim = qcomm_ctx.row_dim
-            padded_output_splits = [
-                split + (row_dim - split % row_dim) % row_dim
-                for split in unpadded_output_split_sizes
-            ]
-            chunks = sharded_output_embeddings.split(padded_output_splits)
-            sharded_output_embeddings = torch.cat(
-                [
-                    chunk[:orig]
-                    for chunk, orig in zip(chunks, unpadded_output_split_sizes)
-                ]
+        splits = none_throws(a2ai.output_splits)
+        padded_splits = _fp8_rowwise_padded_splits(codecs.forward, qcomm_ctx, splits)
+        if padded_splits is not None:
+            sharded_output_embeddings = _strip_splits(
+                sharded_output_embeddings, padded_splits, splits
             )
     return sharded_output_embeddings
 
@@ -1930,41 +1891,21 @@ class Variable_Batch_All2All_Pooled_Req(Function):
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
             qcomm_ctx = codecs.forward.create_context()
-
-            # For FP8 rowwise quantization, pad each split to be a
-            # multiple of row_dim so calc_quantized_size does not assert.
-            # Mirrors the padded_size() logic used in the fixed-batch path.
-            if (
-                qcomm_ctx is not None
-                and qcomm_ctx.row_dim > 0
-                # pyrefly: ignore[missing-attribute]
-                and codecs.forward._comm_precision == SparseType.FP8
-                and _is_fp8_rowwise_padding_enabled()
-            ):
-                row_dim = qcomm_ctx.row_dim
-                unpadded_input_split_sizes = list(input_split_sizes)
-                input_split_sizes = [
-                    split + (row_dim - split % row_dim) % row_dim
-                    for split in unpadded_input_split_sizes
-                ]
-                output_split_sizes = [
-                    split + (row_dim - split % row_dim) % row_dim
-                    for split in output_split_sizes
-                ]
-                if any(
-                    p > o for p, o in zip(input_split_sizes, unpadded_input_split_sizes)
-                ):
-                    chunks = sharded_input_embeddings.split(unpadded_input_split_sizes)
-                    sharded_input_embeddings = torch.cat(
-                        [
-                            torch.nn.functional.pad(chunk, (0, p - o))
-                            for chunk, p, o in zip(
-                                chunks,
-                                input_split_sizes,
-                                unpadded_input_split_sizes,
-                            )
-                        ]
-                    )
+            padded_input_split_sizes = _fp8_rowwise_padded_splits(
+                codecs.forward, qcomm_ctx, input_split_sizes
+            )
+            if padded_input_split_sizes is not None:
+                sharded_input_embeddings = _pad_splits(
+                    sharded_input_embeddings,
+                    input_split_sizes,
+                    padded_input_split_sizes,
+                )
+                input_split_sizes = padded_input_split_sizes
+            padded_output_split_sizes = _fp8_rowwise_padded_splits(
+                codecs.forward, qcomm_ctx, output_split_sizes
+            )
+            if padded_output_split_sizes is not None:
+                output_split_sizes = padded_output_split_sizes
 
             sharded_input_embeddings = codecs.forward.encode(
                 sharded_input_embeddings,
@@ -2076,25 +2017,17 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
                 sharded_output_embeddings,
                 myreq.qcomm_ctx,
             )
-            if (
-                myreq.qcomm_ctx is not None
-                and myreq.qcomm_ctx.row_dim > 0
+            # pyrefly: ignore[missing-attribute]
+            splits = none_throws(a2ai.output_splits)
+            padded_splits = _fp8_rowwise_padded_splits(
                 # pyrefly: ignore[missing-attribute]
-                and codecs.forward._comm_precision == SparseType.FP8
-                # pyrefly: ignore[missing-attribute]
-                and a2ai.output_splits is not None
-                and _is_fp8_rowwise_padding_enabled()
-            ):
-                row_dim = myreq.qcomm_ctx.row_dim
-                # pyrefly: ignore[missing-attribute]
-                unpadded_splits: List[int] = cast(List[int], a2ai.output_splits)
-                padded_splits = [
-                    split + (row_dim - split % row_dim) % row_dim
-                    for split in unpadded_splits
-                ]
-                chunks = sharded_output_embeddings.split(padded_splits)
-                sharded_output_embeddings = torch.cat(
-                    [chunk[:orig] for chunk, orig in zip(chunks, unpadded_splits)]
+                codecs.forward,
+                myreq.qcomm_ctx,
+                splits,
+            )
+            if padded_splits is not None:
+                sharded_output_embeddings = _strip_splits(
+                    sharded_output_embeddings, padded_splits, splits
                 )
         # the return result is a 1-d tensor, like: f_0_s_0, f_0_s1, ..., f_n_s_0, f_n_s_k
         # f_0, f_1, ... , f_n are ordered by features on each rank
