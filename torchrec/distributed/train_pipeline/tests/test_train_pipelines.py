@@ -3217,6 +3217,37 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    def test_reset_drops_batches_from_previous_iterator(self) -> None:
+        pipeline = StagedTrainPipeline(
+            pipeline_stages=[
+                PipelineStage(
+                    name="data_copy",
+                    runnable=partial(get_h2d_func, device=self.device),
+                    stream=torch.cuda.Stream(),
+                ),
+                PipelineStage(
+                    name="identity",
+                    runnable=lambda batch: batch,
+                    stream=torch.cuda.Stream(),
+                ),
+            ],
+            compute_stream=torch.cuda.current_stream(),
+        )
+        pipeline.progress(iter([torch.tensor([i]) for i in range(4)]))
+
+        pipeline.reset()
+        new_iter = iter([torch.tensor([10]), torch.tensor([11])])
+        outputs = [pipeline.progress(new_iter) for _ in range(3)]
+
+        self.assertEqual(
+            [cast(torch.Tensor, out).item() for out in outputs[:2]], [10, 11]
+        )
+        self.assertIsNone(outputs[2])
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     def test_pipelining_embedding_lookup(self) -> None:
         model = self._setup_model()
 

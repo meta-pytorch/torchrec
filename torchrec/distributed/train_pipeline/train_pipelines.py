@@ -3141,6 +3141,18 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         if self.on_flush_end is not None:
             self.on_flush_end()
 
+    def reset(self) -> None:
+        """
+        Drops all in-flight stage outputs so the next `progress()` refills the
+        pipeline from the iterator it is given. State owned by the stages
+        themselves (e.g. `SparseDataDistUtil` contexts) is not reset.
+        """
+        self._stage_outputs = [None] * self.num_stages
+        self._initialized = False
+        self._dataloader_iter = None
+        self._dataloader_exhausted = False
+        self._flushing = False
+
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
     )
