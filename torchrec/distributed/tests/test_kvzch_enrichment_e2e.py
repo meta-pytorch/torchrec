@@ -67,6 +67,7 @@ from torchrec.distributed.test_utils.multi_process import (
 )
 from torchrec.distributed.types import ShardingEnv, ShardingPlan
 from torchrec.modules.embedding_configs import (
+    DataType,
     EmbeddingConfig,
     TimestampBasedEvictionPolicy,
 )
@@ -77,6 +78,9 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 # Embedding dim small enough for fast tests; large enough that the deterministic
 # formula gives distinguishable per-slot values within fp16/bf16 precision.
 EMBEDDING_DIM = 8
+# At 8 dims the fake rows span fewer fp16 ulps than INT4 has levels, so the
+# serving round trip leaves them unchanged; 128 dims (the CU cache width) moves them.
+SERVING_QDQ_DIM = 128
 NUM_EMBEDDINGS = 8000
 TOTAL_NUM_BUCKETS = 20
 FEATURE_NAME = "feature_0"
@@ -89,6 +93,7 @@ _OWNER_LOCAL_CACHE_POLICY_FIELDS = (
     "owner_cache_read_populate",
     "owner_cache_read_populate_max_lookups",
 )
+_SERVING_QDQ_POLICY_FIELDS = ("serving_qdq_bit_rate",)
 
 
 def _expected_fake_value(id_value: int, slot: int) -> float:
@@ -255,13 +260,17 @@ def _build_sharded_model(
     owner_local_cache_read_populate_max_lookups: Optional[int] = None,
     prefetch_pipeline: bool = False,
     num_lookup_groups: int = 1,
+    serving_qdq_bit_rate: int = 0,
+    embedding_dim: int = EMBEDDING_DIM,
+    data_type: DataType = DataType.FP32,
 ) -> DistributedModelParallel:
     """Build row-wise virtual tables backed by the test enrichment provider."""
     tables = [
         EmbeddingConfig(
             num_embeddings=NUM_EMBEDDINGS,
-            embedding_dim=EMBEDDING_DIM,
+            embedding_dim=embedding_dim,
             name=f"table_{index}",
+            data_type=data_type,
             feature_names=[f"feature_{index}"],
             total_num_buckets=TOTAL_NUM_BUCKETS,
             use_virtual_table=True,
@@ -278,9 +287,13 @@ def _build_sharded_model(
         enrichment_type=EnrichmentType.IN_MEMORY_TEST_ONLY,
         provider_name=PROVIDER_NAME,
         client_id=CLIENT_ID,
-        enrichment_dim=EMBEDDING_DIM,
+        enrichment_dim=embedding_dim,
         response_format=EnrichmentResponseFormat.THRIFT_FLOAT,
     )
+    if serving_qdq_bit_rate:
+        enrichment_policy = enrichment_policy._replace(
+            serving_qdq_bit_rate=serving_qdq_bit_rate
+        )
     if direct_backend_gather or owner_local_cache:
         enrichment_policy = enrichment_policy._replace(direct_backend_gather=True)
     if owner_local_cache:
@@ -876,6 +889,87 @@ def _run_owner_local_cache_bounded_read_populate_round_trip(
     )
 
 
+def _publish_round_trip(rows: torch.Tensor) -> torch.Tensor:
+    """What serving decodes after the rowwise INT4 publish of FP16 `rows`."""
+    packed = torch.ops.quantized.embedding_bag_4bit_prepack(rows)
+    return torch.ops.quantized.embedding_bag_4bit_unpack(packed).to(torch.float16)
+
+
+def _serving_fixed_point(rows: torch.Tensor) -> torch.Tensor:
+    for _ in range(4):
+        decoded = _publish_round_trip(rows)
+        if torch.equal(decoded, rows):
+            break
+        rows = decoded
+    return rows
+
+
+def _run_serving_qdq_round_trip(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+    serving_qdq_bit_rate: int = 4,
+) -> None:
+    """Enriched rows, and rows restored around the enrichment path, are stored as
+    the values serving decodes from the publish; with the knob off, as fetched."""
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        sharded_model = _build_sharded_model(
+            ctx,
+            world_size,
+            local_size,
+            serving_qdq_bit_rate=serving_qdq_bit_rate,
+            embedding_dim=SERVING_QDQ_DIM,
+            data_type=DataType.FP16,
+        )
+        hashed_ids = [101, 202, 303, 404]
+        unhashed_ids = [1, 2, 3, 7]
+        read_kjt = _build_input_kjt(hashed_ids, ctx.device)
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(_build_write_kjt(hashed_ids, unhashed_ids, ctx.device))
+        torch.cuda.synchronize()
+
+        stored = _wait_for_cache_fill(sharded_model, read_kjt, len(hashed_ids)).cpu()
+
+        fetched = torch.stack(
+            [_expected_fake_row(uid, SERVING_QDQ_DIM) for uid in unhashed_ids]
+        ).to(torch.float16)
+        expected = _serving_fixed_point(fetched)
+        assert not torch.equal(expected, fetched)
+        if not serving_qdq_bit_rate:
+            torch.testing.assert_close(stored, fetched.float(), rtol=0, atol=0)
+            return
+        torch.testing.assert_close(stored, expected.float(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            _publish_round_trip(stored.half()).float(), stored, rtol=0, atol=0
+        )
+
+        # Rows written straight into the backend, as a checkpoint restore does,
+        # become serving values once apply_state_dict() runs.
+        emb_module = _enrichment_cache(sharded_model).emb_module
+        restored_ids = [505, 606]
+        raw = torch.stack(
+            [_expected_fake_row(uid, SERVING_QDQ_DIM) for uid in (1, 3)]
+        ).to(torch.float16)
+        backend_rows = torch.zeros(
+            len(restored_ids), emb_module.cache_row_dim, dtype=torch.float16
+        )
+        backend_rows[:, :SERVING_QDQ_DIM] = raw
+        emb_module.ssd_db.set(
+            torch.tensor(restored_ids, dtype=torch.int64),
+            backend_rows,
+            torch.tensor([len(restored_ids)], dtype=torch.int64),
+        )
+        emb_module.apply_state_dict()
+        restored = _read_rows(
+            sharded_model, _build_input_kjt(restored_ids, ctx.device)
+        ).cpu()
+        torch.testing.assert_close(
+            restored, _serving_fixed_point(raw).float(), rtol=0, atol=0
+        )
+        assert emb_module.ssd_db.serving_qdq_existing_rows() == 0
+
+
 def _enrichment_cache(sharded_model: DistributedModelParallel) -> Any:
     sharded_ec = cast(Any, sharded_model.module.ec)
     for lookup in sharded_ec._lookups:
@@ -1063,6 +1157,26 @@ class TestKvzchEnrichmentE2E(MultiProcessTestBase):
             callable=_run_reduced_lookup_equivalence,
             world_size=world_size,
             backend="nccl",
+        )
+
+    def test_serving_qdq_stores_enriched_rows_as_served(self) -> None:
+        world_size = 1
+        self._require_test_runtime(world_size)
+        self._require_enrichment_policy_fields(_SERVING_QDQ_POLICY_FIELDS)
+        self._run_multi_process_test(
+            callable=_run_serving_qdq_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_serving_qdq_off_stores_enriched_rows_as_fetched(self) -> None:
+        world_size = 1
+        self._require_test_runtime(world_size)
+        self._run_multi_process_test(
+            callable=_run_serving_qdq_round_trip,
+            world_size=world_size,
+            backend="nccl",
+            serving_qdq_bit_rate=0,
         )
 
 
