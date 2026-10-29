@@ -7,13 +7,26 @@
 
 # pyre-strict
 
+import itertools
 import math
 import unittest
-from typing import cast, Dict, List, Optional, Tuple
+from typing import Any, cast, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
 import torchrec.optim as trec_optim
+from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import EmbeddingLocation
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    apply_split_helper,
+    ComputeDevice,
+    construct_split_state,
+    CounterBasedRegularizationDefinition,
+    CowClipDefinition,
+    GlobalWeightDecayDefinition,
+    SplitTableBatchedEmbeddingBagsCodegen,
+    WeightDecayMode,
+)
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
@@ -30,13 +43,16 @@ from torchrec.distributed.planner.constants import (
 )
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+from torchrec.distributed.planner.provider import DefaultPlannerProvider
 from torchrec.distributed.planner.shard_estimators import (
     _calculate_quantized_weight_bytes,
+    _calculate_rowwise_optimizer_sizes,
     _calculate_shard_io_sizes,
     _calculate_storage_specific_sizes,
     _maybe_charge_weights_to_ddr,
     _validate_io_sizes,
     _validate_perf,
+    calculate_shard_storages,
     EmbeddingOffloadStats,
     EmbeddingStorageEstimator,
 )
@@ -44,10 +60,14 @@ from torchrec.distributed.planner.types import (
     BasicCommsBandwidths,
     ParameterConstraints,
     Perf,
+    PlannerConfig,
+    PlannerSessionContext,
     Shard,
     SharderData,
     ShardingOption,
+    ShardingPlanRequest,
     Storage,
+    StorageReservationPolicy,
     Topology,
 )
 from torchrec.distributed.quant_embeddingbag import QuantEmbeddingBagCollectionSharder
@@ -1443,6 +1463,325 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
 
 
 class TestEmbeddingStorageEstimator(unittest.TestCase):
+    def test_rowwise_storage_matches_native_states(self) -> None:
+        for (dtype, precision), mode in itertools.product(
+            ((torch.float16, SparseType.FP16), (torch.float32, SparseType.FP32)),
+            WeightDecayMode,
+        ):
+            with (
+                self.subTest(dtype=dtype, mode=mode),
+                patch("torch.ops.fbgemm.check_feature_gate_key", return_value=False),
+            ):
+                optimizer_kwargs: Dict[str, Any] = {
+                    "weight_decay_mode": mode,
+                    "counter_based_regularization": (
+                        CounterBasedRegularizationDefinition(counter_halflife=-1)
+                        if mode == WeightDecayMode.COUNTER
+                        else None
+                    ),
+                    "cowclip_regularization": (
+                        CowClipDefinition() if mode == WeightDecayMode.COWCLIP else None
+                    ),
+                    "global_weight_decay": (
+                        GlobalWeightDecayDefinition()
+                        if mode == WeightDecayMode.DECOUPLE_GLOBAL
+                        else None
+                    ),
+                }
+                module = SplitTableBatchedEmbeddingBagsCodegen(
+                    embedding_specs=[
+                        (13, 8, EmbeddingLocation.HOST, ComputeDevice.CPU)
+                    ],
+                    optimizer=EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+                    weights_precision=precision,
+                    **optimizer_kwargs,
+                )
+                native_bytes = sum(
+                    state.numel() * state.element_size()
+                    for state in module.split_optimizer_states()[0]
+                )
+                tensor = torch.empty((13, 64), dtype=dtype, device="meta")
+                vars(tensor).update(
+                    _optimizer_classes=[trec_optim.RowWiseAdagrad],
+                    _optimizer_kwargs=[optimizer_kwargs],
+                )
+                self.assertEqual(
+                    _calculate_rowwise_optimizer_sizes(
+                        tensor, [[13, 8], [13, 32], [5, 16], [0, 16]]
+                    ),
+                    [native_bytes, native_bytes, native_bytes * 5 // 13, 0],
+                )
+
+    def test_rowwise_storage_global_int64_states(self) -> None:
+        split = construct_split_state(
+            [(13, 8, EmbeddingLocation.DEVICE, ComputeDevice.CUDA)],
+            rowwise=True,
+            cacheable=False,
+        )
+        buffers: Dict[str, Any] = {}
+        # Exercise TBE's DEVICE allocation branch on a CPU test runner.
+        for prefix, dtype in (("momentum1", torch.float32), ("prev_iter", torch.int64)):
+            apply_split_helper(
+                buffers.__setitem__,
+                buffers.__setitem__,
+                current_device=torch.device("cpu"),
+                use_cpu=False,
+                feature_table_map=[0],
+                split=split,
+                prefix=prefix,
+                dtype=cast(Any, dtype),
+            )
+        native_bytes = sum(
+            buffers[name].numel() * buffers[name].element_size()
+            for name in ("momentum1_dev", "prev_iter_dev")
+        )
+        tensor = torch.empty((13, 64), device="meta")
+        for from_config in (False, True):
+            with (
+                self.subTest(from_config=from_config),
+                patch(
+                    "torch.ops.fbgemm.check_feature_gate_key",
+                    return_value=not from_config,
+                ),
+            ):
+                vars(tensor).update(
+                    _optimizer_classes=[trec_optim.RowWiseAdagrad],
+                    _optimizer_kwargs=[
+                        {
+                            "weight_decay_mode": WeightDecayMode.DECOUPLE_GLOBAL,
+                            "global_weight_decay": GlobalWeightDecayDefinition(
+                                use_int64_prev_iter=from_config
+                            ),
+                        }
+                    ],
+                )
+                self.assertEqual(
+                    _calculate_rowwise_optimizer_sizes(tensor, [[13, 8], [5, 16]]),
+                    [native_bytes, native_bytes * 5 // 13],
+                )
+
+    def test_rowwise_storage_gate_and_inference(self) -> None:
+        tensor = torch.empty((100, 64), dtype=torch.float16, device="meta")
+        vars(tensor).update(
+            _optimizer_classes=[trec_optim.RowWiseAdagrad],
+            _optimizer_kwargs=[{"weight_decay_mode": WeightDecayMode.COUNTER}],
+        )
+        kwargs: Dict[str, Any] = {
+            "sharder_data": SharderData({}, {}, StorageUsageType.DEFAULT),
+            "sharding_type": ShardingType.COLUMN_WISE.value,
+            "tensor": tensor,
+            "compute_device": "cuda",
+            "compute_kernel": EmbeddingComputeKernel.FUSED.value,
+            "shard_sizes": [[100, 8]],
+            "batch_sizes": [0],
+            "world_size": 1,
+            "local_world_size": 1,
+            "input_lengths": [0.0],
+            "num_poolings": [1.0],
+            "caching_ratio": 0.0,
+            "is_pooled": False,
+            "input_data_type_size": 8,
+            "output_data_type_size": 2,
+        }
+        with patch(
+            "torchrec.distributed.planner.shard_estimators."
+            "_calculate_rowwise_optimizer_sizes",
+            side_effect=AssertionError("Optimizer accounting must be gated"),
+        ):
+            self.assertEqual(calculate_shard_storages(**kwargs)[0].hbm, 1625)
+            self.assertEqual(
+                calculate_shard_storages(
+                    **kwargs, estimate_rowwise_optimizer_storage=False
+                )[0].hbm,
+                1625,
+            )
+            self.assertEqual(
+                calculate_shard_storages(
+                    **kwargs,
+                    estimate_rowwise_optimizer_storage=True,
+                    is_inference=True,
+                )[0].hbm,
+                1600,
+            )
+            for overrides in (
+                {"compute_device": "cpu"},
+                {"compute_device": "mtia"},
+                {"compute_kernel": EmbeddingComputeKernel.DENSE.value},
+                {"compute_kernel": EmbeddingComputeKernel.FUSED_UVM.value},
+                {"compute_kernel": EmbeddingComputeKernel.FUSED_UVM_CACHING.value},
+                {"use_virtual_table": True},
+            ):
+                with self.subTest(overrides=overrides):
+                    variant: Dict[str, Any] = {**kwargs, **overrides}
+                    self.assertEqual(
+                        calculate_shard_storages(**variant),
+                        calculate_shard_storages(
+                            **variant, estimate_rowwise_optimizer_storage=True
+                        ),
+                    )
+        with patch(
+            "torchrec.distributed.planner.shard_estimators."
+            "_calculate_storage_specific_sizes",
+            wraps=_calculate_storage_specific_sizes,
+        ) as storage_helper:
+            calculate_shard_storages(**kwargs)
+            calculate_shard_storages(**kwargs, estimate_rowwise_optimizer_storage=False)
+            self.assertTrue(storage_helper.call_args_list)
+            for call in storage_helper.call_args_list:
+                self.assertNotIn("optimizer_sizes", call.kwargs)
+        self.assertEqual(
+            calculate_shard_storages(**kwargs, estimate_rowwise_optimizer_storage=True)[
+                0
+            ].hbm,
+            2800,
+        )
+
+    def test_rowwise_storage_from_planner_config(self) -> None:
+        model = TestSparseNN(
+            tables=[
+                EmbeddingBagConfig(
+                    name="table_0",
+                    num_embeddings=100,
+                    embedding_dim=64,
+                    data_type=DataType.FP16,
+                    feature_names=["feature_0"],
+                )
+            ],
+            sparse_device=torch.device("meta"),
+        )
+        sharders = [
+            cast(
+                ModuleSharder[torch.nn.Module],
+                EmbeddingBagCollectionSharder(
+                    fused_params={
+                        "optimizer": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+                        "weight_decay_mode": WeightDecayMode.COUNTER,
+                    }
+                ),
+            )
+        ]
+        provider = DefaultPlannerProvider()
+        baseline: List[int] = []
+        for policy, enabled in (
+            (StorageReservationPolicy.UNSET, False),
+            (StorageReservationPolicy.UNSET, True),
+            (StorageReservationPolicy.INFERENCE, True),
+        ):
+            request = ShardingPlanRequest(
+                model=model,
+                sharders=sharders,
+                world_size=2,
+                local_world_size=2,
+                batch_size=1,
+                constraints={
+                    "table_0": ParameterConstraints(
+                        compute_kernels=[EmbeddingComputeKernel.FUSED.value],
+                        sharding_types=[ShardingType.COLUMN_WISE.value],
+                    )
+                },
+                planner_config=PlannerConfig(
+                    estimate_rowwise_optimizer_storage=enabled,
+                    storage_reservation_policy=policy,
+                ),
+            )
+            enumerator = provider._build_enumerator(
+                "unused",
+                Topology(world_size=2, compute_device="cuda"),
+                PlannerSessionContext(request=request, results={}),
+            )
+            with patch(
+                "torchrec.distributed.planner.shard_estimators.calculate_shard_storages",
+                wraps=calculate_shard_storages,
+            ) as storage_calculator:
+                options = enumerator.enumerate(model, sharders)
+                self.assertTrue(options)
+                storages = [
+                    shard.storage.hbm
+                    for option in options
+                    for shard in option.shards
+                    if shard.storage is not None
+                ]
+                self.assertTrue(storages)
+                if not enabled:
+                    baseline = storages
+                elif policy == StorageReservationPolicy.INFERENCE:
+                    self.assertEqual(storages, baseline)
+                else:
+                    self.assertEqual(storages, [size + 1200 for size in baseline])
+                for call in storage_calculator.call_args_list:
+                    if enabled and policy != StorageReservationPolicy.INFERENCE:
+                        self.assertIs(
+                            call.kwargs["estimate_rowwise_optimizer_storage"], True
+                        )
+                    else:
+                        self.assertNotIn(
+                            "estimate_rowwise_optimizer_storage", call.kwargs
+                        )
+
+    def test_rowwise_storage_uses_fused_optimizer_without_tensor_metadata(self) -> None:
+        tensor = torch.empty((13, 64), dtype=torch.float16, device="meta")
+        fused_params = {
+            "optimizer": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            "weight_decay_mode": WeightDecayMode.COUNTER,
+        }
+        self.assertEqual(
+            _calculate_rowwise_optimizer_sizes(tensor, [[13, 8]], fused_params),
+            [13 * 12],
+        )
+        vars(tensor).update(
+            _optimizer_classes=[trec_optim.RowWiseAdagrad],
+            _optimizer_kwargs=[{"weight_decay_mode": WeightDecayMode.NONE}],
+        )
+        self.assertEqual(
+            _calculate_rowwise_optimizer_sizes(tensor, [[13, 8]], fused_params),
+            [13 * 4],
+        )
+        vars(tensor).update(
+            _optimizer_kwargs=[
+                {"optimizer_state_dtypes": {"momentum1": SparseType.FP16}}
+            ]
+        )
+        self.assertIsNone(
+            _calculate_rowwise_optimizer_sizes(
+                tensor,
+                [[13, 8]],
+                fused_params,
+            )
+        )
+        vars(tensor).update(_optimizer_classes=[torch.optim.SGD])
+        self.assertIsNone(
+            _calculate_rowwise_optimizer_sizes(tensor, [[13, 8]], fused_params)
+        )
+
+    def test_rowwise_storage_respects_per_table_optimizer(self) -> None:
+        tensor = torch.empty((13, 64), device="meta")
+        for optimizer_class, optimizer, pooled_bytes, unpooled_bytes in (
+            (trec_optim.RowWiseAdagrad, EmbOptimType.ADAM, None, [13 * 12]),
+            (torch.optim.SGD, EmbOptimType.EXACT_ROWWISE_ADAGRAD, [13 * 12], None),
+        ):
+            vars(tensor).update(
+                _optimizer_classes=[optimizer_class],
+                _optimizer_kwargs=[
+                    {
+                        "optimizer": optimizer,
+                        "weight_decay_mode": WeightDecayMode.COUNTER,
+                    }
+                ],
+            )
+            with self.subTest(optimizer_class=optimizer_class, optimizer=optimizer):
+                self.assertEqual(
+                    _calculate_rowwise_optimizer_sizes(
+                        tensor, [[13, 8]], is_pooled=True
+                    ),
+                    pooled_bytes,
+                )
+                self.assertEqual(
+                    _calculate_rowwise_optimizer_sizes(
+                        tensor, [[13, 8]], is_pooled=False
+                    ),
+                    unpooled_bytes,
+                )
+
     def test_calculate_storage_specific_sizes(self) -> None:
         for inputs in calculate_storage_specific_size_data_provider():
             sharding_type, optimizer_class, expected_storage, clf = inputs.values()

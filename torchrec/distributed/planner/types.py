@@ -2300,6 +2300,9 @@ class PlannerConfig:
     # pre-existing fields.)
     grid_rowwise_shards: Optional[int] = None
 
+    # Fused RowWiseAdagrad state bytes per physical shard.
+    estimate_rowwise_optimizer_storage: bool = False
+
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
         return None
@@ -2562,6 +2565,11 @@ class ShardingPlanRequest:
                         )
                         if (pc := self.planner_config.proposer_config) is not None
                         else None
+                    ),
+                    *(
+                        ["estimate_rowwise_optimizer_storage_v2"]
+                        if self.planner_config.estimate_rowwise_optimizer_storage
+                        else []
                     ),
                     self.planner_config.request_hash_extension(),
                 ]
