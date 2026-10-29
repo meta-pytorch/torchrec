@@ -22,10 +22,12 @@
 """Input preprocessing utilities for TPU SparseCore."""
 
 import dataclasses
+import logging
 import math
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+
 from etils import epath
 from torch import distributed as dist
 from torchrec.experimental.torch_tpu.datasets import pybind_input_preprocessing
@@ -34,6 +36,7 @@ from torchrec.experimental.torch_tpu.datasets.fdo.fdo_client import (
     KeyedSparseCoreInputStats,
     SparseCoreInputStats,
 )
+from torchrec.experimental.torch_tpu.modules import utils
 from torchrec.experimental.torch_tpu.modules.embedding_configs import (
     SparseCoreEmbeddingConfig,
     StackedSparseCoreEmbeddingConfig,
@@ -49,6 +52,13 @@ from torchrec.modules.embedding_configs import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+MinibatchingMode = pybind_input_preprocessing.MinibatchingMode
+
+
+def _round_up_bucket(val: int, min_bucket: int = 32) -> int:
+    """Rounds `val` up to the next power-of-2 bucket (at least `min_bucket`)."""
+    return max(min_bucket, 1 << (max(1, val) - 1).bit_length())
+
 
 @dataclasses.dataclass
 class SparseCorePreprocessedInput:
@@ -61,6 +71,9 @@ class SparseCorePreprocessedInput:
     lengths: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
     actual_num_ids: Dict[str, int] = dataclasses.field(default_factory=dict)
     stats: Optional[SparseCoreInputStats] = None
+    enable_minibatching: bool = False
+    max_ids_per_partition: Optional[int] = None
+    max_unique_ids_per_partition: Optional[int] = None
 
     def to(
         self, device: torch.device, non_blocking: bool = False
@@ -85,6 +98,9 @@ class SparseCorePreprocessedInput:
             lengths=new_lengths,
             actual_num_ids=self.actual_num_ids,
             stats=self.stats,
+            enable_minibatching=self.enable_minibatching,
+            max_ids_per_partition=self.max_ids_per_partition,
+            max_unique_ids_per_partition=self.max_unique_ids_per_partition,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -115,6 +131,9 @@ class SparseCorePreprocessedInput:
             lengths=new_lengths,
             actual_num_ids=self.actual_num_ids,
             stats=self.stats,
+            enable_minibatching=self.enable_minibatching,
+            max_ids_per_partition=self.max_ids_per_partition,
+            max_unique_ids_per_partition=self.max_unique_ids_per_partition,
         )
 
 
@@ -178,7 +197,14 @@ class KeyedSparseCorePreprocessedInput:
 
 
 class SparseCoreInputPreprocessor:
-    """CPU Helper to preprocess KeyedJaggedTensor into KeyedSparseCorePreprocessedInput."""
+    """CPU Helper to preprocess KeyedJaggedTensor into KeyedSparseCorePreprocessedInput.
+
+    Note:
+      When `online_fdo=True`, preprocessing should run in the main process or a
+      thread-based `PrefetchDataLoader` rather than a multi-process
+      `DataLoader(num_workers > 0)` so that in-memory FDO state is shared across
+      batches.
+    """
 
     def __init__(
         self,
@@ -186,11 +212,16 @@ class SparseCoreInputPreprocessor:
         batch_size: int,
         global_device_count: int = 1,
         num_sc_per_device: int = 2,
+        sc_simd_width: Optional[int] = None,
+        hbm_word_size_in_4b: Optional[int] = None,
         allow_id_dropping: bool = False,
         fdo_client: Optional[fdo_client.FDOClient] = None,
         fdo_dir: Optional[epath.PathLike] = None,
         auto_stack: bool = False,
         activation_mem_bytes_limit: int = 6 * 1024 * 1024,
+        minibatching_mode: Union[MinibatchingMode, str] = MinibatchingMode.DISABLED,
+        online_fdo: bool = False,
+        fdo_headroom: float = 1.5,
     ) -> None:
         """Initializes the CPU input preprocessor and its stateful PyBind11 C++ backend.
 
@@ -200,7 +231,11 @@ class SparseCoreInputPreprocessor:
           batch_size: Process-local batch size per training step.
           global_device_count: Total number of TPU devices across all distributed
             hosts.
-          num_sc_per_device: Number of SparseCore virtual partitions per TPU chip.
+          num_sc_per_device: Number of SparseCores per TPU device.
+          sc_simd_width: SIMD width of each SparseCore. Defaults to the
+            `SC_SIMD_WIDTH` environment variable or the SIMD width of the attached
+            TPU, so it must be given on hosts without a TPU with SparseCores.
+          hbm_word_size_in_4b: HBM word size in 4-byte units.
           allow_id_dropping: Whether to drop out-of-capacity embedding IDs without
             raising errors.
           fdo_client: Optional pre-constructed FDO client to record statistics.
@@ -209,14 +244,60 @@ class SparseCoreInputPreprocessor:
           auto_stack: Whether to automatically group compatible tables for stacking.
           activation_mem_bytes_limit: Memory limit in bytes for activation buffers
             per SparseCore partition.
+          minibatching_mode: Minibatching mode (`MinibatchingMode.DISABLED`,
+            `MinibatchingMode.HOST`, `MinibatchingMode.DEVICE`, or string
+            `"disabled"`, `"host"`, `"device"`).
+          online_fdo: Whether to enable zero-config online dynamic FDO. On single
+            device (`global_device_count == 1`), automatically steps up to the next
+            power-of-2 bucket and re-preprocesses the batch on CPU whenever IDs are
+            dropped. On multi-device (`global_device_count > 1`), records running
+            peak stats and requires calling `sync_online_fdo()` at synchronized step
+            or epoch boundaries across all ranks so all devices step up to identical
+            shapes simultaneously.
+          fdo_headroom: Multiplicative safety headroom factor when `online_fdo=True`
+            (default 1.5, must be >= 1.0).
         """
+        if fdo_headroom < 1.0:
+            raise ValueError(f"fdo_headroom must be >= 1.0, got {fdo_headroom}")
+
+        if isinstance(minibatching_mode, str):
+            mode_map = {
+                "disabled": MinibatchingMode.DISABLED,
+                "host": MinibatchingMode.HOST,
+                "device": MinibatchingMode.DEVICE,
+            }
+            key = minibatching_mode.lower()
+            if key not in mode_map:
+                raise ValueError(
+                    f"Unsupported minibatching_mode: {minibatching_mode!r}. Expected"
+                    " one of 'disabled', 'host', or 'device'."
+                )
+            self._minibatching_mode = mode_map[key]
+        else:
+            self._minibatching_mode = minibatching_mode
         self._batch_size = batch_size
         self._local_device_count = 1  # Always 1 for PyTorch TPU.
         self._global_device_count = global_device_count
         self._num_sc_per_device = num_sc_per_device
+        self._sc_simd_width = utils.get_sc_simd_width(sc_simd_width)
+        self._hbm_word_size_in_4b = utils.get_hbm_word_size_in_4b(hbm_word_size_in_4b)
         self._last_stats: Optional[KeyedSparseCoreInputStats] = None
+        self._online_fdo = online_fdo
+        self._fdo_headroom = fdo_headroom
+        self._running_peak_stats: Dict[str, SparseCoreInputStats] = {}
+        self._warned_multihost_online_fdo = False
 
         for table in tables:
+            if (
+                table.max_ids_per_partition <= 0
+                or table.max_unique_ids_per_partition <= 0
+            ):
+                raise ValueError(
+                    f"max_ids_per_partition ({table.max_ids_per_partition}) and"
+                    " max_unique_ids_per_partition"
+                    f" ({table.max_unique_ids_per_partition}) must be > 0 for table"
+                    f" {table.name}"
+                )
             if isinstance(table.config, EmbeddingConfig) and table.max_seq_len is None:
                 raise ValueError(
                     "max_seq_len must be provided for EmbeddingConfig table"
@@ -241,12 +322,12 @@ class SparseCoreInputPreprocessor:
             rank = dist.get_rank() if dist.is_initialized() else 0
             initial_stats = KeyedSparseCoreInputStats(
                 {
-                    t.name: SparseCoreInputStats(
+                    stack_config.stack_name: SparseCoreInputStats(
                         dropped_count=0,
-                        observed_max_ids=t.max_ids_per_partition,
-                        observed_max_unique_ids=t.max_unique_ids_per_partition,
+                        observed_max_ids=stack_config.max_ids_per_partition,
+                        observed_max_unique_ids=stack_config.max_unique_ids_per_partition,
                     )
-                    for t in tables
+                    for stack_config in self._stacked_configs
                 }
             )
             fdo_client = csv_file_fdo_client.CSVFileFDOClient(
@@ -257,7 +338,7 @@ class SparseCoreInputPreprocessor:
 
         # Determine if we are in unpooled (EC) mode
         self._is_unpooled = isinstance(self._tables[0].config, EmbeddingConfig)
-        self._allow_id_dropping = allow_id_dropping
+        self._allow_id_dropping = allow_id_dropping or online_fdo
 
         self._rebuild_backend()
 
@@ -274,7 +355,10 @@ class SparseCoreInputPreprocessor:
             self._local_device_count,
             self._global_device_count,
             self._num_sc_per_device,
+            self._sc_simd_width,
+            self._hbm_word_size_in_4b,
             self._allow_id_dropping,
+            self._minibatching_mode,
         )
 
     @property
@@ -292,10 +376,78 @@ class SparseCoreInputPreprocessor:
         if self._fdo_client is not None:
             self._fdo_client.publish()
 
+    def _update_running_peak_stats(self, stats: KeyedSparseCoreInputStats) -> None:
+        """Updates in-memory running peak statistics per stack."""
+        for name, s in stats.table_stats.items():
+            prev = self._running_peak_stats.get(name)
+            if prev is None:
+                self._running_peak_stats[name] = s
+            else:
+                self._running_peak_stats[name] = SparseCoreInputStats(
+                    dropped_count=prev.dropped_count + s.dropped_count,
+                    observed_max_ids=max(prev.observed_max_ids, s.observed_max_ids),
+                    observed_max_unique_ids=max(
+                        prev.observed_max_unique_ids, s.observed_max_unique_ids
+                    ),
+                )
+
+    def sync_online_fdo(self, device: Optional[torch.device] = None) -> bool:
+        """Synchronizes running peak FDO stats across ranks and steps up to common power-of-2 buckets.
+
+        Args:
+          device: Optional device on which to allocate the reduction tensor when
+            `torch.distributed` is initialized. If None, selects CPU for `gloo` and
+            the active TPU device otherwise.
+
+        Returns:
+          True if any table or stack configuration was updated, False otherwise.
+        """
+        if dist.is_initialized() and self._global_device_count > 1:
+            if device is None:
+                if dist.get_backend() == "gloo":
+                    target_device = torch.device("cpu")
+                else:
+                    target_device = utils.get_device()
+            else:
+                target_device = device
+
+            rows = []
+            for stack_config in self._stacked_configs:
+                peak = self._running_peak_stats.get(stack_config.stack_name)
+                rows.append(
+                    [
+                        peak.dropped_count if peak is not None else 0,
+                        peak.observed_max_ids if peak is not None else 0,
+                        peak.observed_max_unique_ids if peak is not None else 0,
+                    ]
+                )
+            stats_tensor = torch.tensor(rows, dtype=torch.int64, device=target_device)
+            dist.all_reduce(stats_tensor, op=dist.ReduceOp.MAX)
+            synced_rows = stats_tensor.cpu().tolist()
+            synced_stats = KeyedSparseCoreInputStats(
+                {
+                    stack_config.stack_name: SparseCoreInputStats(
+                        dropped_count=int(row[0]),
+                        observed_max_ids=int(row[1]),
+                        observed_max_unique_ids=int(row[2]),
+                    )
+                    for stack_config, row in zip(self._stacked_configs, synced_rows)
+                }
+            )
+        else:
+            if not self._running_peak_stats:
+                return False
+            synced_stats = KeyedSparseCoreInputStats(dict(self._running_peak_stats))
+
+        return self.update_preprocessing_parameters(
+            synced_stats, scale_factor=self._fdo_headroom, bucket_step_up=True
+        )
+
     def update_preprocessing_parameters(
         self,
         updated_params: Optional[KeyedSparseCoreInputStats] = None,
         scale_factor: float = 1.2,
+        bucket_step_up: bool = False,
     ) -> bool:
         """Updates table capacities in-place from loaded FDO stats and rebuilds backend.
 
@@ -304,63 +456,119 @@ class SparseCoreInputPreprocessor:
         Args:
           updated_params: Aggregated FDO statistics. If None, loads from the
             attached FDO client.
-          scale_factor: Multiplicative safety headroom factor (default 1.2 = +20%).
+          scale_factor: Multiplicative safety headroom factor (default 1.2 = +20%,
+            must be >= 1.0).
+          bucket_step_up: Whether to round updated capacities up to the next
+            power-of-2 bucket (minimum 32) to bound recompilations.
 
         Returns:
           True if any table configuration was updated, False otherwise.
         """
+        if scale_factor < 1.0:
+            raise ValueError(f"scale_factor must be >= 1.0, got {scale_factor}")
+
         if updated_params is None:
             if self._fdo_client is None:
                 raise ValueError("No FDO client configured on preprocessor.")
             updated_params = self._fdo_client.load()
 
         changed = False
-        for table in self._tables:
-            if table.name in updated_params.table_stats:
-                t_stats = updated_params.table_stats[table.name]
-                updated_max_ids = max(
-                    table.max_ids_per_partition,
-                    int(math.ceil(t_stats.observed_max_ids * scale_factor)),
+        for stack_config in self._stacked_configs:
+            t_stats = updated_params.table_stats.get(stack_config.stack_name)
+            if t_stats is None:
+                matching_stats = [
+                    updated_params.table_stats[t.name]
+                    for t in stack_config.tables
+                    if t.name in updated_params.table_stats
+                ]
+                if matching_stats:
+                    t_stats = SparseCoreInputStats(
+                        dropped_count=sum(s.dropped_count for s in matching_stats),
+                        observed_max_ids=max(
+                            s.observed_max_ids for s in matching_stats
+                        ),
+                        observed_max_unique_ids=max(
+                            s.observed_max_unique_ids for s in matching_stats
+                        ),
+                    )
+            if t_stats is None:
+                continue
+
+            raw_max_ids = int(math.ceil(t_stats.observed_max_ids * scale_factor))
+            raw_max_unique_ids = int(
+                math.ceil(t_stats.observed_max_unique_ids * scale_factor)
+            )
+            if bucket_step_up:
+                raw_max_ids = _round_up_bucket(raw_max_ids)
+                raw_max_unique_ids = _round_up_bucket(raw_max_unique_ids)
+
+            current_max_ids = stack_config.max_ids_per_partition
+            current_max_unique_ids = stack_config.max_unique_ids_per_partition
+            updated_max_ids = max(current_max_ids, raw_max_ids)
+            updated_max_unique_ids = max(current_max_unique_ids, raw_max_unique_ids)
+
+            limits_increased = (
+                updated_max_ids > current_max_ids
+                or updated_max_unique_ids > current_max_unique_ids
+            )
+            if stack_config.suggested_coo_buffer_size_per_device is not None and (
+                limits_increased or t_stats.dropped_count > 0
+            ):
+                word_size = self._hbm_word_size_in_4b
+                num_scs = self._global_device_count * self._num_sc_per_device
+                max_ids_rounded_up = (
+                    (updated_max_ids + word_size - 1) // word_size
+                ) * word_size
+                num_buckets = (
+                    64 if self._minibatching_mode != MinibatchingMode.DISABLED else 1
                 )
-                updated_max_unique_ids = max(
-                    table.max_unique_ids_per_partition,
-                    int(math.ceil(t_stats.observed_max_unique_ids * scale_factor)),
+                theoretical_max = (
+                    max_ids_rounded_up * self._num_sc_per_device * num_scs * num_buckets
                 )
-                if (
-                    updated_max_ids > table.max_ids_per_partition
-                    or updated_max_unique_ids > table.max_unique_ids_per_partition
-                ):
-                    if table.suggested_coo_buffer_size_per_device is not None:
-                        num_scs = self._global_device_count * self._num_sc_per_device
-                        max_ids_rounded_up = ((updated_max_ids + 7) // 8) * 8
-                        theoretical_max = (
-                            max_ids_rounded_up * self._num_sc_per_device * num_scs
-                        )
-                        alignment = 8 * self._num_sc_per_device
-                        old_rounded = max(
-                            8, ((table.max_ids_per_partition + 7) // 8) * 8
-                        )
-                        scaled_buf = int(
-                            math.ceil(
-                                table.suggested_coo_buffer_size_per_device
-                                * (max_ids_rounded_up / old_rounded)
-                            )
-                        )
-                        scaled_buf = (
-                            (scaled_buf + alignment - 1) // alignment
-                        ) * alignment
-                        min_device_buf = max_ids_rounded_up * self._num_sc_per_device
-                        table.suggested_coo_buffer_size_per_device = min(
-                            theoretical_max,
-                            max(
-                                table.suggested_coo_buffer_size_per_device,
-                                scaled_buf,
-                                min_device_buf,
-                            ),
-                        )
+                alignment = word_size * self._num_sc_per_device
+                old_rounded = max(
+                    word_size,
+                    ((current_max_ids + word_size - 1) // word_size) * word_size,
+                )
+                buf_scale = max(
+                    max_ids_rounded_up / old_rounded,
+                    scale_factor if t_stats.dropped_count > 0 else 1.0,
+                )
+                scaled_buf = int(
+                    math.ceil(
+                        stack_config.suggested_coo_buffer_size_per_device * buf_scale
+                    )
+                )
+                if bucket_step_up and t_stats.dropped_count > 0:
+                    scaled_buf = _round_up_bucket(scaled_buf)
+                scaled_buf = ((scaled_buf + alignment - 1) // alignment) * alignment
+                min_device_buf = (
+                    max_ids_rounded_up * self._num_sc_per_device
+                    if limits_increased
+                    else 0
+                )
+                new_buf = min(
+                    theoretical_max,
+                    max(
+                        stack_config.suggested_coo_buffer_size_per_device,
+                        scaled_buf,
+                        min_device_buf,
+                    ),
+                )
+                if new_buf > stack_config.suggested_coo_buffer_size_per_device:
+                    stack_config.suggested_coo_buffer_size_per_device = new_buf
+                    for table in stack_config.tables:
+                        if table.suggested_coo_buffer_size_per_device is not None:
+                            table.suggested_coo_buffer_size_per_device = new_buf
+                    changed = True
+
+            if limits_increased:
+                stack_config.max_ids_per_partition = updated_max_ids
+                stack_config.max_unique_ids_per_partition = updated_max_unique_ids
+                for table in stack_config.tables:
                     table.max_ids_per_partition = updated_max_ids
                     table.max_unique_ids_per_partition = updated_max_unique_ids
-                    changed = True
+                changed = True
 
         if changed:
             self._rebuild_backend()
@@ -441,11 +649,10 @@ class SparseCoreInputPreprocessor:
         input_indices = {}
         input_offsets = {}
         feature_dict = features.to_dict()
+        table_lengths_dict: Dict[str, Dict[str, torch.Tensor]] = {}
+        table_actual_num_ids_dict: Dict[str, Dict[str, int]] = {}
 
         if self._is_unpooled:
-            table_lengths_dict = {}
-            table_actual_num_ids_dict = {}
-
             for stack_config in self._stacked_configs:
                 input_indices[stack_config.stack_name] = []
                 input_offsets[stack_config.stack_name] = []
@@ -482,37 +689,6 @@ class SparseCoreInputPreprocessor:
 
                 table_lengths_dict[stack_config.stack_name] = lengths_dict
                 table_actual_num_ids_dict[stack_config.stack_name] = actual_num_ids_dict
-
-            # Call official TPU preprocess op (CPU) via PyBind
-            res = self._backend.preprocess(
-                input_indices,
-                input_offsets,
-            )
-
-            table_tensors = {}
-            table_stats = {}
-            for name, t in res.items():
-                table_stats[name] = SparseCoreInputStats(
-                    dropped_count=int(t["dropped_count"].item()),
-                    observed_max_ids=int(t["observed_max_ids"].item()),
-                    observed_max_unique_ids=int(t["observed_max_unique_ids"].item()),
-                )
-                table_tensors[name] = SparseCorePreprocessedInput(
-                    row_pointers=t["row_pointers"],
-                    embedding_ids=t["embedding_ids"],
-                    sample_ids=t["sample_ids"],
-                    gains=t["gains"],
-                    lengths=table_lengths_dict.get(name, {}),
-                    actual_num_ids=table_actual_num_ids_dict.get(name, {}),
-                    stats=table_stats[name],
-                )
-
-            stats = KeyedSparseCoreInputStats(table_stats)
-            self._last_stats = stats
-            if self._fdo_client is not None:
-                self._fdo_client.record(stats)
-            return KeyedSparseCorePreprocessedInput(table_tensors, stats=stats)
-
         else:  # EBC mode
             for stack_config in self._stacked_configs:
                 input_indices[stack_config.stack_name] = []
@@ -527,29 +703,83 @@ class SparseCoreInputPreprocessor:
                             f.offsets().to("cpu", torch.int32)
                         )
 
-            res = self._backend.preprocess(
-                input_indices,
-                input_offsets,
+        res = self._backend.preprocess(
+            input_indices,
+            input_offsets,
+        )
+
+        table_stats = {
+            name: SparseCoreInputStats(
+                dropped_count=int(t["dropped_count"].item()),
+                observed_max_ids=int(t["observed_max_ids"].item()),
+                observed_max_unique_ids=int(t["observed_max_unique_ids"].item()),
+            )
+            for name, t in res.items()
+        }
+        stats = KeyedSparseCoreInputStats(table_stats)
+
+        if self._online_fdo:
+            if self._global_device_count == 1:
+                if any(s.dropped_count > 0 for s in stats.table_stats.values()):
+                    if self.update_preprocessing_parameters(
+                        stats, scale_factor=self._fdo_headroom, bucket_step_up=True
+                    ):
+                        res = self._backend.preprocess(
+                            input_indices,
+                            input_offsets,
+                        )
+                        table_stats = {
+                            name: SparseCoreInputStats(
+                                dropped_count=int(t["dropped_count"].item()),
+                                observed_max_ids=int(t["observed_max_ids"].item()),
+                                observed_max_unique_ids=int(
+                                    t["observed_max_unique_ids"].item()
+                                ),
+                            )
+                            for name, t in res.items()
+                        }
+                        stats = KeyedSparseCoreInputStats(table_stats)
+            elif (
+                any(s.dropped_count > 0 for s in stats.table_stats.values())
+                and not self._warned_multihost_online_fdo
+            ):
+                self._warned_multihost_online_fdo = True
+                logging.warning(
+                    "SparseCore IDs were dropped with online_fdo=True and"
+                    " global_device_count=%d. Per-batch automatic step-up is disabled"
+                    " in multi-device mode to prevent SPMD collective shape"
+                    " divergence; invoke preprocessor.sync_online_fdo() at a"
+                    " synchronized step boundary across all ranks.",
+                    self._global_device_count,
+                )
+
+        self._update_running_peak_stats(stats)
+
+        enable_minibatching = self._minibatching_mode != MinibatchingMode.DISABLED
+        stack_configs_by_name = {sc.stack_name: sc for sc in self._stacked_configs}
+        table_tensors = {}
+        for name, t in res.items():
+            stack_cfg = stack_configs_by_name.get(name)
+            table_tensors[name] = SparseCorePreprocessedInput(
+                row_pointers=t["row_pointers"],
+                embedding_ids=t["embedding_ids"],
+                sample_ids=t["sample_ids"],
+                gains=t["gains"],
+                lengths=table_lengths_dict.get(name, {}),
+                actual_num_ids=table_actual_num_ids_dict.get(name, {}),
+                stats=table_stats[name],
+                enable_minibatching=enable_minibatching,
+                max_ids_per_partition=(
+                    stack_cfg.max_ids_per_partition if stack_cfg is not None else None
+                ),
+                max_unique_ids_per_partition=(
+                    stack_cfg.max_unique_ids_per_partition
+                    if stack_cfg is not None
+                    else None
+                ),
             )
 
-            table_tensors = {}
-            table_stats = {}
-            for name, t in res.items():
-                table_stats[name] = SparseCoreInputStats(
-                    dropped_count=int(t["dropped_count"].item()),
-                    observed_max_ids=int(t["observed_max_ids"].item()),
-                    observed_max_unique_ids=int(t["observed_max_unique_ids"].item()),
-                )
-                table_tensors[name] = SparseCorePreprocessedInput(
-                    row_pointers=t["row_pointers"],
-                    embedding_ids=t["embedding_ids"],
-                    sample_ids=t["sample_ids"],
-                    gains=t["gains"],
-                    stats=table_stats[name],
-                )
-
-            stats = KeyedSparseCoreInputStats(table_stats)
-            self._last_stats = stats
-            if self._fdo_client is not None:
-                self._fdo_client.record(stats)
-            return KeyedSparseCorePreprocessedInput(table_tensors, stats=stats)
+        self._last_stats = stats
+        if self._fdo_client is not None:
+            self._fdo_client.record(stats)
+        return KeyedSparseCorePreprocessedInput(table_tensors, stats=stats)
