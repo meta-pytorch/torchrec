@@ -144,6 +144,24 @@ def _get_shard_offsets_for_kv_zch(
     return shard_row_offsets
 
 
+def _get_grouped_int4_group_size(config: GroupedEmbeddingConfig) -> int:
+    """
+    The grouped INT4 group size shared by every table of a TBE; 0 means rowwise.
+    """
+    group_sizes = {table.grouped_int4_group_size for table in config.embedding_tables}
+    if len(group_sizes) > 1:
+        raise ValueError(
+            "Tables batched into one TBE must share grouped_int4_group_size, got "
+            + str(
+                {
+                    table.name: table.grouped_int4_group_size
+                    for table in config.embedding_tables
+                }
+            )
+        )
+    return group_sizes.pop() if group_sizes else 0
+
+
 def _get_runtime_device(
     device: Optional[torch.device],
     config: GroupedEmbeddingConfig,
@@ -328,6 +346,12 @@ class QuantBatchedEmbeddingBag(
             )
 
         self.lengths_to_tbe: bool = fused_param_lengths_to_offsets_lookup(fused_params)
+
+        if _get_grouped_int4_group_size(config):
+            raise ValueError(
+                "grouped_int4_group_size is only supported for EmbeddingCollection "
+                f"virtual tables, got pooled tables {config.table_names()}"
+            )
 
         if self.lengths_to_tbe:
             tbe_clazz = IntNBitTableBatchedEmbeddingBagsCodegenWithLength
@@ -623,9 +647,22 @@ class QuantBatchedEmbedding(
             ],
         }
 
+        grouped_int4_group_size = _get_grouped_int4_group_size(config)
         # Add KV-specific parameters
         if embedding_clazz == KVEmbeddingInference:
             module_kwargs["embedding_cache_mode"] = embedding_cache_mode
+            # Per table, so never through fused_params, which reach every TBE class.
+            if grouped_int4_group_size:
+                module_kwargs["grouped_int4_group_size"] = grouped_int4_group_size
+            logger.info(
+                f"KVEmbeddingInference for tables {config.table_names()}: "
+                f"{embedding_cache_mode=}, {grouped_int4_group_size=}"
+            )
+        elif grouped_int4_group_size:
+            raise ValueError(
+                "grouped_int4_group_size needs virtual tables served by "
+                f"KVEmbeddingInference, got tables {config.table_names()}"
+            )
 
         # Add fused params
         module_kwargs.update(**(tbe_fused_params(fused_params) or {}))

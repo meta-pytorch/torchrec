@@ -399,6 +399,10 @@ class BaseEmbeddingConfig:
         virtual_table_eviction_policy (Optional[VirtualTableEvictionPolicy]): eviction policy for virtual table.
         enable_embedding_update (bool): whether to enable embedding update.
         stash_weights (bool): whether to stash weights.
+        grouped_int4_group_size (int): keyword-only. For an INT4 virtual table
+            served by KVEmbeddingInference, the number of dims sharing one
+            float8_e4m3fn scale in group-wise INT4 serving rows. 0 serves
+            rowwise INT4 rows.
     """
 
     num_embeddings: int
@@ -422,6 +426,8 @@ class BaseEmbeddingConfig:
     virtual_table_eviction_policy: Optional[VirtualTableEvictionPolicy] = None
     enable_embedding_update: bool = False
     stash_weights: bool = False
+    # Keyword-only so that subclass fields keep their positional slots.
+    grouped_int4_group_size: int = field(default=0, kw_only=True)
 
     def get_weight_init_max(self) -> float:
         if self.weight_init_max is None:

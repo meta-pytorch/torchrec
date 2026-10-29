@@ -265,6 +265,7 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                         virtual_table_eviction_policy=info.embedding_config.virtual_table_eviction_policy,
                         enable_embedding_update=info.embedding_config.enable_embedding_update,
                         stash_weights=info.embedding_config.stash_weights,
+                        grouped_int4_group_size=info.embedding_config.grouped_int4_group_size,
                     )
                 )
         return tables_per_rank
