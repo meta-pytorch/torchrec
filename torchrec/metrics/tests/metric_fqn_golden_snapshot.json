@@ -477,6 +477,14 @@
   "noop_metric_module": {
     "state_dict_keys": []
   },
+  "offloaded_rec_metric_module": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+    ]
+  },
   "perceptron": {
     "state_dict_keys": [
       "_linear.bias",
