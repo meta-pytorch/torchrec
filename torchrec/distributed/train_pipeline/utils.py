@@ -616,6 +616,10 @@ def _rewrite_model(  # noqa C901
     sharded_modules: Dict[str, ShardedModule] = {}  # fqn -> ShardedModule
     for name, m in model.named_modules():
         if isinstance(m, ShardedModule):
+            # A pipelined forward left by an earlier pipeline that was never
+            # detached; drop it so the class forward is saved as the original.
+            if isinstance(m.forward, BaseForward):
+                del m.forward
             sharded_modules[name] = m
 
     ## Trace a model. for more: https://pytorch.org/docs/stable/fx.html

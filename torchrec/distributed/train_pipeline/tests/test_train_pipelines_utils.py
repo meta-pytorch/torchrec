@@ -47,6 +47,7 @@ from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import 
 from torchrec.distributed.train_pipeline.tracing import CallArgs, PipelinedPostproc
 from torchrec.distributed.train_pipeline.utils import (
     _is_data_loading_retriable,
+    _pipeline_detach_model,
     _rewrite_model,
     _start_embedding_lookup,
     DataLoadingThread,
@@ -56,6 +57,7 @@ from torchrec.distributed.train_pipeline.utils import (
 )
 from torchrec.distributed.types import (
     Awaitable,
+    LazyAwaitable,
     ModuleSharder,
     ShardedModule,
     ShardingEnv,
@@ -574,6 +576,54 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         self.assertIn(ebc, pipelined_b, diagnostics)
         self.assertNotIn("sparse.ebc", non_pipelined_b, diagnostics)
         self.assertIn("Module 'sparse.ebc' will be pipelined", arm_b_output)
+
+
+class _FakeShardedModule(ShardedModule):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def create_context(self) -> None:
+        pass
+
+    def input_dist(
+        self, ctx: None, *input: object, **kwargs: object
+    ) -> Awaitable[Awaitable[object]]:
+        raise NotImplementedError
+
+    def compute(self, ctx: None, dist_input: object) -> None:
+        pass
+
+    def output_dist(self, ctx: None, output: object) -> LazyAwaitable[object]:
+        raise NotImplementedError
+
+    @property
+    def unsharded_module_type(self) -> type[torch.nn.Module]:
+        return torch.nn.Module
+
+
+class _FakeShardedModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sharded = _FakeShardedModule()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.sharded(x)
+
+
+class RewriteModelTwiceTest(unittest.TestCase):
+    def test_rewrite_model_twice_restores_original_forward(self) -> None:
+        model = _FakeShardedModel()
+        for _ in range(2):
+            pipelined, _, original_forwards, postprocs, _ = _rewrite_model(
+                model=model,
+                context=TrainPipelineContext(),
+                dist_stream=None,
+            )
+            self.assertIsInstance(model.sharded.forward, PipelinedForward)
+
+        self.assertEqual(pipelined, [model.sharded])
+        _pipeline_detach_model(model, pipelined, original_forwards, [], postprocs)
+        self.assertNotIsInstance(model.sharded.forward, PipelinedForward)
 
 
 # ~50ms on a modern GPU: long enough that a consumer on an unordered stream
