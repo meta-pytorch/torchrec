@@ -94,6 +94,8 @@ _OWNER_LOCAL_CACHE_POLICY_FIELDS = (
     "owner_cache_read_populate_max_lookups",
 )
 _SERVING_QDQ_POLICY_FIELDS = ("serving_qdq_bit_rate",)
+_SERVING_QDQ_GROUPED_POLICY_FIELDS = ("serving_qdq_bit_rate", "serving_qdq_group_size")
+SERVING_QDQ_GROUP_SIZE = 8
 
 
 def _expected_fake_value(id_value: int, slot: int) -> float:
@@ -261,6 +263,7 @@ def _build_sharded_model(
     prefetch_pipeline: bool = False,
     num_lookup_groups: int = 1,
     serving_qdq_bit_rate: int = 0,
+    serving_qdq_group_size: int = 0,
     embedding_dim: int = EMBEDDING_DIM,
     data_type: DataType = DataType.FP32,
 ) -> DistributedModelParallel:
@@ -293,6 +296,10 @@ def _build_sharded_model(
     if serving_qdq_bit_rate:
         enrichment_policy = enrichment_policy._replace(
             serving_qdq_bit_rate=serving_qdq_bit_rate
+        )
+    if serving_qdq_group_size:
+        enrichment_policy = enrichment_policy._replace(
+            serving_qdq_group_size=serving_qdq_group_size
         )
     if direct_backend_gather or owner_local_cache:
         enrichment_policy = enrichment_policy._replace(direct_backend_gather=True)
@@ -889,15 +896,19 @@ def _run_owner_local_cache_bounded_read_populate_round_trip(
     )
 
 
-def _publish_round_trip(rows: torch.Tensor) -> torch.Tensor:
-    """What serving decodes after the rowwise INT4 publish of FP16 `rows`."""
+def _publish_round_trip(rows: torch.Tensor, group_size: int = 0) -> torch.Tensor:
+    """What serving decodes after the INT4 publish of FP16 `rows`: rowwise with an
+    fp16 scale and bias, or group-wise with e4m3 scales when group_size is set."""
+    if group_size:
+        packed = torch.ops.fbgemm.FloatOrHalfToGroupedInt4E4M3(rows, group_size)
+        return torch.ops.fbgemm.GroupedInt4E4M3ToHalf(packed, group_size, rows.shape[1])
     packed = torch.ops.quantized.embedding_bag_4bit_prepack(rows)
     return torch.ops.quantized.embedding_bag_4bit_unpack(packed).to(torch.float16)
 
 
-def _serving_fixed_point(rows: torch.Tensor) -> torch.Tensor:
+def _serving_fixed_point(rows: torch.Tensor, group_size: int = 0) -> torch.Tensor:
     for _ in range(4):
-        decoded = _publish_round_trip(rows)
+        decoded = _publish_round_trip(rows, group_size)
         if torch.equal(decoded, rows):
             break
         rows = decoded
@@ -910,15 +921,18 @@ def _run_serving_qdq_round_trip(
     backend: str,
     local_size: Optional[int] = None,
     serving_qdq_bit_rate: int = 4,
+    serving_qdq_group_size: int = 0,
 ) -> None:
     """Enriched rows, and rows restored around the enrichment path, are stored as
     the values serving decodes from the publish; with the knob off, as fetched."""
+    group_size = serving_qdq_group_size
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         sharded_model = _build_sharded_model(
             ctx,
             world_size,
             local_size,
             serving_qdq_bit_rate=serving_qdq_bit_rate,
+            serving_qdq_group_size=group_size,
             embedding_dim=SERVING_QDQ_DIM,
             data_type=DataType.FP16,
         )
@@ -934,14 +948,17 @@ def _run_serving_qdq_round_trip(
         fetched = torch.stack(
             [_expected_fake_row(uid, SERVING_QDQ_DIM) for uid in unhashed_ids]
         ).to(torch.float16)
-        expected = _serving_fixed_point(fetched)
+        expected = _serving_fixed_point(fetched, group_size)
         assert not torch.equal(expected, fetched)
         if not serving_qdq_bit_rate:
             torch.testing.assert_close(stored, fetched.float(), rtol=0, atol=0)
             return
         torch.testing.assert_close(stored, expected.float(), rtol=0, atol=0)
         torch.testing.assert_close(
-            _publish_round_trip(stored.half()).float(), stored, rtol=0, atol=0
+            _publish_round_trip(stored.half(), group_size).float(),
+            stored,
+            rtol=0,
+            atol=0,
         )
 
         # Rows written straight into the backend, as a checkpoint restore does,
@@ -965,7 +982,7 @@ def _run_serving_qdq_round_trip(
             sharded_model, _build_input_kjt(restored_ids, ctx.device)
         ).cpu()
         torch.testing.assert_close(
-            restored, _serving_fixed_point(raw).float(), rtol=0, atol=0
+            restored, _serving_fixed_point(raw, group_size).float(), rtol=0, atol=0
         )
         assert emb_module.ssd_db.serving_qdq_existing_rows() == 0
 
@@ -1167,6 +1184,17 @@ class TestKvzchEnrichmentE2E(MultiProcessTestBase):
             callable=_run_serving_qdq_round_trip,
             world_size=world_size,
             backend="nccl",
+        )
+
+    def test_serving_qdq_grouped_stores_enriched_rows_as_served(self) -> None:
+        world_size = 1
+        self._require_test_runtime(world_size)
+        self._require_enrichment_policy_fields(_SERVING_QDQ_GROUPED_POLICY_FIELDS)
+        self._run_multi_process_test(
+            callable=_run_serving_qdq_round_trip,
+            world_size=world_size,
+            backend="nccl",
+            serving_qdq_group_size=SERVING_QDQ_GROUP_SIZE,
         )
 
     def test_serving_qdq_off_stores_enriched_rows_as_fetched(self) -> None:
