@@ -489,11 +489,14 @@ class PrefetchEmbeddingPipelinedForward(PrefetchPipelinedForward):
         )
 
     def __call__(self, *input, **kwargs) -> Awaitable:
-        if not self._compute_and_output_dist_awaitable:
+        awaitable = self._compute_and_output_dist_awaitable
+        if not awaitable:
             raise Exception(
                 "compute_and_output_dist must be called before __call__",
             )
-        return self._compute_and_output_dist_awaitable
+        # Keeping it would keep its embeddings alive until the next batch.
+        self._compute_and_output_dist_awaitable = None
+        return awaitable
 
 
 class KJTAllToAllForward:
