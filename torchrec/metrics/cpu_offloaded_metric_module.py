@@ -20,6 +20,7 @@ from typing import Any, cast, Dict, Mapping, Optional, Union
 
 import torch
 from torch import distributed as dist
+from torch.nn.modules.module import _IncompatibleKeys
 from torch.profiler import record_function
 
 try:
@@ -1134,7 +1135,10 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
 
         while not self._shutdown_event.is_set():
             try:
-                self._do_batched_update_work()
+                if self._update_batch_size == 1:
+                    self._do_work(self.update_queue)
+                else:
+                    self._do_batched_update_work()
             except Exception as e:
                 self._update_errors += 1
                 logger.exception(f"Exception in update loop: {e}")
@@ -1394,7 +1398,7 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
     # pyrefly: ignore
     def load_state_dict(
         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
-    ) -> None:
+    ) -> _IncompatibleKeys:
         """
         Load state dict into the offloaded module instead of the comms module.
 
@@ -1411,7 +1415,7 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
         comms_module = self._modules.pop("comms_module", None)
 
         try:
-            super().load_state_dict(state_dict, strict=strict, assign=assign)
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
         finally:
             # Restore comms_module
             if comms_module is not None:
