@@ -590,6 +590,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         enable_dmp_collection_consumer_waits (bool):
             wait for each module's synchronized weights and optimizer state only
             at that module's next consumers. Disable to use the coarse pipeline drain.
+        enable_dmp_collection_used_row_sync (bool):
+            only synchronize replica rows accessed by each embedding lookup instead of all rows.
+            Requires module-granular DMP synchronization and defaults to full-row sync.
         free_features_storage_early (bool): if True, free the original batch KJT
             tensor storage right after permute in input_dist.  Safe because
             PipelinedForward ignores the KJT args during model forward.
@@ -622,6 +625,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         enable_dmp_collection_module_sync: bool = False,
         preserve_forward_order: bool = False,
         enable_dmp_collection_consumer_waits: bool = True,
+        enable_dmp_collection_used_row_sync: bool = False,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
@@ -728,6 +732,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             enable_dmp_collection_module_sync,
             preserve_forward_order,
             enable_dmp_collection_consumer_waits,
+            enable_dmp_collection_used_row_sync,
         )
 
     def _init_2d_sharding(
@@ -736,6 +741,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         enable_dmp_collection_module_sync: bool,
         preserve_forward_order: bool,
         enable_dmp_collection_consumer_waits: bool,
+        enable_dmp_collection_used_row_sync: bool,
     ) -> None:
         """
         This function is called in the init of the train pipeline, when 2D sharding is enabled.
@@ -747,6 +753,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._dmp_collection_module_sync_enabled = enable_dmp_collection_module_sync
         if preserve_forward_order and not enable_dmp_collection_module_sync:
             raise ValueError("preserve_forward_order requires module-granular sync")
+        if (
+            enable_dmp_collection_used_row_sync
+            and not enable_dmp_collection_module_sync
+        ):
+            raise ValueError("used-row sync requires module-granular sync")
         if dmp_collection_sync_interval_batches is None:
             if enable_dmp_collection_module_sync:
                 raise ValueError("module-granular sync requires a sync interval")
@@ -759,6 +770,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             self._model.enable_module_sync(
                 preserve_forward_order=preserve_forward_order,
                 consumer_waits=enable_dmp_collection_consumer_waits,
+                used_row_sync=enable_dmp_collection_used_row_sync,
             )
 
         logger.info(

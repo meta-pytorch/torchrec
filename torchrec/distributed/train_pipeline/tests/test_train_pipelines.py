@@ -1467,6 +1467,7 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         dmp.enable_module_sync.assert_called_once_with(
             preserve_forward_order=False,
             consumer_waits=True,
+            used_row_sync=False,
         )
         dmp.begin_module_sync_step.assert_called_once_with(enabled=True)
         dmp.finish_module_sync_step.assert_called_once_with()
@@ -1486,6 +1487,7 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         dmp.enable_module_sync.assert_called_once_with(
             preserve_forward_order=True,
             consumer_waits=True,
+            used_row_sync=False,
         )
         self.assertIs(
             pipeline._pipelined_forward_type,
@@ -1505,6 +1507,23 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         dmp.enable_module_sync.assert_called_once_with(
             preserve_forward_order=False,
             consumer_waits=False,
+            used_row_sync=False,
+        )
+
+    def test_module_sync_can_select_used_row_payloads(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            enable_dmp_collection_module_sync=True,
+            enable_dmp_collection_used_row_sync=True,
+        )
+
+        dmp.enable_module_sync.assert_called_once_with(
+            preserve_forward_order=False,
+            consumer_waits=True,
+            used_row_sync=True,
         )
 
     def test_preserve_forward_order_requires_module_sync(self) -> None:
