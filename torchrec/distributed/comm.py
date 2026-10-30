@@ -9,7 +9,8 @@
 
 import logging
 import os
-from typing import cast, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import cast, Iterator, List, Optional, Tuple
 
 import torch
 import torch._utils_internal
@@ -26,6 +27,98 @@ _CROSS_PG: Optional[dist.ProcessGroup] = None
 _INTRA_PG_2D: Optional[dist.ProcessGroup] = None
 _CROSS_PG_2D: Optional[dist.ProcessGroup] = None
 _NODE_GROUP_SIZE_2D: Optional[int] = None
+_LOCAL_TOPOLOGY: Optional[Tuple[int, int]] = None
+# Entered override_local_topology scopes, innermost last.
+_TOPOLOGY_SCOPES: List[object] = []
+
+
+@contextmanager
+def override_local_topology(local_size: int, local_rank: int) -> Iterator[None]:
+    """Scope a virtual host topology without changing the launch environment.
+
+    This is process-wide: worker threads see it too. Communication groups created
+    inside the scope belong to that topology and are destroyed when it exits, so
+    every rank enters and exits it together, and it must outlive any module
+    sharded inside it, since sharded modules keep using those groups. Nested
+    scopes restore the previous topology and its cached groups, and must exit in
+    the reverse order of entry: an out-of-order exit raises and changes nothing,
+    since restoring its topology would clobber the scope still open inside it.
+
+    Example::
+
+        with override_local_topology(local_size=8, local_rank=0):
+            intra_pg, cross_pg = intra_and_cross_node_pg()
+
+    Args:
+        local_size (int): ranks per virtual host, returned by ``get_local_size``.
+        local_rank (int): this rank's index on its virtual host, returned by
+            ``get_local_rank``.
+
+    Raises:
+        ValueError: if ``local_rank`` is not in ``[0, local_size)``.
+        RuntimeError: if scopes exit out of order.
+    """
+    if local_size <= 0 or not 0 <= local_rank < local_size:
+        raise ValueError(
+            "Local topology requires local_size > 0 and 0 <= local_rank < local_size; "
+            f"got local_size={local_size}, local_rank={local_rank}"
+        )
+    global _LOCAL_TOPOLOGY, _INTRA_PG, _CROSS_PG
+    global _INTRA_PG_2D, _CROSS_PG_2D, _NODE_GROUP_SIZE_2D
+    previous = (
+        _LOCAL_TOPOLOGY,
+        _INTRA_PG,
+        _CROSS_PG,
+        _INTRA_PG_2D,
+        _CROSS_PG_2D,
+        _NODE_GROUP_SIZE_2D,
+    )
+    scope = object()
+    _TOPOLOGY_SCOPES.append(scope)
+    _LOCAL_TOPOLOGY = (local_size, local_rank)
+    _INTRA_PG = _CROSS_PG = _INTRA_PG_2D = _CROSS_PG_2D = None
+    _NODE_GROUP_SIZE_2D = None
+    try:
+        yield
+    finally:
+        if _TOPOLOGY_SCOPES[-1] is not scope:
+            raise RuntimeError(
+                "override_local_topology scopes must exit in the reverse order of "
+                "entry"
+            )
+        _TOPOLOGY_SCOPES.pop()
+        try:
+            if dist.is_initialized():
+                world = dist.GroupMember.WORLD
+                destroyed: List[dist.ProcessGroup] = []
+                for group in (_INTRA_PG, _CROSS_PG, _INTRA_PG_2D, _CROSS_PG_2D):
+                    # Groups shared with the enclosing scope, such as the
+                    # default group, outlive this topology.
+                    if (
+                        group is None
+                        or group is world
+                        or any(group is outer for outer in previous[1:5])
+                        or any(group is done for done in destroyed)
+                    ):
+                        continue
+                    destroyed.append(group)
+                    try:
+                        dist.destroy_process_group(group)
+                    except Exception as e:
+                        # Cleanup is best effort: keep releasing the other groups
+                        # and do not mask how the scope's body ended.
+                        logger.warning(
+                            "Could not destroy a local-topology process group: %s", e
+                        )
+        finally:
+            (
+                _LOCAL_TOPOLOGY,
+                _INTRA_PG,
+                _CROSS_PG,
+                _INTRA_PG_2D,
+                _CROSS_PG_2D,
+                _NODE_GROUP_SIZE_2D,
+            ) = previous
 
 
 def _env2int(env_list: List[str], default: int = -1) -> int:
@@ -43,14 +136,18 @@ def get_local_size(world_size: Optional[int] = None) -> int:
     Gets the local world size (see https://pytorch.org/docs/stable/elastic/run.html)
     This is usually the size of workers on each node, or nproc_per_node
     """
-    local_size = _env2int(
-        [
-            "LOCAL_WORLD_SIZE",
-            "MPI_LOCALNRANKS",
-            "OMPI_COMM_WORLD_LOCAL_SIZE",
-            "MV2_COMM_WORLD_LOCAL_SIZE",
-        ],
-        8,
+    local_size = (
+        _LOCAL_TOPOLOGY[0]
+        if _LOCAL_TOPOLOGY is not None
+        else _env2int(
+            [
+                "LOCAL_WORLD_SIZE",
+                "MPI_LOCALNRANKS",
+                "OMPI_COMM_WORLD_LOCAL_SIZE",
+                "MV2_COMM_WORLD_LOCAL_SIZE",
+            ],
+            8,
+        )
     )
 
     if local_size == -1 or world_size % local_size != 0:
@@ -75,14 +172,18 @@ def get_local_rank(world_size: Optional[int] = None, rank: Optional[int] = None)
     Gets the local rank of the local processes (see https://pytorch.org/docs/stable/elastic/run.html)
     This is usually the rank of the worker on its node
     """
-    my_local_rank = _env2int(
-        [
-            "LOCAL_RANK",
-            "MPI_LOCALRANKID",
-            "OMPI_COMM_WORLD_LOCAL_RANK",
-            "MV2_COMM_WORLD_LOCAL_RANK",
-        ],
-        -1,
+    my_local_rank = (
+        _LOCAL_TOPOLOGY[1]
+        if _LOCAL_TOPOLOGY is not None
+        else _env2int(
+            [
+                "LOCAL_RANK",
+                "MPI_LOCALRANKID",
+                "OMPI_COMM_WORLD_LOCAL_RANK",
+                "MV2_COMM_WORLD_LOCAL_RANK",
+            ],
+            -1,
+        )
     )
     local_size = get_local_size(world_size)
 
