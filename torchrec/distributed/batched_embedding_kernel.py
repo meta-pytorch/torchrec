@@ -174,6 +174,7 @@ RES_NUM_HBM_COPY_THREADS_STR = "res_num_hbm_copy_threads"
 ENABLE_RAW_EMBEDDING_STREAMING_STR = "enable_raw_embedding_streaming"
 ENABLE_HBM_STREAMING_STR = "enable_hbm_streaming"
 RES_HBM_DRAIN_INTERVAL_STR = "res_hbm_drain_interval"
+RES_HBM_DRAIN_INTERVAL_PER_TABLE_STR = "res_hbm_drain_interval_per_table"
 RES_USE_COPY_DONE_TOKEN_STR = "res_use_copy_done_token"
 _DEFAULT_TBE_CHUNK_SIZE_LIMIT: int = 1024**3
 
@@ -379,6 +380,14 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
     res_hbm_drain_interval = fused_params.pop(RES_HBM_DRAIN_INTERVAL_STR, None)
     if res_hbm_drain_interval is not None:
         res_params.res_hbm_drain_interval = res_hbm_drain_interval
+    # A JSON string, since fused_params is hashed into the TBE grouping key.
+    res_hbm_drain_interval_per_table_json = fused_params.pop(
+        RES_HBM_DRAIN_INTERVAL_PER_TABLE_STR, None
+    )
+    if res_hbm_drain_interval_per_table_json is not None:
+        res_params.res_hbm_drain_interval_per_table = json.loads(
+            res_hbm_drain_interval_per_table_json
+        )
     res_use_copy_done_token = fused_params.pop(RES_USE_COPY_DONE_TOKEN_STR, None)
     if res_use_copy_done_token is not None:
         res_params.res_use_copy_done_token = res_use_copy_done_token
