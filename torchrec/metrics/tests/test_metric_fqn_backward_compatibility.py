@@ -110,6 +110,7 @@ from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
+from torchrec.models.dlrm import DLRM
 from torchrec.modules.activation import SwishLayerNorm
 from torchrec.modules.crossnet import (
     CrossNet,
@@ -128,6 +129,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
+from torchrec.modules.feature_processor import PositionWeightedModule
 from torchrec.modules.feature_processor_ import PositionWeightedModuleCollection
 from torchrec.modules.fp_embedding_modules import FeatureProcessedEmbeddingBagCollection
 from torchrec.modules.hash_mc_evictions import (
@@ -513,6 +515,26 @@ def _make_fp_embedding_bag_collection() -> FeatureProcessedEmbeddingBagCollectio
     )
 
 
+def _make_dlrm() -> DLRM:
+    # DLRM requires the last dense layer to match the embedding dim.
+    return DLRM(
+        embedding_bag_collection=EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name=_TABLE_NAME,
+                    embedding_dim=4,
+                    num_embeddings=50,
+                    feature_names=[_FEATURE_NAME],
+                )
+            ],
+            device=torch.device("cpu"),
+        ),
+        dense_in_features=4,
+        dense_arch_layer_sizes=[8, 4],
+        over_arch_layer_sizes=[8, 1],
+    )
+
+
 class _ITEPEmbedding(torch.nn.Module):
     def __init__(self, table: ShardedEmbeddingTable) -> None:
         super().__init__()
@@ -812,6 +834,14 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         "",
         lambda: PositionWeightedModuleCollection({_FEATURE_NAME: 8}),
     ),
+    # The older class in `feature_processor`, not the `feature_processor_` one
+    # the collection above is built from. Both store `position_weights`.
+    _GoldenCase(
+        "position_weighted_module",
+        PositionWeightedModule,
+        "",
+        lambda: PositionWeightedModule({_FEATURE_NAME: 8}),
+    ),
     _GoldenCase(
         "feature_processed_embedding_bag_collection",
         FeatureProcessedEmbeddingBagCollection,
@@ -850,6 +880,8 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         "",
         lambda: LowRankMixtureCrossNet(in_features=4, num_layers=2),
     ),
+    # A whole model. The arch attribute names prefix every key.
+    _GoldenCase("dlrm", DLRM, "", _make_dlrm),
 )
 
 

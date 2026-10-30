@@ -306,6 +306,19 @@
       "kernels.1"
     ]
   },
+  "dlrm": {
+    "state_dict_keys": [
+      "dense_arch.model._mlp.0._linear.bias",
+      "dense_arch.model._mlp.0._linear.weight",
+      "dense_arch.model._mlp.1._linear.bias",
+      "dense_arch.model._mlp.1._linear.weight",
+      "over_arch.model.0._mlp.0._linear.bias",
+      "over_arch.model.0._mlp.0._linear.weight",
+      "over_arch.model.1.bias",
+      "over_arch.model.1.weight",
+      "sparse_arch.embedding_bag_collection.embedding_bags.table1.weight"
+    ]
+  },
   "embedding_bag_collection": {
     "state_dict_keys": [
       "embedding_bags.table1.weight"
@@ -489,6 +502,11 @@
     "state_dict_keys": [
       "_linear.bias",
       "_linear.weight"
+    ]
+  },
+  "position_weighted_module": {
+    "state_dict_keys": [
+      "position_weights.feature1"
     ]
   },
   "position_weighted_module_collection": {
