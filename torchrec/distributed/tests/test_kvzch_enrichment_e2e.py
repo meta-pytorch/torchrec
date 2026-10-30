@@ -223,6 +223,18 @@ def _build_write_kjt(
     )
 
 
+def _build_row_write_kjt(
+    hashed_ids: List[int], rows: torch.Tensor, device: torch.device
+) -> KeyedJaggedTensor:
+    """Build the KJT of a row write: one row as wide as the table per hashed ID."""
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=[FEATURE_NAME],
+        values=torch.tensor(hashed_ids, dtype=torch.int64, device=device),
+        lengths=torch.ones(len(hashed_ids), dtype=torch.int32, device=device),
+        weights=rows,
+    )
+
+
 def _build_multi_feature_kjt(
     ids_by_feature: list[list[int]],
     device: torch.device,
@@ -987,6 +999,101 @@ def _run_serving_qdq_round_trip(
         assert emb_module.ssd_db.serving_qdq_existing_rows() == 0
 
 
+def _run_owner_local_cache_row_write(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    """Row writes fill only absent or all-zero rows; Laser writes still work."""
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        assert ctx.pg is not None
+        sharded_model = _build_sharded_model(
+            ctx, world_size, local_size, owner_local_cache=True
+        )
+        laser_hashed_ids = [101, 202]
+        laser_unhashed_ids = [1010, 2020]
+        laser_kjt = _build_input_kjt(laser_hashed_ids, ctx.device)
+        laser_expected = torch.stack(
+            [_expected_fake_row(uid, EMBEDDING_DIM) for uid in laser_unhashed_ids]
+        )
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(
+            _build_write_kjt(laser_hashed_ids, laser_unhashed_ids, ctx.device)
+        )
+        torch.cuda.synchronize()
+        _wait_for_cache_fill(sharded_model, laser_kjt, len(laser_hashed_ids))
+
+        new_ids = [303, 404]
+        zero_id = 505
+        # Citrine C3: construct test inputs directly on their target CUDA device.
+        new_rows = 0.25 * torch.arange(
+            1,
+            1 + len(new_ids) * EMBEDDING_DIM,
+            dtype=torch.float32,
+            device=ctx.device,
+        ).reshape(len(new_ids), EMBEDDING_DIM)
+        # A repeated ID, an all-zero row, and rows for the Laser-filled IDs,
+        # which must keep their Laser values.
+        write_ids = new_ids + [new_ids[0], zero_id] + laser_hashed_ids
+        write_rows = torch.cat(
+            [
+                new_rows,
+                new_rows[:1],
+                torch.zeros(1, EMBEDDING_DIM, device=ctx.device),
+                torch.full(
+                    (len(laser_hashed_ids), EMBEDDING_DIM), -7.0, device=ctx.device
+                ),
+            ]
+        )
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(_build_row_write_kjt(write_ids, write_rows, ctx.device))
+        torch.cuda.synchronize()
+
+        new_kjt = _build_input_kjt(new_ids, ctx.device)
+        filled_rows = _wait_for_cache_fill(sharded_model, new_kjt, len(new_ids))
+        torch.testing.assert_close(
+            filled_rows.float().cpu(), new_rows.cpu(), rtol=1e-2, atol=1e-2
+        )
+        torch.testing.assert_close(
+            _read_rows(sharded_model, laser_kjt).float().cpu(),
+            laser_expected,
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        zero_rows = _read_rows(sharded_model, _build_input_kjt([zero_id], ctx.device))
+        assert zero_rows.float().abs().sum().item() < 1e-6
+
+        # The next write cadence moves the written rows into the owner-local
+        # cache, and a Laser write still fills new IDs.
+        more_hashed_ids = [606, 707]
+        more_unhashed_ids = [6060, 7070]
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(
+            _build_write_kjt(more_hashed_ids, more_unhashed_ids, ctx.device)
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            _read_rows(sharded_model, new_kjt).float().cpu(),
+            new_rows.cpu(),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        hits, queries = _owner_local_cache(sharded_model).last_hit_counts()
+        assert hits == queries
+        more_kjt = _build_input_kjt(more_hashed_ids, ctx.device)
+        torch.testing.assert_close(
+            _wait_for_cache_fill(sharded_model, more_kjt, len(more_hashed_ids))
+            .float()
+            .cpu(),
+            torch.stack(
+                [_expected_fake_row(uid, EMBEDDING_DIM) for uid in more_unhashed_ids]
+            ),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+
 def _enrichment_cache(sharded_model: DistributedModelParallel) -> Any:
     sharded_ec = cast(Any, sharded_model.module.ec)
     for lookup in sharded_ec._lookups:
@@ -1163,6 +1270,16 @@ class TestKvzchEnrichmentE2E(MultiProcessTestBase):
         self._require_enrichment_policy_fields(_OWNER_LOCAL_CACHE_POLICY_FIELDS)
         self._run_multi_process_test(
             callable=_run_owner_local_cache_bounded_read_populate_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_owner_local_row_writes_fill_only_empty_rows(self) -> None:
+        world_size = 2
+        self._require_test_runtime(world_size)
+        self._require_enrichment_policy_fields(_OWNER_LOCAL_CACHE_POLICY_FIELDS)
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_row_write,
             world_size=world_size,
             backend="nccl",
         )
