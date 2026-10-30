@@ -2975,8 +2975,34 @@ class ZeroCollisionEmbeddingEnrichmentCache(ZeroCollisionKeyValueEmbedding):
     def update(self, embeddings: KeyedJaggedTensor) -> None:
         """
         Update the embedding table with the new embeddings.
+
+        An enrichment write carries each raw id as two float32 lanes; weights as
+        wide as the table are rows, and go to update_rows.
         """
+        weights = embeddings.weights_or_none()
+        if (
+            weights is not None
+            and weights.dim() == 2
+            and weights.size(1) == self._local_cols[0]
+        ):
+            self.update_rows(embeddings)
+            return
         self.emb_module.enrichment_query_id(
+            embeddings.values(), embeddings.offsets(), embeddings.weights()
+        )
+
+    def update_rows(self, embeddings: KeyedJaggedTensor) -> None:
+        """
+        Write rows of the table's width that the trainer already has (e.g. an
+        item embedding feature) through the enrichment write path, into keys
+        whose rows are absent or all-zero.
+        """
+        if not self.emb_module.ssd_db._has_method("set_embedding_cache_rows_cuda"):
+            raise RuntimeError(
+                "KVZCH row writes need an fbgemm_gpu build with "
+                "set_embedding_cache_rows_cuda; rebuild light_cli"
+            )
+        self.emb_module.enrichment_write_rows(
             embeddings.values(), embeddings.offsets(), embeddings.weights()
         )
 
