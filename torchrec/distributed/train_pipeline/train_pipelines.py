@@ -218,6 +218,9 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
             or interval_batches is None
         ):
             return
+        if getattr(self, "_dmp_collection_module_sync_enabled", False):
+            model.finish_module_sync_step()
+            return
 
         if not context:
             logger.warning(
@@ -576,6 +579,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             (applicable to 2D sharding only)
             if set and DMP collection is enabled for 2D sharding,
             sync DMPs every N batches (default to 1, i.e. every batch, None to disable)
+        enable_dmp_collection_module_sync (bool):
+            enable asynchronous per-module replica synchronization from fused
+            update hooks instead of one blocking post-backward DMP sync. The
+            module set and deterministic order come from the DMP sharding plan.
         free_features_storage_early (bool): if True, free the original batch KJT
             tensor storage right after permute in input_dist.  Safe because
             PipelinedForward ignores the KJT args during model forward.
@@ -605,6 +612,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enable_dmp_collection_module_sync: bool = False,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
@@ -703,10 +711,15 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._batch_ip2: Optional[In] = None
         self._context: TrainPipelineContext = context_type(version=0)
 
-        self._init_2d_sharding(dmp_collection_sync_interval_batches)
+        self._init_2d_sharding(
+            dmp_collection_sync_interval_batches,
+            enable_dmp_collection_module_sync,
+        )
 
     def _init_2d_sharding(
-        self, dmp_collection_sync_interval_batches: Optional[int]
+        self,
+        dmp_collection_sync_interval_batches: Optional[int],
+        enable_dmp_collection_module_sync: bool,
     ) -> None:
         """
         This function is called in the init of the train pipeline, when 2D sharding is enabled.
@@ -715,6 +728,18 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._dmp_collection_sync_interval_batches = (
             dmp_collection_sync_interval_batches
         )
+        if (
+            self._dmp_collection_sync_interval_batches is not None
+            and self._dmp_collection_sync_interval_batches <= 0
+        ):
+            raise ValueError("DMP collection sync interval must be positive")
+        self._dmp_collection_module_sync_enabled = enable_dmp_collection_module_sync
+        if self._dmp_collection_module_sync_enabled:
+            if not has_2d_support or not isinstance(self._model, DMPCollection):
+                raise ValueError("module-granular sync requires a DMPCollection model")
+            if self._dmp_collection_sync_interval_batches is None:
+                raise ValueError("module-granular sync requires a sync interval")
+            self._model.enable_module_sync()
 
         if self._dmp_collection_sync_interval_batches is not None:
             logger.info(
@@ -725,6 +750,22 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                 f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
                 f"{self._dmp_collection_sync_interval_batches} batches"
             )
+
+    def _begin_module_sync_step(self, context: TrainPipelineContext) -> None:
+        if not self._dmp_collection_module_sync_enabled:
+            return
+        index = context.index
+        assert index is not None, "pipeline context does not have a batch index"
+        interval = self._dmp_collection_sync_interval_batches
+        assert interval is not None
+        cast(DMPCollection, self._model).begin_module_sync_step(
+            enabled=index % interval == 0
+        )
+
+    def wait_for_pending_module_syncs(self) -> None:
+        """Drain outstanding module-granular replica synchronization."""
+        if self._dmp_collection_module_sync_enabled:
+            cast(DMPCollection, self._model).wait_all_module_syncs()
 
     def __del__(self) -> None:
         # Best-effort shutdown of the async in-place copy worker (no-op if unused).
@@ -934,6 +975,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
 
         # fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
         self.fill_pipeline(dataloader_iter)
+        self.wait_for_pending_module_syncs()
 
         # here is the expected stop after exhausting all batches
         if not self.batches:
@@ -982,8 +1024,8 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         if self._model.training:
             # backward
             self._state = PipelineState.CALL_BWD
+            self._begin_module_sync_step(self.contexts[0])
             self._backward(losses)
-
             self.sync_embeddings(
                 self._model,
                 self._dmp_collection_sync_interval_batches,

@@ -2132,11 +2132,11 @@ class DMPCollection(DistributedModelParallel):
             return
         claimed_kernel_ids: Set[int] = set()
         units: Dict[str, List[_DMPModuleSyncUnit]] = {}
-        module_fqns = sorted(
+        module_fqns_to_discover = sorted(
             self._plan.plan,
             key=lambda fqn: (-fqn.count("."), fqn),
         )
-        for module_fqn in module_fqns:
+        for module_fqn in module_fqns_to_discover:
             owner = self.module.get_submodule(module_fqn)
             reachable_ids = self._reachable_module_ids(owner)
             module_units = []
@@ -2241,6 +2241,95 @@ class DMPCollection(DistributedModelParallel):
                 for work in handle.weight_works + handle.optimizer_works:
                     work.wait()
         self._pending_module_syncs.clear()
+
+    def enable_module_sync(self) -> None:
+        """Launch module syncs from fused updates.
+
+        The sharding plan provides the stable forward module order shared by
+        every replica rank. Its reverse is the deterministic backward
+        collective order. Each module starts as soon as all of its physical
+        kernels have completed their fused update and every preceding module
+        in that order has started.
+        """
+        if getattr(self, "_module_sync_hook_handles", None):
+            raise RuntimeError("module sync hooks are already enabled")
+        self._module_sync_backward_order = tuple(reversed(self.module_sync_fqns))
+        self._module_sync_hook_handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._module_sync_step_enabled = False
+        self._module_sync_ready_fqns: Set[str] = set()
+        self._module_sync_updated_kernels: Dict[str, Set[int]] = {}
+        self._module_sync_next_index = 0
+
+        for module_fqn in self._module_sync_backward_order:
+            for unit in self._module_sync_units[module_fqn]:
+                register_post_update = getattr(
+                    unit.kernel,
+                    "register_post_fused_update_hook",
+                    None,
+                )
+                if register_post_update is None:
+                    raise ValueError(
+                        f"kernel {type(unit.kernel).__name__} for '{module_fqn}' "
+                        "does not support post-fused-update hooks"
+                    )
+                kernel_id = id(unit.kernel)
+
+                def post_update(
+                    fqn: str = module_fqn,
+                    kernel_identity: int = kernel_id,
+                ) -> None:
+                    self._mark_module_kernel_updated(fqn, kernel_identity)
+
+                self._module_sync_hook_handles.append(register_post_update(post_update))
+
+    def begin_module_sync_step(self, enabled: bool) -> None:
+        """Arm post-update launches for one backward pass."""
+        if not getattr(self, "_module_sync_hook_handles", None):
+            raise RuntimeError("module sync hooks are not enabled")
+        if self._module_sync_step_enabled:
+            raise RuntimeError("the previous module sync step has not finished")
+        self._module_sync_step_enabled = enabled
+        self._module_sync_ready_fqns.clear()
+        self._module_sync_updated_kernels.clear()
+        self._module_sync_next_index = 0
+
+    def _mark_module_kernel_updated(self, module_fqn: str, kernel_id: int) -> None:
+        if not self._module_sync_step_enabled:
+            return
+        updated = self._module_sync_updated_kernels.setdefault(module_fqn, set())
+        if kernel_id in updated:
+            raise RuntimeError(
+                f"kernel for '{module_fqn}' completed more than once in one step"
+            )
+        updated.add(kernel_id)
+        if len(updated) == len(self._module_sync_units[module_fqn]):
+            self._module_sync_ready_fqns.add(module_fqn)
+        self._launch_ready_module_syncs()
+
+    def _launch_ready_module_syncs(self) -> None:
+        while self._module_sync_next_index < len(self._module_sync_backward_order):
+            module_fqn = self._module_sync_backward_order[self._module_sync_next_index]
+            if module_fqn not in self._module_sync_ready_fqns:
+                return
+            self.start_module_sync(module_fqn)
+            self._module_sync_next_index += 1
+
+    def finish_module_sync_step(self) -> None:
+        """Verify that every configured module launched on this sync step."""
+        if self._module_sync_step_enabled and self._module_sync_next_index != len(
+            self._module_sync_backward_order
+        ):
+            missing = self._module_sync_backward_order[self._module_sync_next_index :]
+            raise RuntimeError(f"module sync hooks did not fire for {missing}")
+        self._module_sync_step_enabled = False
+
+    def disable_module_sync(self) -> None:
+        """Drain outstanding work and remove automatic module-sync hooks."""
+        self.wait_all_module_syncs()
+        for handle in getattr(self, "_module_sync_hook_handles", []):
+            handle.remove()
+        self._module_sync_hook_handles = []
+        self._module_sync_step_enabled = False
 
     @property
     def device_mesh(self) -> DeviceMesh:

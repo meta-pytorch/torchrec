@@ -1438,6 +1438,35 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
 
         dmp.assert_called_once()
 
+    def test_module_sync_brackets_backward_without_global_sync(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        dmp.training = True
+        dmp.return_value = (
+            torch.tensor(0.1, requires_grad=True),
+            torch.tensor(2),
+        )
+        pipeline = TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            dmp_collection_sync_interval_batches=10,
+            enable_dmp_collection_module_sync=True,
+        )
+        context = TrainPipelineContext(index=10)
+        mock_data = MagicMock(spec=Pipelineable)
+        for _ in range(3):
+            pipeline.batches.append(mock_data)
+            pipeline.contexts.append(context)
+
+        with self._mocked_pipeline(pipeline):
+            pipeline.progress(MagicMock())
+
+        dmp.enable_module_sync.assert_called_once_with()
+        dmp.begin_module_sync_step.assert_called_once_with(enabled=True)
+        dmp.finish_module_sync_step.assert_called_once_with()
+        dmp.wait_all_module_syncs.assert_called_once_with()
+        dmp.sync.assert_not_called()
+
 
 class _NoConsumerWaitTrainPipelineSparseDist(TrainPipelineSparseDist):
     """Skips the consumer-stream wait to reproduce the race it prevents."""
