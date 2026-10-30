@@ -110,6 +110,7 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
     InSyncEmbeddingPipelinedForward,
     PipelinedForward,
     PrefetchPipelinedForward,
+    PreserveForwardOrderPipelinedForward,
 )
 from torchrec.distributed.train_pipeline.tracing import PipelinedPostproc
 from torchrec.distributed.train_pipeline.types import PipelineState
@@ -217,6 +218,9 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
             or not isinstance(model, DMPCollection)
             or interval_batches is None
         ):
+            return
+        if getattr(self, "_dmp_collection_module_sync_enabled", False):
+            model.finish_module_sync_step()
             return
 
         if not context:
@@ -576,6 +580,19 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             (applicable to 2D sharding only)
             if set and DMP collection is enabled for 2D sharding,
             sync DMPs every N batches (default to 1, i.e. every batch, None to disable)
+        enable_dmp_collection_module_sync (bool):
+            enable asynchronous per-module replica synchronization from fused
+            update hooks instead of one blocking post-backward DMP sync. The
+            module set and deterministic order come from the DMP sharding plan.
+        preserve_forward_order (bool):
+            execute independent sparse backward branches in forward lookup order.
+            Requires module-granular DMP synchronization.
+        enable_dmp_collection_consumer_waits (bool):
+            wait for each module's synchronized weights and optimizer state only
+            at that module's next consumers. Disable to use the coarse pipeline drain.
+        enable_dmp_collection_used_row_sync (bool):
+            only synchronize replica rows accessed by each embedding lookup instead of all rows.
+            Requires module-granular DMP synchronization and defaults to full-row sync.
         free_features_storage_early (bool): if True, free the original batch KJT
             tensor storage right after permute in input_dist.  Safe because
             PipelinedForward ignores the KJT args during model forward.
@@ -605,6 +622,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enable_dmp_collection_module_sync: bool = False,
+        preserve_forward_order: bool = False,
+        enable_dmp_collection_consumer_waits: bool = True,
+        enable_dmp_collection_used_row_sync: bool = False,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
@@ -682,6 +703,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._dataloader_iter: Optional[Iterator[In]] = None
         self._dataloader_exhausted: bool = False
         self._context_type: Type[TrainPipelineContext] = context_type
+        self._preserve_forward_order = preserve_forward_order
+        if preserve_forward_order:
+            self._pipelined_forward_type = PreserveForwardOrderPipelinedForward
 
         # Opt-in: offload the in-place H2D copy dispatch to a background thread.
         # Must run after self.batches / self._memcpy_stream / self._device are set.
@@ -703,10 +727,21 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._batch_ip2: Optional[In] = None
         self._context: TrainPipelineContext = context_type(version=0)
 
-        self._init_2d_sharding(dmp_collection_sync_interval_batches)
+        self._init_2d_sharding(
+            dmp_collection_sync_interval_batches,
+            enable_dmp_collection_module_sync,
+            preserve_forward_order,
+            enable_dmp_collection_consumer_waits,
+            enable_dmp_collection_used_row_sync,
+        )
 
     def _init_2d_sharding(
-        self, dmp_collection_sync_interval_batches: Optional[int]
+        self,
+        dmp_collection_sync_interval_batches: Optional[int],
+        enable_dmp_collection_module_sync: bool,
+        preserve_forward_order: bool,
+        enable_dmp_collection_consumer_waits: bool,
+        enable_dmp_collection_used_row_sync: bool,
     ) -> None:
         """
         This function is called in the init of the train pipeline, when 2D sharding is enabled.
@@ -715,16 +750,60 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._dmp_collection_sync_interval_batches = (
             dmp_collection_sync_interval_batches
         )
+        self._dmp_collection_module_sync_enabled = enable_dmp_collection_module_sync
+        if preserve_forward_order and not enable_dmp_collection_module_sync:
+            raise ValueError("preserve_forward_order requires module-granular sync")
+        if (
+            enable_dmp_collection_used_row_sync
+            and not enable_dmp_collection_module_sync
+        ):
+            raise ValueError("used-row sync requires module-granular sync")
+        if dmp_collection_sync_interval_batches is None:
+            if enable_dmp_collection_module_sync:
+                raise ValueError("module-granular sync requires a sync interval")
+            return
+        if dmp_collection_sync_interval_batches <= 0:
+            raise ValueError("DMP collection sync interval must be positive")
+        if enable_dmp_collection_module_sync:
+            if not has_2d_support or not isinstance(self._model, DMPCollection):
+                raise ValueError("module-granular sync requires a DMPCollection model")
+            self._model.enable_module_sync(
+                preserve_forward_order=preserve_forward_order,
+                consumer_waits=enable_dmp_collection_consumer_waits,
+                used_row_sync=enable_dmp_collection_used_row_sync,
+            )
 
-        if self._dmp_collection_sync_interval_batches is not None:
-            logger.info(
-                f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
-                f"{self._dmp_collection_sync_interval_batches} batches"
-            )
-            one_time_rank0_logger.info(
-                f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
-                f"{self._dmp_collection_sync_interval_batches} batches"
-            )
+        logger.info(
+            f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
+            f"{dmp_collection_sync_interval_batches} batches"
+        )
+        one_time_rank0_logger.info(
+            f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
+            f"{dmp_collection_sync_interval_batches} batches"
+        )
+
+    def _begin_module_sync_step(self, context: TrainPipelineContext) -> None:
+        if not self._dmp_collection_module_sync_enabled:
+            return
+        index = context.index
+        assert index is not None, "pipeline context does not have a batch index"
+        interval = self._dmp_collection_sync_interval_batches
+        assert interval is not None
+        cast(DMPCollection, self._model).begin_module_sync_step(
+            enabled=index % interval == 0
+        )
+
+    def wait_for_pending_module_syncs(self) -> None:
+        """Drain outstanding module-granular replica synchronization."""
+        if self._dmp_collection_module_sync_enabled:
+            cast(DMPCollection, self._model).wait_all_module_syncs()
+
+    def _wait_before_module_sync_step(self) -> None:
+        if not self._dmp_collection_module_sync_enabled:
+            return
+        model = cast(DMPCollection, self._model)
+        if not model.module_sync_uses_consumer_waits:
+            model.wait_all_module_syncs()
 
     def __del__(self) -> None:
         # Best-effort shutdown of the async in-place copy worker (no-op if unused).
@@ -934,6 +1013,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
 
         # fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
         self.fill_pipeline(dataloader_iter)
+        self._wait_before_module_sync_step()
 
         # here is the expected stop after exhausting all batches
         if not self.batches:
@@ -982,8 +1062,8 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         if self._model.training:
             # backward
             self._state = PipelineState.CALL_BWD
+            self._begin_module_sync_step(self.contexts[0])
             self._backward(losses)
-
             self.sync_embeddings(
                 self._model,
                 self._dmp_collection_sync_interval_batches,
@@ -1027,6 +1107,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             pipelined_forward=pipelined_forward,
             pipeline_postproc=self._pipeline_postproc,
         )
+        self._configure_sparse_backward_order()
         if self._free_features_storage_early:
             for module in self._pipelined_modules:
                 if hasattr(module, "_free_features_storage_early"):
@@ -1042,6 +1123,19 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
             self._pipelined_modules
         )
+
+    def _configure_sparse_backward_order(self) -> None:
+        if not self._preserve_forward_order:
+            return
+        module_count = len(self._pipelined_modules)
+        for index, module in enumerate(self._pipelined_modules):
+            forward = module.forward
+            if not isinstance(forward, PreserveForwardOrderPipelinedForward):
+                raise RuntimeError(
+                    "forward-ordered sparse backward requires "
+                    "PreserveForwardOrderPipelinedForward"
+                )
+            forward.set_backward_priority(module_count - index)
 
     def reset(self) -> None:
         self.contexts.clear()
