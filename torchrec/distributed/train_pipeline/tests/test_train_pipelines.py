@@ -1464,11 +1464,57 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         with self._mocked_pipeline(pipeline):
             pipeline.progress(MagicMock())
 
-        dmp.enable_module_sync.assert_called_once_with()
+        dmp.enable_module_sync.assert_called_once_with(
+            preserve_forward_order=False,
+            consumer_waits=True,
+        )
         dmp.begin_module_sync_step.assert_called_once_with(enabled=True)
         dmp.finish_module_sync_step.assert_called_once_with()
         dmp.wait_all_module_syncs.assert_not_called()
         dmp.sync.assert_not_called()
+
+    def test_module_sync_preserve_forward_order_configuration(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        pipeline = TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            enable_dmp_collection_module_sync=True,
+            preserve_forward_order=True,
+        )
+
+        dmp.enable_module_sync.assert_called_once_with(
+            preserve_forward_order=True,
+            consumer_waits=True,
+        )
+        self.assertIs(
+            pipeline._pipelined_forward_type,
+            PreserveForwardOrderPipelinedForward,
+        )
+
+    def test_module_sync_can_disable_consumer_waits(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            enable_dmp_collection_module_sync=True,
+            enable_dmp_collection_consumer_waits=False,
+        )
+
+        dmp.enable_module_sync.assert_called_once_with(
+            preserve_forward_order=False,
+            consumer_waits=False,
+        )
+
+    def test_preserve_forward_order_requires_module_sync(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires module-granular sync"):
+            TrainPipelineSparseDist(
+                MagicMock(spec=DMPCollection),
+                MagicMock(spec=torch.optim.Optimizer),
+                device=torch.device("cpu"),
+                preserve_forward_order=True,
+            )
 
     def test_preserve_forward_order_prioritizes_all_sparse_groups(self) -> None:
         events: List[int] = []

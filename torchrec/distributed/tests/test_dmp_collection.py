@@ -667,9 +667,42 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         self.assertTrue(dmp._module_sync_units_initialized)
         self.assertTrue(dmp.module_sync_uses_consumer_waits)
         self.assertEqual(dmp.module_sync_fqns, ("ebc1", "ebc2"))
-        self.assertEqual(dmp._module_sync_backward_order, ("ebc2", "ebc1"))
+        self.assertEqual(dmp._module_sync_collective_order, ("ebc2", "ebc1"))
         dmp.disable_module_sync()
         self.assertFalse(dmp.module_sync_uses_consumer_waits)
+
+    def test_enable_module_sync_uses_forward_order_for_prioritized_backward(
+        self,
+    ) -> None:
+        model = MockTwoEmbeddingModel(
+            MockHookableEmbeddingKernel(),
+            MockHookableEmbeddingKernel(),
+        )
+        dmp, _, _ = self._module_sync_dmp(model, ("ebc1", "ebc2"))
+
+        dmp.enable_module_sync(preserve_forward_order=True)
+
+        self.assertEqual(dmp._module_sync_collective_order, ("ebc1", "ebc2"))
+        dmp.disable_module_sync()
+
+    def test_enable_module_sync_can_disable_consumer_waits(self) -> None:
+        kernels = [MockHookableEmbeddingKernel(), MockHookableEmbeddingKernel()]
+        dmp, _, _ = self._module_sync_dmp(
+            MockTwoEmbeddingModel(*kernels),
+            ("ebc1", "ebc2"),
+        )
+
+        dmp.enable_module_sync(consumer_waits=False)
+
+        self.assertFalse(dmp.module_sync_uses_consumer_waits)
+        self.assertEqual(
+            [len(kernel.post_update_callbacks) for kernel in kernels], [1, 1]
+        )
+        self.assertEqual([len(kernel._forward_pre_hooks) for kernel in kernels], [0, 0])
+        self.assertEqual(
+            [len(kernel._backward_pre_hooks) for kernel in kernels], [0, 0]
+        )
+        dmp.disable_module_sync()
 
     def test_nested_plan_assigns_multiple_kernels_to_deepest_owner(self) -> None:
         kernels = [MockHookableEmbeddingKernel(), MockHookableEmbeddingKernel()]

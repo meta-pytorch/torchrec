@@ -2271,28 +2271,40 @@ class DMPCollection(DistributedModelParallel):
             self.wait_module_weights(module_fqn)
             self.wait_module_optimizer_state(module_fqn)
 
-    def enable_module_sync(self) -> None:
+    def enable_module_sync(
+        self,
+        *,
+        preserve_forward_order: bool = False,
+        consumer_waits: bool = True,
+    ) -> None:
         """Launch module syncs from fused updates.
 
         The sharding plan provides the stable forward module order shared by
-        every replica rank. Its reverse is the deterministic backward
-        collective order. Each module starts as soon as all of its physical
-        kernels have completed their fused update and every preceding module
-        in that order has started.
+        every replica rank. The collective order follows backward execution:
+        reverse plan order by default, or plan order when forward order is
+        preserved. Each module starts as soon as all of its physical kernels
+        have completed their fused update and every preceding module in that
+        order has started.
         """
         if getattr(self, "_module_sync_hook_handles", None):
             raise RuntimeError("module sync hooks are already enabled")
         self._ensure_module_sync_units()
         if not self._module_sync_units:
             raise ValueError("DMPCollection has no syncable planned embedding modules")
-        self._module_sync_backward_order = tuple(reversed(self.module_sync_fqns))
+        module_sync_fqns = self.module_sync_fqns
+        self._module_sync_collective_order = (
+            module_sync_fqns
+            if preserve_forward_order
+            else tuple(reversed(module_sync_fqns))
+        )
         self._module_sync_hook_handles: List[torch.utils.hooks.RemovableHandle] = []
         self._module_sync_step_enabled = False
         self._module_sync_ready_fqns: Set[str] = set()
         self._module_sync_updated_kernels: Dict[str, Set[int]] = {}
         self._module_sync_next_index = 0
+        self._module_sync_consumer_waits_enabled = consumer_waits
 
-        for module_fqn in self._module_sync_backward_order:
+        for module_fqn in module_sync_fqns:
             for unit in self._module_sync_units[module_fqn]:
                 register_post_update = getattr(
                     unit.kernel,
@@ -2313,6 +2325,9 @@ class DMPCollection(DistributedModelParallel):
                     self._mark_module_kernel_updated(fqn, kernel_identity)
 
                 self._module_sync_hook_handles.append(register_post_update(post_update))
+
+                if not self._module_sync_consumer_waits_enabled:
+                    continue
 
                 def before_lookup(
                     _module: nn.Module,
@@ -2335,7 +2350,6 @@ class DMPCollection(DistributedModelParallel):
                 self._module_sync_hook_handles.append(
                     unit.kernel.register_full_backward_pre_hook(before_backward)
                 )
-        self._module_sync_consumer_waits_enabled = True
 
     @property
     def module_sync_uses_consumer_waits(self) -> bool:
@@ -2363,22 +2377,31 @@ class DMPCollection(DistributedModelParallel):
         updated.add(kernel_id)
         if len(updated) == len(self._module_sync_units[module_fqn]):
             self._module_sync_ready_fqns.add(module_fqn)
-        self._launch_ready_module_syncs()
+        self._drain_ready_module_syncs()
 
-    def _launch_ready_module_syncs(self) -> None:
-        while self._module_sync_next_index < len(self._module_sync_backward_order):
-            module_fqn = self._module_sync_backward_order[self._module_sync_next_index]
-            if module_fqn not in self._module_sync_ready_fqns:
+    def _drain_ready_module_syncs(self) -> None:
+        """Launch the contiguous ready prefix of the collective order.
+
+        Every replica rank must enqueue module collectives in exactly the same
+        order even if its autograd hooks become ready in a different order.
+        Readiness is therefore buffered in `_module_sync_ready_fqns`; it never
+        directly determines which collective launches next.
+        """
+        while self._module_sync_next_index < len(self._module_sync_collective_order):
+            next_module_fqn = self._module_sync_collective_order[
+                self._module_sync_next_index
+            ]
+            if next_module_fqn not in self._module_sync_ready_fqns:
                 return
-            self.start_module_sync(module_fqn)
+            self.start_module_sync(next_module_fqn)
             self._module_sync_next_index += 1
 
     def finish_module_sync_step(self) -> None:
         """Verify that every configured module launched on this sync step."""
         if self._module_sync_step_enabled and self._module_sync_next_index != len(
-            self._module_sync_backward_order
+            self._module_sync_collective_order
         ):
-            missing = self._module_sync_backward_order[self._module_sync_next_index :]
+            missing = self._module_sync_collective_order[self._module_sync_next_index :]
             raise RuntimeError(f"module sync hooks did not fire for {missing}")
         self._module_sync_step_enabled = False
 
