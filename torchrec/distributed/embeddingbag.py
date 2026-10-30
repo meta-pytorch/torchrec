@@ -340,6 +340,9 @@ def create_sharding_infos_by_sharding_device_group(
                     stash_weights=MemoryStashingManager.resolve_stash_weights(
                         table_name, config
                     ),
+                    grouped_int4_group_size=getattr(
+                        config, "grouped_int4_group_size", 0
+                    ),
                 ),
                 param_sharding=parameter_sharding,
                 param=param,
@@ -989,6 +992,9 @@ class ShardedEmbeddingBagCollection(
                     ),
                     stash_weights=MemoryStashingManager.resolve_stash_weights(
                         table_name, config
+                    ),
+                    grouped_int4_group_size=getattr(
+                        config, "grouped_int4_group_size", 0
                     ),
                 ),
                 param_sharding=parameter_sharding,

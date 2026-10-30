@@ -394,6 +394,11 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface, ModuleNoCopyMixin)
             if table.name in table_names:
                 raise ValueError(f"Duplicate table name {table.name}")
             table_names.add(table.name)
+            if getattr(table, "grouped_int4_group_size", 0):
+                raise ValueError(
+                    "grouped_int4_group_size is only supported for EmbeddingCollection "
+                    f"virtual tables, got pooled table {table.name}"
+                )
             if hasattr(table, "use_virtual_table"):
                 key = (table.pooling, table.use_virtual_table)
             else:
@@ -779,7 +784,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
         self._device = device
         self.row_alignment = row_alignment
         self._key_to_tables: Dict[
-            Tuple[DataType, bool, bool], List[EmbeddingConfig]
+            Tuple[DataType, bool, bool, int], List[EmbeddingConfig]
         ] = defaultdict(list)
         self._feature_names: List[str] = []
         self._features_order: Optional[List[int]] = None
@@ -802,8 +807,14 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                     + f" Violating case: {table.name}'s embedding_dim {table.embedding_dim} !="
                     + f" {self._embedding_dim}"
                 )
+            grouped_int4_group_size = getattr(table, "grouped_int4_group_size", 0)
             if hasattr(table, "use_virtual_table"):
-                key = (table.data_type, table.use_virtual_table, False)
+                key = (
+                    table.data_type,
+                    table.use_virtual_table,
+                    False,
+                    grouped_int4_group_size,
+                )
             if hasattr(table, "use_virtual_table") and hasattr(
                 table, "enable_embedding_update"
             ):
@@ -811,15 +822,17 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                     table.data_type,
                     table.use_virtual_table,
                     table.enable_embedding_update,
+                    grouped_int4_group_size,
                 )
             else:
-                key = (table.data_type, False, False)
+                key = (table.data_type, False, False, grouped_int4_group_size)
             self._key_to_tables[key].append(table)
         self._feature_splits: List[int] = []
         for (
             data_type,
             use_virtual_table,
             enable_embedding_update,
+            grouped_int4_group_size,
         ), emb_configs in self._key_to_tables.items():
             embedding_specs = []
             weight_lists: Optional[
@@ -864,6 +877,13 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
             }
             if embedding_clazz == KVEmbeddingInference:
                 kwargs["embedding_cache_mode"] = enable_embedding_update
+                if grouped_int4_group_size:
+                    kwargs["grouped_int4_group_size"] = grouped_int4_group_size
+            elif grouped_int4_group_size:
+                raise ValueError(
+                    "grouped_int4_group_size needs virtual tables served by "
+                    f"KVEmbeddingInference, got tables {[t.name for t in emb_configs]}"
+                )
             emb_module = embedding_clazz(**kwargs)
             if weight_lists is None:
                 emb_module.initialize_weights()

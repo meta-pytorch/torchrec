@@ -291,6 +291,7 @@ def create_sharding_infos_by_sharding_device_group(
                             table_name, config
                         ),
                         enable_embedding_update=config.enable_embedding_update,
+                        grouped_int4_group_size=config.grouped_int4_group_size,
                     ),
                     param_sharding=parameter_sharding,
                     param=param,
@@ -779,6 +780,7 @@ class ShardedEmbeddingCollection(
                             stash_weights=MemoryStashingManager.resolve_stash_weights(
                                 table_name, config
                             ),
+                            grouped_int4_group_size=config.grouped_int4_group_size,
                         ),
                         param_sharding=parameter_sharding,
                         param=param,
