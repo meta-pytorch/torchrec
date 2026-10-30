@@ -3084,6 +3084,30 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
         self.assertEqual(len(first_batch_starts), 1)
 
 
+class TrainPipelineResetTest(unittest.TestCase):
+    def test_reset_drops_batches_from_previous_iterator(self) -> None:
+        for pipeline_cls in (
+            TrainPipelineBase,
+            TrainPipelineSparseDist,
+            EvalPipelineSparseDist,
+        ):
+            with self.subTest(pipeline=pipeline_cls.__name__):
+                model = MagicMock(side_effect=lambda batch: (None, batch))
+                model.training = False
+                pipeline = pipeline_cls(model, MagicMock(), torch.device("cpu"))
+                # The mock model has no sharded modules to rewrite.
+                with patch.object(pipeline, "_init_pipelined_modules", create=True):
+                    pipeline.progress(iter([torch.tensor([i]) for i in range(4)]))
+
+                    pipeline.reset()
+                    new_iter = iter([torch.tensor([10]), torch.tensor([11])])
+                    outputs = [pipeline.progress(new_iter).item() for _ in range(2)]
+
+                    self.assertEqual(outputs, [10, 11])
+                    with self.assertRaises(StopIteration):
+                        pipeline.progress(new_iter)
+
+
 class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
     @unittest.skipIf(
         not torch.cuda.is_available(),
