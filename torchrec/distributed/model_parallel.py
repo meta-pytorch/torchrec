@@ -11,6 +11,7 @@ import abc
 import copy
 import logging as logger
 from collections import defaultdict, OrderedDict
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
@@ -101,6 +102,24 @@ def _is_embedding_kernel_with_sync_tensors(module: nn.Module) -> bool:
     return isinstance(module, SplitTableBatchedEmbeddingBagsCodegen) or _is_triton_tbe(
         module
     )
+
+
+@dataclass
+class DMPModuleSyncHandle:
+    """Outstanding replica synchronization for one planned sharded module."""
+
+    module_fqn: str
+    weight_works: List[dist.Work] = field(default_factory=list)
+    optimizer_works: List[dist.Work] = field(default_factory=list)
+
+
+@dataclass
+class _DMPModuleSyncUnit:
+    kernel: nn.Module
+    parent: nn.Module
+    context: DMPCollectionContext
+    weights_by_dtype: Dict[torch.dtype, List[torch.Tensor]]
+    optimizer_by_dtype: Dict[torch.dtype, List[torch.Tensor]]
 
 
 def _populate_updatable_modules(
@@ -1337,6 +1356,9 @@ class DMPCollection(DistributedModelParallel):
         self._ctxs: List[DMPCollectionContext] = [
             self._default_ctx
         ] + self._submodule_ctxs
+        self._module_sync_units: Dict[str, List[_DMPModuleSyncUnit]] = {}
+        self._module_sync_units_initialized = False
+        self._pending_module_syncs: Dict[str, DMPModuleSyncHandle] = {}
 
         # create process groups and remap sharding plans per module context
         for ctx in self._ctxs:
@@ -2050,6 +2072,324 @@ class DMPCollection(DistributedModelParallel):
             context.weights_by_dtype = dict(weights_by_dtype)
             context.optimizer_tensors_by_dtype = dict(optimizer_by_dtype)
             context.hash_zch_modules = hash_zch_modules
+
+    @staticmethod
+    def _reachable_module_ids(root: nn.Module) -> Set[int]:
+        pending = [root]
+        visited: Set[int] = set()
+        while pending:
+            module = pending.pop()
+            module_id = id(module)
+            if module_id in visited:
+                continue
+            visited.add(module_id)
+            pending.extend(module.children())
+            lookups = getattr(module, "_lookups", None)
+            if lookups is not None:
+                pending.extend(
+                    lookup for lookup in lookups if isinstance(lookup, nn.Module)
+                )
+        return visited
+
+    @staticmethod
+    def _group_tensors_by_dtype(
+        tensors: List[torch.Tensor],
+    ) -> Dict[torch.dtype, List[torch.Tensor]]:
+        grouped: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+        for tensor in tensors:
+            grouped[tensor.dtype].append(tensor)
+        return dict(grouped)
+
+    @classmethod
+    def _module_sync_tensors(
+        cls,
+        kernel: nn.Module,
+        parent: nn.Module,
+    ) -> Tuple[
+        Dict[torch.dtype, List[torch.Tensor]],
+        Dict[torch.dtype, List[torch.Tensor]],
+    ]:
+        sync_kernel = cast(Any, kernel)
+        get_sync_weight_tensors = getattr(parent, "get_sync_weight_tensors", None)
+        weights = list(
+            get_sync_weight_tensors()
+            if get_sync_weight_tensors is not None
+            else sync_kernel.split_embedding_weights()
+        )
+        optimizer = [
+            state["sum"]
+            for state in sync_kernel.get_optimizer_state()
+            if state.get("sum") is not None
+        ]
+        return (
+            cls._group_tensors_by_dtype(weights),
+            cls._group_tensors_by_dtype(optimizer),
+        )
+
+    def _build_module_sync_units(self) -> None:
+        """Retain planned-module ownership for physical embedding kernels."""
+        if getattr(self, "_module_sync_units_initialized", False):
+            return
+        claimed_kernel_ids: Set[int] = set()
+        units: Dict[str, List[_DMPModuleSyncUnit]] = {}
+        module_fqns_to_discover = sorted(
+            self._plan.plan,
+            key=lambda fqn: (-fqn.count("."), fqn),
+        )
+        for module_fqn in module_fqns_to_discover:
+            owner = self.module.get_submodule(module_fqn)
+            reachable_ids = self._reachable_module_ids(owner)
+            module_units = []
+            for context in self._ctxs:
+                for kernel, parent in context.modules_to_sync:
+                    if id(kernel) in claimed_kernel_ids or not (
+                        id(kernel) in reachable_ids or id(parent) in reachable_ids
+                    ):
+                        continue
+                    if not _is_embedding_kernel_with_sync_tensors(kernel):
+                        continue
+                    weights, optimizer = self._module_sync_tensors(kernel, parent)
+                    module_units.append(
+                        _DMPModuleSyncUnit(
+                            kernel=kernel,
+                            parent=parent,
+                            context=context,
+                            weights_by_dtype=weights,
+                            optimizer_by_dtype=optimizer,
+                        )
+                    )
+                    claimed_kernel_ids.add(id(kernel))
+            if module_units:
+                units[module_fqn] = module_units
+        self._module_sync_units = {
+            module_fqn: units[module_fqn]
+            for module_fqn in self._plan.plan
+            if module_fqn in units
+        }
+        self._module_sync_units_initialized = True
+
+    def _ensure_module_sync_units(self) -> None:
+        if not getattr(self, "_module_sync_units_initialized", False):
+            self._build_module_sync_units()
+
+    @property
+    def module_sync_fqns(self) -> Tuple[str, ...]:
+        """Planned module FQNs with independently syncable physical kernels."""
+        return tuple(self._module_sync_units)
+
+    def start_module_sync(
+        self,
+        module_fqn: str,
+        include_optimizer_state: bool = True,
+    ) -> DMPModuleSyncHandle:
+        """Launch asynchronous replica synchronization for one planned module.
+
+        All ranks in a replica process group must call this method for module
+        FQNs in the same order. `wait_all_module_syncs` drains the outstanding
+        weight and optimizer-state collectives before their next use.
+        """
+        self._ensure_module_sync_units()
+        if self._custom_all_reduce is not None or self._all_reduce_hook is not None:
+            raise RuntimeError(
+                "module-granular sync does not support a custom all-reduce hook"
+            )
+        if module_fqn not in self._module_sync_units:
+            raise KeyError(f"no syncable embedding kernels for module '{module_fqn}'")
+        pending = self._pending_module_syncs.get(module_fqn)
+        if pending is not None and (pending.weight_works or pending.optimizer_works):
+            raise RuntimeError(f"module '{module_fqn}' already has pending sync work")
+
+        handle = DMPModuleSyncHandle(module_fqn=module_fqn)
+        restored_contexts: Set[int] = set()
+        with record_function(f"## 2d_module_sync_start {module_fqn} ##"):
+            for unit in self._module_sync_units[module_fqn]:
+                replica_pg = unit.context.replica_pg
+                assert replica_pg is not None, "replica_pg is not initialized"
+                if replica_pg.size() == 1:
+                    continue
+                context_id = id(unit.context)
+                if context_id not in restored_contexts:
+                    self._restore_stashed_sync_tensors(
+                        unit.context,
+                        include_optimizer_state,
+                    )
+                    restored_contexts.add(context_id)
+                opts = dist.AllreduceCoalescedOptions()
+                opts.reduceOp = dist.ReduceOp.AVG
+                for dtype in sorted(unit.weights_by_dtype, key=str):
+                    handle.weight_works.append(
+                        replica_pg.allreduce_coalesced(
+                            unit.weights_by_dtype[dtype],
+                            opts=opts,
+                        )
+                    )
+                if include_optimizer_state:
+                    for dtype in sorted(unit.optimizer_by_dtype, key=str):
+                        handle.optimizer_works.append(
+                            replica_pg.allreduce_coalesced(
+                                unit.optimizer_by_dtype[dtype],
+                                opts=opts,
+                            )
+                        )
+        self._pending_module_syncs[module_fqn] = handle
+        return handle
+
+    def _clear_completed_module_sync(self, module_fqn: str) -> None:
+        handle = self._pending_module_syncs.get(module_fqn)
+        if (
+            handle is not None
+            and not handle.weight_works
+            and not handle.optimizer_works
+        ):
+            del self._pending_module_syncs[module_fqn]
+
+    def wait_module_weights(self, module_fqn: str) -> None:
+        """Make the current stream wait for one module's synchronized weights."""
+        handle = self._pending_module_syncs.get(module_fqn)
+        if handle is None:
+            return
+        with record_function(f"## 2d_module_weight_wait {module_fqn} ##"):
+            for work in handle.weight_works:
+                work.wait()
+            handle.weight_works.clear()
+        self._clear_completed_module_sync(module_fqn)
+
+    def wait_module_optimizer_state(self, module_fqn: str) -> None:
+        """Wait before the module's next fused optimizer update."""
+        handle = self._pending_module_syncs.get(module_fqn)
+        if handle is None:
+            return
+        with record_function(f"## 2d_module_optimizer_wait {module_fqn} ##"):
+            for work in handle.optimizer_works:
+                work.wait()
+            handle.optimizer_works.clear()
+        self._clear_completed_module_sync(module_fqn)
+
+    def wait_all_module_syncs(self) -> None:
+        """Drain all module-granular synchronization work."""
+        for module_fqn in tuple(self._pending_module_syncs):
+            self.wait_module_weights(module_fqn)
+            self.wait_module_optimizer_state(module_fqn)
+
+    def enable_module_sync(self) -> None:
+        """Launch module syncs from fused updates.
+
+        The sharding plan provides the stable forward module order shared by
+        every replica rank. Its reverse is the deterministic backward
+        collective order. Each module starts as soon as all of its physical
+        kernels have completed their fused update and every preceding module
+        in that order has started.
+        """
+        if getattr(self, "_module_sync_hook_handles", None):
+            raise RuntimeError("module sync hooks are already enabled")
+        self._ensure_module_sync_units()
+        if not self._module_sync_units:
+            raise ValueError("DMPCollection has no syncable planned embedding modules")
+        self._module_sync_backward_order = tuple(reversed(self.module_sync_fqns))
+        self._module_sync_hook_handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._module_sync_step_enabled = False
+        self._module_sync_ready_fqns: Set[str] = set()
+        self._module_sync_updated_kernels: Dict[str, Set[int]] = {}
+        self._module_sync_next_index = 0
+
+        for module_fqn in self._module_sync_backward_order:
+            for unit in self._module_sync_units[module_fqn]:
+                register_post_update = getattr(
+                    unit.kernel,
+                    "register_post_fused_update_hook",
+                    None,
+                )
+                if register_post_update is None:
+                    raise ValueError(
+                        f"kernel {type(unit.kernel).__name__} for '{module_fqn}' "
+                        "does not support post-fused-update hooks"
+                    )
+                kernel_id = id(unit.kernel)
+
+                def post_update(
+                    fqn: str = module_fqn,
+                    kernel_identity: int = kernel_id,
+                ) -> None:
+                    self._mark_module_kernel_updated(fqn, kernel_identity)
+
+                self._module_sync_hook_handles.append(register_post_update(post_update))
+
+                def before_lookup(
+                    _module: nn.Module,
+                    _args: Tuple[Any, ...],
+                    fqn: str = module_fqn,
+                ) -> None:
+                    self.wait_module_weights(fqn)
+
+                self._module_sync_hook_handles.append(
+                    unit.kernel.register_forward_pre_hook(before_lookup)
+                )
+
+                def before_backward(
+                    _module: nn.Module,
+                    _grad_output: Any,
+                    fqn: str = module_fqn,
+                ) -> None:
+                    self.wait_module_optimizer_state(fqn)
+
+                self._module_sync_hook_handles.append(
+                    unit.kernel.register_full_backward_pre_hook(before_backward)
+                )
+        self._module_sync_consumer_waits_enabled = True
+
+    @property
+    def module_sync_uses_consumer_waits(self) -> bool:
+        return getattr(self, "_module_sync_consumer_waits_enabled", False)
+
+    def begin_module_sync_step(self, enabled: bool) -> None:
+        """Arm post-update launches for one backward pass."""
+        if not getattr(self, "_module_sync_hook_handles", None):
+            raise RuntimeError("module sync hooks are not enabled")
+        if self._module_sync_step_enabled:
+            raise RuntimeError("the previous module sync step has not finished")
+        self._module_sync_step_enabled = enabled
+        self._module_sync_ready_fqns.clear()
+        self._module_sync_updated_kernels.clear()
+        self._module_sync_next_index = 0
+
+    def _mark_module_kernel_updated(self, module_fqn: str, kernel_id: int) -> None:
+        if not self._module_sync_step_enabled:
+            return
+        updated = self._module_sync_updated_kernels.setdefault(module_fqn, set())
+        if kernel_id in updated:
+            raise RuntimeError(
+                f"kernel for '{module_fqn}' completed more than once in one step"
+            )
+        updated.add(kernel_id)
+        if len(updated) == len(self._module_sync_units[module_fqn]):
+            self._module_sync_ready_fqns.add(module_fqn)
+        self._launch_ready_module_syncs()
+
+    def _launch_ready_module_syncs(self) -> None:
+        while self._module_sync_next_index < len(self._module_sync_backward_order):
+            module_fqn = self._module_sync_backward_order[self._module_sync_next_index]
+            if module_fqn not in self._module_sync_ready_fqns:
+                return
+            self.start_module_sync(module_fqn)
+            self._module_sync_next_index += 1
+
+    def finish_module_sync_step(self) -> None:
+        """Verify that every configured module launched on this sync step."""
+        if self._module_sync_step_enabled and self._module_sync_next_index != len(
+            self._module_sync_backward_order
+        ):
+            missing = self._module_sync_backward_order[self._module_sync_next_index :]
+            raise RuntimeError(f"module sync hooks did not fire for {missing}")
+        self._module_sync_step_enabled = False
+
+    def disable_module_sync(self) -> None:
+        """Drain outstanding work and remove automatic module-sync hooks."""
+        self.wait_all_module_syncs()
+        for handle in getattr(self, "_module_sync_hook_handles", []):
+            handle.remove()
+        self._module_sync_hook_handles = []
+        self._module_sync_consumer_waits_enabled = False
+        self._module_sync_step_enabled = False
 
     @property
     def device_mesh(self) -> DeviceMesh:
