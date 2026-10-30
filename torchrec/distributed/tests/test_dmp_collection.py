@@ -404,6 +404,15 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         dmp._dmp_wrapped_module = module
         return dmp
 
+    def test_module_sync_ownership_traverses_hidden_lookups(self) -> None:
+        kernel = MockSyncableEmbeddingKernel()
+        container = MockLookupContainer(kernel)
+
+        reachable = DMPCollection._reachable_module_ids(container)
+
+        self.assertIn(id(container), reachable)
+        self.assertIn(id(kernel), reachable)
+
     def test_marked_triton_kernel_discovery_caches_sync_tensors_once(self) -> None:
         kernel = MockSyncableEmbeddingKernel()
         dmp = self._dmp_shell(MockLookupContainer(kernel))

@@ -11,6 +11,7 @@ import abc
 import copy
 import logging as logger
 from collections import defaultdict, OrderedDict
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
@@ -101,6 +102,15 @@ def _is_embedding_kernel_with_sync_tensors(module: nn.Module) -> bool:
     return isinstance(module, SplitTableBatchedEmbeddingBagsCodegen) or _is_triton_tbe(
         module
     )
+
+
+@dataclass
+class _DMPModuleSyncUnit:
+    kernel: nn.Module
+    parent: nn.Module
+    context: DMPCollectionContext
+    weights_by_dtype: Dict[torch.dtype, List[torch.Tensor]]
+    optimizer_by_dtype: Dict[torch.dtype, List[torch.Tensor]]
 
 
 def _populate_updatable_modules(
@@ -1337,6 +1347,8 @@ class DMPCollection(DistributedModelParallel):
         self._ctxs: List[DMPCollectionContext] = [
             self._default_ctx
         ] + self._submodule_ctxs
+        self._module_sync_units: Dict[str, List[_DMPModuleSyncUnit]] = {}
+        self._module_sync_units_initialized = False
 
         # create process groups and remap sharding plans per module context
         for ctx in self._ctxs:
@@ -2050,6 +2062,101 @@ class DMPCollection(DistributedModelParallel):
             context.weights_by_dtype = dict(weights_by_dtype)
             context.optimizer_tensors_by_dtype = dict(optimizer_by_dtype)
             context.hash_zch_modules = hash_zch_modules
+
+    @staticmethod
+    def _reachable_module_ids(root: nn.Module) -> Set[int]:
+        pending = [root]
+        visited: Set[int] = set()
+        while pending:
+            module = pending.pop()
+            module_id = id(module)
+            if module_id in visited:
+                continue
+            visited.add(module_id)
+            pending.extend(module.children())
+            lookups = getattr(module, "_lookups", None)
+            if lookups is not None:
+                pending.extend(
+                    lookup for lookup in lookups if isinstance(lookup, nn.Module)
+                )
+        return visited
+
+    @staticmethod
+    def _group_tensors_by_dtype(
+        tensors: List[torch.Tensor],
+    ) -> Dict[torch.dtype, List[torch.Tensor]]:
+        grouped: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+        for tensor in tensors:
+            grouped[tensor.dtype].append(tensor)
+        return dict(grouped)
+
+    @classmethod
+    def _module_sync_tensors(
+        cls,
+        kernel: nn.Module,
+        parent: nn.Module,
+    ) -> Tuple[
+        Dict[torch.dtype, List[torch.Tensor]],
+        Dict[torch.dtype, List[torch.Tensor]],
+    ]:
+        sync_kernel = cast(Any, kernel)
+        get_sync_weight_tensors = getattr(parent, "get_sync_weight_tensors", None)
+        weights = list(
+            get_sync_weight_tensors()
+            if get_sync_weight_tensors is not None
+            else sync_kernel.split_embedding_weights()
+        )
+        optimizer = [
+            state["sum"]
+            for state in sync_kernel.get_optimizer_state()
+            if state.get("sum") is not None
+        ]
+        return (
+            cls._group_tensors_by_dtype(weights),
+            cls._group_tensors_by_dtype(optimizer),
+        )
+
+    def _build_module_sync_units(self) -> None:
+        """Retain planned-module ownership for physical embedding kernels."""
+        if getattr(self, "_module_sync_units_initialized", False):
+            return
+        claimed_kernel_ids: Set[int] = set()
+        units: Dict[str, List[_DMPModuleSyncUnit]] = {}
+        module_fqns = sorted(
+            self._plan.plan,
+            key=lambda fqn: (-fqn.count("."), fqn),
+        )
+        for module_fqn in module_fqns:
+            owner = self.module.get_submodule(module_fqn)
+            reachable_ids = self._reachable_module_ids(owner)
+            module_units = []
+            for context in self._ctxs:
+                for kernel, parent in context.modules_to_sync:
+                    if id(kernel) in claimed_kernel_ids or not (
+                        id(kernel) in reachable_ids or id(parent) in reachable_ids
+                    ):
+                        continue
+                    if not _is_embedding_kernel_with_sync_tensors(kernel):
+                        continue
+                    weights, optimizer = self._module_sync_tensors(kernel, parent)
+                    module_units.append(
+                        _DMPModuleSyncUnit(
+                            kernel=kernel,
+                            parent=parent,
+                            context=context,
+                            weights_by_dtype=weights,
+                            optimizer_by_dtype=optimizer,
+                        )
+                    )
+                    claimed_kernel_ids.add(id(kernel))
+            if module_units:
+                units[module_fqn] = module_units
+        self._module_sync_units = {
+            module_fqn: units[module_fqn]
+            for module_fqn in self._plan.plan
+            if module_fqn in units
+        }
+        self._module_sync_units_initialized = True
 
     @property
     def device_mesh(self) -> DeviceMesh:
