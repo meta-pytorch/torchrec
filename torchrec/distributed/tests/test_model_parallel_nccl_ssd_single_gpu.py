@@ -1106,11 +1106,11 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
                         w1_id = sharded_w1_id.local_shards()[0].tensor
 
                         pmt1 = sharded_t1.local_shards()[0].tensor
-                        w1 = pmt1.get_weights_by_ids(w1_id)
+                        w1 = pmt1.full_tensor()
 
                         # write value into ssd for both emb module for later comparison
                         pmt2 = sharded_t2.local_shards()[0].tensor
-                        pmt2.wrapped.set_weights_and_ids(w1, w1_id.view(-1))
+                        pmt2.set_weights_and_ids(w1, w1_id.view(-1))
 
                     # purge after loading. This is needed, since we pass a batch
                     # through dmp when instantiating them.
@@ -1588,11 +1588,11 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
                         w1_id = sharded_w1_id.local_shards()[0].tensor
 
                         pmt1 = sharded_t1.local_shards()[0].tensor
-                        w1 = pmt1.get_weights_by_ids(w1_id)
+                        w1 = pmt1.full_tensor()
 
                         # write value into ssd for both emb module for later comparison
                         pmt2 = sharded_t2.local_shards()[0].tensor
-                        pmt2.wrapped.set_weights_and_ids(w1, w1_id.view(-1))
+                        pmt2.set_weights_and_ids(w1, w1_id.view(-1))
 
                     # Remove the cache to force state dict read from backend again
                     emb_module1._split_weights_res = None
