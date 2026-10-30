@@ -38,9 +38,13 @@ def _picklable_exception_wrapper(
     # with MaybeEncodingError and the original error is lost. Convert any
     # exception to a plain RuntimeError carrying a stringified traceback so
     # the real failure always reaches the parent process.
+    # Pool workers only report Exception. Any other BaseException, such as
+    # DCP's CheckpointException, kills the worker and the parent waits forever.
     try:
         return callable(*args, **kwargs)
-    except Exception as e:
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: B036 re-raised as RuntimeError below
         raise RuntimeError(
             f"Worker raised {type(e).__name__}: {e}\n{traceback.format_exc()}"
         ) from None
