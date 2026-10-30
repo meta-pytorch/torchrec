@@ -80,6 +80,7 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
     EmbeddingPipelinedForward,
     InSyncPrefetchEmbeddingPipelinedForward,
     PipelinedForward,
+    PreserveForwardOrderPipelinedForward,
 )
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
@@ -1468,6 +1469,24 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         dmp.finish_module_sync_step.assert_called_once_with()
         dmp.wait_all_module_syncs.assert_not_called()
         dmp.sync.assert_not_called()
+
+    def test_preserve_forward_order_prioritizes_all_sparse_groups(self) -> None:
+        events: List[int] = []
+        outputs = []
+        for index in range(3):
+            forward = PreserveForwardOrderPipelinedForward.__new__(
+                PreserveForwardOrderPipelinedForward
+            )
+            forward._backward_sequence_nr = None
+            forward.set_backward_priority(3 - index)
+            output = torch.tensor(float(index + 1), requires_grad=True) * 2
+            forward._prioritize_backward(output)
+            output.register_hook(lambda grad, group=index: events.append(group) or grad)
+            outputs.append(output)
+
+        torch.stack(outputs).sum().backward()
+
+        self.assertEqual(events, [0, 1, 2])
 
     def test_module_sync_flag_requires_dmp_collection(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires a DMPCollection"):
