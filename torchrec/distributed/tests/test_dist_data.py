@@ -52,6 +52,7 @@ from torchrec.distributed.dist_data import (
     _get_recat,
     _get_recat_data_cached,
     JaggedTensorAllToAll,
+    KJEAllToAll,
     KJTAllToAll,
     KJTAllToAllSplitsAwaitable,
     KJTAllToAllTensorsAwaitable,
@@ -2032,44 +2033,45 @@ class GetRecatOverflowTest(unittest.TestCase):
         self.assertTrue(torch.equal(none_throws(first), expected))
         self.assertTrue(torch.equal(none_throws(second), expected))
 
-    @given(
-        local_split=st.integers(min_value=1, max_value=16),
-        split_config=st.sampled_from(
-            [
-                (num_splits, stagger)
-                for num_splits in range(1, 17)
-                for stagger in range(1, num_splits + 1)
-                if num_splits % stagger != 0
-            ]
-        ),
-    )
-    @settings(max_examples=50, deadline=None)
-    def test_get_recat_nondivisible_stagger_matches_reference(
-        self,
-        local_split: int,
-        split_config: Tuple[int, int],
-    ) -> None:
-        num_splits, stagger = split_config
-        feature_order = [
-            x + num_splits // stagger * y
-            for x in range(num_splits // stagger)
-            for y in range(stagger)
-        ]
-        expected = torch.tensor(
-            [i + j * local_split for i in range(local_split) for j in feature_order],
-            dtype=torch.int32,
-        )
+    def test_get_recat_rejects_invalid_stagger(self) -> None:
+        for stagger, local_split, cached in itertools.product(
+            [4, 7, 0, -2], [0, 2], [False, True]
+        ):
+            with self.subTest(
+                stagger=stagger, local_split=local_split, cached=cached
+            ), self.assertRaisesRegex(ValueError, "positive divisor"):
+                _get_recat(
+                    local_split=local_split,
+                    num_splits=6,
+                    stagger=stagger,
+                    device=torch.device("cpu"),
+                    cached=cached,
+                )
 
-        _get_recat_data_cached.cache_clear()
-        actual = _get_recat(
-            local_split=local_split,
-            num_splits=num_splits,
-            stagger=stagger,
-            device=torch.device("cpu"),
-            cached=True,
-        )
+    def test_kjt_all_to_all_rejects_invalid_stagger(self) -> None:
+        pg_mock = MagicMock()
+        pg_mock.size.return_value = 6
+        for module_cls, stagger in itertools.product(
+            [KJTAllToAll, KJEAllToAll], [4, 7, 0, -2]
+        ):
+            with self.subTest(
+                module=module_cls.__name__, stagger=stagger
+            ), self.assertRaisesRegex(ValueError, "positive divisor"):
+                module_cls(
+                    pg=cast(dist.ProcessGroup, pg_mock),
+                    splits=[1] * 6,
+                    stagger=stagger,
+                )
 
-        self.assertTrue(torch.equal(none_throws(actual), expected))
+        for module_cls, stagger in itertools.product(
+            [KJTAllToAll, KJEAllToAll], [1, 2, 3, 6]
+        ):
+            module = module_cls(
+                pg=cast(dist.ProcessGroup, pg_mock),
+                splits=[1] * 6,
+                stagger=stagger,
+            )
+            self.assertEqual(module._stagger, stagger)
 
     @given(
         local_split=st.integers(min_value=1, max_value=16),
