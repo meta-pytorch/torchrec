@@ -33,6 +33,7 @@ from torch.distributed.checkpoint import (
     planner as planner_mod,
 )
 from torchrec.experimental.torch_tpu.checkpoint import utils
+from torchrec.experimental.torch_tpu.modules import utils as modules_utils
 from torchrec.experimental.torch_tpu.modules.embedding_configs import (
     StackedSparseCoreEmbeddingConfig,
 )
@@ -357,6 +358,13 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
         if (self.cross_topology or self.unshard_for_cpu) and fqn in self._cpu_buffers:
             return self.transform_tensor(read_item, self._cpu_buffers[fqn])
 
+        target = self.lookup_tensor(read_item.dest_index)
+        if _is_embedding_param(fqn) and target.device.type == "tpu":
+            # Loads into the CPU, since a copy from it would reset the TPU layout.
+            if fqn not in self._cpu_buffers:
+                self._cpu_buffers[fqn] = torch.empty(target.shape, dtype=target.dtype)
+            return self.transform_tensor(read_item, self._cpu_buffers[fqn])
+
         return super().resolve_tensor(read_item)
 
     def commit_tensor(
@@ -370,7 +378,8 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
 
         # Only process if post-processing is needed
         if not (
-            self.unshard_for_cpu or (fqn in self._cpu_buffers and self.cross_topology)
+            self.unshard_for_cpu
+            or fqn in self._cpu_buffers  # Also for same-topology restores.
         ):
             return
 
@@ -378,6 +387,15 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
 
         expected_chunks = self._expected_local_chunks.get(fqn, 1)
         if self._loaded_chunks[fqn] < expected_chunks:
+            return
+
+        if not (self.unshard_for_cpu or self.cross_topology):
+            target = self.lookup_tensor(read_item.dest_index)
+            buffer = self._cpu_buffers.pop(fqn)
+            with torch.no_grad():  # Copying from a TPU tensor keeps its layout.
+                target.copy_(
+                    modules_utils.to_device_in_sparsecore_layout(buffer, target.device)
+                )
             return
 
         # Common extraction for both paths
@@ -548,11 +566,15 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
         local_slice = target_sharded_cpu[rank * local_rows : (rank + 1) * local_rows]
 
         logging.info("SparseCoreLoadPlanner: Copying slice to TPU for %s", fqn)
+        # Copying from a TPU tensor keeps its layout, unlike copying from the CPU.
+        local_slice = modules_utils.to_device_in_sparsecore_layout(
+            local_slice, target_param.device
+        )
         with torch.no_grad():
             if hasattr(target_param, "to_local"):
-                target_param.to_local().copy_(local_slice.to(target_param.device))
+                target_param.to_local().copy_(local_slice)
             else:
-                target_param.copy_(local_slice.to(target_param.device))
+                target_param.copy_(local_slice)
 
         logging.info("SparseCoreLoadPlanner: Finished processing %s", fqn)
         del self._cpu_buffers[fqn]
