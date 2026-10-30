@@ -706,6 +706,16 @@ def merge_fused_params(
     return _fused_params
 
 
+# fused_params keys that configure the embedding cache. They come either from
+# ParameterSharding.cache_params or directly from the sharder's fused_params.
+_CACHE_FUSED_PARAM_KEYS: Tuple[str, ...] = (
+    "cache_algorithm",
+    "cache_load_factor",
+    "cache_reserved_memory",
+    "cache_precision",
+)
+
+
 def add_params_from_parameter_sharding(
     fused_params: Optional[Dict[str, Any]],
     parameter_sharding: ParameterSharding,
@@ -804,17 +814,25 @@ def add_params_from_parameter_sharding(
             )
         fused_params.update(key_value_params_dict)
 
-    # print warning if sharding_type is data_parallel or kernel is dense
-    if parameter_sharding.sharding_type == ShardingType.DATA_PARALLEL.value:
-        logger.warning(
-            f"Sharding Type is {parameter_sharding.sharding_type}, "
-            "caching params will be ignored"
-        )
-    elif parameter_sharding.compute_kernel == EmbeddingComputeKernel.DENSE.value:
-        logger.warning(
-            f"Compute Kernel is {parameter_sharding.compute_kernel}, "
-            "caching params will be ignored"
-        )
+    # warn if cache settings were set but have no effect: data_parallel and dense
+    # tables are not backed by a cache. Check the merged fused_params so that
+    # settings from both cache_params and the sharder's fused_params are covered
+    if any(key in fused_params for key in _CACHE_FUSED_PARAM_KEYS):
+        if parameter_sharding.sharding_type == ShardingType.DATA_PARALLEL.value:
+            logger.warning(
+                f"Sharding Type is {parameter_sharding.sharding_type}, so the "
+                "table is fully replicated on each device without a cache; "
+                "cache settings (e.g. cache_algorithm, cache_load_factor) from "
+                "cache_params or the sharder's fused_params have no effect and "
+                "will be ignored"
+            )
+        elif parameter_sharding.compute_kernel == EmbeddingComputeKernel.DENSE.value:
+            logger.warning(
+                f"Compute Kernel is {parameter_sharding.compute_kernel}, so "
+                "cache settings (e.g. cache_algorithm, cache_load_factor) from "
+                "cache_params or the sharder's fused_params have no effect and "
+                "will be ignored"
+            )
 
     # calling `get_additional_fused_params` for customized kernel
     # it will be updated to the `fused_params` dict
