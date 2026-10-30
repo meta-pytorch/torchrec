@@ -62,19 +62,20 @@ def is_amd() -> bool:
 
 
 # AMD-compatible kernel variants (no CLC, FP32 accum, portable tl.range)
-from ads_mkl.ops.triton.amd.triton_table_batched_embeddings import (  # noqa: F811
-    _expand_long_runs as _amd_expand_long_runs,
-    _FIXED_GRID as _AMD_FIXED_GRID,
-    _nbit_TBE_forward_kernel_16bits as _amd_nbit_fwd_16bits,
-    _nbit_TBE_forward_kernel_32bits as _amd_nbit_fwd_32bits,
-    triton_tbe_backward_long_run_apply_unweighted as _amd_bwd_long_apply,
-    triton_tbe_backward_long_run_grad_accum_unweighted as _amd_bwd_long_accum_unweighted,
-    triton_tbe_backward_long_run_grad_accum_weighted as _amd_bwd_long_accum_weighted,
-    triton_tbe_backward_short_run_unweighted as _amd_bwd_short_unweighted,
-    triton_tbe_backward_short_run_weighted as _amd_bwd_short_weighted,
-    triton_tbe_forward_unweighted_kernel as _amd_fwd_unweighted_kernel,
-    triton_tbe_forward_weighted_kernel as _amd_fwd_weighted_kernel,
-)
+if is_amd():
+    from ads_mkl.ops.triton.amd.triton_table_batched_embeddings import (  # noqa: F811
+        _expand_long_runs as _amd_expand_long_runs,
+        _FIXED_GRID as _AMD_FIXED_GRID,
+        _nbit_TBE_forward_kernel_16bits as _amd_nbit_fwd_16bits,
+        _nbit_TBE_forward_kernel_32bits as _amd_nbit_fwd_32bits,
+        triton_tbe_backward_long_run_apply_unweighted as _amd_bwd_long_apply,
+        triton_tbe_backward_long_run_grad_accum_unweighted as _amd_bwd_long_accum_unweighted,
+        triton_tbe_backward_long_run_grad_accum_weighted as _amd_bwd_long_accum_weighted,
+        triton_tbe_backward_short_run_unweighted as _amd_bwd_short_unweighted,
+        triton_tbe_backward_short_run_weighted as _amd_bwd_short_weighted,
+        triton_tbe_forward_unweighted_kernel as _amd_fwd_unweighted_kernel,
+        triton_tbe_forward_weighted_kernel as _amd_fwd_weighted_kernel,
+    )
 
 
 @lru_cache(maxsize=None)
