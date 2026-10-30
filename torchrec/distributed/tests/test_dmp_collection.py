@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import cast
+from typing import Callable, cast
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -64,11 +64,32 @@ class MockSyncableEmbeddingKernel(nn.Module):
         return [{"sum": self.optimizer_state}]
 
 
+class MockHookableEmbeddingKernel(MockSyncableEmbeddingKernel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.post_update_callbacks: list[Callable[[], None]] = []
+
+    def register_post_fused_update_hook(
+        self, callback: Callable[[], None]
+    ) -> MagicMock:
+        self.post_update_callbacks.append(callback)
+        handle = MagicMock()
+        handle.remove.side_effect = lambda: self.post_update_callbacks.remove(callback)
+        return handle
+
+
 class MockLookupContainer(nn.Module):
     def __init__(self, kernel: MockSyncableEmbeddingKernel) -> None:
         super().__init__()
         self.kernel = kernel
         self._lookups = [kernel]
+
+
+class MockMultiLookupContainer(nn.Module):
+    def __init__(self, kernels: list[MockSyncableEmbeddingKernel]) -> None:
+        super().__init__()
+        self.kernels = nn.ModuleList(kernels)
+        self._lookups = list(kernels)
 
 
 class MockTwoEmbeddingModel(nn.Module):
@@ -80,6 +101,13 @@ class MockTwoEmbeddingModel(nn.Module):
         super().__init__()
         self.ebc1 = MockLookupContainer(ebc1_kernel)
         self.ebc2 = MockLookupContainer(ebc2_kernel)
+
+
+class MockNestedEmbeddingModel(nn.Module):
+    def __init__(self, kernels: list[MockSyncableEmbeddingKernel]) -> None:
+        super().__init__()
+        self.tower = nn.Module()
+        self.tower.ebc = MockMultiLookupContainer(kernels)
 
 
 class MockChunkAwareLookupContainer(MockLookupContainer):
@@ -424,6 +452,29 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         self.assertIn(id(container), reachable)
         self.assertIn(id(kernel), reachable)
 
+    def _module_sync_dmp(
+        self,
+        model: nn.Module,
+        plan_fqns: tuple[str, ...],
+    ) -> tuple[DMPCollection, DMPCollectionContext, MagicMock]:
+        dmp = self._dmp_shell(model)
+        context = self._context()
+        process_group = MagicMock(spec=dist.ProcessGroup)
+        process_group.size.return_value = 2
+        context.replica_pg = process_group
+        dmp._ctxs = [context]
+        dmp._plan = ShardingPlan(
+            {fqn: MagicMock(spec=EmbeddingModuleShardingPlan) for fqn in plan_fqns}
+        )
+        dmp._custom_all_reduce = None
+        dmp._module_sync_units = {}
+        dmp._module_sync_units_initialized = False
+        dmp._pending_module_syncs = {}
+        dmp._restore_stashed_sync_tensors = MagicMock()
+        dmp._group_sharded_modules([context])
+        dmp._cache_sync_tensors([context])
+        return dmp, context, process_group
+
     def test_marked_triton_kernel_discovery_caches_sync_tensors_once(self) -> None:
         kernel = MockSyncableEmbeddingKernel()
         dmp = self._dmp_shell(MockLookupContainer(kernel))
@@ -581,10 +632,129 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         self.assertEqual(calls[0].args[0], [ebc1_kernel.weight])
         self.assertEqual(calls[1].args[0], [ebc1_kernel.optimizer_state])
 
-        dmp.wait_all_module_syncs()
+        dmp.wait_module_weights("ebc1")
         weight_work.wait.assert_called_once_with()
+        optimizer_work.wait.assert_not_called()
+        self.assertIn("ebc1", dmp._pending_module_syncs)
+
+        dmp.wait_module_optimizer_state("ebc1")
         optimizer_work.wait.assert_called_once_with()
         self.assertNotIn("ebc1", dmp._pending_module_syncs)
+
+    def test_legacy_sync_does_not_build_module_sync_units(self) -> None:
+        model = MockTwoEmbeddingModel(
+            MockSyncableEmbeddingKernel(),
+            MockSyncableEmbeddingKernel(),
+        )
+        dmp, _, process_group = self._module_sync_dmp(model, ("ebc1", "ebc2"))
+        process_group.allreduce_coalesced.return_value = MagicMock(spec=dist.Work)
+
+        dmp.sync()
+
+        self.assertFalse(dmp._module_sync_units_initialized)
+        self.assertEqual(dmp._module_sync_units, {})
+
+    def test_enable_module_sync_builds_units_and_reverses_plan_order(self) -> None:
+        model = MockTwoEmbeddingModel(
+            MockHookableEmbeddingKernel(),
+            MockHookableEmbeddingKernel(),
+        )
+        dmp, _, _ = self._module_sync_dmp(model, ("ebc1", "ebc2"))
+
+        self.assertFalse(dmp._module_sync_units_initialized)
+        dmp.enable_module_sync()
+
+        self.assertTrue(dmp._module_sync_units_initialized)
+        self.assertTrue(dmp.module_sync_uses_consumer_waits)
+        self.assertEqual(dmp.module_sync_fqns, ("ebc1", "ebc2"))
+        self.assertEqual(dmp._module_sync_backward_order, ("ebc2", "ebc1"))
+        dmp.disable_module_sync()
+        self.assertFalse(dmp.module_sync_uses_consumer_waits)
+
+    def test_nested_plan_assigns_multiple_kernels_to_deepest_owner(self) -> None:
+        kernels = [MockHookableEmbeddingKernel(), MockHookableEmbeddingKernel()]
+        dmp, _, _ = self._module_sync_dmp(
+            MockNestedEmbeddingModel(kernels),
+            ("tower", "tower.ebc"),
+        )
+
+        dmp.enable_module_sync()
+
+        self.assertEqual(dmp.module_sync_fqns, ("tower.ebc",))
+        self.assertEqual(len(dmp._module_sync_units["tower.ebc"]), 2)
+        self.assertEqual(
+            [len(kernel.post_update_callbacks) for kernel in kernels], [1, 1]
+        )
+        dmp.disable_module_sync()
+
+    def test_multi_kernel_module_launches_after_every_kernel_updates(self) -> None:
+        kernels = [MockHookableEmbeddingKernel(), MockHookableEmbeddingKernel()]
+        dmp, _, process_group = self._module_sync_dmp(
+            MockNestedEmbeddingModel(kernels),
+            ("tower.ebc",),
+        )
+        process_group.allreduce_coalesced.return_value = MagicMock(spec=dist.Work)
+        dmp.enable_module_sync()
+        dmp.begin_module_sync_step(enabled=True)
+
+        kernels[0].post_update_callbacks[0]()
+        process_group.allreduce_coalesced.assert_not_called()
+
+        kernels[1].post_update_callbacks[0]()
+        self.assertEqual(process_group.allreduce_coalesced.call_count, 4)
+        dmp.finish_module_sync_step()
+        dmp.disable_module_sync()
+
+    def test_enable_module_sync_rejects_unsupported_kernel(self) -> None:
+        model = nn.Module()
+        model.ebc = MockLookupContainer(MockSyncableEmbeddingKernel())
+        dmp, _, _ = self._module_sync_dmp(model, ("ebc",))
+
+        with self.assertRaisesRegex(ValueError, "does not support post-fused-update"):
+            dmp.enable_module_sync()
+
+    def test_enable_module_sync_rejects_model_without_syncable_kernels(self) -> None:
+        model = MockModule()
+        dmp, _, _ = self._module_sync_dmp(model, ("linear",))
+
+        with self.assertRaisesRegex(ValueError, "no syncable planned embedding"):
+            dmp.enable_module_sync()
+
+    def test_finish_module_sync_step_rejects_missing_update(self) -> None:
+        model = nn.Module()
+        model.ebc = MockLookupContainer(MockHookableEmbeddingKernel())
+        dmp, _, _ = self._module_sync_dmp(model, ("ebc",))
+        dmp.enable_module_sync()
+        dmp.begin_module_sync_step(enabled=True)
+
+        with self.assertRaisesRegex(RuntimeError, "hooks did not fire"):
+            dmp.finish_module_sync_step()
+        dmp.disable_module_sync()
+
+    def test_module_sync_rejects_duplicate_update_callback(self) -> None:
+        kernel = MockHookableEmbeddingKernel()
+        model = nn.Module()
+        model.ebc = MockLookupContainer(kernel)
+        dmp, _, process_group = self._module_sync_dmp(model, ("ebc",))
+        process_group.allreduce_coalesced.return_value = MagicMock(spec=dist.Work)
+        dmp.enable_module_sync()
+        dmp.begin_module_sync_step(enabled=True)
+        callback = kernel.post_update_callbacks[0]
+        callback()
+
+        with self.assertRaisesRegex(RuntimeError, "completed more than once"):
+            callback()
+        dmp.finish_module_sync_step()
+        dmp.disable_module_sync()
+
+    def test_module_sync_rejects_custom_all_reduce_hook(self) -> None:
+        model = nn.Module()
+        model.ebc = MockLookupContainer(MockSyncableEmbeddingKernel())
+        dmp, _, _ = self._module_sync_dmp(model, ("ebc",))
+        dmp._all_reduce_hook = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "does not support a custom"):
+            dmp.start_module_sync("ebc")
 
     def test_sync_skips_default_allreduce_for_empty_modules(self) -> None:
         dmp = self._dmp_shell(MockModule())

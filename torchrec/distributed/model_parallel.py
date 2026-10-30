@@ -2234,13 +2234,42 @@ class DMPCollection(DistributedModelParallel):
         self._pending_module_syncs[module_fqn] = handle
         return handle
 
+    def _clear_completed_module_sync(self, module_fqn: str) -> None:
+        handle = self._pending_module_syncs.get(module_fqn)
+        if (
+            handle is not None
+            and not handle.weight_works
+            and not handle.optimizer_works
+        ):
+            del self._pending_module_syncs[module_fqn]
+
+    def wait_module_weights(self, module_fqn: str) -> None:
+        """Make the current stream wait for one module's synchronized weights."""
+        handle = self._pending_module_syncs.get(module_fqn)
+        if handle is None:
+            return
+        with record_function(f"## 2d_module_weight_wait {module_fqn} ##"):
+            for work in handle.weight_works:
+                work.wait()
+            handle.weight_works.clear()
+        self._clear_completed_module_sync(module_fqn)
+
+    def wait_module_optimizer_state(self, module_fqn: str) -> None:
+        """Wait before the module's next fused optimizer update."""
+        handle = self._pending_module_syncs.get(module_fqn)
+        if handle is None:
+            return
+        with record_function(f"## 2d_module_optimizer_wait {module_fqn} ##"):
+            for work in handle.optimizer_works:
+                work.wait()
+            handle.optimizer_works.clear()
+        self._clear_completed_module_sync(module_fqn)
+
     def wait_all_module_syncs(self) -> None:
         """Drain all module-granular synchronization work."""
-        with record_function("## 2d_module_sync_wait_all ##"):
-            for handle in self._pending_module_syncs.values():
-                for work in handle.weight_works + handle.optimizer_works:
-                    work.wait()
-        self._pending_module_syncs.clear()
+        for module_fqn in tuple(self._pending_module_syncs):
+            self.wait_module_weights(module_fqn)
+            self.wait_module_optimizer_state(module_fqn)
 
     def enable_module_sync(self) -> None:
         """Launch module syncs from fused updates.
@@ -2253,6 +2282,9 @@ class DMPCollection(DistributedModelParallel):
         """
         if getattr(self, "_module_sync_hook_handles", None):
             raise RuntimeError("module sync hooks are already enabled")
+        self._ensure_module_sync_units()
+        if not self._module_sync_units:
+            raise ValueError("DMPCollection has no syncable planned embedding modules")
         self._module_sync_backward_order = tuple(reversed(self.module_sync_fqns))
         self._module_sync_hook_handles: List[torch.utils.hooks.RemovableHandle] = []
         self._module_sync_step_enabled = False
@@ -2281,6 +2313,33 @@ class DMPCollection(DistributedModelParallel):
                     self._mark_module_kernel_updated(fqn, kernel_identity)
 
                 self._module_sync_hook_handles.append(register_post_update(post_update))
+
+                def before_lookup(
+                    _module: nn.Module,
+                    _args: Tuple[Any, ...],
+                    fqn: str = module_fqn,
+                ) -> None:
+                    self.wait_module_weights(fqn)
+
+                self._module_sync_hook_handles.append(
+                    unit.kernel.register_forward_pre_hook(before_lookup)
+                )
+
+                def before_backward(
+                    _module: nn.Module,
+                    _grad_output: Any,
+                    fqn: str = module_fqn,
+                ) -> None:
+                    self.wait_module_optimizer_state(fqn)
+
+                self._module_sync_hook_handles.append(
+                    unit.kernel.register_full_backward_pre_hook(before_backward)
+                )
+        self._module_sync_consumer_waits_enabled = True
+
+    @property
+    def module_sync_uses_consumer_waits(self) -> bool:
+        return getattr(self, "_module_sync_consumer_waits_enabled", False)
 
     def begin_module_sync_step(self, enabled: bool) -> None:
         """Arm post-update launches for one backward pass."""
@@ -2329,6 +2388,7 @@ class DMPCollection(DistributedModelParallel):
         for handle in getattr(self, "_module_sync_hook_handles", []):
             handle.remove()
         self._module_sync_hook_handles = []
+        self._module_sync_consumer_waits_enabled = False
         self._module_sync_step_enabled = False
 
     @property

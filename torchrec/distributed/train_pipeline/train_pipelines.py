@@ -728,28 +728,26 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._dmp_collection_sync_interval_batches = (
             dmp_collection_sync_interval_batches
         )
-        if (
-            self._dmp_collection_sync_interval_batches is not None
-            and self._dmp_collection_sync_interval_batches <= 0
-        ):
-            raise ValueError("DMP collection sync interval must be positive")
         self._dmp_collection_module_sync_enabled = enable_dmp_collection_module_sync
-        if self._dmp_collection_module_sync_enabled:
+        if dmp_collection_sync_interval_batches is None:
+            if enable_dmp_collection_module_sync:
+                raise ValueError("module-granular sync requires a sync interval")
+            return
+        if dmp_collection_sync_interval_batches <= 0:
+            raise ValueError("DMP collection sync interval must be positive")
+        if enable_dmp_collection_module_sync:
             if not has_2d_support or not isinstance(self._model, DMPCollection):
                 raise ValueError("module-granular sync requires a DMPCollection model")
-            if self._dmp_collection_sync_interval_batches is None:
-                raise ValueError("module-granular sync requires a sync interval")
             self._model.enable_module_sync()
 
-        if self._dmp_collection_sync_interval_batches is not None:
-            logger.info(
-                f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
-                f"{self._dmp_collection_sync_interval_batches} batches"
-            )
-            one_time_rank0_logger.info(
-                f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
-                f"{self._dmp_collection_sync_interval_batches} batches"
-            )
+        logger.info(
+            f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
+            f"{dmp_collection_sync_interval_batches} batches"
+        )
+        one_time_rank0_logger.info(
+            f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
+            f"{dmp_collection_sync_interval_batches} batches"
+        )
 
     def _begin_module_sync_step(self, context: TrainPipelineContext) -> None:
         if not self._dmp_collection_module_sync_enabled:
@@ -766,6 +764,13 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         """Drain outstanding module-granular replica synchronization."""
         if self._dmp_collection_module_sync_enabled:
             cast(DMPCollection, self._model).wait_all_module_syncs()
+
+    def _wait_before_module_sync_step(self) -> None:
+        if not self._dmp_collection_module_sync_enabled:
+            return
+        model = cast(DMPCollection, self._model)
+        if not model.module_sync_uses_consumer_waits:
+            model.wait_all_module_syncs()
 
     def __del__(self) -> None:
         # Best-effort shutdown of the async in-place copy worker (no-op if unused).
@@ -975,7 +980,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
 
         # fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
         self.fill_pipeline(dataloader_iter)
-        self.wait_for_pending_module_syncs()
+        self._wait_before_module_sync_step()
 
         # here is the expected stop after exhausting all batches
         if not self.batches:
