@@ -18,6 +18,7 @@ from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tup
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    res_bitmap_compact,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
 from torch import nn
@@ -120,6 +121,21 @@ class _DMPModuleSyncUnit:
     context: DMPCollectionContext
     weights_by_dtype: Dict[torch.dtype, List[torch.Tensor]]
     optimizer_by_dtype: Dict[torch.dtype, List[torch.Tensor]]
+
+
+@dataclass
+class _UsedRowKernelState:
+    kernel: SplitTableBatchedEmbeddingBagsCodegen
+    context: DMPCollectionContext
+    weights: List[torch.Tensor]
+    optimizer_states: List[Optional[torch.Tensor]]
+    table_offsets: List[int]
+    table_boundaries: torch.Tensor
+    rows_seen: torch.Tensor
+    count_cpu: torch.Tensor
+    prep_stream: torch.Stream
+    ready_event: torch.Event
+    compacted_rows: Optional[torch.Tensor] = None
 
 
 def _populate_updatable_modules(
@@ -2270,6 +2286,82 @@ class DMPCollection(DistributedModelParallel):
         for module_fqn in tuple(self._pending_module_syncs):
             self.wait_module_weights(module_fqn)
             self.wait_module_optimizer_state(module_fqn)
+
+    @staticmethod
+    def _create_used_row_kernel_state(
+        unit: _DMPModuleSyncUnit,
+    ) -> _UsedRowKernelState:
+        if not isinstance(unit.kernel, SplitTableBatchedEmbeddingBagsCodegen):
+            raise ValueError(
+                "used-row module sync requires SplitTableBatchedEmbeddingBagsCodegen"
+            )
+        kernel = unit.kernel
+        weights = list(kernel.split_embedding_weights())
+        optimizer_states = [
+            optimizer_state.get("sum")
+            for optimizer_state in kernel.get_optimizer_state()
+        ]
+        if len(weights) != len(optimizer_states):
+            raise ValueError("TBE weights and optimizer states must align by table")
+        table_offsets = [0]
+        for weight in weights:
+            table_offsets.append(table_offsets[-1] + weight.size(0))
+        if table_offsets[-1] != kernel.total_hash_size:
+            raise ValueError("TBE linear rows do not match split embedding weights")
+        device = weights[0].device
+        return _UsedRowKernelState(
+            kernel=kernel,
+            context=unit.context,
+            weights=weights,
+            optimizer_states=optimizer_states,
+            table_offsets=table_offsets,
+            table_boundaries=torch.tensor(
+                table_offsets[1:-1],
+                device=device,
+                dtype=torch.long,
+            ),
+            rows_seen=torch.zeros(
+                kernel.total_hash_size + 1,
+                device=device,
+                dtype=torch.uint8,
+            ),
+            count_cpu=torch.empty((), dtype=torch.long, pin_memory=True),
+            prep_stream=torch.cuda.Stream(),
+            ready_event=torch.cuda.Event(),
+        )
+
+    def _prepare_module_used_rows(
+        self,
+        module_fqn: str,
+        kernel_id: int,
+    ) -> None:
+        used_rows_by_module = getattr(self, "_module_sync_used_row_kernels", None)
+        if used_rows_by_module is None:
+            raise RuntimeError("used-row module sync is not enabled")
+        used_rows = used_rows_by_module[module_fqn][kernel_id]
+        kernel = used_rows.kernel
+        replica_pg = used_rows.context.replica_pg
+        assert replica_pg is not None, "replica_pg is not initialized"
+        with record_function(f"## 2d_used_rows_{module_fqn}_union ##"):
+            used_rows.prep_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(used_rows.prep_stream):
+                used_rows.rows_seen.zero_()
+                linear_indices = torch.ops.fbgemm.linearize_cache_indices(
+                    kernel.hash_size_cumsum,
+                    kernel._indices,
+                    kernel._offsets,
+                    kernel._vbe_B_offsets,
+                    kernel._vbe_max_B,
+                ).clamp(max=kernel.total_hash_size)
+                used_rows.rows_seen.index_fill_(0, linear_indices, 1)
+                union_rows_seen = used_rows.rows_seen[: kernel.total_hash_size]
+                opts = dist.AllreduceOptions()
+                opts.reduceOp = dist.ReduceOp.MAX
+                replica_pg.allreduce([union_rows_seen], opts=opts).wait()
+                compacted_rows, count = res_bitmap_compact(union_rows_seen.bool())
+                used_rows.count_cpu.copy_(count, non_blocking=True)
+                used_rows.ready_event.record()
+                used_rows.compacted_rows = compacted_rows
 
     def enable_module_sync(
         self,

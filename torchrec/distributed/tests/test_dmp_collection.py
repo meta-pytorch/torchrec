@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.distributed.remote_device import _remote_device
 from torch.distributed.tensor import DTensor
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.model_parallel import DMPCollection
+from torchrec.distributed.model_parallel import _DMPModuleSyncUnit, DMPCollection
 from torchrec.distributed.sharding_plan import (
     construct_module_sharding_plan,
     table_wise,
@@ -451,6 +451,23 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
 
         self.assertIn(id(container), reachable)
         self.assertIn(id(kernel), reachable)
+
+    def test_used_row_state_requires_fbgemm_tbe(self) -> None:
+        kernel = MockSyncableEmbeddingKernel()
+        context = self._context()
+        unit = _DMPModuleSyncUnit(
+            kernel=kernel,
+            parent=kernel,
+            context=context,
+            weights_by_dtype={torch.float32: [kernel.weight]},
+            optimizer_by_dtype={torch.float32: [kernel.optimizer_state]},
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires SplitTableBatchedEmbeddingBagsCodegen",
+        ):
+            DMPCollection._create_used_row_kernel_state(unit)
 
     def _module_sync_dmp(
         self,
