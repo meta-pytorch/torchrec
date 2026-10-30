@@ -11,7 +11,7 @@ import abc
 import copy
 import logging as logger
 from collections import defaultdict, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
@@ -102,6 +102,15 @@ def _is_embedding_kernel_with_sync_tensors(module: nn.Module) -> bool:
     return isinstance(module, SplitTableBatchedEmbeddingBagsCodegen) or _is_triton_tbe(
         module
     )
+
+
+@dataclass
+class DMPModuleSyncHandle:
+    """Outstanding replica synchronization for one planned sharded module."""
+
+    module_fqn: str
+    weight_works: List[dist.Work] = field(default_factory=list)
+    optimizer_works: List[dist.Work] = field(default_factory=list)
 
 
 @dataclass
@@ -1349,6 +1358,7 @@ class DMPCollection(DistributedModelParallel):
         ] + self._submodule_ctxs
         self._module_sync_units: Dict[str, List[_DMPModuleSyncUnit]] = {}
         self._module_sync_units_initialized = False
+        self._pending_module_syncs: Dict[str, DMPModuleSyncHandle] = {}
 
         # create process groups and remap sharding plans per module context
         for ctx in self._ctxs:
@@ -2157,6 +2167,80 @@ class DMPCollection(DistributedModelParallel):
             if module_fqn in units
         }
         self._module_sync_units_initialized = True
+
+    def _ensure_module_sync_units(self) -> None:
+        if not getattr(self, "_module_sync_units_initialized", False):
+            self._build_module_sync_units()
+
+    @property
+    def module_sync_fqns(self) -> Tuple[str, ...]:
+        """Planned module FQNs with independently syncable physical kernels."""
+        return tuple(self._module_sync_units)
+
+    def start_module_sync(
+        self,
+        module_fqn: str,
+        include_optimizer_state: bool = True,
+    ) -> DMPModuleSyncHandle:
+        """Launch asynchronous replica synchronization for one planned module.
+
+        All ranks in a replica process group must call this method for module
+        FQNs in the same order. `wait_all_module_syncs` drains the outstanding
+        weight and optimizer-state collectives before their next use.
+        """
+        self._ensure_module_sync_units()
+        if self._custom_all_reduce is not None or self._all_reduce_hook is not None:
+            raise RuntimeError(
+                "module-granular sync does not support a custom all-reduce hook"
+            )
+        if module_fqn not in self._module_sync_units:
+            raise KeyError(f"no syncable embedding kernels for module '{module_fqn}'")
+        pending = self._pending_module_syncs.get(module_fqn)
+        if pending is not None and (pending.weight_works or pending.optimizer_works):
+            raise RuntimeError(f"module '{module_fqn}' already has pending sync work")
+
+        handle = DMPModuleSyncHandle(module_fqn=module_fqn)
+        restored_contexts: Set[int] = set()
+        with record_function(f"## 2d_module_sync_start {module_fqn} ##"):
+            for unit in self._module_sync_units[module_fqn]:
+                replica_pg = unit.context.replica_pg
+                assert replica_pg is not None, "replica_pg is not initialized"
+                if replica_pg.size() == 1:
+                    continue
+                context_id = id(unit.context)
+                if context_id not in restored_contexts:
+                    self._restore_stashed_sync_tensors(
+                        unit.context,
+                        include_optimizer_state,
+                    )
+                    restored_contexts.add(context_id)
+                opts = dist.AllreduceCoalescedOptions()
+                opts.reduceOp = dist.ReduceOp.AVG
+                for dtype in sorted(unit.weights_by_dtype, key=str):
+                    handle.weight_works.append(
+                        replica_pg.allreduce_coalesced(
+                            unit.weights_by_dtype[dtype],
+                            opts=opts,
+                        )
+                    )
+                if include_optimizer_state:
+                    for dtype in sorted(unit.optimizer_by_dtype, key=str):
+                        handle.optimizer_works.append(
+                            replica_pg.allreduce_coalesced(
+                                unit.optimizer_by_dtype[dtype],
+                                opts=opts,
+                            )
+                        )
+        self._pending_module_syncs[module_fqn] = handle
+        return handle
+
+    def wait_all_module_syncs(self) -> None:
+        """Drain all module-granular synchronization work."""
+        with record_function("## 2d_module_sync_wait_all ##"):
+            for handle in self._pending_module_syncs.values():
+                for work in handle.weight_works + handle.optimizer_works:
+                    work.wait()
+        self._pending_module_syncs.clear()
 
     @property
     def device_mesh(self) -> DeviceMesh:
