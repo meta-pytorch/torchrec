@@ -106,12 +106,21 @@ def _is_embedding_kernel_with_sync_tensors(module: nn.Module) -> bool:
 
 
 @dataclass
+class _PackedUsedRows:
+    target: torch.Tensor
+    row_ids: torch.Tensor
+    payload: torch.Tensor
+
+
+@dataclass
 class DMPModuleSyncHandle:
     """Outstanding replica synchronization for one planned sharded module."""
 
     module_fqn: str
     weight_works: List[dist.Work] = field(default_factory=list)
     optimizer_works: List[dist.Work] = field(default_factory=list)
+    packed_weight_rows: List[_PackedUsedRows] = field(default_factory=list)
+    packed_optimizer_rows: List[_PackedUsedRows] = field(default_factory=list)
 
 
 @dataclass
@@ -2230,20 +2239,32 @@ class DMPCollection(DistributedModelParallel):
                         include_optimizer_state,
                     )
                     restored_contexts.add(context_id)
+                weights_by_dtype = unit.weights_by_dtype
+                optimizer_by_dtype = unit.optimizer_by_dtype
+                if getattr(self, "_module_sync_used_row_sync_enabled", False):
+                    (
+                        weights_by_dtype,
+                        optimizer_by_dtype,
+                    ) = self._pack_module_used_rows(
+                        module_fqn,
+                        unit,
+                        handle,
+                        include_optimizer_state,
+                    )
                 opts = dist.AllreduceCoalescedOptions()
                 opts.reduceOp = dist.ReduceOp.AVG
-                for dtype in sorted(unit.weights_by_dtype, key=str):
+                for dtype in sorted(weights_by_dtype, key=str):
                     handle.weight_works.append(
                         replica_pg.allreduce_coalesced(
-                            unit.weights_by_dtype[dtype],
+                            weights_by_dtype[dtype],
                             opts=opts,
                         )
                     )
                 if include_optimizer_state:
-                    for dtype in sorted(unit.optimizer_by_dtype, key=str):
+                    for dtype in sorted(optimizer_by_dtype, key=str):
                         handle.optimizer_works.append(
                             replica_pg.allreduce_coalesced(
-                                unit.optimizer_by_dtype[dtype],
+                                optimizer_by_dtype[dtype],
                                 opts=opts,
                             )
                         )
@@ -2267,7 +2288,10 @@ class DMPCollection(DistributedModelParallel):
         with record_function(f"## 2d_module_weight_wait {module_fqn} ##"):
             for work in handle.weight_works:
                 work.wait()
+            for packed in handle.packed_weight_rows:
+                packed.target.index_copy_(0, packed.row_ids, packed.payload)
             handle.weight_works.clear()
+            handle.packed_weight_rows.clear()
         self._clear_completed_module_sync(module_fqn)
 
     def wait_module_optimizer_state(self, module_fqn: str) -> None:
@@ -2278,7 +2302,10 @@ class DMPCollection(DistributedModelParallel):
         with record_function(f"## 2d_module_optimizer_wait {module_fqn} ##"):
             for work in handle.optimizer_works:
                 work.wait()
+            for packed in handle.packed_optimizer_rows:
+                packed.target.index_copy_(0, packed.row_ids, packed.payload)
             handle.optimizer_works.clear()
+            handle.packed_optimizer_rows.clear()
         self._clear_completed_module_sync(module_fqn)
 
     def wait_all_module_syncs(self) -> None:
@@ -2363,11 +2390,60 @@ class DMPCollection(DistributedModelParallel):
                 used_rows.ready_event.record()
                 used_rows.compacted_rows = compacted_rows
 
+    def _pack_module_used_rows(
+        self,
+        module_fqn: str,
+        unit: _DMPModuleSyncUnit,
+        handle: DMPModuleSyncHandle,
+        include_optimizer_state: bool,
+    ) -> Tuple[
+        Dict[torch.dtype, List[torch.Tensor]],
+        Dict[torch.dtype, List[torch.Tensor]],
+    ]:
+        used_rows = self._module_sync_used_row_kernels[module_fqn][id(unit.kernel)]
+        used_rows.ready_event.synchronize()
+        count = int(used_rows.count_cpu.item())
+        if used_rows.compacted_rows is None:
+            raise RuntimeError("used-row union was not prepared before backward")
+        rows = used_rows.compacted_rows[:count]
+        split_positions = [0]
+        if used_rows.table_boundaries.numel() > 0:
+            split_positions.extend(
+                torch.searchsorted(rows, used_rows.table_boundaries).cpu().tolist()
+            )
+        split_positions.append(count)
+
+        weights_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+        optimizer_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+        with record_function(f"## 2d_used_rows_{module_fqn}_pack ##"):
+            for table_index, (start, end) in enumerate(
+                zip(split_positions, split_positions[1:])
+            ):
+                if start == end:
+                    continue
+                row_ids = rows[start:end].sub(used_rows.table_offsets[table_index])
+                weight = used_rows.weights[table_index]
+                weight_payload = weight.index_select(0, row_ids)
+                weights_by_dtype[weight.dtype].append(weight_payload)
+                handle.packed_weight_rows.append(
+                    _PackedUsedRows(weight, row_ids, weight_payload)
+                )
+                optimizer = used_rows.optimizer_states[table_index]
+                if include_optimizer_state and optimizer is not None:
+                    optimizer_payload = optimizer.index_select(0, row_ids)
+                    optimizer_by_dtype[optimizer.dtype].append(optimizer_payload)
+                    handle.packed_optimizer_rows.append(
+                        _PackedUsedRows(optimizer, row_ids, optimizer_payload)
+                    )
+        used_rows.compacted_rows = None
+        return dict(weights_by_dtype), dict(optimizer_by_dtype)
+
     def enable_module_sync(
         self,
         *,
         preserve_forward_order: bool = False,
         consumer_waits: bool = True,
+        used_row_sync: bool = False,
     ) -> None:
         """Launch module syncs from fused updates.
 
@@ -2395,6 +2471,20 @@ class DMPCollection(DistributedModelParallel):
         self._module_sync_updated_kernels: Dict[str, Set[int]] = {}
         self._module_sync_next_index = 0
         self._module_sync_consumer_waits_enabled = consumer_waits
+        self._module_sync_used_row_sync_enabled = used_row_sync
+        self._module_sync_used_row_kernels: Dict[
+            str, Dict[int, _UsedRowKernelState]
+        ] = {}
+        if used_row_sync:
+            if self.device.type != "cuda":
+                raise ValueError("used-row module sync requires CUDA")
+            self._module_sync_used_row_kernels = {
+                module_fqn: {
+                    id(unit.kernel): self._create_used_row_kernel_state(unit)
+                    for unit in self._module_sync_units[module_fqn]
+                }
+                for module_fqn in module_sync_fqns
+            }
 
         for module_fqn in module_sync_fqns:
             for unit in self._module_sync_units[module_fqn]:
@@ -2417,6 +2507,21 @@ class DMPCollection(DistributedModelParallel):
                     self._mark_module_kernel_updated(fqn, kernel_identity)
 
                 self._module_sync_hook_handles.append(register_post_update(post_update))
+
+                if self._module_sync_used_row_sync_enabled:
+
+                    def prepare_used_rows(
+                        _module: nn.Module,
+                        _inputs: Any,
+                        _output: Any,
+                        fqn: str = module_fqn,
+                        kernel_identity: int = kernel_id,
+                    ) -> None:
+                        self._prepare_module_used_rows(fqn, kernel_identity)
+
+                    self._module_sync_hook_handles.append(
+                        unit.kernel.register_forward_hook(prepare_used_rows)
+                    )
 
                 if not self._module_sync_consumer_waits_enabled:
                     continue
@@ -2504,6 +2609,8 @@ class DMPCollection(DistributedModelParallel):
             handle.remove()
         self._module_sync_hook_handles = []
         self._module_sync_consumer_waits_enabled = False
+        self._module_sync_used_row_sync_enabled = False
+        self._module_sync_used_row_kernels = {}
         self._module_sync_step_enabled = False
 
     @property

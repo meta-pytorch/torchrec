@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import Callable, cast
+from typing import Any, Callable, cast
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -17,7 +17,12 @@ import torch.nn as nn
 from torch.distributed.remote_device import _remote_device
 from torch.distributed.tensor import DTensor
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.model_parallel import _DMPModuleSyncUnit, DMPCollection
+from torchrec.distributed.model_parallel import (
+    _DMPModuleSyncUnit,
+    _UsedRowKernelState,
+    DMPCollection,
+    DMPModuleSyncHandle,
+)
 from torchrec.distributed.sharding_plan import (
     construct_module_sharding_plan,
     table_wise,
@@ -468,6 +473,64 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
             "requires SplitTableBatchedEmbeddingBagsCodegen",
         ):
             DMPCollection._create_used_row_kernel_state(unit)
+
+    def test_pack_module_used_rows_splits_table_local_payloads(self) -> None:
+        kernel = MockSyncableEmbeddingKernel()
+        context = self._context()
+        weights = [torch.arange(6).view(3, 2), torch.arange(4).view(2, 2)]
+        optimizer_states = [torch.arange(3), torch.arange(2)]
+        ready_event = MagicMock()
+        used_rows = _UsedRowKernelState(
+            kernel=cast(Any, kernel),
+            context=context,
+            weights=weights,
+            optimizer_states=optimizer_states,
+            table_offsets=[0, 3, 5],
+            table_boundaries=torch.tensor([3]),
+            rows_seen=torch.empty(0, dtype=torch.uint8),
+            count_cpu=torch.tensor(4),
+            prep_stream=MagicMock(),
+            ready_event=ready_event,
+            compacted_rows=torch.tensor([0, 2, 3, 4]),
+        )
+        unit = _DMPModuleSyncUnit(
+            kernel=kernel,
+            parent=kernel,
+            context=context,
+            weights_by_dtype={torch.int64: weights},
+            optimizer_by_dtype={torch.int64: optimizer_states},
+        )
+        handle = DMPModuleSyncHandle("ebc")
+        dmp = self._dmp_shell(MockLookupContainer(kernel))
+        dmp._module_sync_used_row_kernels = {"ebc": {id(kernel): used_rows}}
+
+        packed_weights, packed_optimizer = dmp._pack_module_used_rows(
+            "ebc",
+            unit,
+            handle,
+            include_optimizer_state=True,
+        )
+
+        ready_event.synchronize.assert_called_once_with()
+        self.assertTrue(
+            torch.equal(packed_weights[torch.int64][0], weights[0][[0, 2]])
+        )
+        self.assertTrue(
+            torch.equal(packed_weights[torch.int64][1], weights[1][[0, 1]])
+        )
+        self.assertTrue(
+            torch.equal(
+                packed_optimizer[torch.int64][0], optimizer_states[0][[0, 2]]
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                packed_optimizer[torch.int64][1], optimizer_states[1][[0, 1]]
+            )
+        )
+        self.assertEqual(len(handle.packed_weight_rows), 2)
+        self.assertEqual(len(handle.packed_optimizer_rows), 2)
+        self.assertIsNone(used_rows.compacted_rows)
 
     def _module_sync_dmp(
         self,
