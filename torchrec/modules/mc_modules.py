@@ -1033,6 +1033,19 @@ class DistanceLFU_EvictionPolicy(MCHEvictionPolicy):
         return evicted_indices, selected_new_indices
 
 
+@torch.jit.ignore
+def _mch_remap_cuda(
+    sorted_raw_ids: torch.Tensor,
+    remapped_ids_mapping: torch.Tensor,
+    values: torch.Tensor,
+    default_index: int,
+) -> torch.Tensor:
+    # Triton is optional for CPU installs, so import it only on the CUDA path.
+    from torchrec.modules.triton_mch_remap import mch_remap_cuda
+
+    return mch_remap_cuda(sorted_raw_ids, remapped_ids_mapping, values, default_index)
+
+
 @torch.fx.wrap
 def _mch_remap(
     features: Dict[str, JaggedTensor],
@@ -1040,23 +1053,30 @@ def _mch_remap(
     mch_remapped_ids_mapping: torch.Tensor,
     zch_index: int,
 ) -> Dict[str, JaggedTensor]:
-    """Remap feature ids to zch ids, TODO: create a custom kernel"""
+    """Remap feature ids to zch ids."""
     remapped_features: Dict[str, JaggedTensor] = {}
     for name, feature in features.items():
         values = feature.values()
-        remapped_ids = torch.empty_like(values)
+        if values.is_cuda and not torch.jit.is_scripting():
+            remapped_ids = _mch_remap_cuda(
+                mch_sorted_raw_ids, mch_remapped_ids_mapping, values, zch_index
+            )
+        else:
+            # TorchScript cannot compile a Triton launch; retain the existing
+            # tensor path for scripted inference and CPU execution.
+            remapped_ids = torch.empty_like(values)
 
-        # compute overlap between incoming IDs and remapping table
-        searched_indices = torch.searchsorted(mch_sorted_raw_ids[:-1], values)
-        retrieved_indices = mch_sorted_raw_ids[searched_indices]
-        # identify matching inputs IDs
-        matching_indices = retrieved_indices == values
-        # update output with remapped matching IDs
-        remapped_ids[matching_indices] = mch_remapped_ids_mapping[
-            searched_indices[matching_indices]
-        ]
-        # default embedding for non-matching ids
-        remapped_ids[~matching_indices] = zch_index
+            # compute overlap between incoming IDs and remapping table
+            searched_indices = torch.searchsorted(mch_sorted_raw_ids[:-1], values)
+            retrieved_indices = mch_sorted_raw_ids[searched_indices]
+            # identify matching inputs IDs
+            matching_indices = retrieved_indices == values
+            # update output with remapped matching IDs
+            remapped_ids[matching_indices] = mch_remapped_ids_mapping[
+                searched_indices[matching_indices]
+            ]
+            # default embedding for non-matching ids
+            remapped_ids[~matching_indices] = zch_index
 
         remapped_features[name] = JaggedTensor(
             values=remapped_ids,
