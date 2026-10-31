@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import cast, Dict, Optional
+from typing import Any, cast, Dict, Optional
 from unittest.mock import patch
 
 import torch
@@ -209,6 +209,7 @@ class TestMCH(unittest.TestCase):
                         features=["feature"],
                         single_ttl=12,
                     ),
+                    deduplicate_input_ids=True,
                 ),
             )
         }
@@ -227,6 +228,127 @@ class TestMCH(unittest.TestCase):
             embedding_configs=embedding_configs,
         )
         torch.jit.script(mcc_ec)
+
+    def test_deduplicate_input_ids_rejects_incompatible_configs(self) -> None:
+        cases: Dict[str, Dict[str, Any]] = {
+            "only LRU eviction": {
+                "eviction_policy_name": None,
+                "eviction_config": None,
+            },
+            "probabilistic opt-in": {
+                "opt_in_prob": 50,
+                "percent_reserved_slots": 10,
+            },
+            "ID frequency tracking": {"track_id_freq": True},
+            "custom runtime metadata": {"write_runtime_meta_dim": 1},
+        }
+        for expected_message, overrides in cases.items():
+            with self.subTest(expected_message=expected_message):
+                constructor_args: Dict[str, Any] = {
+                    "zch_size": 10,
+                    "device": torch.device("cpu"),
+                    "total_num_buckets": 2,
+                    "eviction_policy_name": HashZchEvictionPolicyName.LRU_EVICTION,
+                    "eviction_config": HashZchEvictionConfig(
+                        features=[],
+                        single_ttl=12,
+                    ),
+                    "deduplicate_input_ids": True,
+                }
+                constructor_args.update(overrides)
+                with self.assertRaisesRegex(AssertionError, expected_message):
+                    HashZchManagedCollisionModule(**constructor_args)
+
+    def test_lru_deduplication_reset_inference_then_rebuild(self) -> None:
+        module = HashZchManagedCollisionModule(
+            zch_size=10,
+            device=torch.device("cpu"),
+            total_num_buckets=2,
+            eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=12,
+            ),
+            deduplicate_input_ids=True,
+        )
+
+        module.reset_inference_mode()
+        rebuilt_module = module.rebuild_with_output_id_range((5, 10))
+
+        self.assertFalse(rebuilt_module.training)
+        self.assertTrue(rebuilt_module._is_inference)
+        self.assertTrue(rebuilt_module._deduplicate_input_ids)
+        self.assertIsNone(rebuilt_module._eviction_policy_name)
+
+        rebuilt_module.reset_training_mode()
+        self.assertTrue(rebuilt_module.training)
+        self.assertEqual(
+            HashZchEvictionPolicyName.LRU_EVICTION,
+            rebuilt_module._eviction_policy_name,
+        )
+        self.assertIsNotNone(rebuilt_module._eviction_module)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_lru_deduplicates_mutating_inputs(self) -> None:
+        module = HashZchManagedCollisionModule(
+            zch_size=64,
+            device=torch.device("cuda"),
+            total_num_buckets=1,
+            max_probe=64,
+            eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=24,
+            ),
+            deduplicate_input_ids=True,
+        )
+        rebuilt_module = module.rebuild_with_output_id_range((0, 64))
+        self.assertTrue(rebuilt_module._deduplicate_input_ids)
+
+        empty = JaggedTensor(
+            values=torch.empty(0, dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([0], dtype=torch.int64, device="cuda"),
+        )
+        empty_output = module.remap({"feature": empty})["feature"]
+        self.assertEqual(0, empty_output.values().numel())
+        torch.testing.assert_close(empty_output.lengths(), empty.lengths())
+
+        initial = JaggedTensor(
+            values=torch.arange(64, dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([64], dtype=torch.int64, device="cuda"),
+        )
+        with patch("time.time", return_value=100 * 3600):
+            module.remap({"feature": initial})
+
+        duplicate_values = torch.full((128,), 1_000, dtype=torch.int64, device="cuda")
+        duplicate_lengths = torch.tensor([64, 64], dtype=torch.int64, device="cuda")
+        duplicate_weights = torch.arange(128, dtype=torch.float32, device="cuda")
+        duplicates = JaggedTensor(
+            values=duplicate_values,
+            lengths=duplicate_lengths,
+            weights=duplicate_weights,
+        )
+        with patch("time.time", return_value=125 * 3600):
+            output = module.remap({"feature": duplicates})["feature"]
+
+        self.assertEqual(128, output.values().numel())
+        self.assertEqual(1, torch.unique(output.values()).numel())
+        torch.testing.assert_close(output.lengths(), duplicate_lengths)
+        torch.testing.assert_close(output.weights(), duplicate_weights)
+        self.assertEqual(
+            1,
+            torch.count_nonzero(module._hash_zch_identities == 1_000).item(),
+        )
+        evicted_indices = module.evict()
+        self.assertIsNotNone(evicted_indices)
+        self.assertEqual(
+            1,
+            none_throws(evicted_indices).numel(),
+            "evictions represent unique physical slots, not input occurrences",
+        )
 
     @unittest.skipIf(
         torch.cuda.device_count() < 2,

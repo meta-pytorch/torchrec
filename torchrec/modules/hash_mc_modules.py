@@ -45,6 +45,32 @@ def _tensor_may_to_device(
     return (src, src_device)
 
 
+@torch.fx.wrap
+def _deduplicate_lru_inputs(
+    values: torch.Tensor,
+    input_metadata: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    unique_values, reverse_indices = torch.unique(
+        values,
+        sorted=False,
+        return_inverse=True,
+    )
+    unique_metadata: Optional[torch.Tensor] = None
+    if input_metadata is not None:
+        unique_metadata = torch.zeros_like(
+            unique_values,
+            dtype=input_metadata.dtype,
+        )
+        unique_metadata.scatter_reduce_(
+            0,
+            reverse_indices,
+            input_metadata,
+            reduce="amax",
+            include_self=False,
+        )
+    return unique_values, reverse_indices, unique_metadata
+
+
 def _compute_lengths_from_hits(
     lengths: torch.Tensor,
     hit_indices: torch.Tensor,
@@ -218,6 +244,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         percent_reserved_slots: percentage of slots to be reserved when opt-in is enabled, the value must be in [0, 100)
         persist_hash_zch_bucket: when False, exclude the bucket-count buffer from state_dict. Useful for warm-loading checkpoints saved before this buffer existed.
         long_dtype: The dtype of the identites/metadata. If true, then dtype is int64, else int32. Default True.
+        deduplicate_input_ids: when True, remap each unique ID once per mutating
+            LRU call and expand the result back to every original occurrence.
 
     Example::
         module = HashZchManagedCollisionModule(...)
@@ -257,6 +285,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         write_runtime_meta_dim: int = 0,
         persist_hash_zch_bucket: bool = True,
         long_dtype: bool = True,
+        deduplicate_input_ids: bool = False,
     ) -> None:
         if output_segments is None:
             assert (
@@ -293,8 +322,11 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._name: Optional[str] = name
         self._tb_logging_frequency: int = tb_logging_frequency
         self._scalar_logger: Optional[ScalarLogger] = None
-        self._eviction_policy_name: Optional[HashZchEvictionPolicyName] = (
+        self._eviction_policy_name_copy: Optional[HashZchEvictionPolicyName] = (
             eviction_policy_name
+        )
+        self._eviction_policy_name: Optional[HashZchEvictionPolicyName] = (
+            self._eviction_policy_name_copy
         )
         self._eviction_config: Optional[HashZchEvictionConfig] = eviction_config
         self._eviction_module: Optional[HashZchEvictionModule] = (
@@ -321,6 +353,22 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         assert not (
             self._track_id_freq and self._write_runtime_meta_dim > 0
         ), f"_hash_zch_runtime_meta is used for either tracking id frequency or saving custom metadata, but not both. Got {self._track_id_freq=} and {self._write_runtime_meta_dim=}."
+        self._deduplicate_input_ids: bool = deduplicate_input_ids
+        if self._deduplicate_input_ids:
+            assert (
+                self._eviction_policy_name_copy
+                == HashZchEvictionPolicyName.LRU_EVICTION
+            ), "deduplicate_input_ids currently supports only LRU eviction"
+            assert (
+                self._opt_in_prob == -1
+            ), "deduplicate_input_ids does not support probabilistic opt-in"
+            assert not self._track_id_freq, (
+                "deduplicate_input_ids cannot preserve per-occurrence ID frequency "
+                "tracking"
+            )
+            assert (
+                self._write_runtime_meta_dim == 0
+            ), "deduplicate_input_ids does not support custom runtime metadata"
         if torch.jit.is_scripting() or self._is_inference or self._name is None:
             self._tb_logging_frequency = 0
 
@@ -394,9 +442,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         if self._is_inference is True:
             self.reset_inference_mode()
 
-        self._eviction_policy_name_copy: Optional[HashZchEvictionPolicyName] = (
-            self._eviction_policy_name
-        )
         self._read_only_suffix: str = read_only_suffix
         self._enable_per_feature_lookups: bool = enable_per_feature_lookups
         self._no_bag = no_bag
@@ -412,7 +457,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
             f"{self._no_bag=}, {self._write_runtime_meta_dim=}, "
-            f"{self._persist_hash_zch_bucket=}, {self._long_dtype=}"
+            f"{self._persist_hash_zch_bucket=}, {self._deduplicate_input_ids=}, "
+            f"{self._long_dtype=}"
         )
 
     def _create_zch_buffer(
@@ -688,10 +734,22 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 values = feature.values()
                 self._assert_identity_dtype_matches_input(name, values)
 
-                input_metadata, eviction_threshold = (
-                    self._eviction_module(feature)
-                    if self._eviction_module is not None
-                    else (None, -1)
+                input_metadata: Optional[torch.Tensor] = None
+                eviction_threshold: int = -1
+                if self._eviction_module is not None:
+                    input_metadata, eviction_threshold = self._eviction_module(feature)
+
+                values, orig_device = _tensor_may_to_device(values, self.device)
+                reverse_indices: Optional[torch.Tensor] = None
+                if self._deduplicate_input_ids and not overwrite_readonly:
+                    # LRU scores use one TTL and are identical within a remap call.
+                    values, reverse_indices, input_metadata = _deduplicate_lru_inputs(
+                        values, input_metadata
+                    )
+
+                values, local_sizes, offsets = self.input_mapper(
+                    values=values,
+                    output_offset=self._output_global_offset_tensor,
                 )
 
                 # self._opt_in_prob == 100 means reserved slots are used as always-on table
@@ -702,12 +760,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     and self._opt_in_prob < 100
                     and self.training
                     else None
-                )
-
-                values, orig_device = _tensor_may_to_device(values, self.device)
-                values, local_sizes, offsets = self.input_mapper(
-                    values=values,
-                    output_offset=self._output_global_offset_tensor,
                 )
 
                 num_reserved_slots: int = self.get_reserved_slots_per_bucket()
@@ -741,6 +793,10 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                         else self._hash_zch_runtime_meta
                     ),
                 )
+                if reverse_indices is not None:
+                    values = torch.index_select(values, 0, reverse_indices)
+                    remapped_ids = torch.index_select(remapped_ids, 0, reverse_indices)
+                # Evictions name physical slots, so they must remain deduplicated.
                 # Zero out runtime_meta at evicted slots so it follows
                 # the same eviction behavior as the identity tensor.
                 if (
@@ -869,7 +925,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             output_segments=self._output_segments,
             name=self._name,
             tb_logging_frequency=self._tb_logging_frequency,
-            eviction_policy_name=self._eviction_policy_name,
+            eviction_policy_name=self._eviction_policy_name_copy,
             eviction_config=self._eviction_config,
             opt_in_prob=self._opt_in_prob,
             percent_reserved_slots=self._percent_reserved_slots,
@@ -880,6 +936,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             no_bag=self._no_bag,
             write_runtime_meta_dim=self._write_runtime_meta_dim,
             persist_hash_zch_bucket=self._persist_hash_zch_bucket,
+            deduplicate_input_ids=self._deduplicate_input_ids,
             long_dtype=self._long_dtype,
         )
 
