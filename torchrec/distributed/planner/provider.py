@@ -25,7 +25,16 @@ so the OSS layer never imports fb. The provider is *injected* (not registered by
 import side effect), so the wiring is explicit, typed, and testable.
 """
 
-from typing import Callable, Dict, List, Optional, Protocol, runtime_checkable, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    runtime_checkable,
+    Union,
+)
 
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import (
@@ -263,10 +272,17 @@ class DefaultPlannerProvider(PlannerProvider):
             if cfg.pipeline_type is not None
             else PipelineType.NONE
         )
+        rowwise_storage_kwargs: Dict[str, Any] = {}
+        if (
+            cfg.estimate_rowwise_optimizer_storage
+            and cfg.storage_reservation_policy != StorageReservationPolicy.INFERENCE
+        ):
+            rowwise_storage_kwargs["estimate_rowwise_optimizer_storage"] = True
         return EmbeddingStorageEstimator(
             topology=topology,
             constraints=constraints,  # pyre-ignore[6]
             pipeline_type=pipeline_type,
+            **rowwise_storage_kwargs,
         )
 
     def _build_enumerator(
