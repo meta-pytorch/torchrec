@@ -23,6 +23,7 @@ from torchrec.distributed.planner.utils import (
     BinarySearchPredicate,
     build_sharder_data,
     LuusJaakolaSearch,
+    placement,
     reset_shard_rank,
 )
 from torchrec.distributed.types import (
@@ -391,6 +392,21 @@ class TestLuusJaakolaSearch(unittest.TestCase):
             ],
         )
         torch.testing.assert_close(results, want)
+
+
+class TestPlacement(unittest.TestCase):
+    def test_placement(self) -> None:
+        cases = [
+            ("cuda", "rank:3/cuda:1"),
+            ("mtia", "rank:3/mtia:1"),
+            ("xpu", "rank:3/xpu:1"),
+            ("cpu", "rank:3/cpu"),
+        ]
+        for compute_device, expected in cases:
+            with self.subTest(compute_device=compute_device):
+                self.assertEqual(
+                    placement(compute_device, rank=3, local_size=2), expected
+                )
 
 
 class TestBuildSharderData(unittest.TestCase):

@@ -77,3 +77,23 @@ class TestKernelBWLookup(unittest.TestCase):
         ]
 
         self.assertEqual(expected_uvm_caching_bw, uvm_caching_bw)
+
+    def test_quant_bw(self) -> None:
+        cases = [
+            ("cuda", HBM_MEM_BW),
+            ("mtia", HBM_MEM_BW),
+            ("xpu", HBM_MEM_BW),
+            ("cpu", DDR_MEM_BW),
+        ]
+        for compute_device, expected in cases:
+            with self.subTest(compute_device=compute_device):
+                self.assertEqual(
+                    kernel_bw_lookup(
+                        compute_device,
+                        EmbeddingComputeKernel.QUANT.value,
+                        HBM_MEM_BW,
+                        DDR_MEM_BW,
+                        HBM_TO_DDR_MEM_BW,
+                    ),
+                    expected,
+                )

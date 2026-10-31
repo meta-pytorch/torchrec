@@ -209,7 +209,7 @@ class SparseDataDistUtil(Generic[In]):
         ] = (
             # pyrefly: ignore[bad-assignment]
             torch.get_device_module(self._device).stream
-            if self._device.type in ["cuda", "mtia"]
+            if self._device.type in ["cuda", "mtia", "xpu"]
             else torch.cuda.stream
         )
 
@@ -232,7 +232,7 @@ class SparseDataDistUtil(Generic[In]):
 
         self._default_stream: Optional[torch.Stream] = (
             (torch.get_device_module(self._device).Stream())
-            if self._device.type in ["cuda", "mtia"]
+            if self._device.type in ["cuda", "mtia", "xpu"]
             else None
         )
         # When data iterator is exhausted, contexts should continue advancing until

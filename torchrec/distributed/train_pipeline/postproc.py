@@ -89,7 +89,7 @@ class PipelinedPostproc(torch.nn.Module):
             device: torch.device = self._dist_stream.device
             self._stream_context = (
                 torch.get_device_module(device).stream
-                if device.type in ["cuda", "mtia"]
+                if device.type in ["cuda", "mtia", "xpu"]
                 else torch.cuda.stream
             )
         else:
@@ -277,7 +277,7 @@ class PipelinedPostproc(torch.nn.Module):
         res: Union[torch.Tensor, Pipelineable, Iterable[Any], Dict[Any, Any]],
         stream: torch.Stream,
     ) -> None:
-        if isinstance(res, torch.Tensor) and res.device.type in ["cuda", "mtia"]:
+        if isinstance(res, torch.Tensor) and res.device.type in ["cuda", "mtia", "xpu"]:
             res.record_stream(stream)
         elif isinstance(res, Pipelineable):
             res.record_stream(stream)

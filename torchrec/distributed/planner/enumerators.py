@@ -118,7 +118,7 @@ class EmbeddingEnumerator(Enumerator):
         )
         memory_type = (
             "hbm_cap"
-            if topology.compute_device in {"cuda", "mtia", "tpu"}
+            if topology.compute_device in {"cuda", "mtia", "tpu", "xpu"}
             else "ddr_cap"
         )
         self._device_memory_sizes: Optional[

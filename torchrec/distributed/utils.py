@@ -336,6 +336,8 @@ def get_device_type() -> str:
         device_type = "mtia"
     elif hasattr(torch, "tpu") and torch.tpu.is_available():
         device_type = "tpu"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device_type = "xpu"
     else:
         device_type = "cpu"
     return device_type

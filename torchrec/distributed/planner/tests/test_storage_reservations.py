@@ -311,6 +311,37 @@ class TestGetKjtStorage(unittest.TestCase):
         self.assertGreater(kjt_storage.hbm, 0)
         self.assertEqual(kjt_storage.ddr, 0)
 
+    def test_get_kjt_storage_xpu(self) -> None:
+        """Test _get_kjt_storage with XPU topology returns storage with HBM."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="xpu")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        batch_inputs, _ = _get_batch_inputs_and_shardable_parameters(
+            model, sharders, batch_size=10
+        )
+        kjt_storage = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            multiplier=20,
+        )
+
+        self.assertGreater(kjt_storage.hbm, 0)
+        self.assertEqual(kjt_storage.ddr, 0)
+
     def test_get_kjt_storage_multiple_tables(self) -> None:
         """Test _get_kjt_storage with multiple tables computes aggregate size."""
         tables = [

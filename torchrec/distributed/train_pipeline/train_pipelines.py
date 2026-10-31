@@ -284,7 +284,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._device = device
         self._memcpy_stream: Optional[torch.Stream] = (
             torch.get_device_module(device).Stream()
-            if device.type in ["cuda", "mtia"]
+            if device.type in ["cuda", "mtia", "xpu"]
             else None
         )
         self._batch_count = 0
@@ -296,7 +296,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
 
         self._stream_context = (
             torch.get_device_module(self._device).stream
-            if self._device.type in ["cuda", "mtia"]
+            if self._device.type in ["cuda", "mtia", "xpu"]
             else torch.cuda.stream
         )
         self._cur_batch: Optional[In] = None
@@ -615,7 +615,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._skip_batch_record_stream: bool = (
             skip_batch_record_stream
             and not enable_inplace_copy_batch
-            and device.type in ["cuda", "mtia"]
+            and device.type in ["cuda", "mtia", "xpu"]
         )
         self._free_features_storage_early = free_features_storage_early
         self._batch_count = 0
@@ -632,7 +632,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             f"skip_batch_record_stream: {self._skip_batch_record_stream}"
         )
 
-        if device.type == "cuda":
+        if device.type in ["cuda", "xpu"]:
             # use two data streams to support two concurrent batches
             # Dynamo does not support cuda stream specificaiton,
             # this freedom is left for compiler pipelining optimizations.
@@ -642,18 +642,18 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
 
         self._stream_context = (
             torch.get_device_module(self._device).stream
-            if self._device.type in ["cuda", "mtia"]
+            if self._device.type in ["cuda", "mtia", "xpu"]
             else torch.cuda.stream
         )
 
         self._memcpy_stream: Optional[torch.Stream] = (
             (torch.get_device_module(device).Stream(priority=-1))
-            if device.type in ["cuda", "mtia"]
+            if device.type in ["cuda", "mtia", "xpu"]
             else None
         )
         self._data_dist_stream: Optional[torch.Stream] = (
             (torch.get_device_module(device).Stream(priority=-1))
-            if device.type in ["cuda", "mtia"]
+            if device.type in ["cuda", "mtia", "xpu"]
             else None
         )
 
@@ -1682,13 +1682,13 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             self._selective_emb_lookup_module_name = module_name
             self._selective_emb_lookup_stream = (
                 (torch.get_device_module(device).Stream())
-                if device.type in ["cuda", "mtia"]
+                if device.type in ["cuda", "mtia", "xpu"]
                 else None
             )
         elif emb_lookup_stream == "new":
             self._emb_lookup_stream = (
                 (torch.get_device_module(device).Stream())
-                if device.type in ["cuda", "mtia"]
+                if device.type in ["cuda", "mtia", "xpu"]
                 else None
             )
         elif emb_lookup_stream == "current":
@@ -2966,7 +2966,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
 
         self._stream_context = (
             torch.get_device_module(self._compute_stream.device).stream
-            if self._compute_stream.device.type in ["cuda", "mtia"]
+            if self._compute_stream.device.type in ["cuda", "mtia", "xpu"]
             else torch.cuda.stream
         )
 

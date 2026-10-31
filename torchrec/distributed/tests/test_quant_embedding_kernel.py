@@ -13,6 +13,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 import torchrec.distributed.quant_embedding_kernel as qek
+from fbgemm_gpu.split_embedding_configs import SparseType
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.distributed.fused_params import (
     FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER,
     fused_param_enable_fs_2d_async_allgather,
@@ -20,6 +26,7 @@ from torchrec.distributed.fused_params import (
     is_fused_param_device_ro,
     tbe_fused_params,
 )
+from torchrec.modules.embedding_configs import DataType, PoolingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -140,3 +147,33 @@ class QuantBatchedEmbeddingBagDeviceRoTest(unittest.TestCase):
         self.assertIsNotNone(filtered_params)
         self.assertNotIn(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER, filtered_params)
         self.assertIn("output_dtype", filtered_params)
+
+
+class CopyConfigRowAlignmentTest(unittest.TestCase):
+    def test_rows_padded_to_16_bytes_on_gpus(self) -> None:
+        # 20 INT8 values plus a 2-byte scale and a 2-byte bias: 24 bytes, 32 when
+        # padded to 16 bytes.
+        config = GroupedEmbeddingConfig(
+            data_type=DataType.FP32,
+            pooling=PoolingType.NONE,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=EmbeddingComputeKernel.QUANT,
+            embedding_tables=[
+                ShardedEmbeddingTable(
+                    name="table_0",
+                    num_embeddings=10,
+                    embedding_dim=20,
+                    feature_names=["feature_0"],
+                    local_rows=10,
+                    local_cols=20,
+                    compute_kernel=EmbeddingComputeKernel.QUANT,
+                )
+            ],
+        )
+        for device, expected in (("cuda", 32), ("xpu", 32), ("cpu", 24)):
+            with self.subTest(device=device):
+                quantized = qek._copy_config(
+                    config, DataType.INT8, SparseType.INT8, torch.device(device)
+                )
+                self.assertEqual(quantized.embedding_tables[0].local_cols, expected)

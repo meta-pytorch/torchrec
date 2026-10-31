@@ -331,7 +331,7 @@ def _pin_and_move(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     """
     return (
         tensor.pin_memory().to(device=device, non_blocking=True)
-        if device.type == "cuda" and tensor.device.type == "cpu"
+        if device.type in ["cuda", "xpu"] and tensor.device.type == "cpu"
         else tensor.to(device=device, non_blocking=True)
     )
 
