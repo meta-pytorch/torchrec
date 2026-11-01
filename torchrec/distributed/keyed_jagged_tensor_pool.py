@@ -682,7 +682,7 @@ class KeyedJaggedTensorPoolSharder(ModuleSharder[KeyedJaggedTensorPool]):
         super().__init__()
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def shard(
         self,
         module: KeyedJaggedTensorPool,

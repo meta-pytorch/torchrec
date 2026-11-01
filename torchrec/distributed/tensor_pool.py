@@ -587,7 +587,7 @@ class TensorPoolSharder(ModuleSharder[TensorPool]):
         self._split_ids_by_lengths = split_ids_by_lengths
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def shard(
         self,
         module: TensorPool,

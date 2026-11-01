@@ -233,6 +233,7 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
             )
         )
 
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: FeatureProcessedEmbeddingBagCollection,

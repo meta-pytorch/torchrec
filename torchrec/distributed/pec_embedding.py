@@ -857,6 +857,7 @@ class PECEmbeddingCollectionSharder(BaseEmbeddingSharder[PECEmbeddingCollection]
             module._embedding_collection
         )
 
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: PECEmbeddingCollection,
