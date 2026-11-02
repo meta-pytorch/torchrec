@@ -226,13 +226,17 @@ def maybe_variable_batch_all2all_pooled_uneven_tpu(
     world_size = group.size()
     if has_codecs or is_torchdynamo_compiling() or world_size <= 1:
         return None
+
+    rank = group.rank()
+    if not batch_size_per_rank_per_feature and not emb_dim_per_rank_per_feature[rank]:
+        batch_size_per_rank_per_feature = [[] for _ in range(world_size)]
+    # TODO: Check if this condition is really needed and would not fail anyways
     if (
         len(batch_size_per_rank_per_feature) != world_size
         or len(emb_dim_per_rank_per_feature) != world_size
     ):
         raise ValueError("VBE metadata must match the process-group size")
 
-    rank = group.rank()
     input_split_sizes = [
         sum(
             batch_size * embedding_dim
