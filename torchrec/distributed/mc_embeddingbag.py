@@ -164,6 +164,7 @@ class ShardedManagedCollisionEmbeddingBagCollection(
                     kt_key_ordering=emb_mod._kt_key_ordering,
                     inverse_indices=ctx.inverse_indices,
                     weights=features.weights_or_none(),
+                    rs_mean_embedding_mask=emb_mod._rs_mean_embedding_mask,
                 )
 
         return self._managed_collision_collection.input_dist(
