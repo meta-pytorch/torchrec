@@ -271,10 +271,8 @@ def _get_recat_tensor(
     stagger: int,
     device: Optional[torch.device],
 ) -> torch.Tensor:
-    # Round down to replicate the _get_recat_data list-comprehension behavior.
-    rounded_num_splits = num_splits // stagger * stagger
     feature_order = (
-        torch.arange(rounded_num_splits, device=device, dtype=torch.int32)
+        torch.arange(num_splits, device=device, dtype=torch.int32)
         .view(stagger, -1)
         .transpose(0, 1)
         .flatten()
@@ -293,6 +291,14 @@ def _get_recat_data_cached(
     device: Optional[torch.device],
 ) -> torch.Tensor:
     return _get_recat_tensor(local_split, num_splits, stagger, device)
+
+
+def _check_stagger(num_splits: int, stagger: int) -> None:
+    if stagger < 1 or num_splits % stagger != 0:
+        raise ValueError(
+            f"stagger must be a positive divisor of the number of splits, got "
+            f"stagger={stagger}, num_splits={num_splits}"
+        )
 
 
 def _normalize_recat_device(
@@ -477,7 +483,8 @@ def _get_recat(
         local_split (int): number of features in local split.
         num_splits (int): number of splits (typically WORLD_SIZE).
         stagger (int): secondary reordering, (typically 1, but
-            `WORLD_SIZE/LOCAL_WORLD_SIZE` for TWRW).
+            `WORLD_SIZE/LOCAL_WORLD_SIZE` for TWRW). Must be a positive divisor of
+            `num_splits`.
         device (Optional[torch.device]): device on which buffer will be allocated.
         batch_size_per_rank (Optional[List[int]]): batch size per rank, needed for
             variable batch size.
@@ -499,6 +506,7 @@ def _get_recat(
     """
 
     with record_function("## all2all_data:recat_permute_gen ##"):
+        _check_stagger(num_splits, stagger)
         if local_split == 0:
             return None
 
@@ -1273,7 +1281,7 @@ class KJEAllToAll(nn.Module):
             send to each pg.rank(). It is assumed the `KeyedJaggedTensor` is ordered by
             destination rank. Same for all ranks.
         stagger (int): stagger value to apply to recat tensor, see `_get_recat` function
-            for more detail.
+            for more detail. Must be a positive divisor of `len(splits)`.
 
     Example::
 
@@ -1320,6 +1328,7 @@ class KJEAllToAll(nn.Module):
     ) -> None:
         super().__init__()
         torch._check(len(splits) == pg.size())
+        _check_stagger(len(splits), stagger)
         self._pg: dist.ProcessGroup = pg
         self._splits = splits
         self._splits_cumsum: List[int] = [0] + list(itertools.accumulate(splits))
@@ -1379,7 +1388,7 @@ class KJTAllToAll(nn.Module):
             send to each pg.rank(). It is assumed the `KeyedJaggedTensor` is ordered by
             destination rank. Same for all ranks.
         stagger (int): stagger value to apply to recat tensor, see `_get_recat` function
-            for more detail.
+            for more detail. Must be a positive divisor of `len(splits)`.
 
     Example::
 
@@ -1425,6 +1434,7 @@ class KJTAllToAll(nn.Module):
     ) -> None:
         super().__init__()
         torch._check(len(splits) == pg.size())
+        _check_stagger(len(splits), stagger)
         self._pg: dist.ProcessGroup = pg
         self._splits = splits
         self._splits_cumsum: List[int] = [0] + list(itertools.accumulate(splits))
