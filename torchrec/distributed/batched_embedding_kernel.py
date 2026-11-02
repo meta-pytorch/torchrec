@@ -6105,6 +6105,24 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
                 )
         self.init_parameters()
 
+    def init_parameters(self) -> None:
+        if not self._use_batched_lookup:
+            super().init_parameters()
+            return
+        # Avoid writing through 2-D views of the stacked weight on torch_tpu.
+        flat = self._emb_module.weights.data.view(-1)
+        specs, offsets = self._emb_module.embedding_specs, self._emb_module.offsets
+        assert (
+            len(specs)
+            == len(offsets)
+            == len(self._weight_init_mins)
+            == len(self._weight_init_maxs)
+        )
+        for (rows, dim), offset, lo, hi in zip(
+            specs, offsets, self._weight_init_mins, self._weight_init_maxs
+        ):
+            flat[offset : offset + rows * dim].uniform_(lo, hi)
+
     @property
     # pyrefly: ignore [bad-override]
     def emb_module(
