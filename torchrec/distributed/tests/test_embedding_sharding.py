@@ -741,11 +741,11 @@ class TestECBucketMetadata(unittest.TestCase):
             if expect_failure:
                 with self.assertRaises(AssertionError):
                     zch_kv_emb = ZeroCollisionKeyValueEmbedding(
-                        table_group, None, torch.device("cpu")
+                        table_group, None, torch.device("cuda")
                     )
             else:
                 zch_kv_emb = ZeroCollisionKeyValueEmbedding(
-                    table_group, None, torch.device("cpu")
+                    table_group, None, torch.device("cuda")
                 )
                 expected_tuple = [
                     (
