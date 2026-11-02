@@ -885,6 +885,7 @@ class ShardedEmbeddingTowerCollection(
 
 class EmbeddingTowerSharder(BaseEmbeddingSharder[EmbeddingTower]):
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: EmbeddingTower,
@@ -987,6 +988,7 @@ class EmbeddingTowerCollectionSharder(BaseEmbeddingSharder[EmbeddingTowerCollect
         )
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: EmbeddingTowerCollection,

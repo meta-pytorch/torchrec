@@ -137,6 +137,7 @@ class TestEBCSharderMCH(
     def module_type(self) -> Type[ManagedCollisionEmbeddingBagCollection]:
         return ManagedCollisionEmbeddingBagCollection
 
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: ManagedCollisionEmbeddingBagCollection,

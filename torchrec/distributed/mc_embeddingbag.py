@@ -155,13 +155,18 @@ class ShardedManagedCollisionEmbeddingBagCollection(
                     offsets=features.offsets(),
                     pooling_type_to_rs_features=emb_mod._pooling_type_to_rs_features,
                     stride_per_key=features.stride_per_key(),
+                    # pyrefly: ignore [bad-argument-type]
                     dim_per_key=emb_mod._dim_per_key,
                     embedding_names=emb_mod._embedding_names,
                     embedding_dims=emb_mod._embedding_dims,
+                    # pyrefly: ignore [missing-attribute]
                     variable_batch_per_feature=ctx.variable_batch_per_feature,
+                    # pyrefly: ignore [bad-argument-type]
                     kjt_inverse_order=emb_mod._kjt_inverse_order,
                     kjt_key_indices=emb_mod._kjt_key_indices,
+                    # pyrefly: ignore [bad-argument-type]
                     kt_key_ordering=emb_mod._kt_key_ordering,
+                    # pyrefly: ignore [missing-attribute]
                     inverse_indices=ctx.inverse_indices,
                     weights=features.weights_or_none(),
                     rs_mean_embedding_mask=emb_mod._rs_mean_embedding_mask,
@@ -197,6 +202,7 @@ class ManagedCollisionEmbeddingBagCollectionSharder(
         )
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: ManagedCollisionEmbeddingBagCollection,
