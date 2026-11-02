@@ -203,6 +203,55 @@ def _feature_ranges_for_process_mode(
     return tuple(result)
 
 
+def _power_of_two_alignment(values: Sequence[int], cap: int = 16) -> int:
+    divisor = math.gcd(*values)
+    return min(cap, divisor & -divisor) if divisor else cap
+
+
+@dataclass(frozen=True)
+class _VBEForwardLaunchGroup:
+    feature_start: int
+    feature_end: int
+    block_size: int
+    row_alignment: int
+
+
+def _vbe_forward_launch_groups(
+    feature_dims: Sequence[int],
+    feature_table_map: Sequence[int],
+    table_offsets: Sequence[int],
+) -> Tuple[_VBEForwardLaunchGroup, ...]:
+    # Group consecutive features by padded width so narrow tables do not pad to
+    # the widest one. Consecutive features keep each group's VBE bags contiguous.
+    groups = []
+    feature_start = 0
+    while feature_start < len(feature_dims):
+        block_size = triton.next_power_of_2(feature_dims[feature_start])
+        feature_end = feature_start + 1
+        while (
+            feature_end < len(feature_dims)
+            and triton.next_power_of_2(feature_dims[feature_end]) == block_size
+        ):
+            feature_end += 1
+        features = range(feature_start, feature_end)
+        groups.append(
+            _VBEForwardLaunchGroup(
+                feature_start,
+                feature_end,
+                block_size,
+                _power_of_two_alignment(
+                    [feature_dims[feature] for feature in features]
+                    + [
+                        table_offsets[feature_table_map[feature]]
+                        for feature in features
+                    ]
+                ),
+            )
+        )
+        feature_start = feature_end
+    return tuple(groups)
+
+
 @dataclass(frozen=True)
 class _SavedHistogramPlan:
     feature: int
@@ -1524,6 +1573,164 @@ def table_batched_embedding_bag_forward_unweighted_parallel_bags_kernel(  # noqa
             )
             output_mask = in_bounds[:, None] & (col_offsets[None, :] < embedding_dim)
             tl.store(output_ptr + output_offsets, bag_output, mask=output_mask)
+
+
+@triton.jit
+# Triton TR001: BLOCK_SIZE is fixed by the embedding width.
+def table_batched_embedding_bag_forward_unweighted_vbe_kernel(  # noqa: TR001
+    output_ptr,
+    indices_ptr,
+    offsets_ptr,
+    weight_ptr,
+    table_offsets_ptr,
+    embedding_dims_ptr,
+    feature_table_map_ptr,
+    rows_cumsum_ptr,
+    bounds_check_warning_ptr,
+    row_output_offsets_ptr,
+    b_t_map_ptr,
+    bag_start,
+    bag_end,
+    info_B_num_bits,
+    BLOCK_SIZE: tl.constexpr,
+    PARALLEL_BAGS: tl.constexpr,
+    ROW_ALIGNMENT: tl.constexpr,
+    OUTPUT_ALIGNMENT: tl.constexpr,
+    FUSED_BOUNDS_CHECK: tl.constexpr = False,
+) -> None:
+    # VBE bags of consecutive features are contiguous in offsets, so a launch
+    # covers the flat range [bag_start, bag_end) and recovers each bag's feature
+    # from b_t_map. Unlike a max_B grid, no program idles on smaller features.
+    b_t = (
+        bag_start
+        + tl.program_id(0).to(tl.int64) * PARALLEL_BAGS
+        + tl.arange(0, PARALLEL_BAGS)
+    )
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    in_bounds = b_t < bag_end
+    # b_t_map packs the feature into the high bits as unsigned, so a top
+    # bit set by the feature must not sign-extend.
+    packed_b_t = tl.load(b_t_map_ptr + b_t, mask=in_bounds, other=0)
+    t = (packed_b_t.to(tl.uint32, bitcast=True) >> info_B_num_bits).to(tl.int32)
+    table_idx = tl.load(feature_table_map_ptr + t, mask=in_bounds, other=0)
+    table_offset = tl.load(table_offsets_ptr + table_idx, mask=in_bounds, other=0)
+    # ROW_ALIGNMENT divides every dim in the launch. Without the hint the
+    # per-bag column mask blocks vectorized row loads.
+    embedding_dim = tl.multiple_of(
+        tl.load(embedding_dims_ptr + t, mask=in_bounds, other=0), ROW_ALIGNMENT
+    )
+    if FUSED_BOUNDS_CHECK:
+        num_rows = tl.load(
+            rows_cumsum_ptr + table_idx + 1, mask=in_bounds, other=0
+        ) - tl.load(rows_cumsum_ptr + table_idx, mask=in_bounds, other=0)
+    start = tl.load(offsets_ptr + b_t, mask=in_bounds, other=0)
+    end = tl.load(offsets_ptr + b_t + 1, mask=in_bounds, other=0)
+    row_mask = in_bounds[:, None] & (col_offsets[None, :] < embedding_dim[:, None])
+    bag_output = tl.zeros((PARALLEL_BAGS, BLOCK_SIZE), dtype=tl.float32)
+    max_bag_length = tl.max(end - start, axis=0)
+    warning_count = tl.zeros((PARALLEL_BAGS,), dtype=tl.int32)
+
+    for step in range(0, max_bag_length):
+        position = start + step
+        active = in_bounds & (position < end)
+        row_idx, invalid = _load_checked_index(
+            indices_ptr,
+            position,
+            num_rows if FUSED_BOUNDS_CHECK else 0,
+            active,
+            FUSED_BOUNDS_CHECK,
+        )
+        if FUSED_BOUNDS_CHECK:
+            warning_count += invalid.to(tl.int32)
+        row_start = tl.multiple_of(
+            table_offset + row_idx.to(tl.int64) * embedding_dim,
+            ROW_ALIGNMENT,
+        )
+        row = tl.load(
+            weight_ptr + row_start[:, None] + col_offsets[None, :],
+            mask=row_mask & active[:, None],
+            other=0.0,
+        )
+        bag_output += row.to(tl.float32)
+
+    output_start = tl.multiple_of(
+        tl.load(row_output_offsets_ptr + b_t, mask=in_bounds, other=0),
+        OUTPUT_ALIGNMENT,
+    )
+    tl.store(
+        output_ptr + output_start[:, None] + col_offsets[None, :],
+        bag_output,
+        mask=row_mask,
+    )
+
+    if FUSED_BOUNDS_CHECK:
+        total_warnings = tl.sum(warning_count, axis=0)
+        if total_warnings > 0:
+            tl.atomic_add(bounds_check_warning_ptr, total_warnings.to(tl.int64))
+
+
+def _vbe_forward_parallel_bags(block_size: int) -> int:
+    """Return how many bags a one-warp VBE forward program pools at once."""
+    # Tuned on B200 VBE production shapes: 4K-element tiles for narrow rows;
+    # wider rows run out of registers well before that.
+    if block_size <= 64:
+        return min(128, 4096 // block_size)
+    return max(1, 512 // block_size)
+
+
+def _launch_unweighted_vbe_forward(
+    output: torch.Tensor,
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    weight: torch.Tensor,
+    table_offsets: torch.Tensor,
+    embedding_dims: torch.Tensor,
+    feature_table_map: torch.Tensor,
+    rows_cumsum: torch.Tensor,
+    bounds_check_warning: torch.Tensor,
+    row_output_offsets: torch.Tensor,
+    b_t_map: torch.Tensor,
+    batch_size_per_feature_per_rank: List[List[int]],
+    info_B_num_bits: int,
+    launch_groups: Tuple[_VBEForwardLaunchGroup, ...],
+    output_alignment: int,
+    fused_bounds_check: bool,
+) -> None:
+    # Bag ranges come from the host batch sizes, so launching needs no sync.
+    B_offsets = lengths_to_offsets(
+        [sum(batch_sizes) for batch_sizes in batch_size_per_feature_per_rank],
+        keep_last=True,
+    )
+    for group in launch_groups:
+        bag_start = B_offsets[group.feature_start]
+        bag_end = B_offsets[group.feature_end]
+        if bag_start >= bag_end:
+            continue
+        parallel_bags = _vbe_forward_parallel_bags(group.block_size)
+        table_batched_embedding_bag_forward_unweighted_vbe_kernel[
+            (triton.cdiv(bag_end - bag_start, parallel_bags),)
+        ](
+            output,
+            indices,
+            offsets,
+            weight,
+            table_offsets,
+            embedding_dims,
+            feature_table_map,
+            rows_cumsum,
+            bounds_check_warning,
+            row_output_offsets,
+            b_t_map,
+            bag_start,
+            bag_end,
+            info_B_num_bits,
+            BLOCK_SIZE=group.block_size,
+            PARALLEL_BAGS=parallel_bags,
+            ROW_ALIGNMENT=group.row_alignment,
+            OUTPUT_ALIGNMENT=output_alignment,
+            FUSED_BOUNDS_CHECK=fused_bounds_check,
+            num_warps=1,
+        )
 
 
 @triton.jit
@@ -3047,6 +3254,8 @@ class TritonTBE(torch.autograd.Function):
         enable_triton_tbe_optimizations: bool = False,
         forward_block_limit: int = 0,
         vbe_forward_block_limit: int = 0,
+        vbe_forward_groups: Tuple[_VBEForwardLaunchGroup, ...] = (),
+        vbe_output_alignment: int = 1,
     ) -> torch.Tensor:
         assert weight_ptrs
         assert weight_chunk_starts
@@ -3578,6 +3787,31 @@ class TritonTBE(torch.autograd.Function):
                     BLOCK_SIZE=block_size,
                     vbe=vbe,
                     num_warps=num_warps,
+                )
+            elif (
+                vbe
+                and enable_triton_tbe_optimizations
+                and len(weight_ptrs) == 1
+                and vbe_forward_groups
+            ):
+                assert batch_size_per_feature_per_rank is not None
+                _launch_unweighted_vbe_forward(
+                    output,
+                    indices,
+                    offsets,
+                    weight_ptrs[0],
+                    table_offsets,
+                    embedding_dims,
+                    feature_table_map,
+                    rows_cumsum,
+                    bounds_check_warning_ptr,
+                    row_output_offsets_ptr,
+                    b_t_map_ptr,
+                    batch_size_per_feature_per_rank,
+                    info_B_num_bits,
+                    vbe_forward_groups,
+                    vbe_output_alignment,
+                    fused_bounds_check,
                 )
             else:
                 bags_per_program = (
@@ -4626,6 +4860,16 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         self._D_offsets = torch.zeros(self.T + 1, device=device, dtype=torch.int32)
         self._D_offsets[1:] = torch.cumsum(self.embedding_dims.int(), dim=0)
         self._max_D = self.max_embedding_dim
+        self._vbe_forward_groups: Tuple[_VBEForwardLaunchGroup, ...] = (
+            _vbe_forward_launch_groups(
+                feature_dims,
+                feature_table_map,
+                lengths_to_offsets(table_sizes),
+            )
+        )
+        # VBE output rows start at sums of B * D over features, so they share
+        # the alignment of the embedding dims.
+        self._vbe_output_alignment: int = _power_of_two_alignment(feature_dims)
 
         self.block_size = triton.next_power_of_2(self.max_embedding_dim)
 
@@ -4977,6 +5221,8 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             self.enable_triton_tbe_optimizations,
             self.forward_block_limit,
             self.vbe_forward_block_limit,
+            self._vbe_forward_groups,
+            self._vbe_output_alignment,
         )
 
     def _forward(
