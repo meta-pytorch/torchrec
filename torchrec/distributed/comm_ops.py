@@ -656,7 +656,10 @@ def alltoall_pooled(
     )
 
     # Keep the experimental dependency out of non-TPU import and execution paths.
-    if getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+    if getattr(torch, "tpu", None) is not None and (
+        torch.accelerator.current_accelerator(check_available=True)
+        == torch.device("tpu")
+    ):
         from torchrec.experimental.torch_tpu.uneven_all_to_all import (
             maybe_all2all_pooled_uneven_tpu,
         )
