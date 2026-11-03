@@ -73,12 +73,28 @@ from torchrec.metrics.calibration_with_recalibration import (
 )
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
+from torchrec.metrics.cpu_offloaded_metric_process import (
+    ProcessIsolatedCPUOffloadedRecMetricModule,
+)
+from torchrec.metrics.cpu_offloaded_metric_worker import oss_worker_factory
 from torchrec.metrics.ctr import CTRMetric
 from torchrec.metrics.gauc import GAUCMetric
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
 from torchrec.metrics.mae import MAEMetric
-from torchrec.metrics.metric_module import OffloadedRecMetricModule, RecMetricModule
-from torchrec.metrics.metrics_config import BatchSizeStage, RecComputeMode, RecTaskInfo
+from torchrec.metrics.metric_module import (
+    generate_metric_module,
+    OffloadedRecMetricModule,
+    RecMetricModule,
+)
+from torchrec.metrics.metrics_config import (
+    BatchSizeStage,
+    MetricsConfig,
+    RecComputeMode,
+    RecMetricDef,
+    RecMetricEnum,
+    RecTaskInfo,
+    ThroughputDef,
+)
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.multi_label_precision import MultiLabelPrecisionMetric
 from torchrec.metrics.multiclass_recall import MulticlassRecallMetric
@@ -319,6 +335,18 @@ class _GoldenCase:
     def key(self) -> str:
         return f"{self.stable_id}_{self.variant}" if self.variant else self.stable_id
 
+    def state_dict_keys(self) -> Set[str]:
+        module = self.build()
+        try:
+            assert type(module) is self.expected_class, (
+                type(module),
+                self.expected_class,
+            )
+            return set(module.state_dict())
+        finally:
+            if isinstance(module, ProcessIsolatedCPUOffloadedRecMetricModule):
+                module.shutdown()
+
     @classmethod
     def for_metric(
         cls,
@@ -431,6 +459,34 @@ def _make_cpu_offloaded_module(
             **_module_fixture_kwargs(),
             throughput_metric=throughput_metric,
         )
+
+
+def _make_process_isolated_module(
+    with_throughput: bool = False,
+) -> RecMetricModule:
+    tasks = [create_test_task("task1")]
+    config = MetricsConfig(
+        rec_tasks=tasks,
+        rec_metrics={RecMetricEnum.NE: RecMetricDef(rec_tasks=tasks, window_size=100)},
+        throughput_metric=(
+            ThroughputDef(window_size=100, warmup_steps=10) if with_throughput else None
+        ),
+    )
+    return generate_metric_module(
+        metric_class=ProcessIsolatedCPUOffloadedRecMetricModule,
+        metrics_config=config,
+        batch_size=32,
+        world_size=1,
+        my_rank=0,
+        state_metrics_mapping={},
+        device=torch.device("cpu"),
+        module_kwargs={
+            "model_out_device": torch.device("cpu"),
+            "worker_factory": oss_worker_factory(config, 32, 1, 0),
+            "num_slots": 4,
+            "slot_bytes": 1024,
+        },
+    )
 
 
 def _make_mch_module(policy: MCHEvictionPolicy) -> MCHManagedCollisionModule:
@@ -627,6 +683,18 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         CPUOffloadedRecMetricModule,
         "with_throughput",
         lambda: _make_cpu_offloaded_module(_make_throughput_metric()),
+    ),
+    _GoldenCase(
+        "process_isolated_cpu_offloaded_rec_metric_module",
+        ProcessIsolatedCPUOffloadedRecMetricModule,
+        "",
+        _make_process_isolated_module,
+    ),
+    _GoldenCase(
+        "process_isolated_cpu_offloaded_rec_metric_module",
+        ProcessIsolatedCPUOffloadedRecMetricModule,
+        "with_throughput",
+        lambda: _make_process_isolated_module(with_throughput=True),
     ),
     # Buffer names come from the eviction policy, and DistanceLFU is the union
     # of the other two, so each policy needs its own row.
@@ -997,8 +1065,7 @@ class GoldenCaseTest(unittest.TestCase):
         cls.golden_snapshot = load_required_golden_snapshot()
 
     def _check_case(self, case: _GoldenCase) -> None:
-        module = case.build()
-        self.assertIs(type(module), case.expected_class)
+        current_keys = case.state_dict_keys()
 
         if case.key not in self.golden_snapshot:
             self.fail(
@@ -1008,9 +1075,7 @@ class GoldenCaseTest(unittest.TestCase):
                 "whole file at once corrupt it."
             )
 
-        _validate_case_entry(
-            case, self.golden_snapshot[case.key], set(module.state_dict())
-        )
+        _validate_case_entry(case, self.golden_snapshot[case.key], current_keys)
 
     def test_golden_cases(self) -> None:
         for case in _SCHEMA_CASES:
@@ -1088,7 +1153,7 @@ class GoldenCaseTest(unittest.TestCase):
         by_id: Dict[str, List[FrozenSet[str]]] = {}
         for case in _SCHEMA_CASES:
             by_id.setdefault(case.stable_id, []).append(
-                frozenset(case.build().state_dict().keys())
+                frozenset(case.state_dict_keys())
             )
 
         for stable_id, entries in by_id.items():
@@ -1868,7 +1933,7 @@ def generate_schema_case_entries() -> Dict[str, Dict[str, Any]]:
                 "the other's golden entry."
             )
         entries[case.key] = {
-            "state_dict_keys": sorted(case.build().state_dict().keys()),
+            "state_dict_keys": sorted(case.state_dict_keys()),
         }
     return entries
 
