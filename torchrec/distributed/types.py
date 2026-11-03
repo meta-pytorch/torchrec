@@ -350,6 +350,10 @@ class QuantizedCommCodecs:
     forward: QuantizedCommCodec = NoOpQuantizedCommCodec()
     # pyrefly: ignore[bad-assignment]
     backward: QuantizedCommCodec = NoOpQuantizedCommCodec()
+    # Hand the encoded forward output to the consumer instead of decoding it in the
+    # comm op. Only `VariableBatchPooledEmbeddingsAllToAll` with an MX4 forward codec
+    # honors it; other comm ops decode as usual.
+    defer_forward_decode: bool = False
 
 
 class CommOp(Enum):
