@@ -3067,7 +3067,9 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             is_tpu = self.device().type == "tpu"
             if not torch.jit.is_scripting():
                 is_tpu = is_tpu or (
-                    getattr(torch, "tpu", None) is not None and torch.tpu.is_available()
+                    getattr(torch, "tpu", None) is not None
+                    and torch.accelerator.current_accelerator(check_available=True)
+                    == torch.device("tpu")
                 )
             permuted_lengths, _ = _permute_tensor_by_segments(
                 self.lengths(),
@@ -3490,7 +3492,10 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                     if not torch.jit.is_scripting():
                         is_tpu = is_tpu or (
                             getattr(torch, "tpu", None) is not None
-                            and torch.tpu.is_available()
+                            and torch.accelerator.current_accelerator(
+                                check_available=True
+                            )
+                            == torch.device("tpu")
                         )
                     lengths, _ = _permute_tensor_by_segments(
                         lengths,

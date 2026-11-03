@@ -327,7 +327,8 @@ class CwPooledEmbeddingSharding(
                 hasattr(torch, "tpu")
                 and device is not None
                 and device.type == "tpu"
-                and torch.tpu.is_available()
+                and torch.accelerator.current_accelerator(check_available=True)
+                == torch.device("tpu")
             ):
                 callbacks = [
                     build_tpu_permute(
