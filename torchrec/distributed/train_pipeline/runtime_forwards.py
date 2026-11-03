@@ -10,7 +10,18 @@
 import itertools
 import logging
 from contextlib import nullcontext
-from typing import cast, Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    cast,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import torch
 from torch import distributed as dist
@@ -155,6 +166,72 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
             ctx.record_stream(cur_stream)
 
         return self._module.compute_and_output_dist(ctx, data)
+
+
+class PreserveForwardOrderPipelinedForward(PipelinedForward):
+    """Run independent sparse backward branches in their forward lookup order."""
+
+    _BACKWARD_SEQUENCE_BASE: int = 1 << 62
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._backward_sequence_nr: Optional[int] = None
+
+    def set_backward_priority(self, priority: int) -> None:
+        if priority < 0:
+            raise ValueError("backward priority must be non-negative")
+        self._backward_sequence_nr = self._BACKWARD_SEQUENCE_BASE + priority
+
+    def __call__(self, *input: Any, **kwargs: Any) -> Awaitable:
+        awaitable = super().__call__(*input, **kwargs)
+        if self._backward_sequence_nr is not None:
+            awaitable.callbacks.append(self._prioritize_backward)
+        return awaitable
+
+    def _prioritize_backward(self, embeddings: Any) -> Any:
+        for tensor in self._embedding_tensors(embeddings):
+            self._prioritize_grad_fn_tree(tensor)
+        return embeddings
+
+    @staticmethod
+    def _embedding_tensors(embeddings: Any) -> List[torch.Tensor]:
+        if isinstance(embeddings, torch.Tensor):
+            return [embeddings]
+        if isinstance(embeddings, KeyedTensor):
+            return [embeddings.values()]
+        if isinstance(embeddings, dict):
+            tensors = []
+            for value in embeddings.values():
+                if isinstance(value, torch.Tensor):
+                    tensors.append(value)
+                elif isinstance(value, JaggedTensor):
+                    tensors.append(value.values())
+                else:
+                    raise RuntimeError(
+                        "forward-ordered sparse backward does not support "
+                        f"embedding output {type(value).__name__}"
+                    )
+            return tensors
+        raise RuntimeError(
+            "forward-ordered sparse backward does not support "
+            f"embedding output {type(embeddings).__name__}"
+        )
+
+    def _prioritize_grad_fn_tree(self, tensor: torch.Tensor) -> None:
+        sequence_nr = self._backward_sequence_nr
+        if sequence_nr is None:
+            return
+        stack = [tensor.grad_fn]
+        visited: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if node is None or id(node) in visited:
+                continue
+            visited.add(id(node))
+            if node._sequence_nr() == (1 << 64) - 1:
+                continue
+            node._set_sequence_nr(sequence_nr)
+            stack.extend(next_node for next_node, _ in node.next_functions)
 
 
 class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
