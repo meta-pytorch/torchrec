@@ -27,7 +27,6 @@ import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-
 from etils import epath
 from torch import distributed as dist
 from torchrec.experimental.torch_tpu.datasets import pybind_input_preprocessing
