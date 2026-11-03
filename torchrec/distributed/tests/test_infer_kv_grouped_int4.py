@@ -48,12 +48,23 @@ from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
 )
 
+
+def _has_dram_kv_inference_wrapper() -> bool:
+    try:
+        torch.classes.fbgemm.DramKVEmbeddingInferenceWrapper  # noqa: B018
+    except RuntimeError:
+        return False
+    return True
+
+
 # Open-source CI installs a released fbgemm_gpu, which can predate grouped INT4
-# KV rows; the tests that build KV modules need it.
+# KV rows, and FBGEMM's open-source CPU build doesn't register the DRAM KV
+# inference wrapper; the tests that build KV modules need both.
 skip_without_grouped_int4_fbgemm = unittest.skipUnless(
     "grouped_int4_group_size"
-    in inspect.signature(KVEmbeddingInference.__init__).parameters,
-    "fbgemm_gpu KVEmbeddingInference predates grouped_int4_group_size",
+    in inspect.signature(KVEmbeddingInference.__init__).parameters
+    and _has_dram_kv_inference_wrapper(),
+    "fbgemm_gpu lacks grouped INT4 KVEmbeddingInference or the DRAM KV inference wrapper",
 )
 
 NUM_EMBEDDINGS = 64
