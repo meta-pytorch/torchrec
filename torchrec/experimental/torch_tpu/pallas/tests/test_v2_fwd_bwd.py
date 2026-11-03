@@ -250,15 +250,20 @@ class V2FwdBwdTest(unittest.TestCase):
         )
         rows = torch.tensor([2, 5])
         row_grads = grad_per_row[rows]
-        for _ in range(2):
+        tpu = vars(torch)["tpu"]
+        for iteration, lr in enumerate((0.05, 0.02)):
             updated_momentum = expected_momentum[rows] + row_grads.square().mean(1)
             expected_weights[rows] -= (
-                0.05 * row_grads / (updated_momentum.sqrt().unsqueeze(1) + 0.001)
+                lr * row_grads / (updated_momentum.sqrt().unsqueeze(1) + 0.001)
             )
             expected_momentum[rows] = updated_momentum
+            misses_before = tpu._get_cache_misses()
             torch.ops.torchrec.embedding_pooled_batched_lookup_offset_adagrad_update(
-                *args, actual_weights, actual_momentum, 0.05, 0.001
+                *args, actual_weights, actual_momentum, lr, 0.001
             )
+            torch.accelerator.synchronize()
+            if iteration > 0:
+                self.assertEqual(tpu._get_cache_misses(), misses_before)
             self.assertEqual(actual_weights.shape, (expected_weights.numel(),))
             torch.testing.assert_close(
                 actual_weights.cpu().reshape_as(expected_weights),
