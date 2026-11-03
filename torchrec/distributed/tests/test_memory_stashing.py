@@ -1950,6 +1950,75 @@ class TestStashOptimizerStateSliced(unittest.TestCase):
         )
 
 
+class TestRestoreOnDefaultStream(unittest.TestCase):
+    """Tests for which stream's pool a restore allocates its HBM from."""
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+        self.side_stream = torch.cuda.Stream(device=self.device)
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    # Returns the stream of the allocator segment holding the tensor's storage
+    def _segment_stream(self, tensor: torch.Tensor) -> int:
+        ptr = tensor.data_ptr()
+        for segment in torch.cuda.memory_snapshot():
+            if segment["address"] <= ptr < segment["address"] + segment["total_size"]:
+                return segment["stream"]
+        self.fail("restored tensor is not in any allocator segment")
+
+    # Stashes Adam state, restores it from the side stream, and returns exp_avg
+    def _restore_from_side_stream(self) -> torch.Tensor:
+        model = nn.Linear(512, 512).to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
+        model(torch.randn(32, 512, device=self.device)).sum().backward()
+        optimizer.step()
+        original = {
+            k: v.clone()
+            for k, v in optimizer.state[model.weight].items()
+            if isinstance(v, torch.Tensor)
+        }
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
+        torch.cuda.synchronize()
+        # Restore hooks fire inside backward on a side stream, e.g. FSDP's
+        # reduce-scatter stream
+        with torch.cuda.stream(self.side_stream):
+            MemoryStashingManager.restore_optimizer_state()
+            await_restore(None)
+        torch.cuda.synchronize()
+
+        state = optimizer.state[model.weight]
+        for key, value in original.items():
+            self.assertTrue(torch.allclose(state[key], value), f"{key} not restored")
+        return state["exp_avg"]
+
+    def test_default_allocates_on_the_current_stream(self) -> None:
+        exp_avg = self._restore_from_side_stream()
+        self.assertEqual(self._segment_stream(exp_avg), self.side_stream.cuda_stream)
+
+    def test_flag_allocates_on_the_default_stream(self) -> None:
+        MemoryStashingManager.set_restore_on_default_stream(optimizer=True)
+        exp_avg = self._restore_from_side_stream()
+        self.assertEqual(
+            self._segment_stream(exp_avg),
+            torch.cuda.default_stream(self.device).cuda_stream,
+        )
+
+    def test_setter_leaves_omitted_use_case_untouched(self) -> None:
+        MemoryStashingManager.set_restore_on_default_stream(embedding=True)
+        MemoryStashingManager.set_restore_on_default_stream(optimizer=True)
+        self.assertTrue(MemoryStashingManager._embedding_restore_on_default_stream)
+        self.assertTrue(MemoryStashingManager._optimizer_restore_on_default_stream)
+
+        MemoryStashingManager.reset()
+        self.assertFalse(MemoryStashingManager._embedding_restore_on_default_stream)
+        self.assertFalse(MemoryStashingManager._optimizer_restore_on_default_stream)
+
+
 class TestRestoreStashedSyncTensors(unittest.TestCase):
     """Tests for DMPCollection._restore_stashed_sync_tensors (the 2D-sync IMA fix).
 

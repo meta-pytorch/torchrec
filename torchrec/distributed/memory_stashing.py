@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import contextlib
 import json
 import logging
 import threading
@@ -239,6 +240,11 @@ class MemoryStashingManager:
     _embedding_restore_chunk_size_bytes: int = _DEFAULT_CHUNK_SIZE_BYTES
     _optimizer_stash_chunk_size_bytes: int = _DEFAULT_CHUNK_SIZE_BYTES
     _optimizer_restore_chunk_size_bytes: int = _DEFAULT_CHUNK_SIZE_BYTES
+    # Whether each use case's restore allocates its HBM on the default stream
+    # instead of whatever stream is current when the restore hook fires. See
+    # ``set_restore_on_default_stream``.
+    _embedding_restore_on_default_stream: bool = False
+    _optimizer_restore_on_default_stream: bool = False
     _stashed_tables: Optional[Set[str]] = None
     # Optimizer stash settings reported in its cycle summary. ``stash_async``
     # stays set once the threaded path has been used in this process.
@@ -284,6 +290,10 @@ class MemoryStashingManager:
             settings: Tuple[Tuple[str, Any], ...] = (
                 ("stash_chunk_size_bytes", cls._embedding_stash_chunk_size_bytes),
                 ("restore_chunk_size_bytes", cls._embedding_restore_chunk_size_bytes),
+                (
+                    "restore_on_default_stream",
+                    cls._embedding_restore_on_default_stream,
+                ),
                 ("delay_stash", cls._delay_stash),
             )
             if cls._stashed_tables is None:
@@ -296,6 +306,10 @@ class MemoryStashingManager:
             return (
                 ("stash_chunk_size_bytes", cls._optimizer_stash_chunk_size_bytes),
                 ("restore_chunk_size_bytes", cls._optimizer_restore_chunk_size_bytes),
+                (
+                    "restore_on_default_stream",
+                    cls._optimizer_restore_on_default_stream,
+                ),
                 ("num_slices", cls._optimizer_num_slices),
                 ("stash_async", cls._optimizer_stash_async),
             )
@@ -511,6 +525,31 @@ class MemoryStashingManager:
             cls._optimizer_restore_chunk_size_bytes = restore_size_bytes
 
     @classmethod
+    def set_restore_on_default_stream(
+        cls,
+        embedding: Optional[bool] = None,
+        optimizer: Optional[bool] = None,
+    ) -> None:
+        """Allocate restored HBM on the default stream.
+
+        Restore hooks run on whatever stream is current where they're attached,
+        which can be a side stream (e.g. FSDP's reduce-scatter stream when the
+        hooked param is FSDP-managed). The caching allocator only reuses a free
+        block on the stream it was allocated on, so a restore there maps new memory
+        into that stream's pool even when the default stream has plenty free,
+        and the side pool's peak stacks on top of the default stream's peak.
+        Allocating on the default stream reuses its free blocks instead. The
+        H2D copy still runs on ``h2d_stream``, which then also has to wait for
+        work already queued on the default stream.
+
+        Only the arguments that are not ``None`` are applied.
+        """
+        if embedding is not None:
+            cls._embedding_restore_on_default_stream = embedding
+        if optimizer is not None:
+            cls._optimizer_restore_on_default_stream = optimizer
+
+    @classmethod
     def set_delay_stash(cls, delay: bool) -> None:
         """Enable or disable delayed stashing.
 
@@ -548,6 +587,8 @@ class MemoryStashingManager:
         cls._embedding_restore_chunk_size_bytes = _DEFAULT_CHUNK_SIZE_BYTES
         cls._optimizer_stash_chunk_size_bytes = _DEFAULT_CHUNK_SIZE_BYTES
         cls._optimizer_restore_chunk_size_bytes = _DEFAULT_CHUNK_SIZE_BYTES
+        cls._embedding_restore_on_default_stream = False
+        cls._optimizer_restore_on_default_stream = False
         cls._pending_stash_callbacks.clear()
         with cls._cycle_lock:
             cls._cycle_tallies.clear()
@@ -677,6 +718,7 @@ class MemoryStashingManager:
         delay: bool = False,
         stash_chunk_size_bytes: Optional[int] = None,
         restore_chunk_size_bytes: Optional[int] = None,
+        restore_on_default_stream: bool = False,
         caller: str = "",
     ) -> Tuple[
         Callable[[Optional[torch.Tensor]], None],
@@ -713,6 +755,9 @@ class MemoryStashingManager:
                 points always pass their use case's configured value.
             restore_chunk_size_bytes: Trunk size for the H2D copy in the
                 returned ``restore`` callback.  Same fallback as above.
+            restore_on_default_stream: If True, the returned ``restore``
+                allocates HBM on the default stream instead of the current
+                stream (see ``set_restore_on_default_stream``).
             use_case: Key into ``_USE_CASE_TECHNIQUES``. Picks the technique
                 and event-name prefix for this stash's events, and the cycle
                 tally the freed HBM is added to (see ``_log_cycle_summary``).
@@ -908,8 +953,19 @@ class MemoryStashingManager:
             if stash_done_events and not stash_done_events[-1].query():
                 stash_done_events[-1].synchronize()
 
+            alloc_stream: Optional[torch.cuda.Stream] = (
+                torch.cuda.default_stream() if restore_on_default_stream else None
+            )
+            alloc_ctx = (
+                torch.cuda.stream(alloc_stream)
+                if alloc_stream is not None
+                else contextlib.nullcontext()
+            )
+
             try:
-                with record_function(f"restore {label} on device ({size_text})"):
+                with record_function(
+                    f"restore {label} on device ({size_text})"
+                ), alloc_ctx:
                     for (
                         (hbm_ref, _cpu_buf, orig_storage_size),
                         orig_stor,
@@ -939,6 +995,10 @@ class MemoryStashingManager:
                     h2d_stream.wait_event(sync_event)
                 else:
                     h2d_stream.wait_stream(torch.cuda.current_stream())
+                # A block reused from the default stream's pool may still be in
+                # use by work queued on that stream, so the copy has to wait.
+                if alloc_stream is not None:
+                    h2d_stream.wait_stream(alloc_stream)
 
                 with record_function(f"restore {label} from host ({size_text})"):
                     for hbm_ref, cpu_buf, _ in stash_data:
@@ -1097,6 +1157,7 @@ class MemoryStashingManager:
                 delay=True,
                 stash_chunk_size_bytes=cls._embedding_stash_chunk_size_bytes,
                 restore_chunk_size_bytes=cls._embedding_restore_chunk_size_bytes,
+                restore_on_default_stream=cls._embedding_restore_on_default_stream,
                 use_case="embedding",
                 caller=caller,
             )
@@ -1115,6 +1176,7 @@ class MemoryStashingManager:
             label="embedding",
             stash_chunk_size_bytes=cls._embedding_stash_chunk_size_bytes,
             restore_chunk_size_bytes=cls._embedding_restore_chunk_size_bytes,
+            restore_on_default_stream=cls._embedding_restore_on_default_stream,
             use_case="embedding",
             caller=caller,
         )
@@ -1378,6 +1440,7 @@ class MemoryStashingManager:
                 sync_event=sync_event,
                 stash_chunk_size_bytes=cls._optimizer_stash_chunk_size_bytes,
                 restore_chunk_size_bytes=cls._optimizer_restore_chunk_size_bytes,
+                restore_on_default_stream=cls._optimizer_restore_on_default_stream,
                 use_case="optimizer_state",
                 caller=type(optimizer).__name__,
             )
@@ -1407,6 +1470,7 @@ class MemoryStashingManager:
                 sync_event=sync_event,
                 stash_chunk_size_bytes=cls._optimizer_stash_chunk_size_bytes,
                 restore_chunk_size_bytes=cls._optimizer_restore_chunk_size_bytes,
+                restore_on_default_stream=cls._optimizer_restore_on_default_stream,
                 use_case="optimizer_state",
                 caller=type(optimizer).__name__,
             )
