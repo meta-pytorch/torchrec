@@ -56,15 +56,22 @@ class SparseCorePreprocessorBackend {
       int64_t local_device_count,
       int64_t global_device_count,
       int64_t num_sc_per_device,
-      bool allow_id_dropping)
+      int64_t sc_simd_width,
+      int64_t hbm_word_size_in_4b,
+      bool allow_id_dropping,
+      jax_sc_embedding::MinibatchingMode minibatching_mode =
+          jax_sc_embedding::MinibatchingMode::kDisabled)
       : local_device_count_(local_device_count),
         global_device_count_(global_device_count),
         jax_options_{
             .local_device_count = static_cast<int>(local_device_count),
             .global_device_count = static_cast<int>(global_device_count),
             .num_sc_per_device = static_cast<int>(num_sc_per_device),
+            .sc_simd_width = static_cast<int>(sc_simd_width),
+            .hbm_word_size_in_4b = static_cast<int>(hbm_word_size_in_4b),
             .sharding_strategy = jax_sc_embedding::ShardingStrategy::kMod,
             .allow_id_dropping = allow_id_dropping,
+            .minibatching_mode = minibatching_mode,
         },
         row_pointers_size_per_device_(
             jax_options_.GetRowPointersSizePerDevice()) {
@@ -284,19 +291,37 @@ class SparseCorePreprocessorBackend {
 
 PYBIND11_MODULE(pybind_input_preprocessing, m) {
   py::module_::import("torch");
+  py::enum_<jax_sc_embedding::MinibatchingMode>(
+      m, "MinibatchingMode", py::module_local())
+      .value("DISABLED", jax_sc_embedding::MinibatchingMode::kDisabled)
+      .value("HOST", jax_sc_embedding::MinibatchingMode::kHost)
+      .value("DEVICE", jax_sc_embedding::MinibatchingMode::kDevice);
   py::class_<SparseCorePreprocessorBackend>(
       m,
       "SparseCorePreprocessorBackend",
       "Stateful C++ backend for CPU dataset preprocessing of SparseCore "
       "embedding tables.")
       .def(
-          py::init<py::list, int64_t, int64_t, int64_t, int64_t, bool>(),
+          py::init<
+              py::list,
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              bool,
+              jax_sc_embedding::MinibatchingMode>(),
           py::arg("tables_metadata"),
           py::arg("batch_size"),
           py::arg("local_device_count"),
           py::arg("global_device_count"),
           py::arg("num_sc_per_device"),
+          py::arg("sc_simd_width"),
+          py::arg("hbm_word_size_in_4b"),
           py::arg("allow_id_dropping") = false,
+          py::arg("minibatching_mode") =
+              jax_sc_embedding::MinibatchingMode::kDisabled,
           "Initializes the preprocessor backend, pre-computing stacked table "
           "metadata and required buffer sizes.")
       .def(
