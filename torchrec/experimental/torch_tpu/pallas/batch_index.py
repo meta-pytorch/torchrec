@@ -32,6 +32,8 @@ def batch_index_select_sc(
     VBE feature-segment parallelism splits each feature reverse_indices into
     NL-sized segments. Each subcore gathers one segment of deduped embedding
     rows and writes it into the corresponding embedding output rows.
+
+    # TODO: For improvements, see padding TODO below.
     """
     # Typical sparse-core subcore information
     sc = pltpu.get_tpu_info().sparse_core  # pyrefly: ignore [missing-attribute]
@@ -54,8 +56,18 @@ def batch_index_select_sc(
         raise ValueError(
             "Total number of elements in `indices` should be a multiple of `num_features`"
         )
-    if batch_size % NL != 0:
-        raise NotImplementedError(f"batch size must be divisible by {NL}")
+    # TODO: Investigate whether it is better to only pad as one-dimensional array than 2-D
+    #       but this requires changing how the kernel addressing + masking works, so current
+    #       setup cannot pad this all together.
+    logical_batch_size = batch_size
+    pad_right = (-batch_size) % NL
+    if pad_right:
+        indices = jnp.pad(
+            indices.reshape(num_features, batch_size),
+            ((0, 0), (0, pad_right)),
+            constant_values=0,
+        ).reshape(-1)
+        batch_size += pad_right
     if total_columns % COL_TILE != 0 or inputs.shape[0] % COL_TILE != 0:
         raise NotImplementedError(
             f"embedding dimensions must be divisible by {COL_TILE}"
@@ -181,9 +193,10 @@ def batch_index_select_sc(
         _inner()
 
     # FBGEMM returns a flat tensor; this reshape is metadata-only.
-    return _kernel(
-        input_tiles, indices, input_offsets, columns, column_offsets
-    ).reshape(-1)
+    output = _kernel(input_tiles, indices, input_offsets, columns, column_offsets)
+    if pad_right:
+        output = output[:logical_batch_size]
+    return output.reshape(-1)
 
 
 @functools.partial(jax.jit, static_argnames=["num_features", "batch_size"])
@@ -243,8 +256,9 @@ def batch_index_select_bwd_sc(
     """
     Backward pallas kernel for the batch index select
 
-    This takes the expanded gradient, and produces the deduped summed gradient. This assumes the assumption made
-    inside forward still hold, e.g. B % LANE_SIZE == 0
+    This takes the expanded gradient and produces the deduped summed gradient.
+    We assume that embedding widths must be a multiple of COL_TILE, but batch sizes
+    can be unaligned.
 
     Args:
         grad_output: The flattened (row-major order, [B, F, D]) gradient of the expanded embedding table lookup.
