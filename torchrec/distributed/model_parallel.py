@@ -142,6 +142,29 @@ class DataParallelWrapper(abc.ABC):
     Interface implemented by custom data parallel wrappers.
     """
 
+    @property
+    def supports_forward_only(self) -> bool:
+        """Whether forward-only initialization covers the most specific wrap()."""
+        for cls in type(self).__mro__:
+            if cls is DataParallelWrapper:
+                break
+            if "wrap_forward_only" in cls.__dict__:
+                return True
+            if "wrap" in cls.__dict__:
+                return False
+        return False
+
+    def wrap_forward_only(
+        self,
+        dmp: "DistributedModelParallel",
+        env: ShardingEnv,
+        device: torch.device,
+    ) -> None:
+        """Place and synchronize replicated parameters without creating reducers."""
+        raise NotImplementedError(
+            "This data parallel wrapper does not support forward-only initialization"
+        )
+
     @abc.abstractmethod
     def wrap(
         self,
@@ -156,6 +179,28 @@ class DefaultDataParallelWrapper(DataParallelWrapper):
     """
     Default data parallel wrapper, which applies data parallel to all unsharded modules.
     """
+
+    def wrap_forward_only(
+        self,
+        dmp: "DistributedModelParallel",
+        env: ShardingEnv,
+        device: torch.device,
+    ) -> None:
+        """Place the model and synchronize its replicated parameters."""
+        dmp._dmp_wrapped_module.to(device)
+        if env.process_group is None or isinstance(
+            dmp._dmp_wrapped_module, (DistributedDataParallel, FullyShardedDataParallel)
+        ):
+            return
+        params_to_ignore = set(
+            DistributedModelParallel._sharded_parameter_names(dmp._dmp_wrapped_module)
+        ).union(self._additional_params_to_ignore)
+        init_data_parallel_state(
+            dmp._dmp_wrapped_module,
+            env.process_group,
+            params_to_ignore=params_to_ignore,
+            broadcast_buffers=False,
+        )
 
     def __init__(
         self,
@@ -257,14 +302,6 @@ class DefaultDataParallelWrapper(DataParallelWrapper):
         all_parameter_names = set(dict(dmp.named_parameters()).keys())
         if len(all_parameter_names - ddp_ignore_param_names) == 0:
             return
-        if dmp._skip_data_parallel_grad_sync:
-            init_data_parallel_state(
-                dmp._dmp_wrapped_module,
-                pg,
-                params_to_ignore=ddp_ignore_param_names,
-                broadcast_buffers=False,
-            )
-            return
         DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
             module=dmp._dmp_wrapped_module,
             params_and_buffers_to_ignore=ddp_ignore_param_names,
@@ -290,8 +327,10 @@ class DefaultDataParallelWrapper(DataParallelWrapper):
         env: ShardingEnv,
         device: torch.device,
     ) -> None:
-        if dmp._skip_data_parallel_grad_sync and env.process_group is None:
-            return
+        if dmp._skip_data_parallel_grad_sync:
+            raise RuntimeError(
+                "Forward-only DMP must be initialized with wrap_forward_only()"
+            )
         if isinstance(dmp._dmp_wrapped_module, DistributedDataParallel) or isinstance(
             dmp._dmp_wrapped_module, FullyShardedDataParallel
         ):
@@ -373,7 +412,9 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             DistributedModelParallel.init_data_parallel().
         init_parameters (bool): initialize parameters for modules still on meta device.
         data_parallel_wrapper (Optional[DataParallelWrapper]): custom wrapper for data
-            parallel modules.
+            parallel modules. With skip_data_parallel_grad_sync=True, the wrapper
+            must support wrap_forward_only(), including its parameter exclusions
+            and device placement.
         model_tracker_config (Optional[DeltaTrackerConfig]): config for model tracker.
         skip_data_parallel_grad_sync (bool): evaluation-only mode that omits DDP
             gradient reducers. With a process group, startup broadcasts dense
@@ -416,10 +457,14 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
 
         self.init_parameters = init_parameters
         self._skip_data_parallel_grad_sync: bool = skip_data_parallel_grad_sync
-        if skip_data_parallel_grad_sync and data_parallel_wrapper is not None:
+        if (
+            skip_data_parallel_grad_sync
+            and data_parallel_wrapper is not None
+            and not data_parallel_wrapper.supports_forward_only
+        ):
             raise ValueError(
-                "skip_data_parallel_grad_sync=True cannot be combined with a custom "
-                "data_parallel_wrapper because the wrapper would be skipped"
+                "skip_data_parallel_grad_sync=True requires a data_parallel_wrapper "
+                "that supports forward-only initialization"
             )
         if skip_data_parallel_grad_sync and not init_data_parallel:
             raise ValueError(
@@ -496,8 +541,12 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             and self._skip_data_parallel_grad_sync
             and self.device.type != "meta"
         ):
-            self._dmp_wrapped_module.to(self.device)
-            self._data_parallel_wrapper.wrap(self, self._env, self.device)
+            self._data_parallel_wrapper.wrap_forward_only(self, self._env, self.device)
+            if find_ddp_modules(self._dmp_wrapped_module):
+                raise RuntimeError(
+                    "skip_data_parallel_grad_sync=True requires a data_parallel_wrapper "
+                    "that does not create DDP wrappers"
+                )
 
         self.model_trackers: Dict[str, ModelDeltaTracker] = {}
 
