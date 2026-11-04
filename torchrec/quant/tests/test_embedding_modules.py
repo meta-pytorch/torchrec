@@ -28,12 +28,18 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
+from torchrec.modules.mc_modules import (
+    LFU_EvictionPolicy,
+    ManagedCollisionCollection,
+    MCHManagedCollisionModule,
+)
 from torchrec.quant.embedding_modules import (
     _fx_trec_unwrap_kjt,
     _get_batching_hinted_output,
     _get_unflattened_lengths,
     EmbeddingBagCollection as QuantEmbeddingBagCollection,
     EmbeddingCollection as QuantEmbeddingCollection,
+    QuantManagedCollisionEmbeddingCollection,
     MODULE_ATTR_USE_UNFLATTENED_LENGTHS_FOR_BATCHING,
     quant_prep_enable_quant_state_dict_split_scale_bias,
 )
@@ -1111,3 +1117,53 @@ class EmbeddingCollectionTest(unittest.TestCase):
             found_get_unflattened_lengths_func,
             "_get_unflattened_lengths must exist in the graph",
         )
+
+
+class QuantManagedCollisionEmbeddingCollectionTest(unittest.TestCase):
+    @unittest.skipIf(torch.cuda.device_count() < 1, "CUDA required")
+    def test_mch_remap_cuda_inference(self) -> None:
+        device = torch.device("cuda")
+        table = EmbeddingConfig(
+            name="t1",
+            embedding_dim=8,
+            num_embeddings=5,
+            feature_names=["f1"],
+            data_type=DataType.FP16,
+        )
+        mc_module = MCHManagedCollisionModule(
+            zch_size=5,
+            device=device,
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=1,
+        )
+        mc_collection = ManagedCollisionCollection(
+            managed_collision_modules={"t1": mc_module},
+            embedding_configs=[table],
+        )
+        model = QuantManagedCollisionEmbeddingCollection(
+            tables=[table],
+            device=device,
+            output_dtype=torch.float16,
+            managed_collision_collection=mc_collection,
+        ).eval()
+        model._emb_modules[0].split_embedding_weights()[0][0].zero_()
+        mc_module._mch_sorted_raw_ids.copy_(
+            torch.tensor([3, 7, 2**40, 2**63 - 1, 2**63 - 1], device=device)
+        )
+        mc_module._mch_remapped_ids_mapping.copy_(
+            torch.tensor([1, 3, 0, 2, 4], device=device)
+        )
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1"],
+            values=torch.tensor([3, 7, 9, 2**40], device=device),
+            lengths=torch.tensor([4], device=device),
+        )
+
+        embeddings, remapped = model(features)
+        assert remapped is not None
+        torch.testing.assert_close(
+            remapped.values(), torch.tensor([1, 3, 4, 0], device=device)
+        )
+        expected = QuantEmbeddingCollection.forward(model, remapped)
+        assert isinstance(embeddings, dict)
+        torch.testing.assert_close(embeddings["f1"].values(), expected["f1"].values())
