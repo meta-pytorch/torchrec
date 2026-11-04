@@ -21,13 +21,7 @@ def tpu_is_available() -> bool:
         _ = torch_tpu
     except ImportError:
         return False
-    tpu = getattr(torch, "tpu", None)
-    if tpu is None:
-        return False
-    is_available = getattr(tpu, "is_available", None)
-    if callable(is_available):
-        return bool(is_available())
-    return bool(getattr(tpu, "available", False))
+    return torch.accelerator.is_available()
 
 
 def _setup_tpu() -> None:
@@ -90,6 +84,13 @@ CASES = [
     ("single_feature", 16, [5], [48], "random"),
     ("unused_bag_gets_zero_grad", 16, [4, 3], [16, 16], "unused_bag"),
     ("large_random", 256, [17, 100, 256], [32, 16, 48], "random"),
+]
+
+
+UNALIGNED_CASES = [
+    ("unaligned_15", 15, [2, 3], [16, 32], "modulo"),
+    ("unaligned_17_unused_bag", 17, [4, 3], [16, 32], "unused_bag"),
+    ("unaligned_19_mixed_dims", 19, [3, 5, 7], [16, 64, 32], "random"),
 ]
 
 
@@ -251,8 +252,11 @@ class BatchIndexSelectTest(unittest.TestCase):
         torch.testing.assert_close(actual, inputs.grad)
 
     @parameterized.expand(
-        [(*case, False) for case in CASES]
-        + [("compiled_two_features", 16, [2, 2], [16, 16], "modulo", True)]
+        [(*case, False) for case in CASES + UNALIGNED_CASES]
+        + [
+            ("compiled_two_features", 16, [2, 2], [16, 16], "modulo", True),
+            ("compiled_unaligned", 17, [2, 3], [16, 32], "modulo", True),
+        ]
     )
     def test_sparse_core_matches_fbgemm_cpu(
         self,
@@ -277,7 +281,7 @@ class BatchIndexSelectTest(unittest.TestCase):
         tpu_inputs = inputs.detach().to("tpu").requires_grad_()
         op = torch.ops.fbgemm.batch_index_select_dim0
         if compile_op:
-            op = torch.compile(op, backend="aot_eager", fullgraph=True)
+            op = torch.compile(op, backend="aot_eager", fullgraph=True, dynamic=False)
         actual = op(
             tpu_inputs,
             indices.to("tpu"),
@@ -286,6 +290,16 @@ class BatchIndexSelectTest(unittest.TestCase):
             input_columns,
             True,
         )
+
+        nodes = [actual.grad_fn]
+        visited = set()
+        while nodes:
+            node = nodes.pop()
+            if node is None or node in visited:
+                continue
+            visited.add(node)
+            self.assertNotIn(node.name(), ("ToCopyBackward0", "SliceBackward0"))
+            nodes.extend(parent for parent, _ in node.next_functions)
 
         torch.testing.assert_close(actual.cpu(), expected)
         grad_output = torch.randn(
@@ -299,7 +313,6 @@ class BatchIndexSelectTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("unaligned_batch", 15, [16, 32], True),
             ("unaligned_columns", 16, [18, 32], True),
             ("feature_major", 16, [16, 32], False),
         ]
@@ -337,7 +350,7 @@ class BatchIndexSelectTest(unittest.TestCase):
         self.assertIsNotNone(inputs.grad)
         torch.testing.assert_close(tpu_inputs.grad.cpu(), inputs.grad)
 
-    @parameterized.expand(CASES)
+    @parameterized.expand(CASES + UNALIGNED_CASES)
     def test_sparse_core_backward_kernel_matches_fbgemm_cpu(
         self,
         _name: str,

@@ -238,7 +238,6 @@ def batch_index_select_dim0_tpu(
     batch_size = input_num_indices[0]
     if (
         permute_output_dim_0_1
-        and batch_size % 16 == 0
         and all(size == batch_size for size in input_num_indices)
         and all(columns % 16 == 0 for columns in input_columns)
     ):
@@ -251,6 +250,17 @@ def batch_index_select_dim0_tpu(
             raise ValueError(
                 "All input_num_indices must be the same if `permute_output_dim_0_1` is true."
                 f"Instead it is {input_num_indices}."
+            )
+
+        if (
+            torch.is_grad_enabled()
+            and inputs.requires_grad
+            and any(rows > batch_size for rows in input_rows)
+        ):
+            raise NotImplementedError(
+                "SparseCore batch-index backward requires input_rows <= batch_size; "
+                "stored rows beyond batch_size would have unwritten gradients. "
+                f"Got input_rows={input_rows}, batch_size={batch_size}."
             )
 
         return impl.batch_index_select_dim0_tpu(
