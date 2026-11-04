@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import unittest
 from typing import cast
@@ -25,6 +26,11 @@ from torchrec.experimental.torch_tpu.uneven_all_to_all import (
     maybe_kjt_a2a_uneven_tpu,
     maybe_variable_batch_all2all_pooled_uneven_tpu,
 )
+
+
+_BACKENDS: list[tuple[str, str]] = [("gloo", "cpu")]
+if importlib.util.find_spec("torch_tpu") is not None:
+    _BACKENDS.append(("tpu_dist", "tpu"))
 
 
 class UnevenAllToAllTest(unittest.TestCase):
@@ -359,21 +365,21 @@ class UnevenAllToAllTest(unittest.TestCase):
             )
         return True
 
-    @parameterized.expand([("gloo", "cpu"), ("tpu_dist", "tpu")])
+    @parameterized.expand(_BACKENDS)
     def test_kjt_forward(self, backend: str, device_type: str) -> None:
         self.assertTrue(self._run_backend(backend, device_type, "kjt"))
 
-    @parameterized.expand([("gloo", "cpu"), ("tpu_dist", "tpu")])
+    @parameterized.expand(_BACKENDS)
     def test_pooled_forward_and_backward(self, backend: str, device_type: str) -> None:
         self.assertTrue(self._run_backend(backend, device_type, "pooled"))
 
-    @parameterized.expand([("gloo", "cpu"), ("tpu_dist", "tpu")])
+    @parameterized.expand(_BACKENDS)
     def test_variable_batch_forward_and_backward(
         self, backend: str, device_type: str
     ) -> None:
         self.assertTrue(self._run_backend(backend, device_type, "variable_batch"))
 
-    @parameterized.expand([("gloo", "cpu"), ("tpu_dist", "tpu")])
+    @parameterized.expand(_BACKENDS)
     def test_variable_batch_empty_rank_forward_and_backward(
         self, backend: str, device_type: str
     ) -> None:
