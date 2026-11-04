@@ -193,7 +193,7 @@ def _tensor_from_bytes(
     dtype: torch.dtype, shape: tuple[int, ...], payload: bytes
 ) -> torch.Tensor:
     if not payload:
-        return torch.empty(shape, dtype=dtype)
+        return torch.empty(shape, dtype=dtype, device="cpu")
     # clone() gives torch-allocated (aligned) storage before the dtype view.
     return (
         torch.frombuffer(bytearray(payload), dtype=torch.uint8)

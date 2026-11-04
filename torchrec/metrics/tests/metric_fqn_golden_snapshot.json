@@ -514,6 +514,25 @@
       "position_weights.feature1"
     ]
   },
+  "process_isolated_cpu_offloaded_rec_metric_module": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+    ]
+  },
+  "process_isolated_cpu_offloaded_rec_metric_module_with_throughput": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples",
+      "throughput_metric.time_lapse_after_warmup",
+      "throughput_metric.total_examples",
+      "throughput_metric.warmup_examples"
+    ]
+  },
   "rec_metric_module": {
     "state_dict_keys": [
       "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",

@@ -13,6 +13,10 @@ from typing import Dict, List, Optional
 import torch
 import torch.distributed as dist
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
+from torchrec.metrics.cpu_offloaded_metric_process import (
+    ProcessIsolatedCPUOffloadedRecMetricModule,
+)
+from torchrec.metrics.cpu_offloaded_metric_worker import oss_worker_factory
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import (
     MetricsConfig,
@@ -59,6 +63,9 @@ class RecMetricConfig:
             "unfused" (default), "fused", or "fused_states".
         enable_zorm (bool): If True, use CPUOffloadedRecMetricModule (ZORM)
             instead of RecMetricModule. Default is False.
+        enable_process_zorm (bool): Run ZORM in a separate worker process
+            (ProcessIsolatedCPUOffloadedRecMetricModule). Ignored unless
+            enable_zorm is True.
     """
 
     enable_metrics: bool = False
@@ -68,6 +75,7 @@ class RecMetricConfig:
     num_tasks: int = 1
     rec_compute_mode: str = "unfused"
     enable_zorm: bool = False
+    enable_process_zorm: bool = False
     # Per-task "extra" tensors added to model_out beyond pred/label/weight,
     # to simulate distillation / multi-head outputs / teacher logits that
     # bloat model_out in production models. Each tensor is shape
@@ -163,7 +171,16 @@ class RecMetricConfig:
             compute_interval_steps=self.compute_interval,
         )
 
-        if self.enable_zorm:
+        if self.enable_zorm and self.enable_process_zorm:
+            metric_class = ProcessIsolatedCPUOffloadedRecMetricModule
+            module_kwargs = {
+                "model_out_device": device,
+                "worker_factory": oss_worker_factory(
+                    metrics_config, batch_size, world_size, rank
+                ),
+            }
+            metric_module_device = torch.device("cpu")
+        elif self.enable_zorm:
             metric_class = CPUOffloadedRecMetricModule
             module_kwargs = {"model_out_device": device}
             # ZORM keeps metric states on CPU; worker transfers model_out
