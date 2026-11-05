@@ -1943,8 +1943,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         if self._model.training:
             # update
-            with record_function("## optimizer ##"):
-                self._optimizer.step()
+            self._optimizer_step()
 
         self.dequeue_batch()
         return output
