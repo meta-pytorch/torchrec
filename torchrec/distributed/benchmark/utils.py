@@ -38,6 +38,45 @@ def as_bool(value: Any, default: bool) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def synchronize_device(device: torch.device) -> None:
+    """Block the host until all work queued on ``device`` has executed.
+
+    A no-op on CPU. On TPU, execution is lazy, so a host-side timer only measures
+    device time once this flush has returned. ``torch_tpu`` is an out-of-tree wheel,
+    hence the lazy import; builds without its ``sync`` module fall back to
+    ``torch.accelerator.synchronize``.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "tpu":
+        try:
+            from torch_tpu._internal import sync  # pyrefly: ignore[missing-import]
+        except ImportError:
+            torch.accelerator.synchronize()
+            return
+        sync.synchronize(wait=True)
+
+
+def default_index_dtype(device: torch.device) -> torch.dtype:
+    """Default dtype of KJT ids (``values``): int32 on TPU, int64 elsewhere.
+
+    TPUs have no native 64-bit integer arithmetic (XLA emulates it), and the TPU
+    lookup kernels take int32 ids.
+    """
+    return torch.int32 if device.type == "tpu" else torch.int64
+
+
+def set_tpu_eager_mode(mode: str) -> None:
+    """Set ``torch_tpu``'s eager execution mode (e.g. ``"defer_never"``).
+
+    Process-wide, and read when ops are dispatched, so it applies to everything that
+    runs after this call.
+    """
+    from torch_tpu._internal import execution_mode  # pyrefly: ignore[missing-import]
+
+    execution_mode.eager_mode = execution_mode.EagerMode.__members__[mode.upper()]
+
+
 def get_gpu_type() -> str:
     """Return the GPU device name, or 'N/A' if CUDA is unavailable."""
     if torch.cuda.is_available():

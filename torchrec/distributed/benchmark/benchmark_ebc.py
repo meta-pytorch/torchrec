@@ -37,6 +37,11 @@ Three sharding types are supported, and ``name`` selects one of them:
   a narrow slice of every table and ``output_dist`` is again an all-to-all, but of
   narrower per-rank embeddings.
 
+On TPU (``--backend=tpu_dist``) only ``column_wise`` without the pipeline is supported:
+the tables run on the ``unfused_tpu`` compute kernel (the Pallas lookup from
+``torchrec.experimental.torch_tpu``) and the plan places every shard at ``tpu:0`` (each
+process drives one core).
+
 A follow-up launcher binary will call ``runner`` explicitly with options to run on
 MAST or locally.
 """
@@ -66,7 +71,12 @@ import torch
 import torchrec.distributed.planner  # noqa: F401
 from torch import nn
 from torchrec.distributed.benchmark.base import benchmark_func, BenchmarkResult
-from torchrec.distributed.benchmark.utils import as_bool
+from torchrec.distributed.benchmark.utils import (
+    as_bool,
+    default_index_dtype,
+    set_tpu_eager_mode,
+    synchronize_device,
+)
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionSharder,
@@ -102,6 +112,10 @@ logger.setLevel(logging.INFO)
 # convergence, so the value only has to be finite -- it is the step's memory
 # traffic that is being measured, not where it lands.
 _LEARNING_RATE: float = 0.01
+
+# The unfused_tpu kernel needs every column shard to be a multiple of this many
+# columns wide.
+_TPU_CW_SHARD_MULTIPLE: int = 16
 
 # Batches ``TrainPipelineSparseDist`` keeps in flight: one in forward/backward, one
 # in input_dist, one being copied to device. A batch stream no longer than this
@@ -319,12 +333,17 @@ def _shard_ebc(
     world_size: int,
     device: torch.device,
     pg: torch.distributed.ProcessGroup,
+    fused_params: Optional[Dict[str, Any]] = None,
 ) -> ShardedEmbeddingBagCollection:
     """Build an ``EmbeddingBagCollection`` and shard it with ``sharding_type``.
 
     The unsharded module is created on the ``meta`` device so no rank ever
     materializes the full tables; ``shard`` allocates only this rank's shards on
     ``device``.
+
+    On TPU the plan is built with ``local_size=1``: shard placements are
+    ``rank:{r}/tpu:{r % local_size}``, and every torch_tpu process addresses its core
+    as ``tpu:0``.
 
     ``compute_kernel`` is passed explicitly rather than left to the plan builder's
     inference, which falls back to ``dense`` unless the table carries an in-backward
@@ -333,7 +352,7 @@ def _shard_ebc(
     """
     generator_factory = _SHARDING_GENERATORS[sharding_type]
     ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
-    sharder = EmbeddingBagCollectionSharder()
+    sharder = EmbeddingBagCollectionSharder(fused_params=fused_params)
     plan = construct_module_sharding_plan(
         ebc,
         {
@@ -344,6 +363,7 @@ def _shard_ebc(
         # assignable to the plan builder's ModuleSharder[nn.Module] parameter even
         # though it only calls module-agnostic methods on it.
         sharder=cast(ModuleSharder[nn.Module], sharder),
+        local_size=1 if device.type == "tpu" else None,
         world_size=world_size,
         device_type=device.type,
     )
@@ -358,7 +378,8 @@ def _make_optimizer(module: ShardedEmbeddingBagCollection) -> KeyedOptimizer:
     a plain SGD over whatever parameters are left. Under the default ``fused``
     compute kernel every embedding parameter is in-backward, so the dense set is
     empty and is skipped -- ``torch.optim.SGD`` rejects an empty parameter list.
-    The ``dense`` kernel is the case that actually produces dense parameters.
+    The ``dense`` and ``unfused_tpu`` kernels are the cases that actually produce
+    dense parameters.
     """
     optims: List[Union[KeyedOptimizer, Tuple[str, KeyedOptimizer]]] = [
         module.fused_optimizer
@@ -403,10 +424,11 @@ def _run_iteration(
     LR scheduling reaches the kernel through. They also drive the dense parameters the
     ``dense`` compute kernel produces.
 
-    We ``torch.cuda.synchronize()`` at the end to actually block the host on the
-    whole chain inside the measured region; that is what makes the wall-clock timer
-    reflect end-to-end latency (GPU-event timing is unaffected either way). The
-    input KJT is reused across iterations.
+    We synchronize the device at the end to actually block the host on the whole
+    chain inside the measured region; that is what makes the wall-clock timer
+    reflect end-to-end latency (GPU-event timing is unaffected either way; on TPU,
+    whose execution is lazy, the wall clock is the only timer). The input KJT is
+    reused across iterations.
     """
     if optimizer is not None:
         optimizer.zero_grad()
@@ -414,8 +436,7 @@ def _run_iteration(
     if optimizer is not None:
         values.sum().backward()
         optimizer.step()
-    if values.is_cuda:
-        torch.cuda.synchronize(values.device)
+    synchronize_device(values.device)
 
 
 def _run_pipelined_iteration(
@@ -457,8 +478,7 @@ def _run_pipelined_iteration(
             pipeline.progress(dataloader)
         except StopIteration:
             break
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+    synchronize_device(device)
 
 
 def _benchmark_sharding_type(
@@ -490,7 +510,11 @@ def _benchmark_sharding_type(
         **kwargs: benchmark options:
             compute_kernel (str): ``EmbeddingComputeKernel`` value the local lookup
                 runs on. Default ``"fused"`` (the FBGEMM TBE); ``"dense"`` falls back
-                to ``nn.EmbeddingBag``.
+                to ``nn.EmbeddingBag``. On TPU the default is ``"unfused_tpu"``.
+            fused_params (Dict[str, Any]): sharder ``fused_params``, which reach the
+                compute kernel (e.g. ``unfused_tpu``'s ``pooled_lookup_kernel``).
+                Not expressible on the command line, so a wrapper that builds them
+                passes them in. Default None.
             backward (bool): measure a full training iteration -- ``values.sum()``
                 as the stand-in dense arch, its backward, and the optimizer step --
                 rather than the forward alone. Default True.
@@ -513,13 +537,14 @@ def _benchmark_sharding_type(
             pooling_factor (int): indices looked up per feature per sample. Default
                 per sharding type.
             values_dtype (torch.dtype): dtype of the KJT ``values`` tensor.
-                Default int64.
+                Default int64, or int32 on TPU.
             num_benchmarks (int): number of measured iterations. Default 200, or
                 100 with ``pipeline``, where each iteration already drives
                 ``num_batches`` batches.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
-            profile_dir (str): directory for chrome traces; empty disables profiling.
+            profile_dir (str): directory for chrome traces (a rank-0 xprof trace on
+                TPU); empty disables profiling.
             memory_snapshot (bool): capture a CUDA memory snapshot alongside the
                 profile (requires profile_dir). Default True.
         The benchmark name (which keys the result files) is
@@ -530,11 +555,21 @@ def _benchmark_sharding_type(
 
     Raises:
         ValueError: if ``column_wise`` is selected but ``embedding_dim`` is not
-            divisible by ``world_size``, or if ``pipeline`` is combined with a
-            ``num_batches`` at or below the pipeline depth.
+            divisible by ``world_size``, if ``pipeline`` is combined with a
+            ``num_batches`` at or below the pipeline depth, or if on TPU the run is
+            not ``column_wise`` without the pipeline, or each rank's column shard is
+            not a multiple of 16 wide.
     """
+    is_tpu = ctx.device.type == "tpu"
     compute_kernel: str = str(
-        kwargs.get("compute_kernel", EmbeddingComputeKernel.FUSED.value)
+        kwargs.get(
+            "compute_kernel",
+            (
+                EmbeddingComputeKernel.UNFUSED_TPU.value
+                if is_tpu
+                else EmbeddingComputeKernel.FUSED.value
+            ),
+        )
     )
     shape = _DEFAULT_SHAPES[sharding_type]
     num_tables: int = int(kwargs.get("num_tables", shape["num_tables"]))
@@ -542,7 +577,9 @@ def _benchmark_sharding_type(
     embedding_dim: int = int(kwargs.get("embedding_dim", shape["embedding_dim"]))
     batch_size: int = int(kwargs.get("batch_size", shape["batch_size"]))
     pooling_factor: int = int(kwargs.get("pooling_factor", shape["pooling_factor"]))
-    values_dtype: torch.dtype = kwargs.get("values_dtype", torch.int64)
+    values_dtype: torch.dtype = kwargs.get(
+        "values_dtype", default_index_dtype(ctx.device)
+    )
     backward: bool = as_bool(kwargs.get("backward"), True)
     pipeline: bool = as_bool(kwargs.get("pipeline"), False)
     num_batches: int = int(kwargs.get("num_batches", 10))
@@ -556,6 +593,11 @@ def _benchmark_sharding_type(
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
     assert pg is not None, "ctx.pg must be initialized by the process runner"
 
+    if is_tpu and (sharding_type != ShardingType.COLUMN_WISE.value or pipeline):
+        raise ValueError(
+            "TPU supports only column_wise sharding without the pipeline, got "
+            f"sharding_type={sharding_type} pipeline={pipeline}."
+        )
     if pipeline:
         # The pipeline holds three batches in flight, so a stream at or below that
         # depth is all fill and drain and never reaches the steady state the
@@ -575,6 +617,12 @@ def _benchmark_sharding_type(
             raise ValueError(
                 f"column_wise needs embedding_dim ({embedding_dim}) divisible by "
                 f"world_size ({world_size}) to split each table evenly across ranks."
+            )
+        if is_tpu and embedding_dim % (_TPU_CW_SHARD_MULTIPLE * world_size) != 0:
+            raise ValueError(
+                f"column_wise on TPU needs embedding_dim ({embedding_dim}) divisible "
+                f"by {_TPU_CW_SHARD_MULTIPLE} * world_size ({world_size}): each "
+                f"rank's shard must be a multiple of {_TPU_CW_SHARD_MULTIPLE} columns."
             )
     elif (
         sharding_type == ShardingType.TABLE_WISE.value and num_tables % world_size != 0
@@ -598,6 +646,7 @@ def _benchmark_sharding_type(
         world_size=world_size,
         device=ctx.device,
         pg=pg,
+        fused_params=kwargs.get("fused_params"),
     )
     logger.info(
         "rank=%d local_rank=%d host=%s running module benchmark: sharding_type=%s "
@@ -711,6 +760,8 @@ def benchmark_runner(
         world_size: total number of ranks.
         name: the sharding type to run; one of :func:`available_sharding_types`.
         **kwargs: forwarded to :func:`_benchmark_sharding_type` (e.g. ``pipeline``).
+            On TPU, ``tpu_eager_mode`` (str) sets ``torch_tpu``'s eager execution
+            mode first. Default ``"defer_never"``.
 
     Returns:
         This rank's ``BenchmarkResult``.
@@ -722,4 +773,6 @@ def benchmark_runner(
         socket.gethostname(),
         name,
     )
+    if ctx.device.type == "tpu":
+        set_tpu_eager_mode(str(kwargs.get("tpu_eager_mode", "defer_never")))
     return _benchmark_sharding_type(ctx, rank, world_size, name, **kwargs)

@@ -94,6 +94,21 @@ def check_required_env_vars() -> None:
         )
 
 
+def _init_tpu_runtime() -> None:
+    """Import the out-of-tree ``torch_tpu`` stack before any TPU use.
+
+    ``torch_tpu`` registers the ``tpu`` device and the ``tpu_dist`` backend, so it has
+    to land before ``torch.device("tpu")`` or ``init_process_group``. The Pallas
+    modules register the TPU impls of the fbgemm ops sharded embedding modules call
+    (e.g. ``permute_2D_sparse_data`` in the KJT all-to-all recat).
+    """
+    import torch_tpu  # pyrefly: ignore[missing-import]  # noqa: F401
+    from torchrec.experimental.torch_tpu.pallas import (  # @manual  # pyrefly: ignore[missing-import]  # noqa: F401
+        dispatcher,
+        impl,
+    )
+
+
 class SingleProcessContext:
     """Context manager that owns this rank's device + default process group.
 
@@ -106,7 +121,8 @@ class SingleProcessContext:
         rank: global rank of this process (from ``RANK``).
         world_size: global world size (from ``WORLD_SIZE``).
         local_rank: local rank on this host (from ``LOCAL_RANK``); selects the GPU.
-        device: the bound ``torch.device`` (``cuda:LOCAL_RANK`` or ``cpu``).
+        device: the bound ``torch.device`` (``cuda:LOCAL_RANK``, ``tpu`` when the
+            backend includes ``tpu_dist``, or ``cpu``).
         pg: the default process group, available after ``__enter__``.
     """
 
@@ -121,10 +137,15 @@ class SingleProcessContext:
         self.local_rank: int = int(os.environ["LOCAL_RANK"])
         self.disable_cuda_tf_32 = disable_cuda_tf_32
         self.pg_timeout: timedelta = pg_timeout or DEFAULT_PG_TIMEOUT
-        # Default to nccl on GPU hosts, gloo otherwise.
+        # Default to nccl on GPU hosts, gloo otherwise. TPU is opt-in via ``tpu_dist``.
         self.backend: str = backend or ("nccl" if torch.cuda.is_available() else "gloo")
 
-        if torch.cuda.is_available():
+        if "tpu_dist" in self.backend:
+            _init_tpu_runtime()
+            # Each torch_tpu process drives exactly one core, always addressed as
+            # plain "tpu"; the runtime owns the rank -> core mapping.
+            self.device: torch.device = torch.device("tpu")
+        elif torch.cuda.is_available():
             # Bind to the LOCAL device index, not the global rank: on a multi-host
             # job rank 10 on an 8-GPU host would map to a nonexistent cuda:10.
             self.device: torch.device = torch.device(f"cuda:{self.local_rank}")
