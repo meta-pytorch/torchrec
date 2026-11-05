@@ -680,6 +680,16 @@ def _populate_zero_collision_tbe_params(
         tbe_params.pop("kvzch_tbe_config")
         eviction_trigger_mode = kvzch_tbe_config.kvzch_eviction_trigger_mode
         eviction_free_mem_threshold_gb = kvzch_tbe_config.eviction_free_mem_threshold_gb
+        # Older fbgemm_gpu configs predate these two fields.
+        eviction_step_intervals = getattr(
+            kvzch_tbe_config, "eviction_step_intervals", None
+        )
+        eviction_mem_threshold_gb = getattr(
+            kvzch_tbe_config, "eviction_mem_threshold_gb", None
+        )
+        if eviction_mem_threshold_gb is None:
+            # l2_cache_size is what mem_util has always used.
+            eviction_mem_threshold_gb = l2_cache_size
         threshold_calculation_bucket_stride = (
             kvzch_tbe_config.threshold_calculation_bucket_stride
         )
@@ -760,7 +770,8 @@ def _populate_zero_collision_tbe_params(
                     )
         eviction_policy = EvictionPolicy(
             eviction_trigger_mode=eviction_trigger_mode,
-            eviction_mem_threshold_gb=l2_cache_size,
+            eviction_mem_threshold_gb=eviction_mem_threshold_gb,
+            eviction_step_intervals=eviction_step_intervals,
             eviction_strategy=eviction_strategy,
             counter_thresholds=counter_thresholds,
             ttls_in_mins=ttls_in_mins,
