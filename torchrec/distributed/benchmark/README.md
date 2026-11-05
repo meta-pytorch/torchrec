@@ -24,3 +24,20 @@ buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_com
 python -m torchrec.distributed.benchmark.benchmark_comms \
   a2a_single --name=a2a_sync_base-$(git rev-parse --short HEAD || echo $USER) --memory_snapshot=true
 ```
+
+## benchmark_primitive / benchmark_ebc usage
+Collective (`--benchmark=primitive`) and sharded-EBC (`--benchmark=module`) micro
+benchmarks, dispatched by `benchmark_launcher`.
+- local (GPU, or CPU with gloo):
+```
+python -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \
+    --mode=local --benchmark=primitive --name=kt_a2a --world-size=2
+```
+- TPU (one rank per core, `torch_tpu` installed, topology env exported by its launcher;
+  `module` supports only `column_wise` without the pipeline):
+```
+eval "$(python -m torch.tpu.distributed)"
+python -m torch.distributed.run --nproc_per_node="${WORLD_SIZE}" \
+    -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \
+    --mode=remote --backend=tpu_dist --benchmark=module --name=column_wise
+```

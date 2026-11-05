@@ -45,6 +45,12 @@ Examples:
     # remote: invoked per-rank by torchrun/MAST (rendezvous env preset)
     python -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \\
         --mode=remote --benchmark=all
+
+    # TPU: one rank per core, under torchrun on a TPU host, after exporting the
+    # topology env from torch_tpu's launcher (``eval "$(python -m torch.tpu.distributed)"``)
+    python -m torch.distributed.run --nproc_per_node=8 \\
+        -m torchrec.distributed.test_utils.benchmark_utils.benchmark_launcher \\
+        --mode=remote --backend=tpu_dist --benchmark=primitive --name=kt_a2a
 """
 
 import argparse
@@ -265,7 +271,9 @@ def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
         "--backend",
         type=str,
         default=None,
-        help="process-group backend (defaults to nccl on GPU, gloo otherwise).",
+        help="process-group backend (defaults to nccl on GPU, gloo otherwise). "
+        "tpu_dist runs on TPU (requires the torch_tpu wheel); use it with "
+        "--mode=remote under torch.distributed.run.",
     )
     # Named after the ``profile_dir`` kwarg the benchmark runners consume, so the flag,
     # the forwarded kwarg and the runner argument are all one name. Accept both

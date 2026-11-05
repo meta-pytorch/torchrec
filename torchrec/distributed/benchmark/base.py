@@ -42,6 +42,7 @@ from torchrec.distributed.benchmark.utils import (
     create_snapshot_file_name,
     create_trace_file_name,
     dump_benchmark_result,
+    synchronize_device,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port
@@ -107,6 +108,35 @@ class GPUMemoryStats:
         return cls(
             rank,
             alloc_retries,
+            max_allocated // 1024 // 1024,
+            max_reserved // 1024 // 1024,
+            free // 1024 // 1024,
+            total // 1024 // 1024,
+        )
+
+    @classmethod
+    def for_tpu(cls, rank: int) -> "GPUMemoryStats":
+        """HBM stats for this process's TPU core (per core, not per chip).
+
+        libtpu does not implement peak reset, so the peaks are process-lifetime: a
+        later benchmark in the same job reports at least the earlier ones' peaks.
+        Builds without ``allocated_bytes`` counters report ``active_bytes``; builds
+        without memory stats at all report zeros rather than failing the run after
+        its timings are in.
+        """
+        try:
+            stats = torch.accelerator.memory_stats()
+            free, total = torch.accelerator.get_memory_info()
+        except RuntimeError as e:
+            logger.warning(f"TPU memory stats unavailable: {e}")
+            return cls(rank, 0, 0, 0, 0, 0)
+        max_allocated = stats.get(
+            "allocated_bytes.all.peak", stats.get("active_bytes.all.peak", 0)
+        )
+        max_reserved = stats.get("reserved_bytes.all.peak", 0)
+        return cls(
+            rank,
+            0,
             max_allocated // 1024 // 1024,
             max_reserved // 1024 // 1024,
             free // 1024 // 1024,
@@ -867,6 +897,21 @@ def _bench_cuda_device(rank: int) -> int:
     return 0
 
 
+def _trim_outliers(values: List[float], num_benchmarks: int) -> torch.Tensor:
+    """Convert to tensor, dropping the first and last iterations to remove outliers.
+
+    When ``num_benchmarks >= 5`` the first and last entries are stripped
+    to remove warm-up and cool-down outliers.  Otherwise all values are
+    kept (or a single zero is returned when there are none).
+    """
+    if num_benchmarks >= 5:
+        return torch.tensor(values[1:-1], dtype=torch.float)
+    elif num_benchmarks > 0:
+        return torch.tensor(values, dtype=torch.float)
+    else:
+        return torch.zeros(1, dtype=torch.float)
+
+
 class PerfWrapper:
     """Wraps per-iteration CUDA + CPU measurements around a benchmark callable.
 
@@ -977,18 +1022,7 @@ class PerfWrapper:
         self._end()
 
     def _trim_outliers(self, values: List[float]) -> torch.Tensor:
-        """Convert to tensor, dropping the first and last iterations to remove outliers.
-
-        When ``num_benchmarks >= 5`` the first and last entries are stripped
-        to remove warm-up and cool-down outliers.  Otherwise all values are
-        kept (or a single zero is returned when there are none).
-        """
-        if self._num_benchmarks >= 5:
-            return torch.tensor(values[1:-1], dtype=torch.float)
-        elif self._num_benchmarks > 0:
-            return torch.tensor(values, dtype=torch.float)
-        else:
-            return torch.zeros(1, dtype=torch.float)
+        return _trim_outliers(values, self._num_benchmarks)
 
     @property
     def cpu_elapsed_time(self) -> torch.Tensor:
@@ -1128,6 +1162,109 @@ def _run_cuda_benchmark(
     logger.info(f"Cuda benchmark finished on rank {rank}")
 
     return perf
+
+
+def _run_tpu_benchmark(
+    name: str,
+    run_iter_fn: Callable[[], None],
+    num_benchmarks: int,
+    rank: int,
+    sample_count: int = 0,
+    pg: Optional[dist.ProcessGroup] = None,
+    prepare_iter_fn: Optional[Callable[[], None]] = None,
+) -> BenchmarkResult:
+    """Run benchmark iterations on TPU, timing each one with the host clock.
+
+    TPUs have no CUDA-event equivalent, so the device time is the wall-clock time
+    of an iteration bracketed by device syncs: the window opens once the previous
+    iteration, the setup and the barrier have all executed, and closes once the
+    iteration's own work has. ``gpu_elapsed_time`` therefore equals
+    ``wall_elapsed_time`` and includes host dispatch. When ``pg`` is set, ranks
+    barrier before each window so arrival skew stays out of it.
+    """
+    device = torch.device("tpu")
+    logger.info(f"Running tpu benchmark {num_benchmarks} times on rank {rank}")
+    wall_times_ms: List[float] = []
+    cpu_times_ms: List[float] = []
+    for _ in range(num_benchmarks):
+        if prepare_iter_fn is not None:
+            prepare_iter_fn()
+        if pg is not None:
+            dist.barrier(group=pg)
+        synchronize_device(device)
+        cpu_start_ns = time.process_time_ns()
+        wall_start_ns = time.perf_counter_ns()
+        run_iter_fn()
+        synchronize_device(device)
+        wall_times_ms.append((time.perf_counter_ns() - wall_start_ns) / 1e6)
+        cpu_times_ms.append((time.process_time_ns() - cpu_start_ns) / 1e6)
+    logger.info(f"Tpu benchmark finished on rank {rank}")
+
+    wall_elapsed_time = _trim_outliers(wall_times_ms, num_benchmarks)
+    cpu_elapsed_time = _trim_outliers(cpu_times_ms, num_benchmarks)
+    cpu_utilization = cpu_elapsed_time / wall_elapsed_time.clamp(min=1e-6)
+    qps = (
+        sample_count / (wall_elapsed_time / 1e3).clamp(min=1e-9)
+        if sample_count > 0
+        else torch.zeros_like(wall_elapsed_time)
+    )
+    return BenchmarkResult(
+        short_name=name,
+        gpu_elapsed_time=wall_elapsed_time.clone(),
+        cpu_elapsed_time=cpu_elapsed_time,
+        cpu_utilization=cpu_utilization,
+        normalized_cpu_utilization=cpu_utilization / (os.cpu_count() or 1),
+        gpu_mem_stats=[GPUMemoryStats.for_tpu(rank)],
+        cpu_mem_stats=[CPUMemoryStats.for_process(rank)],
+        qps=qps,
+        wall_elapsed_time=wall_elapsed_time,
+        rank=rank,
+    )
+
+
+class _NoOpProfiler:
+    """Stands in for the profiler on ranks that run the profiled iterations untraced."""
+
+    def step(self) -> None:
+        pass
+
+
+def _run_tpu_profiling(
+    name: str,
+    profile_iter_fn: Callable[[Any], None],
+    rank: int,
+    output_dir: str,
+) -> None:
+    """Capture an xprof trace of the profiled iterations into ``output_dir``.
+
+    Every rank runs the iterations, since they issue collectives, but only rank 0
+    traces: xprof drives libtpu per host, so concurrent per-rank traces on one host
+    would collide. ``torch_tpu``'s profiler records the device timeline;
+    ``torch.profiler``'s CPU/CUDA activities cannot see it.
+    """
+    device = torch.device("tpu")
+    if rank > 0:
+        profile_iter_fn(_NoOpProfiler())
+        synchronize_device(device)
+        return
+
+    run_dir = os.path.join(output_dir, f"xprof-{name}")
+    os.makedirs(run_dir, exist_ok=True)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.PrivateUse1],
+        # torch.tpu is registered at runtime by torch_tpu.
+        # pyrefly: ignore[missing-attribute]
+        experimental_config=torch.tpu.profiler.TpuProfilerConfig(
+            host_tracer_level=2,
+            device_tracer_level=1,
+            python_tracer_level=1,
+            run_dir=run_dir,
+        ),
+    ) as prof:
+        profile_iter_fn(prof)
+        # Flush the queued work into the trace window before it closes.
+        synchronize_device(device)
+    logger.info(f"xprof trace for {name} written to {run_dir}")
 
 
 def _run_cpu_benchmark(
@@ -1285,8 +1422,9 @@ def _run_benchmark_core(
             stats. ``rank == -1`` means single-process mode.
         num_benchmarks: Number of measured iterations.
 
-        device_type: "cuda" or "cpu".
-        output_dir: Where to write chrome traces / stack files.
+        device_type: "cuda", "tpu" or "cpu".
+        output_dir: Where to write chrome traces / stack files (an xprof trace
+            directory on TPU).
         pre_gpu_load: Number of dummy matmul operations to run before the first
             measured iteration (helps simulating a loaded allocator).
         export_stacks: Whether to export flamegraph-compatible stack files.
@@ -1336,6 +1474,16 @@ def _run_benchmark_core(
             prepare_iter_fn,
         )
         result = perf.to_benchmark_result(name, rank, world_size)
+    elif device_type == "tpu":
+        result = _run_tpu_benchmark(
+            name,
+            run_iter_fn,
+            num_benchmarks,
+            rank,
+            sample_count,
+            pg,
+            prepare_iter_fn,
+        )
     else:  # CPU benchmarking
         times = _run_cpu_benchmark(run_iter_fn, num_benchmarks, prepare_iter_fn)
         cpu_elapsed_time = torch.tensor(times) * 1e3  # convert to ms
@@ -1374,11 +1522,26 @@ def _run_benchmark_core(
             gpu_backlog_cycles=gpu_backlog_cycles,
             gpu_backlog_ms=gpu_backlog_ms,
         )
+    elif output_dir and profile_iter_fn and device_type == "tpu":
+        _run_tpu_profiling(
+            name=name,
+            profile_iter_fn=profile_iter_fn,
+            rank=rank,
+            output_dir=output_dir,
+        )
 
     # Dump benchmark result to local storage
     if output_dir:
+        # GKE injects the slice type (e.g. "tpu7x-8"); get_gpu_type() only sees CUDA.
+        gpu_type = (
+            os.environ.get("TPU_ACCELERATOR_TYPE", "TPU")
+            if device_type == "tpu"
+            else None
+        )
         try:
-            dump_benchmark_result(result, output_dir, world_size, test_name=test_name)
+            dump_benchmark_result(
+                result, output_dir, world_size, test_name=test_name, gpu_type=gpu_type
+            )
         except OSError as e:
             logger.warning(f"Failed to dump benchmark result: {e}")
 
@@ -1551,7 +1714,7 @@ def benchmark_func(
             times the function will be called
         profile_dir: Where to write chrome traces / stack files.
 
-        device_type: "cuda" or "cpu".
+        device_type: "cuda", "tpu" or "cpu".
         pre_gpu_load: Number of dummy matmul operations to run before the first
             measured iteration (helps simulating a loaded allocator).
         export_stacks: Whether to export flamegraph-compatible stack files.
