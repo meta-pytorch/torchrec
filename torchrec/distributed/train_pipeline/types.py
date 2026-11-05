@@ -9,7 +9,7 @@
 import abc
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class BaseArgInfoStep(abc.ABC):
@@ -162,3 +162,55 @@ class PipelinePhase(Enum):
 
     # the optimizer step usually only includes the dense module weights
     DENSE_OPTIMIZER_STEP = "dense_optimizer_step"
+
+
+@unique
+class PipeliningDiagnosticReason(str, Enum):
+    """
+    Why a sharded module was refused by the sparse data dist pipeline.
+    """
+
+    def __str__(self) -> str:
+        return self.value
+
+    # the postproc module ahead of the sharded module has trainable params
+    POSTPROC_TRAINABLE_PARAMS = "postproc_trainable_params"
+
+    # an fx node on the path from the train batch cannot be replayed
+    POSTPROC_FX_UNTRACEABLE = "postproc_fx_untraceable"
+
+    # a postproc module or constant was reached with `pipeline_postproc=False`
+    POSTPROC_DISABLED = "postproc_disabled"
+
+    # the call_module target is not found among the model's submodules
+    POSTPROC_NOT_FOUND = "postproc_not_found"
+
+    # the call_module target resolved to something other than an nn.Module
+    POSTPROC_NOT_MODULE = "postproc_not_module"
+
+    # the postproc module is called without inputs, so its output is assumed to
+    # be a modified KJT
+    POSTPROC_NO_INPUT = "postproc_no_input"
+
+    # a KeyedJaggedTensor is built from the output of a module call
+    POSTPROC_KJT_FROM_MODULE = "postproc_kjt_from_module"
+
+    # inputs were not resolved but no failure site recorded a reason
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class PipeliningDiagnostic:
+    reason: PipeliningDiagnosticReason
+    fx_node: Optional[str] = None
+    fx_target: Optional[str] = None
+
+    def __str__(self) -> str:
+        if self.reason in (
+            PipeliningDiagnosticReason.POSTPROC_FX_UNTRACEABLE,
+            PipeliningDiagnosticReason.POSTPROC_KJT_FROM_MODULE,
+        ):
+            return f"{self.reason}({self.fx_node}:{self.fx_target})"
+        if self.fx_target is not None:
+            return f"{self.reason}({self.fx_target})"
+        return str(self.reason)

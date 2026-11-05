@@ -108,7 +108,11 @@ from torchrec.distributed.train_pipeline.tracing import (
     NodeArgsHelper,
     Tracer,
 )
-from torchrec.distributed.train_pipeline.types import CallArgs  # noqa
+from torchrec.distributed.train_pipeline.types import (  # noqa
+    CallArgs,
+    PipeliningDiagnostic,
+    PipeliningDiagnosticReason,
+)
 from torchrec.distributed.types import Awaitable
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
@@ -659,6 +663,7 @@ def _rewrite_model(  # noqa C901
     pipelined_sharded_modules = []
 
     non_pipelined_sharded_modules = []
+    non_pipelined_reasons: Dict[str, List[PipeliningDiagnostic]] = {}
 
     args_helper = NodeArgsHelper(
         model, context, pipeline_postproc, default_stream, dist_stream
@@ -678,8 +683,11 @@ def _rewrite_model(  # noqa C901
             logger.warning(f"Module '{node.target}' is a ShardedModule with zero input")
             continue
 
+        diagnostics: List[PipeliningDiagnostic] = []
         # List[ArgInfo]: for rebuilding the input arguments, while the num verifies if missing any
-        arg_info_list, num_found = args_helper.get_node_args(node)
+        arg_info_list, num_found = args_helper.get_node_args(
+            node, diagnostics=diagnostics
+        )
 
         if num_found == total_num_args:
             logger.info(f"Module '{node.target}' will be pipelined")
@@ -705,6 +713,9 @@ def _rewrite_model(  # noqa C901
                 f"Module '{node.target}' will NOT be pipelined, due to input modifications"
             )
             non_pipelined_sharded_modules.append(node.target)
+            non_pipelined_reasons[str(node.target)] = list(
+                dict.fromkeys(diagnostics)
+            ) or [PipeliningDiagnostic(reason=PipeliningDiagnosticReason.UNKNOWN)]
 
     # JIT script unsharded modules if applicable.
     if apply_jit:
@@ -724,6 +735,7 @@ def _rewrite_model(  # noqa C901
         pipelined_module_fqns=pipelined_sharded_modules,
         non_pipelined_module_fqns=non_pipelined_sharded_modules,
         pipeline_forward_type=pipelined_forward.__name__,
+        non_pipelined_reasons=non_pipelined_reasons,
     )
 
     return (

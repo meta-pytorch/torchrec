@@ -9,7 +9,7 @@
 
 import unittest
 from typing import List, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import parameterized
 import torch
@@ -22,6 +22,10 @@ from torchrec.distributed.train_pipeline.tracing import (
     CallArgs,
     NodeArgsHelper,
     Tracer,
+)
+from torchrec.distributed.train_pipeline.types import (
+    PipeliningDiagnostic,
+    PipeliningDiagnosticReason,
 )
 from torchrec.distributed.types import NullShardedModuleContext, ShardedModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -113,6 +117,263 @@ class TestNodeArg(unittest.TestCase):
 
         # Weights is call_module node, so we should only find 2 args unmodified
         self.assertEqual(num_found, len(kjt_args) - 1)
+
+    def test_diagnostics_are_scoped_to_the_callers_list(self) -> None:
+        graph = torch.fx.Graph()
+        # `call_method` with a target other than `get` is unhandled.
+        unhandled = torch.fx.Node(graph, "unhandled", "call_method", "size", (), {})
+        failing_node = torch.fx.Node(
+            graph, "ebc_a", "call_module", "ebc_a", (unhandled,), {}
+        )
+        features = torch.fx.Node(
+            graph, "features", "placeholder", "torch.Tensor", (), {}
+        )
+        succeeding_node = torch.fx.Node(
+            graph, "ebc_b", "call_module", "ebc_b", (features,), {}
+        )
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), False)
+
+        failing_diagnostics: List[PipeliningDiagnostic] = []
+        _, num_found = node_args_helper.get_node_args(
+            failing_node, diagnostics=failing_diagnostics
+        )
+        self.assertEqual(num_found, 0)
+        self.assertEqual(
+            failing_diagnostics,
+            [
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_FX_UNTRACEABLE,
+                    fx_node="unhandled",
+                    fx_target="size",
+                )
+            ],
+        )
+
+        succeeding_diagnostics: List[PipeliningDiagnostic] = []
+        _, num_found = node_args_helper.get_node_args(
+            succeeding_node, diagnostics=succeeding_diagnostics
+        )
+        self.assertEqual(num_found, 1)
+        self.assertEqual(succeeding_diagnostics, [])
+        self.assertEqual(len(failing_diagnostics), 1)
+
+    def test_second_positional_arg_is_still_for_postproc_module(self) -> None:
+        graph = torch.fx.Graph()
+        node = torch.fx.Node(graph, "ebc", "call_module", "ebc", (None,), {})
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), False)
+
+        # A `None` arg resolves only outside a postproc walk.
+        _, num_found = node_args_helper.get_node_args(node)
+        self.assertEqual(num_found, 1)
+
+        _, num_found = node_args_helper.get_node_args(node, True)
+        self.assertEqual(num_found, 0)
+
+    def test_untraceable_function_records_its_qualified_name(self) -> None:
+        graph = torch.fx.Graph()
+        features = torch.fx.Node(
+            graph, "features", "placeholder", "torch.Tensor", (), {}
+        )
+        cat = torch.fx.Node(graph, "cat_2", "call_function", torch.cat, (features,), {})
+        node = torch.fx.Node(graph, "ebc", "call_module", "ebc", (cat,), {})
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), True)
+
+        diagnostics: List[PipeliningDiagnostic] = []
+        node_args_helper.get_node_args(node, diagnostics=diagnostics)
+        self.assertEqual(
+            diagnostics,
+            [
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_FX_UNTRACEABLE,
+                    fx_node="cat_2",
+                    fx_target="torch.cat",
+                )
+            ],
+        )
+
+    def test_postproc_disabled_records_the_postproc_module(self) -> None:
+        graph = torch.fx.Graph()
+        postproc = torch.fx.Node(
+            graph, "sparse_postproc", "call_module", "sparse.postproc", (), {}
+        )
+        node = torch.fx.Node(graph, "ebc", "call_module", "ebc", (postproc,), {})
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), False)
+
+        diagnostics: List[PipeliningDiagnostic] = []
+        _, num_found = node_args_helper.get_node_args(node, diagnostics=diagnostics)
+        self.assertEqual(num_found, 0)
+        self.assertEqual(
+            diagnostics,
+            [
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_DISABLED,
+                    fx_node="sparse_postproc",
+                    fx_target="sparse.postproc",
+                )
+            ],
+        )
+
+    @parameterized.parameterized.expand(
+        [
+            (
+                "trainable_params",
+                nn.Linear(2, 2),
+                True,
+                PipeliningDiagnosticReason.POSTPROC_TRAINABLE_PARAMS,
+            ),
+            ("not_found", None, True, PipeliningDiagnosticReason.POSTPROC_NOT_FOUND),
+            (
+                "no_input",
+                nn.Identity(),
+                False,
+                PipeliningDiagnosticReason.POSTPROC_NO_INPUT,
+            ),
+        ]
+    )
+    def test_postproc_failure_records_the_postproc_module(
+        self,
+        _name: str,
+        postproc_module: Optional[nn.Module],
+        with_input: bool,
+        reason: PipeliningDiagnosticReason,
+    ) -> None:
+        model = nn.Module()
+        if postproc_module is not None:
+            model.postproc = postproc_module
+        graph = torch.fx.Graph()
+        features = torch.fx.Node(
+            graph, "features", "placeholder", "torch.Tensor", (), {}
+        )
+        postproc = torch.fx.Node(
+            graph,
+            "postproc",
+            "call_module",
+            "postproc",
+            (features,) if with_input else (),
+            {},
+        )
+        node = torch.fx.Node(graph, "ebc", "call_module", "ebc", (postproc,), {})
+
+        node_args_helper = NodeArgsHelper(model, TrainPipelineContext(), True)
+
+        diagnostics: List[PipeliningDiagnostic] = []
+        _, num_found = node_args_helper.get_node_args(node, diagnostics=diagnostics)
+        self.assertEqual(num_found, 0)
+        self.assertEqual(
+            diagnostics,
+            [PipeliningDiagnostic(reason, fx_node="postproc", fx_target="postproc")],
+        )
+
+    def test_postproc_not_module_records_the_postproc_module(self) -> None:
+        graph = torch.fx.Graph()
+        postproc = torch.fx.Node(graph, "postproc", "call_module", "postproc", (), {})
+        node = torch.fx.Node(graph, "ebc", "call_module", "ebc", (postproc,), {})
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), True)
+
+        diagnostics: List[PipeliningDiagnostic] = []
+        with patch(
+            "torchrec.distributed.train_pipeline.tracing._find_postproc_module_recursive",
+            return_value=object(),
+        ):
+            node_args_helper.get_node_args(node, diagnostics=diagnostics)
+        self.assertEqual(
+            diagnostics,
+            [
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_NOT_MODULE,
+                    fx_node="postproc",
+                    fx_target="postproc",
+                )
+            ],
+        )
+
+    def test_kjt_from_module_records_the_kjt_node(self) -> None:
+        graph = torch.fx.Graph()
+        values = torch.fx.Node(graph, "values", "placeholder", "torch.Tensor", (), {})
+        weights = torch.fx.Node(
+            graph, "weights", "call_module", "PositionWeightedModule", (), {}
+        )
+        kjt = torch.fx.Node(
+            graph,
+            "kjt",
+            "call_function",
+            KeyedJaggedTensor,
+            (),
+            {"keys": ["f1"], "values": values, "weights": weights},
+        )
+        node = torch.fx.Node(graph, "ebc", "call_module", "ebc", (kjt,), {})
+
+        node_args_helper = NodeArgsHelper(MagicMock(), TrainPipelineContext(), True)
+
+        diagnostics: List[PipeliningDiagnostic] = []
+        _, num_found = node_args_helper.get_node_args(node, diagnostics=diagnostics)
+        self.assertEqual(num_found, 0)
+        self.assertEqual(
+            diagnostics,
+            [
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_KJT_FROM_MODULE,
+                    fx_node="kjt",
+                    fx_target="torchrec.sparse.jagged_tensor.KeyedJaggedTensor",
+                )
+            ],
+        )
+
+    @parameterized.parameterized.expand(
+        [
+            (
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_FX_UNTRACEABLE,
+                    fx_node="cat_2",
+                    fx_target="torch.cat",
+                ),
+                "postproc_fx_untraceable(cat_2:torch.cat)",
+            ),
+            (
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_TRAINABLE_PARAMS,
+                    fx_node="sparse_arch_feature_proc",
+                    fx_target="sparse_arch.feature_proc",
+                ),
+                "postproc_trainable_params(sparse_arch.feature_proc)",
+            ),
+            (
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_DISABLED
+                ),
+                "postproc_disabled",
+            ),
+            (
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_KJT_FROM_MODULE,
+                    fx_node="kjt",
+                    fx_target="torchrec.sparse.jagged_tensor.KeyedJaggedTensor",
+                ),
+                "postproc_kjt_from_module(kjt:torchrec.sparse.jagged_tensor.KeyedJaggedTensor)",
+            ),
+            (
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_NO_INPUT,
+                    fx_node="sparse_arch_id_gen",
+                    fx_target="sparse_arch.id_gen",
+                ),
+                "postproc_no_input(sparse_arch.id_gen)",
+            ),
+            (
+                PipeliningDiagnostic(reason=PipeliningDiagnosticReason.UNKNOWN),
+                "unknown",
+            ),
+        ]
+    )
+    def test_diagnostic_str(
+        self, diagnostic: PipeliningDiagnostic, expected: str
+    ) -> None:
+        self.assertEqual(str(diagnostic), expected)
 
 
 class DummyShardedModule(
