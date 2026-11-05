@@ -455,5 +455,16 @@ class PrefetchTrainPipelineTest(PrefetchTrainPipelineTestBase):
                 torch.testing.assert_close(pred, pred_pipeline)
 
 
+class PrefetchPipelineBackwardHooksTest(PrefetchPipelineStageHooksTestBase):
+    """Check backward-hook calls in training and evaluation."""
+
+    @parameterized.expand([("train", True), ("eval", False)])
+    def test_progress_calls_backward_hook(self, _name: str, training: bool) -> None:
+        pipeline = self._create_pipeline()
+        with patch.object(pipeline, "_backward", wraps=pipeline._backward) as backward:
+            self._check_progress(pipeline, training)
+        self.assertEqual(backward.call_count, 2 if training else 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2531,8 +2531,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
         if self._model.training:
             # backward
-            with record_function("## backward ##"):
-                torch.sum(losses, dim=0).backward()
+            self._backward(losses)
 
             # update
             with record_function("## optimizer ##"):
