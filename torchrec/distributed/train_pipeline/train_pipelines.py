@@ -2455,6 +2455,14 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
     )
+    def _wait_for_batch(self) -> None:
+        """Order the compute stream after the current batch's cache prefetch."""
+        with record_function("## wait_for_batch ##"):
+            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         Executes one training iteration with prefetch pipelining.
@@ -2489,8 +2497,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             with record_function("## zero_grad ##"):
                 self._optimizer.zero_grad()
 
-        with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+        self._wait_for_batch()
 
         # batch i+2: load data and copy to gpu
         self.enqueue_batch(dataloader_iter)
