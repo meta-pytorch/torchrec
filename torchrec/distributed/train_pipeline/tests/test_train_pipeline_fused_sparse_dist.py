@@ -159,6 +159,39 @@ class PerModuleLookupFenceTest(unittest.TestCase):
 
 
 class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_optimizer_matches_sync(self) -> None:
+        for sharding_type, kernel_type, defer_dp_lookup in [
+            (ShardingType.TABLE_WISE.value, EmbeddingComputeKernel.FUSED.value, False),
+            (
+                ShardingType.DATA_PARALLEL.value,
+                EmbeddingComputeKernel.DENSE.value,
+                True,
+            ),
+        ]:
+            with self.subTest(sharding_type=sharding_type):
+                self._run_async_optimizer_parity(
+                    TrainPipelineFusedSparseDist,
+                    sharding_type,
+                    kernel_type,
+                    defer_dp_lookup=defer_dp_lookup,
+                )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_optimizer_falls_back_without_defer_dp_lookup(self) -> None:
+        self._run_async_optimizer_parity(
+            TrainPipelineFusedSparseDist,
+            ShardingType.DATA_PARALLEL.value,
+            EmbeddingComputeKernel.DENSE.value,
+            expect_async=False,
+        )
+
     def _create_dp_sharded_ec(self) -> ShardedEmbeddingCollection:
         module = EmbeddingCollection(
             tables=[
