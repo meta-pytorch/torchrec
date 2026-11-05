@@ -29,6 +29,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Sequence,
     Tuple,
     TYPE_CHECKING,
     TypeVar,
@@ -567,6 +568,68 @@ def _generate_init_range_for_virtual_tables(
         tbe_params["ssd_uniform_init_upper"] = sum(init_maxs) / num_tables
 
 
+def _resolve_eviction_check_interval_batch(
+    # KVZCHTBEConfig, left as Any because the fbgemm_gpu KVZCH types are behind
+    # the optional import above.
+    kvzch_tbe_config: Any,
+) -> Optional[int]:
+    """
+    Batches between eviction checks. The deprecated
+    `eviction_free_mem_check_interval_batch` is honoured only for free_mem (5),
+    the only mode that ever read it; other modes get the per-mode default.
+    """
+    explicit = getattr(kvzch_tbe_config, "eviction_check_interval_batch", None)
+    if explicit is not None:
+        return explicit
+    deprecated = kvzch_tbe_config.eviction_free_mem_check_interval_batch
+    if deprecated is None:
+        return None
+    if kvzch_tbe_config.kvzch_eviction_trigger_mode == 5:
+        return deprecated
+    logger.warning(
+        "eviction_free_mem_check_interval_batch is set to "
+        f"{kvzch_tbe_config.eviction_free_mem_check_interval_batch} but trigger "
+        f"mode is {kvzch_tbe_config.kvzch_eviction_trigger_mode}, not free_mem "
+        "(5). That field only ever applied to free_mem, so it is ignored here "
+        "and the per-mode default cadence applies. Set "
+        "eviction_check_interval_batch to pin a cadence for this mode."
+    )
+    return None
+
+
+def _eviction_coordination_kwargs(
+    # KVZCHTBEConfig, as above.
+    kvzch_tbe_config: Any,
+    eviction_policy_fields: Sequence[str],
+) -> Dict[str, Any]:
+    """
+    `EvictionPolicy` kwargs for the eviction timing set on `kvzch_tbe_config`.
+    OSS TorchRec can run against an older fbgemm_gpu whose config and
+    `EvictionPolicy` lack these fields, so unset ones are left out, and an
+    `EvictionPolicy` without `eviction_check_interval_batch` gets the
+    deprecated free_mem cadence field it still reads.
+    """
+    if "eviction_check_interval_batch" not in eviction_policy_fields:
+        kwargs = {
+            "eviction_free_mem_check_interval_batch": (
+                kvzch_tbe_config.eviction_free_mem_check_interval_batch
+            ),
+        }
+    else:
+        kwargs = {
+            "eviction_check_interval_batch": _resolve_eviction_check_interval_batch(
+                kvzch_tbe_config
+            ),
+            "eviction_insufficient_backoff_batch": getattr(
+                kvzch_tbe_config, "eviction_insufficient_backoff_batch", None
+            ),
+            "eviction_free_mem_floor_gb": getattr(
+                kvzch_tbe_config, "eviction_free_mem_floor_gb", None
+            ),
+        }
+    return {name: value for name, value in kwargs.items() if value is not None}
+
+
 def _populate_zero_collision_tbe_params(
     tbe_params: Dict[str, Any],
     sharded_local_buckets: List[Tuple[int, int, int]],
@@ -617,9 +680,6 @@ def _populate_zero_collision_tbe_params(
         tbe_params.pop("kvzch_tbe_config")
         eviction_trigger_mode = kvzch_tbe_config.kvzch_eviction_trigger_mode
         eviction_free_mem_threshold_gb = kvzch_tbe_config.eviction_free_mem_threshold_gb
-        eviction_free_mem_check_interval_batch = (
-            kvzch_tbe_config.eviction_free_mem_check_interval_batch
-        )
         threshold_calculation_bucket_stride = (
             kvzch_tbe_config.threshold_calculation_bucket_stride
         )
@@ -711,7 +771,7 @@ def _populate_zero_collision_tbe_params(
             l2_weight_thresholds=l2_weight_thresholds,
             meta_header_lens=meta_header_lens,
             eviction_free_mem_threshold_gb=eviction_free_mem_threshold_gb,
-            eviction_free_mem_check_interval_batch=eviction_free_mem_check_interval_batch,
+            **_eviction_coordination_kwargs(kvzch_tbe_config, EvictionPolicy._fields),
             threshold_calculation_bucket_stride=threshold_calculation_bucket_stride,
             threshold_calculation_bucket_num=threshold_calculation_bucket_num,
             enable_eviction_for_feature_score_eviction_policy=enable_eviction_for_feature_score_eviction_policy,
