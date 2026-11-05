@@ -112,6 +112,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.optim.clipping import GradientClippingOptimizer
 from torchrec.optim.keyed import (
     CombinedOptimizer,
     KeyedOptimizer,
@@ -3947,13 +3948,24 @@ def _wrap_in_warmup(optimizer: CombinedOptimizer) -> CombinedOptimizer:
     )
 
 
+def _allocator_stream(tensor: torch.Tensor) -> int:
+    """Returns the CUDA stream whose caching-allocator segment holds ``tensor``."""
+    ptr = tensor.data_ptr()
+    for segment in torch.cuda.memory_snapshot():
+        if segment["address"] <= ptr < segment["address"] + segment["total_size"]:
+            return segment["stream"]
+    raise AssertionError(f"No allocator segment holds address {ptr:#x}")
+
+
 @unittest.skipIf(
     not torch.cuda.is_available(),
     "Not enough GPUs, this test requires at least one GPU",
 )
 class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
     def _setup_async_pipeline(
-        self, optimizer_class: Type[CombinedOptimizer] = CombinedOptimizer
+        self,
+        optimizer_class: Type[CombinedOptimizer] = CombinedOptimizer,
+        **pipeline_kwargs: Any,
     ) -> Tuple[DistributedModelParallel, TrainPipelineSparseDist]:
         model, optimizer = self._setup_ddp_model_and_optimizer(
             self._setup_model(model_type=_EvalPairTestSparseNN),
@@ -3966,6 +3978,7 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
             optimizer=optimizer_class(optimizer.optimizers),
             device=self.device,
             async_optimizer=True,
+            **pipeline_kwargs,
         )
         return model, pipeline
 
@@ -4017,6 +4030,104 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(
             child_streams,
             [[pipeline._async_stream] * 2 for _ in optimizer.optimizers],
+        )
+
+    def test_hooks_added_after_arming_run_on_caller_stream(self) -> None:
+        _, pipeline = self._setup_async_pipeline()
+        data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
+        # The first step arms DDP and checks the optimizer, before the hook exists.
+        pipeline.progress(data_iter)
+        streams: List[torch.Stream] = []
+        pipeline._optimizer.register_step_pre_hook(
+            lambda *_: streams.append(torch.cuda.current_stream())
+        )
+
+        pipeline.progress(data_iter)
+        pipeline.progress(data_iter)
+
+        self.assertEqual(streams, [torch.cuda.current_stream()] * 2)
+        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+
+    def test_top_level_optimizer_wrapper_matches_sync(self) -> None:
+        # OptimizerWrapper never creates the step hook dicts.
+        self._run_async_optimizer_parity(
+            TrainPipelineSparseDist,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            optimizer_factory=GradientClippingOptimizer,
+        )
+
+    def _first_step_state_streams(
+        self, **pipeline_kwargs: Any
+    ) -> Tuple[set[int], TrainPipelineSparseDist]:
+        """
+        Runs one step and returns the streams whose allocator pools hold the dense
+        Adam state, which Adam creates (``exp_avg``, ``exp_avg_sq``) in that step.
+        """
+        _, pipeline = self._setup_async_pipeline(**pipeline_kwargs)
+        data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
+        pipeline.progress(data_iter)
+
+        # Fused TBE state is allocated when the module is built, so only the dense
+        # child's state is created by the first step.
+        _, dense_optimizer = cast(CombinedOptimizer, pipeline._optimizer).optimizers[1]
+        state_tensors = [
+            value
+            for param_state in dense_optimizer.state.values()
+            for value in param_state.values()
+            if isinstance(value, torch.Tensor) and value.is_cuda
+        ]
+        self.assertGreater(len(state_tensors), 0)
+        return {_allocator_stream(t) for t in state_tensors}, pipeline
+
+    def test_lazy_optimizer_state_allocated_on_caller_stream(self) -> None:
+        streams, _ = self._first_step_state_streams()
+        self.assertEqual(streams, {torch.cuda.current_stream().cuda_stream})
+
+    def test_no_main_stream_steps_allocates_state_on_side_stream(self) -> None:
+        streams, pipeline = self._first_step_state_streams(
+            async_num_opt_steps_on_main_stream=0
+        )
+        async_stream = cast(torch.cuda.Stream, pipeline._async_stream)
+        self.assertEqual(streams, {async_stream.cuda_stream})
+
+    def test_main_stream_steps_run_before_side_stream_steps(self) -> None:
+        _, pipeline = self._setup_async_pipeline(async_num_opt_steps_on_main_stream=2)
+        streams = _record_step_streams(cast(CombinedOptimizer, pipeline._optimizer))
+        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
+
+        for _ in range(4):
+            pipeline.progress(data_iter)
+
+        main_stream = torch.cuda.current_stream()
+        async_stream = pipeline._async_stream
+        self.assertEqual(
+            streams, [main_stream, main_stream, async_stream, async_stream]
+        )
+
+    def test_negative_main_stream_steps_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "async_num_opt_steps_on_main_stream"):
+            self._setup_async_pipeline(async_num_opt_steps_on_main_stream=-1)
+
+    def test_hook_forced_step_counts_as_main_stream_step(self) -> None:
+        _, pipeline = self._setup_async_pipeline(async_num_opt_steps_on_main_stream=2)
+        optimizer = cast(CombinedOptimizer, pipeline._optimizer)
+        streams = _record_step_streams(optimizer)
+        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
+        # The first step arms the pipeline, which refuses hooks that exist then.
+        pipeline.progress(data_iter)
+        hook = optimizer.register_step_pre_hook(lambda *_: None)
+        pipeline.progress(data_iter)
+        hook.remove()
+
+        pipeline.progress(data_iter)
+        pipeline.progress(data_iter)
+
+        main_stream = torch.cuda.current_stream()
+        async_stream = pipeline._async_stream
+        # Step 2 has a hook and is also the second main-stream step.
+        self.assertEqual(
+            streams, [main_stream, main_stream, async_stream, async_stream]
         )
 
     def test_combined_optimizer_subclass_steps_whole(self) -> None:

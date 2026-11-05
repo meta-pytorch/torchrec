@@ -130,6 +130,7 @@ from torchrec.distributed.train_pipeline.utils import (
     DataLoadingThread,
     ddp_managed_param_ids,
     find_ddp_modules,
+    has_step_hooks,
     is_deferred_dp_supported,
     prefetch_embeddings,
     use_context_for_postprocs,
@@ -596,7 +597,16 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             the optimizer steps must be reduced by a DDP, because the side stream
             does not wait for the main stream. Falls back to the regular optimizer
             step on devices without streams, if the model has no DDP, or if
-            ``async_optimizer_unsupported_reason`` gives a reason.
+            ``async_optimizer_unsupported_reason`` gives a reason. The first
+            ``async_num_opt_steps_on_main_stream`` steps run on the main stream
+            instead, so optimizer state they create lazily (e.g.
+            ``torch.optim.Adam``'s) lands in the main stream's memory pool rather
+            than the side stream's.
+        async_num_opt_steps_on_main_stream (int): with ``async_optimizer``, how
+            many optimizer steps run on the main stream before the rest move to
+            the side stream. The default of 1 covers optimizers that create their
+            state in their first step. Raise it for an optimizer that creates
+            state in a later step; 0 runs every step on the side stream.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -625,7 +635,13 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         async_next_batch: bool = False,
         skip_batch_record_stream: bool = False,
         async_optimizer: bool = False,
+        async_num_opt_steps_on_main_stream: int = 1,
     ) -> None:
+        if async_num_opt_steps_on_main_stream < 0:
+            raise ValueError(
+                "async_num_opt_steps_on_main_stream must be >= 0, got "
+                f"{async_num_opt_steps_on_main_stream}"
+            )
         self._model = model
         self._optimizer = optimizer
         self._device = device
@@ -658,7 +674,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             f"async_next_batch: {async_next_batch} "
             f"free_features_storage_early: {free_features_storage_early} "
             f"skip_batch_record_stream: {self._skip_batch_record_stream} "
-            f"async_optimizer: {self._async_optimizer}"
+            f"async_optimizer: {self._async_optimizer} "
+            "async_num_opt_steps_on_main_stream: "
+            f"{async_num_opt_steps_on_main_stream}"
         )
 
         if device.type == "cuda":
@@ -692,6 +710,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             else None
         )
         self._async_optimizer_ddp_modules: List[DistributedDataParallel] = []
+        self._async_main_stream_steps_left: int = async_num_opt_steps_on_main_stream
 
         self._original_forwards: List[Callable[..., Any]] = []
 
@@ -1036,8 +1055,31 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         # getattr: some callers build a pipeline with __new__ alone, skipping
         # __init__, to call this method.
         if getattr(self, "_async_optimizer_ddp_modules", None):
-            self._async_optimizer_step()
+            # Step hooks added after the pipeline armed were never checked, so a
+            # step that has them runs on the main stream.
+            if self._async_main_stream_steps_left == 0 and not has_step_hooks(
+                self._optimizer
+            ):
+                self._async_optimizer_step()
+            else:
+                self._caller_stream_optimizer_step()
+                # Every main-stream step counts, including hook-forced ones, so
+                # the first N steps always run on the main stream.
+                if self._async_main_stream_steps_left > 0:
+                    self._async_main_stream_steps_left -= 1
             return
+        with record_function(f"## optimizer {self.contexts[0].index} ##"):
+            self._optimizer.step()
+
+    def _caller_stream_optimizer_step(self) -> None:
+        """
+        Does the work of ``_async_optimizer_step`` on the caller stream, so
+        optimizer state created lazily by ``step()`` is allocated from the caller
+        stream's memory pool instead of the side stream's.
+        """
+        with record_function("## finalize_backward ##"):
+            for ddp in self._async_optimizer_ddp_modules:
+                ddp.finalize_backward()
         with record_function(f"## optimizer {self.contexts[0].index} ##"):
             self._optimizer.step()
 
@@ -1753,6 +1795,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             DATA_PARALLEL tables, use ``defer_dp_lookup=True`` so their lookups
             run in the forward, after the optimizer step; without it, the
             pipeline uses the regular optimizer step.
+        async_num_opt_steps_on_main_stream (int): see `TrainPipelineSparseDist`.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -1781,6 +1824,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         defer_dp_lookup: bool = False,
         defer_pipeline_stream_fences: bool = False,
         async_optimizer: bool = False,
+        async_num_opt_steps_on_main_stream: int = 1,
     ) -> None:
         super().__init__(
             model=model,
@@ -1796,6 +1840,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             free_features_storage_early=free_features_storage_early,
             clear_data_dist_inputs=clear_data_dist_inputs,
             async_optimizer=async_optimizer,
+            async_num_opt_steps_on_main_stream=async_num_opt_steps_on_main_stream,
         )
 
         self._embedding_lookup_phase = _resolve_embedding_lookup_phase(
