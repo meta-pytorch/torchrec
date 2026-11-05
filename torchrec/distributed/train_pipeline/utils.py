@@ -22,6 +22,7 @@ from typing import (
     Dict,
     Generator,
     Generic,
+    Iterable,
     Iterator,
     List,
     Optional,
@@ -78,6 +79,9 @@ except Exception:
     )
 
     one_time_rank0_logger = logging.getLogger(__name__)
+from torchrec.distributed.composable.table_batched_embedding_slice import (
+    TableBatchedEmbeddingSlice,
+)
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
     get_module,
@@ -110,6 +114,13 @@ from torchrec.distributed.train_pipeline.tracing import (
 )
 from torchrec.distributed.train_pipeline.types import CallArgs  # noqa
 from torchrec.distributed.types import Awaitable
+from torchrec.optim.fused import FusedOptimizer
+from torchrec.optim.keyed import (
+    CombinedOptimizer,
+    KeyedOptimizer,
+    KeyedOptimizerWrapper,
+    OptimizerWrapper,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
 
@@ -146,6 +157,108 @@ def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
             collect(lookup)
 
     return ddp_modules
+
+
+def ddp_managed_param_ids(ddp_modules: Iterable[DistributedDataParallel]) -> Set[int]:
+    """
+    Returns the ids of the params whose gradients ``ddp_modules`` all-reduce, using
+    the same rule as DDP's reducer (``_build_params_for_reducer``).
+    """
+    return {
+        id(param)
+        for ddp in ddp_modules
+        for module_name, module in ddp.module.named_modules()
+        for param_name, param in module.named_parameters(recurse=False)
+        if param.requires_grad
+        and f"{module_name}.{param_name}" not in ddp.parameters_to_ignore
+    }
+
+
+def _params_stepped_from_grads(
+    optimizer: torch.optim.Optimizer, prefix: str = ""
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Yields ``(name, param)`` for every param of a non-fused optimizer in ``optimizer``."""
+    if isinstance(optimizer, FusedOptimizer):
+        return
+    if isinstance(optimizer, CombinedOptimizer):
+        for key, child in optimizer.optimizers:
+            yield from _params_stepped_from_grads(
+                child, f"{prefix}{key}." if key else prefix
+            )
+    elif isinstance(optimizer, OptimizerWrapper):
+        yield from _params_stepped_from_grads(optimizer._optimizer, prefix)
+    else:
+        # A KeyedOptimizer's params only name what step() updates: they can also
+        # hold params it never steps, such as WarmupOptimizer's placeholder.
+        names = (
+            {id(param): name for name, param in optimizer.params.items()}
+            if isinstance(optimizer, KeyedOptimizer)
+            else {}
+        )
+        for i, group in enumerate(optimizer.param_groups):
+            for j, param in enumerate(group["params"]):
+                yield prefix + names.get(id(param), f"param_groups[{i}][{j}]"), param
+
+
+def has_step_hooks(optimizer: torch.optim.Optimizer) -> bool:
+    """
+    Whether ``optimizer``, or any optimizer its ``step()`` steps, has step hooks.
+    ``OptimizerWrapper`` never creates the hook dicts, so it has none of its own.
+    """
+    if getattr(optimizer, "_optimizer_step_pre_hooks", None) or getattr(
+        optimizer, "_optimizer_step_post_hooks", None
+    ):
+        return True
+    if isinstance(optimizer, CombinedOptimizer):
+        return any(has_step_hooks(child) for _, child in optimizer.optimizers)
+    if isinstance(optimizer, (OptimizerWrapper, KeyedOptimizerWrapper)):
+        return has_step_hooks(optimizer._optimizer)
+    return False
+
+
+def async_optimizer_unsupported_reason(
+    optimizer: object, ddp_param_ids: Set[int]
+) -> Optional[str]:
+    """
+    Returns why ``optimizer`` can't step on ``async_optimizer``'s side stream,
+    or ``None`` if it can.
+
+    The side stream waits only for the DDP all-reduces (through
+    ``finalize_backward()``), so every param stepped from a gradient must be in
+    ``ddp_param_ids``. ``FusedOptimizer`` children are skipped: their update already
+    ran in backward, and their ``step()`` only sets a CPU learning rate.
+    ``CombinedOptimizer`` children and the optimizer inside an ``OptimizerWrapper``
+    are checked recursively. Step hooks on any optimizer in the tree are refused,
+    since they may touch tensors the side stream does not wait for.
+    """
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        return f"{type(optimizer).__name__} is not a torch.optim.Optimizer"
+    if has_step_hooks(optimizer):
+        return (
+            "the optimizer, or an optimizer it steps, has step hooks, which may "
+            "touch tensors the side stream does not wait for"
+        )
+    named_params = [
+        (name, param)
+        for name, param in _params_stepped_from_grads(optimizer)
+        if param.requires_grad
+    ]
+    if not named_params:
+        return "there is nothing to step outside fused optimizers"
+    for name, param in named_params:
+        # A per-table view of a batched embedding weight gets its .grad from that
+        # weight, which is what DDP reduces.
+        grad_source = (
+            param._original_tensor
+            if isinstance(param, TableBatchedEmbeddingSlice)
+            else param
+        )
+        if id(grad_source) not in ddp_param_ids:
+            return (
+                f"{name} is not reduced by a DDP, so the side stream would not wait "
+                "for its gradient"
+            )
+    return None
 
 
 def _batch_tensor_size(batch: Any) -> int:
