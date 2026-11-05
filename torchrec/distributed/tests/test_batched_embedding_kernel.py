@@ -7,8 +7,9 @@
 
 # pyre-strict
 
+import types
 import unittest
-from typing import cast, List, Tuple
+from typing import Any, cast, List, Tuple
 from unittest.mock import patch
 
 import torch
@@ -19,13 +20,16 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     EmbeddingLocation,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
+from fbgemm_gpu.tbe.ssd.ssd_config import KVZCHTBEConfig
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata
 from torch.distributed._shard.sharded_tensor.metadata import TensorProperties
 from torchrec.distributed.batched_embedding_kernel import (
+    _eviction_coordination_kwargs,
     _gen_named_parameters_by_table_dense,
     _gen_named_parameters_by_table_fused,
     _get_grid_shard_cw_count,
+    _resolve_eviction_check_interval_batch,
     EmbeddingFusedOptimizer,
     KeyValueEmbeddingFusedOptimizer,
 )
@@ -318,3 +322,105 @@ class GridShardParameterSliceTest(unittest.TestCase):
             for rows in ([7, 7], [7]):
                 with self.subTest(fused=fused, rows=rows):
                     self._check_slices(rows, fused=fused, row_slicing_enabled=False)
+
+
+# OSS CI pairs TorchRec with the fbgemm_gpu nightly, which can predate these
+# KVZCHTBEConfig fields.
+_needs_eviction_coordination_fields = unittest.skipIf(
+    "eviction_check_interval_batch" not in KVZCHTBEConfig._fields,
+    "fbgemm_gpu predates the coordinated eviction fields of KVZCHTBEConfig",
+)
+
+
+class EvictionCheckIntervalResolutionTest(unittest.TestCase):
+    """`eviction_free_mem_check_interval_batch` is honoured only for free_mem."""
+
+    @staticmethod
+    def _config(**kwargs: Any) -> KVZCHTBEConfig:
+        return KVZCHTBEConfig(**kwargs)
+
+    @_needs_eviction_coordination_fields
+    def test_canonical_field_wins_over_the_deprecated_alias(self) -> None:
+        resolved = _resolve_eviction_check_interval_batch(
+            self._config(
+                kvzch_eviction_trigger_mode=5,
+                eviction_check_interval_batch=7,
+                eviction_free_mem_check_interval_batch=1000,
+            )
+        )
+        self.assertEqual(resolved, 7)
+
+    def test_alias_is_honoured_for_free_mem(self) -> None:
+        resolved = _resolve_eviction_check_interval_batch(
+            self._config(
+                kvzch_eviction_trigger_mode=5,
+                eviction_free_mem_check_interval_batch=1000,
+            )
+        )
+        self.assertEqual(resolved, 1000)
+
+    def test_unset_alias_does_not_pin_a_cadence(self) -> None:
+        # The alias defaults to None, so a config that never mentions it must
+        # resolve to "take the per-mode default" without warning about a field
+        # nobody set.
+        resolved = _resolve_eviction_check_interval_batch(
+            self._config(kvzch_eviction_trigger_mode=2)
+        )
+        self.assertIsNone(resolved)
+
+    def test_alias_is_ignored_for_the_budgeted_modes(self) -> None:
+        # Configs that set the alias to 1000 under mode 2 never had it read --
+        # those tables were checked on every prefetch -- so honouring it now
+        # would be a 1000x coarsening.
+        # None means "take the per-mode default in training.py".
+        for mode in (1, 2, 4):
+            with self.subTest(trigger_mode=mode):
+                resolved = _resolve_eviction_check_interval_batch(
+                    self._config(
+                        kvzch_eviction_trigger_mode=mode,
+                        eviction_free_mem_check_interval_batch=1000,
+                    )
+                )
+                self.assertIsNone(resolved)
+
+
+class EvictionCoordinationKwargsTest(unittest.TestCase):
+    """OSS TorchRec can run against an fbgemm_gpu without these fields."""
+
+    _NEW_FIELDS: Tuple[str, ...] = (
+        "eviction_check_interval_batch",
+        "eviction_insufficient_backoff_batch",
+        "eviction_free_mem_floor_gb",
+    )
+
+    @_needs_eviction_coordination_fields
+    def test_set_fields_are_passed(self) -> None:
+        kwargs = _eviction_coordination_kwargs(
+            KVZCHTBEConfig(
+                kvzch_eviction_trigger_mode=4,
+                eviction_check_interval_batch=7,
+                eviction_free_mem_floor_gb=0,
+            ),
+            self._NEW_FIELDS,
+        )
+        self.assertEqual(
+            kwargs,
+            {"eviction_check_interval_batch": 7, "eviction_free_mem_floor_gb": 0},
+        )
+
+    def test_config_without_the_fields_passes_nothing(self) -> None:
+        old_config = types.SimpleNamespace(
+            kvzch_eviction_trigger_mode=4, eviction_free_mem_check_interval_batch=None
+        )
+        self.assertEqual(
+            _eviction_coordination_kwargs(old_config, self._NEW_FIELDS), {}
+        )
+
+    def test_old_eviction_policy_gets_the_deprecated_cadence(self) -> None:
+        old_config = types.SimpleNamespace(
+            kvzch_eviction_trigger_mode=5, eviction_free_mem_check_interval_batch=1000
+        )
+        self.assertEqual(
+            _eviction_coordination_kwargs(old_config, ("eviction_trigger_mode",)),
+            {"eviction_free_mem_check_interval_batch": 1000},
+        )
