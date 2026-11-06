@@ -10,12 +10,15 @@
 import copy
 import enum
 import unittest
-from typing import cast, List, NamedTuple, Optional, Protocol, Tuple, Union
+from typing import Any, cast, List, NamedTuple, Optional, Protocol, Tuple, Union
 from unittest.mock import MagicMock, patch
 
 import torch
 from torch._dynamo import is_dynamo_supported
 from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.composable.table_batched_embedding_slice import (
+    TableBatchedEmbeddingSlice,
+)
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionSharder,
@@ -30,6 +33,10 @@ from torchrec.distributed.test_utils.test_model import (
     ModelInput,
     TestNegSamplingModule,
     TestSparseNN,
+)
+from torchrec.distributed.train_pipeline.gradient_accumulation import (
+    _GAOptimizerWrapper,
+    GradientAccumulationConfig,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -49,7 +56,9 @@ from torchrec.distributed.train_pipeline.utils import (
     _is_data_loading_retriable,
     _rewrite_model,
     _start_embedding_lookup,
+    async_optimizer_unsupported_reason,
     DataLoadingThread,
+    ddp_managed_param_ids,
     find_ddp_modules,
     start_embedding_lookup_post_prefetch,
     use_context_for_postprocs,
@@ -64,6 +73,10 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.optim.clipping import GradientClippingOptimizer
+from torchrec.optim.fused import EmptyFusedOptimizer
+from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
+from torchrec.optim.warmup import WarmupOptimizer, WarmupStage
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Multistreamable
 
@@ -1021,3 +1034,179 @@ class FindDDPModulesTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(2, len(ddp_modules))
         self.assertIs(ddp_modules[0], ddp_wrapper)
         self.assertIs(ddp_modules[1], lookup_ddp)
+
+
+class _DDPManagedParamIdsTestModel(torch.nn.Module):
+    def __init__(self, device: torch.device) -> None:
+        super().__init__()
+        self.inner = torch.nn.Linear(2, 2, device=device)
+        self.frozen = torch.nn.Parameter(
+            torch.zeros(2, device=device), requires_grad=False
+        )
+
+
+class DDPManagedParamIdsTest(TrainPipelineSparseDistTestBase):
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_skips_ignored_and_frozen_params(self) -> None:
+        model = _DDPManagedParamIdsTestModel(self.device)
+        DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
+            model, ["inner.bias"]
+        )
+        ddp = DistributedDataParallel(model, process_group=self.pg)
+
+        self.assertEqual(ddp_managed_param_ids([ddp]), {id(model.inner.weight)})
+
+
+def _sgd(params: dict[str, torch.Tensor]) -> KeyedOptimizerWrapper:
+    return KeyedOptimizerWrapper(
+        params,
+        # Citrine C2: use the multi-tensor optimizer implementation.
+        lambda p: torch.optim.SGD(p, lr=0.1, foreach=True),
+    )
+
+
+class AsyncOptimizerUnsupportedReasonTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.weight = torch.nn.Parameter(torch.zeros(2))
+        self.dense: KeyedOptimizerWrapper = _sgd({"w": self.weight})
+
+    def _fused_and_dense(self) -> CombinedOptimizer:
+        return CombinedOptimizer(
+            [("sparse", EmptyFusedOptimizer()), ("dense", self.dense)]
+        )
+
+    def test_fused_and_ddp_params_are_supported(self) -> None:
+        self.assertIsNone(
+            async_optimizer_unsupported_reason(
+                self._fused_and_dense(), {id(self.weight)}
+            )
+        )
+
+    def test_param_outside_ddp_is_unsupported(self) -> None:
+        reason = async_optimizer_unsupported_reason(self._fused_and_dense(), set())
+
+        assert reason is not None
+        self.assertIn("dense.w", reason)
+        self.assertIn("DDP", reason)
+
+    def test_slice_of_ddp_param_is_supported(self) -> None:
+        # Sharded embedding modules expose per-table views of a batched weight; DDP
+        # reduces the batched weight, and each view's .grad is a slice of its grad.
+        batched_weight = torch.nn.Parameter(torch.zeros(8))
+        table = TableBatchedEmbeddingSlice(batched_weight, 0, 4, 2, 2)
+        optimizer = CombinedOptimizer([("dense", _sgd({"table": table}))])
+
+        self.assertIsNone(
+            async_optimizer_unsupported_reason(optimizer, {id(batched_weight)})
+        )
+
+    def test_warmup_wrapped_fused_is_supported(self) -> None:
+        warmup = WarmupOptimizer(
+            CombinedOptimizer([("f", EmptyFusedOptimizer())]),
+            [WarmupStage(max_iters=10, value=0.1)],
+            lr=0.1,
+        )
+        optimizer = CombinedOptimizer([("sparse", warmup), ("dense", self.dense)])
+
+        self.assertIsNone(
+            async_optimizer_unsupported_reason(optimizer, {id(self.weight)})
+        )
+
+    def test_warmup_wrapped_dense_is_supported(self) -> None:
+        # MVAI wraps a dense group that has an LR warmup schedule this way. The
+        # placeholder param WarmupOptimizer adds to self.dense.params is never stepped.
+        warmup = WarmupOptimizer(
+            self.dense,
+            [WarmupStage(max_iters=10, value=0.1)],
+            lr=0.1,
+            param_name="dense.__warmup",
+        )
+        optimizer = CombinedOptimizer(
+            [("sparse", EmptyFusedOptimizer()), ("dense", warmup)]
+        )
+
+        self.assertIsNone(
+            async_optimizer_unsupported_reason(optimizer, {id(self.weight)})
+        )
+
+    def test_top_level_optimizer_wrapper_is_checked(self) -> None:
+        optimizer = GradientClippingOptimizer(self._fused_and_dense())
+
+        self.assertIsNone(
+            async_optimizer_unsupported_reason(optimizer, {id(self.weight)})
+        )
+        self.assertIsNotNone(async_optimizer_unsupported_reason(optimizer, set()))
+
+    def test_frozen_param_outside_ddp_is_supported(self) -> None:
+        frozen = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+        optimizer = CombinedOptimizer(
+            [("dense", _sgd({"w": self.weight, "frozen": frozen}))]
+        )
+
+        self.assertIsNone(
+            async_optimizer_unsupported_reason(optimizer, {id(self.weight)})
+        )
+
+    def test_plain_optimizer_is_checked(self) -> None:
+        # Citrine C2: use the multi-tensor optimizer implementation.
+        optimizer = torch.optim.SGD([self.weight], lr=0.1, foreach=True)
+
+        self.assertIsNone(
+            async_optimizer_unsupported_reason(optimizer, {id(self.weight)})
+        )
+        self.assertIsNotNone(async_optimizer_unsupported_reason(optimizer, set()))
+
+    def test_step_hooks_are_unsupported(self) -> None:
+        optimizer = self._fused_and_dense()
+        optimizer.register_step_pre_hook(lambda *_: None)
+
+        reason = async_optimizer_unsupported_reason(optimizer, {id(self.weight)})
+
+        assert reason is not None
+        self.assertIn("hook", reason)
+
+    def test_step_hooks_on_children_are_unsupported(self) -> None:
+        hooked_combined = self._fused_and_dense()
+        hooked_combined.register_step_pre_hook(lambda *_: None)
+
+        def hooked_sgd(params: Any) -> torch.optim.Optimizer:
+            # Citrine C2: use the multi-tensor optimizer implementation.
+            optimizer = torch.optim.SGD(params, lr=0.1, foreach=True)
+            optimizer.register_step_post_hook(lambda *_: None)
+            return optimizer
+
+        hooked_leaf = KeyedOptimizerWrapper({"w": self.weight}, hooked_sgd)
+
+        for name, optimizer in [
+            ("child", CombinedOptimizer([("child", hooked_combined)])),
+            ("wrapped", GradientClippingOptimizer(hooked_combined)),
+            ("leaf", CombinedOptimizer([("dense", hooked_leaf)])),
+        ]:
+            with self.subTest(name):
+                reason = async_optimizer_unsupported_reason(
+                    optimizer, {id(self.weight)}
+                )
+
+                assert reason is not None
+                self.assertIn("hook", reason)
+
+    def test_gradient_accumulation_wrapper_is_unsupported(self) -> None:
+        wrapper = _GAOptimizerWrapper(
+            CombinedOptimizer([("dense", self.dense)]), GradientAccumulationConfig()
+        )
+
+        reason = async_optimizer_unsupported_reason(wrapper, {id(self.weight)})
+
+        assert reason is not None
+        self.assertIn("_GAOptimizerWrapper", reason)
+
+    def test_only_fused_is_unsupported(self) -> None:
+        optimizer = CombinedOptimizer([("sparse", EmptyFusedOptimizer())])
+
+        reason = async_optimizer_unsupported_reason(optimizer, set())
+
+        assert reason is not None
+        self.assertIn("nothing", reason)
