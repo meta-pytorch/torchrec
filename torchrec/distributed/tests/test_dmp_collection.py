@@ -733,6 +733,26 @@ class TestDMPCollectionRemapPlacement(unittest.TestCase):
                 self.assertEqual(self._table(plan).ranks, [1, 3])
 
 
+class TestDMPCollectionDeviceCheck(unittest.TestCase):
+    """The device check at the top of `DMPCollection.__init__`."""
+
+    def test_rejects_a_device_other_than_cuda_mtia_or_cpu(self) -> None:
+        # The check runs before the constructor uses the process group, so a
+        # mock group is enough: a constructor that accepted the device would
+        # fail on the mock with a different error.
+        with self.assertRaisesRegex(
+            AssertionError, "only supports CUDA, MTIA or CPU, got meta"
+        ):
+            DMPCollection(
+                module=MockModule(),
+                device=torch.device("meta"),
+                plan=ShardingPlan({}),
+                world_size=2,
+                sharding_group_size=1,
+                global_pg=MagicMock(spec=dist.ProcessGroup),
+            )
+
+
 def _test_cpu_construction(
     rank: int,
     world_size: int,
