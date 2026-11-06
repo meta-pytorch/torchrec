@@ -12,9 +12,11 @@ from typing import Dict, Optional, Type
 
 import torch
 from torchrec.metrics.hindsight_target_pr import (
+    compute_false_neg_sum,
     compute_precision,
     compute_recall,
     compute_threshold_idx,
+    compute_true_pos_sum,
     HindsightTargetPRMetric,
 )
 from torchrec.metrics.rec_metric import RecComputeMode, RecMetric
@@ -110,7 +112,7 @@ class TestHindsightTargetRecallMetric(TestMetric):
             fp_sum[i] = torch.sum(
                 weights * ((predictions >= threshold) * (1 - labels)), -1
             )
-            fn_sum[i] = torch.sum(weights * ((predictions <= threshold) * labels), -1)
+            fn_sum[i] = torch.sum(weights * ((predictions < threshold) * labels), -1)
         return {
             "true_pos_sum": tp_sum,
             "false_pos_sum": fp_sum,
@@ -162,3 +164,22 @@ class TestHindsightTargetPRMetricTest(unittest.TestCase):
             world_size=WORLD_SIZE,
             entry_point=metric_test_helper,
         )
+
+
+class HindsightFalseNegativeTest(unittest.TestCase):
+    def test_grid_endpoints_do_not_double_count_saturated_scores(self) -> None:
+        labels = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        predictions = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        weights = torch.ones_like(labels)
+        true_pos = compute_true_pos_sum(labels, predictions, weights)
+        false_neg = compute_false_neg_sum(labels, predictions, weights)
+
+        # Threshold 0 predicts every non-negative score positive.
+        self.assertEqual(float(true_pos[0]), 4.0)
+        self.assertEqual(float(false_neg[0]), 0.0)
+        # Threshold 1 keeps only the saturated positives. The zeros are the
+        # false negatives, and the ones are not counted again.
+        self.assertEqual(float(true_pos[999]), 2.0)
+        self.assertEqual(float(false_neg[999]), 2.0)
+        recall = compute_recall(true_pos[999], false_neg[999])
+        self.assertTrue(torch.allclose(recall, torch.tensor(0.5, dtype=torch.double)))
