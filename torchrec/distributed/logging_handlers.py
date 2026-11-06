@@ -10,7 +10,7 @@ import functools
 import logging
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Dict, Generator, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Generator, List, Mapping, Optional, TypeVar
 
 from torchrec.distributed.logging_utils import (
     EventLoggingHandlerBase,
@@ -486,6 +486,7 @@ def log_pipeline_module_info(
     pipelined_module_fqns: List[str],
     non_pipelined_module_fqns: List[str],
     pipeline_forward_type: str = "",
+    non_pipelined_reasons: Optional[Mapping[str, List[Any]]] = None,
 ) -> None:
     """No-op OSS stub."""
     pass
