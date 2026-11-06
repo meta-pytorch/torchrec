@@ -32,6 +32,7 @@ from torchrec.distributed.embeddingbag import (
     ShardedEmbeddingBagCollection,
 )
 from torchrec.distributed.model_parallel import (
+    DataParallelWrapper,
     DefaultDataParallelWrapper,
     DistributedModelParallel,
     find_ddp_modules,
@@ -428,14 +429,85 @@ class DataParallelGradSyncOptOutTest(MultiProcessTestBase):
         self._run(is_ebc=False)
 
 
+class _UnsupportedDataParallelWrapper(DataParallelWrapper):
+    def wrap(
+        self, dmp: DistributedModelParallel, env: ShardingEnv, device: torch.device
+    ) -> None:
+        raise AssertionError("Unsupported wrapper must not be invoked")
+
+
+class _CustomWrapDataParallelWrapper(DefaultDataParallelWrapper):
+    def wrap(
+        self, dmp: DistributedModelParallel, env: ShardingEnv, device: torch.device
+    ) -> None:
+        raise AssertionError("Custom training wrapper must not be invoked")
+
+
 class DistributedModelParallelSkipDataParallelGradSyncTest(unittest.TestCase):
-    def test_custom_wrapper_is_rejected_when_grad_sync_is_skipped(self) -> None:
-        with self.assertRaisesRegex(ValueError, "custom data_parallel_wrapper"):
+    def test_unsupported_custom_wrapper_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "supports forward-only initialization"):
             DistributedModelParallel(
                 module=nn.Linear(4, 2),
                 skip_data_parallel_grad_sync=True,
-                data_parallel_wrapper=DefaultDataParallelWrapper(),
+                data_parallel_wrapper=_UnsupportedDataParallelWrapper(),
             )
+
+    def test_custom_wrap_without_forward_only_override_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "supports forward-only initialization"):
+            DistributedModelParallel(
+                module=nn.Linear(4, 2),
+                skip_data_parallel_grad_sync=True,
+                data_parallel_wrapper=_CustomWrapDataParallelWrapper(),
+            )
+
+    def test_custom_wrap_below_forward_only_override_is_rejected(self) -> None:
+        class ForwardOnlyWrapper(_CustomWrapDataParallelWrapper):
+            def wrap_forward_only(
+                self,
+                dmp: DistributedModelParallel,
+                env: ShardingEnv,
+                device: torch.device,
+            ) -> None:
+                super().wrap_forward_only(dmp, env, device)
+
+        class CustomChildWrapper(ForwardOnlyWrapper):
+            def wrap(
+                self,
+                dmp: DistributedModelParallel,
+                env: ShardingEnv,
+                device: torch.device,
+            ) -> None:
+                raise AssertionError("Custom child wrapper must not be invoked")
+
+        with self.assertRaisesRegex(ValueError, "supports forward-only initialization"):
+            DistributedModelParallel(
+                module=nn.Linear(4, 2),
+                skip_data_parallel_grad_sync=True,
+                data_parallel_wrapper=CustomChildWrapper(),
+            )
+
+    def test_supported_custom_wrapper_initializes_without_reducers(self) -> None:
+        class RecordingWrapper(_CustomWrapDataParallelWrapper):
+            def wrap_forward_only(
+                self,
+                dmp: DistributedModelParallel,
+                env: ShardingEnv,
+                device: torch.device,
+            ) -> None:
+                super().wrap_forward_only(dmp, env, device)
+                dmp.module.register_buffer("initialized", torch.ones(1, device=device))
+
+        wrapper = RecordingWrapper()
+        dmp = DistributedModelParallel(
+            module=nn.Linear(4, 2),
+            plan=ShardingPlan({}),
+            env=ShardingEnv.from_local(world_size=1, rank=0),
+            sharders=[],
+            data_parallel_wrapper=wrapper,
+            skip_data_parallel_grad_sync=True,
+        )
+        torch.testing.assert_close(dmp.module.get_buffer("initialized"), torch.ones(1))
+        self.assertEqual(find_ddp_modules(dmp), [])
 
     def test_skip_grad_sync_preserves_dense_module_forward(self) -> None:
         module = nn.Linear(4, 2)
@@ -455,6 +527,12 @@ class DistributedModelParallelSkipDataParallelGradSyncTest(unittest.TestCase):
             torch.testing.assert_close(dmp(inputs), expected)
         with self.assertRaisesRegex(RuntimeError, "skip_data_parallel_grad_sync=True"):
             dmp.init_data_parallel()
+        with self.assertRaisesRegex(RuntimeError, "wrap_forward_only"):
+            DefaultDataParallelWrapper().wrap(
+                dmp,
+                ShardingEnv.from_local(world_size=1, rank=0),
+                torch.device("cpu"),
+            )
 
     def test_skip_grad_sync_materializes_meta_params(self) -> None:
         dmp = DistributedModelParallel(
