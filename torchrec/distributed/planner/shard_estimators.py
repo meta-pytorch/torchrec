@@ -11,7 +11,7 @@ import hashlib
 import logging
 import math
 import sys
-from typing import cast, Dict, List, Optional, Sequence, Set, Tuple, Type
+from typing import Any, cast, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Type
 
 import torch
 import torchrec.optim as trec_optim
@@ -146,7 +146,11 @@ class EmbeddingStorageEstimator(ShardEstimator):
             Default to false because this is typically false for RecSys since memory
             peak happens at the end of dense forwrad / beginning of dense backward instead.
         is_inference (bool): If the model is inference model. Default to False.
+        estimate_rowwise_optimizer_storage (bool): Count fused RowWiseAdagrad's
+            state rows per physical shard using their runtime dtypes.
     """
+
+    _estimate_rowwise_optimizer_storage: bool = False
 
     @_torchrec_method_logger()
     def __init__(
@@ -156,12 +160,14 @@ class EmbeddingStorageEstimator(ShardEstimator):
         pipeline_type: PipelineType = PipelineType.NONE,
         run_embedding_at_peak_memory: bool = False,
         is_inference: bool = False,
+        estimate_rowwise_optimizer_storage: bool = False,
     ) -> None:
         self._topology = topology
         self._constraints = constraints
         self._pipeline_type = pipeline_type
         self._run_embedding_at_peak_memory = run_embedding_at_peak_memory
         self._is_inference = is_inference
+        self._estimate_rowwise_optimizer_storage = estimate_rowwise_optimizer_storage
 
     @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def estimate(
@@ -177,6 +183,9 @@ class EmbeddingStorageEstimator(ShardEstimator):
             sharder_data_map (SharderDataMap): sharder data map.
         """
         tables_warned_missing_quantized_dtype: Set[str] = set()
+        rowwise_storage_kwargs: Dict[str, Any] = {}
+        if self._estimate_rowwise_optimizer_storage and not self._is_inference:
+            rowwise_storage_kwargs["estimate_rowwise_optimizer_storage"] = True
         for sharding_option in sharding_options:
             sharder_key = sharding_option.module_type_key
 
@@ -285,6 +294,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     use_virtual_table=use_virtual_table,
                     weight_init_on_cpu=weight_init_on_cpu,
                     quantized_weight_dtype=quantized_weight_dtype,
+                    **rowwise_storage_kwargs,
                 )
             except ZeroDivisionError as e:
                 raise ValueError(
@@ -367,6 +377,7 @@ def calculate_shard_storages(
     use_virtual_table: bool = False,
     weight_init_on_cpu: bool = False,
     quantized_weight_dtype: Optional[DataType] = None,
+    estimate_rowwise_optimizer_storage: bool = False,
 ) -> List[Storage]:
     """
     Calculates estimated storage sizes for each sharded tensor using SharderData.
@@ -399,16 +410,39 @@ def calculate_shard_storages(
         hbm_storage = round(ddr_storage * caching_ratio)
 
     optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-
-    hbm_specific_sizes: List[int] = _calculate_storage_specific_sizes(
-        storage=hbm_storage,
-        shape=tensor.shape,
-        shard_sizes=shard_sizes,
-        sharding_type=sharding_type,
-        optimizer_class=optimizer_class,
-        is_inference=is_inference,
-        clf=caching_ratio if table_cached else None,
+    rowwise_optimizer_sizes = (
+        _calculate_rowwise_optimizer_sizes(
+            tensor, shard_sizes, sharder_data.fused_params, is_pooled=is_pooled
+        )
+        if estimate_rowwise_optimizer_storage
+        and not is_inference
+        and compute_kernel == EmbeddingComputeKernel.FUSED.value
+        and compute_device == "cuda"
+        and not use_virtual_table
+        else None
     )
+
+    if rowwise_optimizer_sizes is None:
+        hbm_specific_sizes = _calculate_storage_specific_sizes(
+            storage=hbm_storage,
+            shape=tensor.shape,
+            shard_sizes=shard_sizes,
+            sharding_type=sharding_type,
+            optimizer_class=optimizer_class,
+            is_inference=is_inference,
+            clf=caching_ratio if table_cached else None,
+        )
+    else:
+        hbm_specific_sizes = _calculate_storage_specific_sizes(
+            storage=hbm_storage,
+            shape=tensor.shape,
+            shard_sizes=shard_sizes,
+            sharding_type=sharding_type,
+            optimizer_class=optimizer_class,
+            is_inference=is_inference,
+            clf=caching_ratio if table_cached else None,
+            optimizer_sizes=rowwise_optimizer_sizes,
+        )
     ddr_specific_sizes: List[int] = _calculate_storage_specific_sizes(
         storage=ddr_storage,
         shape=tensor.shape,
@@ -919,6 +953,7 @@ def _calculate_storage_specific_sizes(
     optimizer_class: Optional[Type[torch.optim.Optimizer]] = None,
     is_inference: bool = False,
     clf: Optional[float] = None,
+    optimizer_sizes: list[int] | None = None,
 ) -> List[int]:
     tensor_sizes: List[int] = _calculate_tensor_sizes(
         storage,
@@ -926,11 +961,12 @@ def _calculate_storage_specific_sizes(
         shard_sizes,
         sharding_type,
     )
-    optimizer_sizes = _calculate_optimizer_sizes(
-        tensor_sizes,
-        optimizer_class,
-        shape,
-    )
+    if optimizer_sizes is None:
+        optimizer_sizes = _calculate_optimizer_sizes(
+            tensor_sizes,
+            optimizer_class,
+            shape,
+        )
     cache_aux_state_sizes: List[int] = _calculate_cache_aux_state_sizes(
         shard_sizes,
         clf,
@@ -946,6 +982,43 @@ def _calculate_storage_specific_sizes(
             cache_aux_state_sizes, tensor_sizes, optimizer_sizes
         )
     ]
+
+
+def _calculate_rowwise_optimizer_sizes(
+    tensor: torch.Tensor,
+    shard_sizes: list[list[int]],
+    fused_params: Mapping[str, Any] | None = None,
+    is_pooled: bool = False,
+) -> list[int] | None:
+    """Count fused RowWiseAdagrad's state rows on every physical shard."""
+    fused_params = fused_params or {}
+    optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+    optimizer_kwargs = getattr(tensor, "_optimizer_kwargs", [{}])[0]
+    optimizer = optimizer_kwargs.get("optimizer", fused_params.get("optimizer"))
+    if optimizer_class is not None and (
+        not is_pooled or "optimizer" not in optimizer_kwargs
+    ):
+        if optimizer_class != trec_optim.RowWiseAdagrad:
+            return None
+        optimizer = "exact_row_wise_adagrad"
+    if getattr(optimizer, "value", optimizer) != "exact_row_wise_adagrad":
+        return None
+    # Per-table optimizer kwargs override sharder defaults, as in TBE.
+    fused_params = {**fused_params, **optimizer_kwargs}
+    if fused_params.get("optimizer_state_dtypes") is not None:
+        return None
+    weight_decay_mode = fused_params.get("weight_decay_mode", 0)
+    weight_decay_mode = getattr(weight_decay_mode, "value", weight_decay_mode)
+    row_state_bytes = 4
+    if weight_decay_mode in (3, 4):
+        row_state_bytes += 8
+    elif weight_decay_mode == 5:
+        global_weight_decay = fused_params.get("global_weight_decay")
+        use_int64_prev_iter = getattr(
+            global_weight_decay, "use_int64_prev_iter", False
+        ) or torch.ops.fbgemm.check_feature_gate_key("TBE_GWD_PREV_ITER_INT64")
+        row_state_bytes += 8 if use_int64_prev_iter else 4
+    return [size[0] * row_state_bytes for size in shard_sizes]
 
 
 # Targets `_convert_weights` produces with a plain element-wise cast, so the bytes

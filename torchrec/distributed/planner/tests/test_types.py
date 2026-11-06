@@ -2560,6 +2560,21 @@ class ShardingPlanRequestTest(unittest.TestCase):
             ).request_hash,
         )
 
+    def test_rowwise_storage_changes_request_hash_only_when_enabled(self) -> None:
+        base = self._create_request().request_hash
+        self.assertEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(estimate_rowwise_optimizer_storage=False)
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(estimate_rowwise_optimizer_storage=True)
+            ).request_hash,
+        )
+
     def test_request_hash_includes_reserve_module_terms(self) -> None:
         """The flag decides whether dense and kjt are added on top of the margin, so
         it changes the reservation and therefore the plan. If it fell out of the hash
