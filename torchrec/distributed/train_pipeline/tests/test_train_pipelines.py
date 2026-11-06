@@ -9,6 +9,7 @@
 
 import copy
 import unittest
+from collections import deque
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 from functools import partial
@@ -32,6 +33,9 @@ from hypothesis import assume, given, settings, strategies as st, Verbosity
 from torch import nn, optim
 from torch._dynamo.testing import reduce_to_scalar_loss
 from torch._dynamo.utils import counters
+from torch.autograd import DeviceType
+from torch.nn.parallel import DistributedDataParallel
+from torch.profiler import ProfilerActivity
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
@@ -95,7 +99,11 @@ from torchrec.distributed.train_pipeline.train_pipelines import (
     TrainPipelineSparseDistCompAutograd,
     TrainPipelineSparseDistLite,
 )
-from torchrec.distributed.train_pipeline.utils import DataLoadingThread, get_h2d_func
+from torchrec.distributed.train_pipeline.utils import (
+    DataLoadingThread,
+    find_ddp_modules,
+    get_h2d_func,
+)
 from torchrec.distributed.types import (
     ModuleSharder,
     ShardingEnv,
@@ -104,8 +112,14 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
-from torchrec.optim.keyed import KeyedOptimizerWrapper
+from torchrec.optim.clipping import GradientClippingOptimizer
+from torchrec.optim.keyed import (
+    CombinedOptimizer,
+    KeyedOptimizer,
+    KeyedOptimizerWrapper,
+)
 from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.optim.warmup import WarmupOptimizer, WarmupStage
 from torchrec.pt2.utils import kjt_for_pt2_tracing
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
@@ -1120,6 +1134,72 @@ def fp_ebc_rw_sharding_test_runner(
             torch.testing.assert_close(pred_pipeline.cpu(), pred.cpu())
 
 
+def async_optimizer_parity_test_runner(
+    rank: int,
+    world_size: int,
+    tables: List[EmbeddingBagConfig],
+    weighted_tables: List[EmbeddingBagConfig],
+    data: List[Tuple[ModelInput, List[ModelInput]]],
+    backend: str = "nccl",
+    local_size: Optional[int] = None,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        pg = ctx.pg
+        assert pg is not None
+        # The same seed on every rank gives every rank the same global model.
+        torch.manual_seed(0)
+        model = TestSparseNN(
+            tables=tables,
+            weighted_tables=weighted_tables,
+            dense_device=ctx.device,
+            sparse_device=ctx.device,
+        )
+        sharder = cast(
+            ModuleSharder[nn.Module],
+            TestEBCSharder(
+                sharding_type=ShardingType.TABLE_WISE.value,
+                kernel_type=EmbeddingComputeKernel.FUSED.value,
+            ),
+        )
+
+        def make_pipeline(async_optimizer: bool) -> TrainPipelineSparseDist:
+            sharded_model = DistributedModelParallel(
+                module=copy.deepcopy(model),
+                env=ShardingEnv.from_process_group(pg),
+                device=ctx.device,
+                sharders=[sharder],
+            )
+            copy_state_dict(sharded_model.state_dict(), model.state_dict())
+            # Citrine C2: use the multi-tensor optimizer implementation.
+            optimizer = optim.Adam(
+                dict(
+                    in_backward_optimizer_filter(sharded_model.named_parameters())
+                ).values(),
+                lr=0.01,
+                foreach=True,
+            )
+            return TrainPipelineSparseDist(
+                sharded_model,
+                optimizer,
+                ctx.device,
+                async_optimizer=async_optimizer,
+            )
+
+        sync_pipeline = make_pipeline(async_optimizer=False)
+        async_pipeline = make_pipeline(async_optimizer=True)
+        batches = [local_inputs[rank].to(ctx.device) for _, local_inputs in data]
+        sync_iter, async_iter = iter(batches), iter(batches)
+        for _ in batches:
+            torch.testing.assert_close(
+                async_pipeline.progress(async_iter), sync_pipeline.progress(sync_iter)
+            )
+
+        assert len(async_pipeline._async_optimizer_ddp_modules) > 0
+        async_params = dict(async_pipeline._model.named_parameters())
+        for name, param in sync_pipeline._model.named_parameters():
+            torch.testing.assert_close(async_params[name], param)
+
+
 class TrainPipelineGPUTest(MultiProcessTestBase):
     def setUp(self, backend: str = "nccl") -> None:
         super().setUp()
@@ -1181,6 +1261,20 @@ class TrainPipelineGPUTest(MultiProcessTestBase):
             tables=self.tables,
             weighted_tables=self.weighted_tables,
             data=data,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_async_optimizer_matches_sync_two_ranks(self) -> None:
+        # Each rank gets different data, so DDP's all-reduce changes the gradients.
+        self._run_multi_process_test(
+            callable=async_optimizer_parity_test_runner,
+            world_size=2,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            data=self._generate_data(num_batches=10, batch_size=32),
         )
 
 
@@ -3796,3 +3890,371 @@ class TrainPipelineSparseDistCompAutogradTest(TrainPipelineSparseDistTest):
     )
     def test_async_next_batch_setup_and_exhaustion(self) -> None:
         super().test_async_next_batch_setup_and_exhaustion()
+
+
+class _EvalPairTestSparseNN(TestSparseNN):
+    # TrainPipelineSparseDist.progress() unpacks (losses, output) in eval mode too.
+    def forward(
+        self, input: ModelInput
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        output = super().forward(input)
+        if isinstance(output, torch.Tensor):
+            return output, output
+        return output
+
+
+def _add_param_outside_ddp(optimizer: CombinedOptimizer) -> CombinedOptimizer:
+    """Adds a non-fused child whose param no DDP reduces, like MVAI's ``__sparse_non_fused``."""
+    outside = KeyedOptimizerWrapper(
+        {"outside": nn.Parameter(torch.zeros(2))},
+        # Citrine C2: use the multi-tensor optimizer implementation.
+        lambda params: optim.SGD(params, lr=0.1, foreach=True),
+    )
+    return CombinedOptimizer([*optimizer.optimizers, ("outside", outside)])
+
+
+def _record_step_streams(optimizer: KeyedOptimizer) -> List[torch.Stream]:
+    """
+    Makes ``optimizer.step()`` record the current CUDA stream and returns the list
+    it records into. Step hooks would not do: only ``CombinedOptimizer`` runs them.
+    """
+    streams: List[torch.Stream] = []
+    step = optimizer.step
+
+    def recording_step(closure: Any = None) -> Any:
+        streams.append(torch.cuda.current_stream())
+        return step(closure)
+
+    optimizer.step = recording_step
+    return streams
+
+
+def _warmup(optimizer: KeyedOptimizer, key: str = "__sparse_fused") -> WarmupOptimizer:
+    return WarmupOptimizer(
+        optimizer,
+        [WarmupStage(max_iters=5, value=0.1)],
+        lr=0.1,
+        param_name=f"{key}.__warmup",
+    )
+
+
+def _wrap_in_warmup(optimizer: CombinedOptimizer) -> CombinedOptimizer:
+    (_, fused), (_, dense) = optimizer.optimizers
+    return CombinedOptimizer(
+        [
+            ("__sparse_fused", _warmup(fused, "__sparse_fused")),
+            ("__dense", _warmup(dense, "__dense")),
+        ]
+    )
+
+
+def _allocator_stream(tensor: torch.Tensor) -> int:
+    """Returns the CUDA stream whose caching-allocator segment holds ``tensor``."""
+    ptr = tensor.data_ptr()
+    for segment in torch.cuda.memory_snapshot():
+        if segment["address"] <= ptr < segment["address"] + segment["total_size"]:
+            return segment["stream"]
+    raise AssertionError(f"No allocator segment holds address {ptr:#x}")
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available(),
+    "Not enough GPUs, this test requires at least one GPU",
+)
+class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
+    def _setup_async_pipeline(
+        self,
+        optimizer_class: Type[CombinedOptimizer] = CombinedOptimizer,
+        **pipeline_kwargs: Any,
+    ) -> Tuple[DistributedModelParallel, TrainPipelineSparseDist]:
+        model, optimizer = self._setup_ddp_model_and_optimizer(
+            self._setup_model(model_type=_EvalPairTestSparseNN),
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+        )
+        assert isinstance(optimizer, CombinedOptimizer)
+        pipeline = TrainPipelineSparseDist(
+            model=model,
+            optimizer=optimizer_class(optimizer.optimizers),
+            device=self.device,
+            async_optimizer=True,
+            **pipeline_kwargs,
+        )
+        return model, pipeline
+
+    def _train_twice_then_eval(
+        self, grad_enabled: bool
+    ) -> Tuple[DistributedModelParallel, TrainPipelineSparseDist]:
+        model, pipeline = self._setup_async_pipeline()
+        data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
+        pipeline.progress(data_iter)
+        pipeline.progress(data_iter)
+        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+        model.eval()
+        with torch.set_grad_enabled(grad_enabled):
+            pipeline.progress(data_iter)
+        return model, pipeline
+
+    def test_async_optimizer_matches_sync(self) -> None:
+        for sharding_type, kernel_type in [
+            (ShardingType.TABLE_WISE.value, EmbeddingComputeKernel.FUSED.value),
+            (ShardingType.DATA_PARALLEL.value, EmbeddingComputeKernel.DENSE.value),
+        ]:
+            with self.subTest(sharding_type=sharding_type):
+                self._run_async_optimizer_parity(
+                    TrainPipelineSparseDist, sharding_type, kernel_type
+                )
+
+    def test_plain_dense_optimizer_matches_sync(self) -> None:
+        self._run_async_optimizer_parity(
+            TrainPipelineSparseDist,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            combined_optimizer=False,
+        )
+
+    def test_optimizer_step_runs_on_side_stream(self) -> None:
+        _, pipeline = self._setup_async_pipeline()
+        data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
+        # The first step arms DDP.
+        pipeline.progress(data_iter)
+        optimizer = cast(CombinedOptimizer, pipeline._optimizer)
+        child_streams = [
+            _record_step_streams(child) for _, child in optimizer.optimizers
+        ]
+
+        pipeline.progress(data_iter)
+        pipeline.progress(data_iter)
+
+        self.assertNotEqual(pipeline._async_stream, torch.cuda.current_stream())
+        self.assertEqual(
+            child_streams,
+            [[pipeline._async_stream] * 2 for _ in optimizer.optimizers],
+        )
+
+    def test_hooks_added_after_arming_run_on_caller_stream(self) -> None:
+        _, pipeline = self._setup_async_pipeline()
+        data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
+        # The first step arms DDP and checks the optimizer, before the hook exists.
+        pipeline.progress(data_iter)
+        streams: List[torch.Stream] = []
+        pipeline._optimizer.register_step_pre_hook(
+            lambda *_: streams.append(torch.cuda.current_stream())
+        )
+
+        pipeline.progress(data_iter)
+        pipeline.progress(data_iter)
+
+        self.assertEqual(streams, [torch.cuda.current_stream()] * 2)
+        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+
+    def test_top_level_optimizer_wrapper_matches_sync(self) -> None:
+        # OptimizerWrapper never creates the step hook dicts.
+        self._run_async_optimizer_parity(
+            TrainPipelineSparseDist,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            optimizer_factory=GradientClippingOptimizer,
+        )
+
+    def _first_step_state_streams(
+        self, **pipeline_kwargs: Any
+    ) -> Tuple[set[int], TrainPipelineSparseDist]:
+        """
+        Runs one step and returns the streams whose allocator pools hold the dense
+        Adam state, which Adam creates (``exp_avg``, ``exp_avg_sq``) in that step.
+        """
+        _, pipeline = self._setup_async_pipeline(**pipeline_kwargs)
+        data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
+        pipeline.progress(data_iter)
+
+        # Fused TBE state is allocated when the module is built, so only the dense
+        # child's state is created by the first step.
+        _, dense_optimizer = cast(CombinedOptimizer, pipeline._optimizer).optimizers[1]
+        state_tensors = [
+            value
+            for param_state in dense_optimizer.state.values()
+            for value in param_state.values()
+            if isinstance(value, torch.Tensor) and value.is_cuda
+        ]
+        self.assertGreater(len(state_tensors), 0)
+        return {_allocator_stream(t) for t in state_tensors}, pipeline
+
+    def test_lazy_optimizer_state_allocated_on_caller_stream(self) -> None:
+        streams, _ = self._first_step_state_streams()
+        self.assertEqual(streams, {torch.cuda.current_stream().cuda_stream})
+
+    def test_no_main_stream_steps_allocates_state_on_side_stream(self) -> None:
+        streams, pipeline = self._first_step_state_streams(
+            async_num_opt_steps_on_main_stream=0
+        )
+        async_stream = cast(torch.cuda.Stream, pipeline._async_stream)
+        self.assertEqual(streams, {async_stream.cuda_stream})
+
+    def test_main_stream_steps_run_before_side_stream_steps(self) -> None:
+        _, pipeline = self._setup_async_pipeline(async_num_opt_steps_on_main_stream=2)
+        streams = _record_step_streams(cast(CombinedOptimizer, pipeline._optimizer))
+        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
+
+        for _ in range(4):
+            pipeline.progress(data_iter)
+
+        main_stream = torch.cuda.current_stream()
+        async_stream = pipeline._async_stream
+        self.assertEqual(
+            streams, [main_stream, main_stream, async_stream, async_stream]
+        )
+
+    def test_negative_main_stream_steps_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "async_num_opt_steps_on_main_stream"):
+            self._setup_async_pipeline(async_num_opt_steps_on_main_stream=-1)
+
+    def test_hook_forced_step_counts_as_main_stream_step(self) -> None:
+        _, pipeline = self._setup_async_pipeline(async_num_opt_steps_on_main_stream=2)
+        optimizer = cast(CombinedOptimizer, pipeline._optimizer)
+        streams = _record_step_streams(optimizer)
+        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
+        # The first step arms the pipeline, which refuses hooks that exist then.
+        pipeline.progress(data_iter)
+        hook = optimizer.register_step_pre_hook(lambda *_: None)
+        pipeline.progress(data_iter)
+        hook.remove()
+
+        pipeline.progress(data_iter)
+        pipeline.progress(data_iter)
+
+        main_stream = torch.cuda.current_stream()
+        async_stream = pipeline._async_stream
+        # Step 2 has a hook and is also the second main-stream step.
+        self.assertEqual(
+            streams, [main_stream, main_stream, async_stream, async_stream]
+        )
+
+    def test_combined_optimizer_subclass_steps_whole(self) -> None:
+        class _StepCountingOptimizer(CombinedOptimizer):
+            step_count: int = 0
+
+            def step(self, closure: Any = None) -> None:
+                self.step_count += 1
+                super().step(closure)
+
+        _, pipeline = self._setup_async_pipeline(_StepCountingOptimizer)
+        data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
+        for _ in range(3):
+            pipeline.progress(data_iter)
+
+        self.assertEqual(
+            cast(_StepCountingOptimizer, pipeline._optimizer).step_count, 3
+        )
+        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+
+    def test_param_outside_ddp_falls_back(self) -> None:
+        self._run_async_optimizer_parity(
+            TrainPipelineSparseDist,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            optimizer_factory=_add_param_outside_ddp,
+            expect_async=False,
+        )
+
+    def test_warmup_wrapped_optimizers_match_sync(self) -> None:
+        # MVAI's RecOptimizer wraps each group that has an LR warmup schedule, fused
+        # or dense, in a WarmupOptimizer.
+        self._run_async_optimizer_parity(
+            TrainPipelineSparseDist,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            optimizer_factory=_wrap_in_warmup,
+        )
+
+    def test_fused_optimizer_step_launches_no_device_work(self) -> None:
+        for kernel_type in [
+            EmbeddingComputeKernel.FUSED.value,
+            EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+        ]:
+            with self.subTest(kernel_type=kernel_type):
+                model, _ = self._setup_ddp_model_and_optimizer(
+                    self._setup_model(), ShardingType.TABLE_WISE.value, kernel_type
+                )
+                optimizer = _warmup(model.fused_optimizer)
+                torch.cuda.synchronize()
+
+                with torch.profiler.profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                ) as prof:
+                    optimizer.step()
+                    torch.cuda.synchronize()
+
+                self.assertEqual(
+                    [e.name for e in prof.events() if e.device_type == DeviceType.CUDA],
+                    [],
+                )
+
+    def test_detach_after_no_grad_eval_disarms_ddp(self) -> None:
+        model, pipeline = self._train_twice_then_eval(grad_enabled=False)
+
+        pipeline.detach()
+
+        for ddp in find_ddp_modules(model):
+            self.assertFalse(ddp.require_manual_backward_finalization)
+
+    def test_detach_after_grad_eval_raises_clearly(self) -> None:
+        _, pipeline = self._train_twice_then_eval(grad_enabled=True)
+        armed_ddp_modules = list(pipeline._async_optimizer_ddp_modules)
+
+        with self.assertRaisesRegex(RuntimeError, r"torch\.no_grad\(\)"):
+            pipeline.detach()
+
+        self.assertTrue(pipeline._model_attached)
+        self.assertEqual(pipeline._async_optimizer_ddp_modules, armed_ddp_modules)
+
+    def test_attach_new_model_without_detach_disarms_old_model(self) -> None:
+        old_model, pipeline = self._setup_async_pipeline()
+        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
+        pipeline.progress(data_iter)
+        new_model, _ = self._setup_ddp_model_and_optimizer(
+            self._setup_model(model_type=_EvalPairTestSparseNN),
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+        )
+
+        pipeline.attach(new_model)
+        pipeline.progress(data_iter)
+
+        for ddp in find_ddp_modules(old_model):
+            self.assertFalse(ddp.require_manual_backward_finalization)
+        # The pipeline's optimizer steps the old model's params, which no DDP of the
+        # new model reduces, so the new model falls back to the regular step.
+        self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
+
+    def test_ddp_refusing_manual_finalization_leaves_none_armed(self) -> None:
+        model, pipeline = self._setup_async_pipeline()
+        ddp_modules = find_ddp_modules(model)
+        refusing_ddp = DistributedDataParallel(
+            nn.Linear(2, 2, device=self.device), process_group=self.pg
+        )
+        # A forward with grad enabled and no backward leaves DDP waiting for a
+        # backward, so it refuses to change its finalization mode.
+        refusing_ddp(torch.ones(1, 2, device=self.device))
+        model.module.add_module("refusing_ddp", refusing_ddp)
+
+        with self.assertRaisesRegex(RuntimeError, "DDP refused"):
+            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+
+        for ddp in ddp_modules:
+            self.assertFalse(ddp.require_manual_backward_finalization)
+        self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
+
+
+class TrainPipelineSparseDistWithoutInitTest(unittest.TestCase):
+    def test_optimizer_step_without_init_uses_regular_step(self) -> None:
+        # Callers build a pipeline with __new__ alone to run one method without a
+        # model (for example aps_models' ads_eval_dummy_optimizer_test).
+        optimizer = MagicMock()
+        pipeline = TrainPipelineSparseDist.__new__(TrainPipelineSparseDist)
+        pipeline._optimizer = optimizer
+        pipeline.contexts = deque([TrainPipelineContext(index=0)])
+
+        pipeline._optimizer_step()
+
+        optimizer.step.assert_called_once_with()

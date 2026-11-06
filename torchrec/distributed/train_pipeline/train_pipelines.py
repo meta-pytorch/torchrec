@@ -33,6 +33,7 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
+from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm_ops import Request  # noqa: F401
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding import EmbeddingCollectionAwaitable  # noqa: F401
@@ -124,8 +125,12 @@ from torchrec.distributed.train_pipeline.utils import (
     _to_device,
     _wait_for_batch,
     _wait_for_events,
+    async_optimizer_unsupported_reason,
     AsyncInplaceCopyMixin,
     DataLoadingThread,
+    ddp_managed_param_ids,
+    find_ddp_modules,
+    has_step_hooks,
     is_deferred_dp_supported,
     prefetch_embeddings,
     use_context_for_postprocs,
@@ -585,6 +590,23 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             every consumer of batch tensors to be ordered before the default or
             data_dist stream, and the batch copy to run on the thread that frees
             batches. Ignored when ``enable_inplace_copy_batch`` is set.
+        async_optimizer (bool): run DDP gradient finalization
+            and the whole optimizer step on a side stream so they overlap the rest
+            of backward. Fused optimizers already updated their weights in
+            backward, so their ``step()`` does no device work. Every other param
+            the optimizer steps must be reduced by a DDP, because the side stream
+            does not wait for the main stream. Falls back to the regular optimizer
+            step on devices without streams, if the model has no DDP, or if
+            ``async_optimizer_unsupported_reason`` gives a reason. The first
+            ``async_num_opt_steps_on_main_stream`` steps run on the main stream
+            instead, so optimizer state they create lazily (e.g.
+            ``torch.optim.Adam``'s) lands in the main stream's memory pool rather
+            than the side stream's.
+        async_num_opt_steps_on_main_stream (int): with ``async_optimizer``, how
+            many optimizer steps run on the main stream before the rest move to
+            the side stream. The default of 1 covers optimizers that create their
+            state in their first step. Raise it for an optimizer that creates
+            state in a later step; 0 runs every step on the side stream.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -612,7 +634,14 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         async_inplace_copy: bool = False,
         async_next_batch: bool = False,
         skip_batch_record_stream: bool = False,
+        async_optimizer: bool = False,
+        async_num_opt_steps_on_main_stream: int = 1,
     ) -> None:
+        if async_num_opt_steps_on_main_stream < 0:
+            raise ValueError(
+                "async_num_opt_steps_on_main_stream must be >= 0, got "
+                f"{async_num_opt_steps_on_main_stream}"
+            )
         self._model = model
         self._optimizer = optimizer
         self._device = device
@@ -625,6 +654,13 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             and not enable_inplace_copy_batch
             and device.type in ["cuda", "mtia"]
         )
+        has_device_streams = device.type in ["cuda", "mtia"]
+        self._async_optimizer: bool = async_optimizer and has_device_streams
+        if async_optimizer and not has_device_streams:
+            logger.warning(
+                f"async_optimizer: no device streams on {device.type}, "
+                "using the regular optimizer step"
+            )
         self._free_features_storage_early = free_features_storage_early
         self._batch_count = 0
         self._inplace_copy_batch_size_logged = False
@@ -637,7 +673,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             f"async_inplace_copy: {async_inplace_copy} "
             f"async_next_batch: {async_next_batch} "
             f"free_features_storage_early: {free_features_storage_early} "
-            f"skip_batch_record_stream: {self._skip_batch_record_stream}"
+            f"skip_batch_record_stream: {self._skip_batch_record_stream} "
+            f"async_optimizer: {self._async_optimizer} "
+            "async_num_opt_steps_on_main_stream: "
+            f"{async_num_opt_steps_on_main_stream}"
         )
 
         if device.type == "cuda":
@@ -664,6 +703,14 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             if device.type in ["cuda", "mtia"]
             else None
         )
+
+        self._async_stream: Optional[torch.Stream] = (
+            (torch.get_device_module(device).Stream())
+            if self._async_optimizer
+            else None
+        )
+        self._async_optimizer_ddp_modules: List[DistributedDataParallel] = []
+        self._async_main_stream_steps_left: int = async_num_opt_steps_on_main_stream
 
         self._original_forwards: List[Callable[..., Any]] = []
 
@@ -741,8 +788,13 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         needs to be called.
         Inflight batches are kept so pipeline.progress(data_iter) can be resumed normally.
 
+        With ``async_optimizer``, raises if called between a forward with grad enabled
+        and its backward, because DDP cannot leave manual finalization then. The
+        pipeline stays attached.
+
         Returns the original model.
         """
+        self._disarm_async_optimizer_ddps()
         if self._pipelined_modules:
             _pipeline_detach_model(
                 model=self._model,
@@ -763,6 +815,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         when user want to switch the train pipeline. for more please see:
         https://github.com/meta-pytorch/torchrec/pull/2076
         """
+        # Without a detach(), the previous model's DDPs are still armed; the model
+        # rewrite below re-arms the model being attached.
+        self._disarm_async_optimizer_ddps()
         if model:
             self._model = model
 
@@ -997,8 +1052,56 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         return output
 
     def _optimizer_step(self) -> None:
+        # getattr: some callers build a pipeline with __new__ alone, skipping
+        # __init__, to call this method.
+        if getattr(self, "_async_optimizer_ddp_modules", None):
+            # Step hooks added after the pipeline armed were never checked, so a
+            # step that has them runs on the main stream.
+            if self._async_main_stream_steps_left == 0 and not has_step_hooks(
+                self._optimizer
+            ):
+                self._async_optimizer_step()
+            else:
+                self._caller_stream_optimizer_step()
+                # Every main-stream step counts, including hook-forced ones, so
+                # the first N steps always run on the main stream.
+                if self._async_main_stream_steps_left > 0:
+                    self._async_main_stream_steps_left -= 1
+            return
         with record_function(f"## optimizer {self.contexts[0].index} ##"):
             self._optimizer.step()
+
+    def _caller_stream_optimizer_step(self) -> None:
+        """
+        Does the work of ``_async_optimizer_step`` on the caller stream, so
+        optimizer state created lazily by ``step()`` is allocated from the caller
+        stream's memory pool instead of the side stream's.
+        """
+        with record_function("## finalize_backward ##"):
+            for ddp in self._async_optimizer_ddp_modules:
+                ddp.finalize_backward()
+        with record_function(f"## optimizer {self.contexts[0].index} ##"):
+            self._optimizer.step()
+
+    def _async_optimizer_step(self) -> None:
+        """
+        Finalizes DDP gradients and steps the optimizer on the side stream.
+        ``finalize_backward()`` runs on the current stream, so its waits on the DDP
+        all-reduces block only the side stream, letting the step overlap the rest
+        of backward.
+        """
+        async_stream = self._async_stream
+        assert async_stream is not None
+        caller_stream = torch.get_device_module(self._device).current_stream()
+        try:
+            with async_stream:
+                with record_function("## finalize_backward ##"):
+                    for ddp in self._async_optimizer_ddp_modules:
+                        ddp.finalize_backward()
+                with record_function(f"## async optimizer {self.contexts[0].index} ##"):
+                    self._optimizer.step()
+        finally:
+            caller_stream.wait_stream(async_stream)
 
     def _create_context(self) -> TrainPipelineContext:
         context = self._context_type(index=self._next_index, version=1)
@@ -1042,6 +1145,73 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
             self._pipelined_modules
         )
+        self._arm_async_optimizer_ddps()
+
+    def _arm_async_optimizer_ddps(self) -> None:
+        """
+        Checks that the optimizer can step on the side stream and makes every DDP
+        in the model wait for an explicit ``finalize_backward()``, which
+        ``_async_optimizer_step`` issues on the side stream. Runs after each
+        model rewrite, so ``attach()`` re-arms it.
+        """
+        if not self._async_optimizer or self._async_optimizer_ddp_modules:
+            return
+
+        ddp_modules = find_ddp_modules(self._model)
+        if not ddp_modules:
+            logger.warning(
+                "async_optimizer: no DDP found, using the regular optimizer step"
+            )
+            self._async_optimizer = False
+            return
+
+        # Check before arming any DDP, so falling back leaves DDP in automatic mode.
+        reason = async_optimizer_unsupported_reason(
+            self._optimizer, ddp_managed_param_ids(ddp_modules)
+        )
+        if reason is not None:
+            logger.warning(
+                f"async_optimizer: {reason}. Using the regular optimizer step."
+            )
+            self._async_optimizer = False
+            return
+        for ddp in ddp_modules:
+            try:
+                self._set_manual_ddp_finalization(ddp, required=True)
+            except RuntimeError:
+                # Arm every DDP or none: the side stream waits only for armed ones.
+                self._disarm_async_optimizer_ddps()
+                raise
+            self._async_optimizer_ddp_modules.append(ddp)
+        logger.info(f"Enabled manual finalize on {len(ddp_modules)} DDP instance(s)")
+
+    def _disarm_async_optimizer_ddps(self) -> None:
+        """
+        Returns every armed DDP to automatic finalization, so a detached model
+        trains normally outside the pipeline. If DDP refuses partway, the list
+        still holds exactly the DDPs that remain armed.
+        """
+        while self._async_optimizer_ddp_modules:
+            self._set_manual_ddp_finalization(
+                self._async_optimizer_ddp_modules[-1], required=False
+            )
+            self._async_optimizer_ddp_modules.pop()
+
+    @staticmethod
+    def _set_manual_ddp_finalization(
+        ddp: DistributedDataParallel, required: bool
+    ) -> None:
+        try:
+            ddp.require_manual_backward_finalization = required
+        except RuntimeError as e:
+            raise RuntimeError(
+                "async_optimizer: DDP refused "
+                f"require_manual_backward_finalization={required} (see the error "
+                "above). This usually means a forward ran with grad enabled and no "
+                "backward, so DDP is waiting for a backward pass. Run non-training "
+                "forwards under torch.no_grad(), or detach right after a training "
+                "step."
+            ) from e
 
     def reset(self) -> None:
         self.contexts.clear()
@@ -1621,6 +1791,11 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         defer_pipeline_stream_fences (bool): defer whole-stream waits by recording
             per-module lookup completion events and keeping produced tensors alive
             on their consuming streams.
+        async_optimizer (bool): see `TrainPipelineSparseDist`. With
+            DATA_PARALLEL tables, use ``defer_dp_lookup=True`` so their lookups
+            run in the forward, after the optimizer step; without it, the
+            pipeline uses the regular optimizer step.
+        async_num_opt_steps_on_main_stream (int): see `TrainPipelineSparseDist`.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -1648,6 +1823,8 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         embedding_lookup_before_optimizer: bool = False,
         defer_dp_lookup: bool = False,
         defer_pipeline_stream_fences: bool = False,
+        async_optimizer: bool = False,
+        async_num_opt_steps_on_main_stream: int = 1,
     ) -> None:
         super().__init__(
             model=model,
@@ -1662,6 +1839,8 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             free_features_storage_early=free_features_storage_early,
             clear_data_dist_inputs=clear_data_dist_inputs,
+            async_optimizer=async_optimizer,
+            async_num_opt_steps_on_main_stream=async_num_opt_steps_on_main_stream,
         )
 
         self._embedding_lookup_phase = _resolve_embedding_lookup_phase(
@@ -1709,6 +1888,27 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             self._emb_lookup_stream = self._data_dist_stream
         else:
             raise RuntimeError(f"Unknown emb_lookup_stream {emb_lookup_stream}")
+
+    def _arm_async_optimizer_ddps(self) -> None:
+        """
+        Falls back to the regular optimizer step when the model has DATA_PARALLEL
+        tables and ``defer_dp_lookup`` is off. Their weights are updated by the
+        optimizer step, and a lookup issued outside the forward is not ordered
+        after the side stream.
+        """
+        # Sharded modules wrap each DATA_PARALLEL lookup in a DDP.
+        if (
+            self._async_optimizer
+            and not self._defer_dp_lookup
+            and any(find_ddp_modules(module) for module in self._pipelined_modules)
+        ):
+            logger.warning(
+                "async_optimizer: DATA_PARALLEL tables need defer_dp_lookup=True. "
+                "Using the regular optimizer step."
+            )
+            self._async_optimizer = False
+            return
+        super()._arm_async_optimizer_ddps()
 
     def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
         super().fill_pipeline(dataloader_iter)
