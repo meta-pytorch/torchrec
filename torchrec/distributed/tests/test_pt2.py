@@ -441,8 +441,8 @@ class TestPt2(unittest.TestCase):
             )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_kt_regroup_as_dict(
         self,
@@ -642,7 +642,7 @@ class TestPt2(unittest.TestCase):
             self.assertFalse("auto_functionalized" in str(n.name))
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 1,
         "Not enough GPUs available",
     )
     def test_sharded_quant_fpebc_non_strict_export(self) -> None:
@@ -754,7 +754,7 @@ class TestPt2(unittest.TestCase):
             self.assertEqual(counter.frame_count, 1)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 1,
         "Not enough GPUs available",
     )
     def test_ebc_vb_reindex(self) -> None:
@@ -799,8 +799,8 @@ class TestPt2(unittest.TestCase):
         _test_compile_fwd_bwd(fn, ins, device, unpack_inp=True)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_permute_pooled_embs(self) -> None:
         device = "cuda"
@@ -813,8 +813,8 @@ class TestPt2(unittest.TestCase):
         _test_compile_fwd_bwd(m, inp, device, backend="aot_eager")
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_permute_pooled_embs_split(self) -> None:
         device = "cuda"
@@ -827,8 +827,8 @@ class TestPt2(unittest.TestCase):
         _test_compile_fwd_bwd(m, inp, device)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_permute_multi_embedding(self) -> None:
         device = "cuda"

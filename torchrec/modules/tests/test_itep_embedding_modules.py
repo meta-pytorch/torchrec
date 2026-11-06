@@ -198,7 +198,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
 
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_init_itep_module(self) -> None:
         itep_module = GenericITEPModule(
@@ -233,8 +233,8 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_init_itep_module_without_pruned_table(self) -> None:
         itep_module = GenericITEPModule(
@@ -365,7 +365,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
 
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_iter_increment_per_forward(self) -> None:
         """Test that the iteration counter increments correctly with each forward pass."""
@@ -515,7 +515,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
                     self.assertIsInstance(captured_iter, int)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
     )
     def test_error_handling_invalid_iter_tensor_values_cuda_disabled_in_oss_compatibility(
