@@ -39,6 +39,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 from fbgemm_gpu.split_embedding_configs import SparseType
+from fbgemm_gpu.tbe.ssd import SSDTableBatchedEmbeddingBags
 from fbgemm_gpu.tbe.ssd.ssd_config import (
     EnrichmentPolicy,
     EnrichmentResponseFormat,
@@ -92,6 +93,11 @@ _OWNER_LOCAL_CACHE_POLICY_FIELDS = (
     "owner_cache_size_mb",
     "owner_cache_read_populate",
     "owner_cache_read_populate_max_lookups",
+)
+_OWNER_LOCAL_CACHE_EXCLUSIVE_POLICY_FIELDS = (
+    *_OWNER_LOCAL_CACHE_POLICY_FIELDS,
+    "owner_cache_int8",
+    "owner_cache_exclusive",
 )
 _SERVING_QDQ_POLICY_FIELDS = ("serving_qdq_bit_rate",)
 _SERVING_QDQ_GROUPED_POLICY_FIELDS = ("serving_qdq_bit_rate", "serving_qdq_group_size")
@@ -272,6 +278,7 @@ def _build_sharded_model(
     owner_local_cache: bool = False,
     owner_local_cache_read_populate: bool = False,
     owner_local_cache_read_populate_max_lookups: Optional[int] = None,
+    owner_local_cache_exclusive: bool = False,
     prefetch_pipeline: bool = False,
     num_lookup_groups: int = 1,
     serving_qdq_bit_rate: int = 0,
@@ -324,6 +331,10 @@ def _build_sharded_model(
             owner_cache_read_populate_max_lookups=(
                 owner_local_cache_read_populate_max_lookups
             )
+        )
+    if owner_local_cache_exclusive:
+        enrichment_policy = enrichment_policy._replace(
+            owner_cache_int8=True, owner_cache_exclusive=True
         )
     fused_params = {
         "embedding_cache_mode": True,
@@ -908,6 +919,117 @@ def _run_owner_local_cache_bounded_read_populate_round_trip(
     )
 
 
+def _dram_rows(tbe: SSDTableBatchedEmbeddingBags) -> int:
+    """Rows the DRAM backend holds a block for (rows only in HBM excluded)."""
+    return int(tbe.ssd_db.get_dram_kv_perf(1, 1)[22])
+
+
+def _modules_with_ssd_db(module: nn.Module) -> int:
+    """The traversal of dper_lib create_ssd_rdb_checkpoint: a module with
+    `_lookups` (or `_lookup`) is a sharded container walked through it."""
+    found = int(hasattr(module, "_ssd_db"))
+    lookups = getattr(module, "_lookups", None)
+    if lookups is not None:
+        return found + sum(_modules_with_ssd_db(m) for m in lookups)
+    lookup = getattr(module, "_lookup", None)
+    if lookup is not None:
+        return found + _modules_with_ssd_db(lookup)
+    return found + sum(_modules_with_ssd_db(c) for _, c in module.named_children())
+
+
+def _run_owner_local_cache_exclusive_round_trip(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    """Rows a lookup reads move into the exclusive HBM cache and leave DRAM;
+    checkpoint reads still see them, and a reset moves them back to DRAM.
+    Every rank runs every collective before any check, so a failed check on one
+    rank cannot leave the other waiting in a collective."""
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        assert ctx.pg is not None
+        sharded_model = _build_sharded_model(
+            ctx,
+            world_size,
+            local_size,
+            owner_local_cache=True,
+            owner_local_cache_exclusive=True,
+            data_type=DataType.FP16,
+        )
+        tbe = _enrichment_cache(sharded_model).emb_module
+        hashed_ids = [101, 202, 303, 404]
+        unhashed_ids = [1010, 2020, 3030, 4040]
+        read_kjt = _build_input_kjt(hashed_ids, ctx.device)
+        expected = torch.stack(
+            [_expected_fake_row(uid, EMBEDDING_DIM) for uid in unhashed_ids]
+        )
+
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(_build_write_kjt(hashed_ids, unhashed_ids, ctx.device))
+        torch.cuda.synchronize()
+        _wait_for_cache_fill(sharded_model, read_kjt, len(hashed_ids))
+        torch.cuda.synchronize()
+        tbe.ssd_db.exclusive_hbm_wait()
+        hbm_rows_read = _read_rows(sharded_model, read_kjt).float().cpu()
+        hits, queries = _owner_local_cache(sharded_model).last_hit_counts()
+        # A second write cadence runs the write-side cache fill over ids that
+        # are already in HBM.
+        # pyrefly: ignore[missing-attribute]
+        sharded_model.write(_build_write_kjt(hashed_ids, unhashed_ids, ctx.device))
+        torch.cuda.synchronize()
+        tbe.ssd_db.exclusive_hbm_wait()
+        stats = [int(v) for v in tbe.ssd_db.exclusive_hbm_stats()]
+        in_hbm = stats[0]
+        dram_rows = _dram_rows(tbe)
+
+        pmts, id_splits, _, _ = tbe.split_embedding_weights(no_snapshot=True)
+        assert id_splits is not None
+        ids = id_splits[0].view(-1)
+        saved = pmts[0].wrapped.narrow(0, 0, ids.numel()) if ids.numel() else None
+
+        # The end-of-training publish walks the model like this.
+        walked_ssd_dbs = _modules_with_ssd_db(sharded_model)
+
+        tbe.reset_enrichment_cache()
+        in_hbm_after_reset = int(tbe.ssd_db.exclusive_hbm_stats()[0])
+        dram_rows_after_reset = _dram_rows(tbe)
+        reset_rows_read = _read_rows(sharded_model, read_kjt).float().cpu()
+
+        # Every row a rank owns now lives only in HBM: hits, no DRAM block.
+        torch.testing.assert_close(hbm_rows_read, expected, rtol=1e-2, atol=1e-2)
+        assert hits == queries, (hits, queries)
+        # Each rank looks up every id it owns once per input batch.
+        assert 0 < in_hbm <= queries or in_hbm == queries == 0, (in_hbm, queries)
+        assert dram_rows == 0, dram_rows
+        # No lookup read a row that lived only in HBM.
+        assert stats[7] == 0, stats
+        # Checkpoint reads include the HBM rows.
+        assert ids.numel() == in_hbm, (ids.numel(), in_hbm)
+        if saved is not None:
+            by_hashed = dict(zip(hashed_ids, unhashed_ids))
+            want = torch.stack(
+                [
+                    _expected_fake_row(by_hashed[int(i)], EMBEDDING_DIM)
+                    for i in ids.tolist()
+                ]
+            )
+            # Whole-row checkpoint rows start with the 16-byte MetaHeader.
+            first = 16 // saved.element_size() if tbe.backend_return_whole_row else 0
+            cols = min(EMBEDDING_DIM, saved.size(1) - first)
+            torch.testing.assert_close(
+                saved[:, first : first + cols].float(),
+                want[:, :cols],
+                rtol=1e-2,
+                atol=1e-2,
+            )
+        assert walked_ssd_dbs >= 1, walked_ssd_dbs
+        # A reset moves every row back to DRAM; reads are unchanged.
+        assert in_hbm_after_reset == 0, in_hbm_after_reset
+        assert dram_rows_after_reset == in_hbm, (dram_rows_after_reset, in_hbm)
+        torch.testing.assert_close(reset_rows_read, expected, rtol=1e-2, atol=1e-2)
+
+
 def _publish_round_trip(rows: torch.Tensor, group_size: int = 0) -> torch.Tensor:
     """What serving decodes after the INT4 publish of FP16 `rows`: rowwise with an
     fp16 scale and bias, or group-wise with e4m3 scales when group_size is set."""
@@ -1280,6 +1402,18 @@ class TestKvzchEnrichmentE2E(MultiProcessTestBase):
         self._require_enrichment_policy_fields(_OWNER_LOCAL_CACHE_POLICY_FIELDS)
         self._run_multi_process_test(
             callable=_run_owner_local_cache_row_write,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_owner_local_exclusive_cache_moves_rows_out_of_dram(self) -> None:
+        world_size = 2
+        self._require_test_runtime(world_size)
+        self._require_enrichment_policy_fields(
+            _OWNER_LOCAL_CACHE_EXCLUSIVE_POLICY_FIELDS
+        )
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_exclusive_round_trip,
             world_size=world_size,
             backend="nccl",
         )
