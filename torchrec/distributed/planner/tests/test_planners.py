@@ -765,6 +765,32 @@ class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
             "Hashes should be equal for identical planners",
         )
 
+    def test_uvm_cache_dimension_padding_changes_hash(self) -> None:
+        planner = EmbeddingShardingPlanner(
+            topology=self.topology,
+            batch_size=self.batch_size,
+            enumerator=self.enumerator,
+            storage_reservation=self.storage_reservation,
+            performance_model=self.perf_model,
+            constraints=self.constraints,
+        )
+
+        def hashes(padding_enabled: bool) -> tuple[int, str]:
+            with patch(
+                "torchrec.distributed.planner.planners._uvm_cache_dimension_padding_jk_enabled",
+                return_value=padding_enabled,
+            ):
+                return (
+                    planner.hash_planner_context_inputs(),
+                    planner.hash_planner_context_inputs_str(),
+                )
+
+        disabled_hash, disabled_hash_str = hashes(padding_enabled=False)
+        enabled_hash, enabled_hash_str = hashes(padding_enabled=True)
+        self.assertNotEqual(disabled_hash, enabled_hash)
+        self.assertNotEqual(disabled_hash_str, enabled_hash_str)
+        self.assertEqual((disabled_hash, disabled_hash_str), hashes(False))
+
     def test_hash_inequality(self) -> None:
         planner1 = EmbeddingShardingPlanner(
             topology=self.topology,
