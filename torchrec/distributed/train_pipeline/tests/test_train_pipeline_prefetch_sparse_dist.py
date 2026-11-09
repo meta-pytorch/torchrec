@@ -19,7 +19,7 @@ This module tests the prefetch pipeline API changes including:
 
 import unittest
 from typing import Any, Dict, Iterator, List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from hypothesis import given, settings, strategies as st
@@ -64,6 +64,91 @@ class PrefetchEmbeddingsUtilTest(unittest.TestCase):
         )
 
         stream_context.assert_not_called()
+
+
+class PrefetchPipelineStageHooksTestBase(unittest.TestCase):
+    """Check stage hooks without sharded embeddings or a GPU."""
+
+    def _create_pipeline(self) -> PrefetchTrainPipelineSparseDist:
+        model = nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        # Citrine C2: use multi-tensor optimizer execution.
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+
+        def forward(batch: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+            assert batch is not None
+            output = model(batch)
+            return output.flatten(), output
+
+        return PrefetchTrainPipelineSparseDist(
+            model, optimizer, torch.device("cpu"), custom_model_fwd=forward
+        )
+
+    def _check_progress(
+        self, pipeline: PrefetchTrainPipelineSparseDist, training: bool
+    ) -> None:
+        """Check outputs, gradients, queue draining, and iterator exhaustion."""
+        pipeline._model.train(training)
+        batches = [torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 4.0]])]
+        pipeline.batches.extend(batches)
+        pipeline.contexts.extend(
+            PrefetchTrainPipelineContext(index=index) for index in range(2)
+        )
+        dataloader: Iterator[torch.Tensor] = iter([])
+        expected_weight = torch.ones(1, 2)
+
+        for batch in batches:
+            expected_output = batch @ expected_weight.t()
+            output = pipeline.progress(dataloader)
+            torch.testing.assert_close(output, expected_output)
+            if training:
+                expected_weight -= 0.1 * batch
+                torch.testing.assert_close(pipeline._model.weight.grad, batch)
+            else:
+                self.assertIsNone(pipeline._model.weight.grad)
+            torch.testing.assert_close(pipeline._model.weight, expected_weight)
+
+        self.assertEqual(len(pipeline.batches), 0)
+        self.assertEqual(len(pipeline.contexts), 0)
+        with self.assertRaises(StopIteration):
+            pipeline.progress(dataloader)
+
+
+class PrefetchPipelineWaitHooksTest(PrefetchPipelineStageHooksTestBase):
+    """Check wait-hook calls and prefetch-stream ordering."""
+
+    @parameterized.expand([("train", True), ("eval", False)])
+    def test_progress_calls_wait_hook(self, _name: str, training: bool) -> None:
+        pipeline = self._create_pipeline()
+        with patch.object(
+            pipeline, "_wait_for_batch", wraps=pipeline._wait_for_batch
+        ) as wait:
+            self._check_progress(pipeline, training)
+        self.assertEqual(wait.call_count, 2)
+
+    def test_wait_uses_prefetch_stream_without_device_synchronization(self) -> None:
+        pipeline = self._create_pipeline()
+        batch = MagicMock(spec=torch.Tensor)
+        prefetch_stream = MagicMock(spec=torch.Stream)
+        data_dist_stream = MagicMock(spec=torch.Stream)
+        current_stream = MagicMock(spec=torch.Stream)
+        pipeline.batches.append(batch)
+
+        with (
+            patch.object(pipeline, "_prefetch_stream", prefetch_stream),
+            patch.object(pipeline, "_data_dist_stream", data_dist_stream),
+            patch("torch.get_device_module") as device_module,
+            patch("torch.cuda.synchronize") as synchronize,
+        ):
+            device_module.return_value.current_stream.return_value = current_stream
+            pipeline._wait_for_batch()
+
+        current_stream.wait_stream.assert_called_once_with(prefetch_stream)
+        batch.record_stream.assert_called_once_with(current_stream)
+        prefetch_stream.synchronize.assert_not_called()
+        current_stream.synchronize.assert_not_called()
+        synchronize.assert_not_called()
 
 
 class PrefetchTrainPipelineTestBase(TrainPipelineSparseDistTestBase):
