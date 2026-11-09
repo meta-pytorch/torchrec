@@ -59,6 +59,8 @@ from torchrec.metrics.cpu_offloaded_metric_worker import (
     Reply,
     ReplyMessage,
     require_handlers,
+    TraceUploader,
+    WindowStat,
     worker_main,
     WorkerArgs,
     WorkerFactory,
@@ -398,6 +400,24 @@ class _RingWriter:
         compute_stream.wait_event(self._packed)
 
 
+class _TrainerHealth:
+    """Trainer-side samples reported, then reset, with each worker heartbeat."""
+
+    def __init__(self) -> None:
+        self.update_ms = WindowStat("trainer_update_ms")
+        self.ring_in_flight = WindowStat("ring_in_flight")
+        self.ring_backlog = WindowStat("ring_backlog")
+        self.ring_full_wait_ms = WindowStat("ring_full_wait_ms")
+        self.compute_latency_ms = WindowStat("compute_latency_ms")
+
+    def pop_report(self) -> dict[str, float]:
+        return {
+            key: value
+            for stat in vars(self).values()
+            for key, value in stat.pop_report().items()
+        }
+
+
 class _WorkerFuture(concurrent.futures.Future):
     """Future resolved by the listener thread. Waiting from the listener thread
     itself (e.g. a `subscribe()` callback that calls `state_dict()`) pumps
@@ -436,8 +456,14 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
         non_metric_model_out_keys: keys dropped before transfer unless a
             configured metric consumes them.
         cpu_process_group: group whose rank/world size the worker group mirrors.
+        profile_window: (start_update, num_updates) to CPU-profile the worker.
+            When None, the worker profiles exactly the updates issued while
+            the trainer's profiler is enabled.
+        trace_uploader: "module:function" taking (local_trace_path, rank), run
+            in the worker after profiling.
         worker_launcher: returns the (target, args) the worker process runs;
             defaults to `worker_main(worker_args)`.
+        health_interval_sec: seconds between worker health heartbeats.
     """
 
     def __init__(
@@ -449,8 +475,11 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
         slot_bytes: int = 64 * 1024,
         non_metric_model_out_keys: Collection[str] | None = None,
         cpu_process_group: Optional[dist.ProcessGroup] = None,
+        profile_window: Optional[tuple[int, int]] = None,
+        trace_uploader: Optional[TraceUploader] = None,
         worker_launcher: Optional[WorkerLauncher] = None,
         ring_bytes_budget: int = 64 * 1024 * 1024,
+        health_interval_sec: float = 60.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -482,7 +511,10 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
         self._pending: dict[int, concurrent.futures.Future[Any]] = {}
         self._request_ids: itertools.count[int] = itertools.count()
         self._worker_ready = threading.Event()
+        self._follow_trainer_profiler: bool = profile_window is None
+        self._worker_profiling = False
         self._kwargs_sent: Optional[dict[str, Any]] = None
+        self._health = _TrainerHealth()
         self._control_lock = threading.Lock()
         self._rank: int = 0
         self._state_initialized = False
@@ -508,6 +540,9 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
             worker_factory=worker_factory,
             rendezvous=rendezvous,
             num_threads=torch.get_num_threads(),
+            profile_window=profile_window,
+            trace_uploader=trace_uploader,
+            health_interval_sec=health_interval_sec,
         )
         target, target_args = (worker_launcher or _launch_worker_main)(worker_args)
         self._process: multiprocessing.process.BaseProcess = ctx.Process(
@@ -527,6 +562,8 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
             Reply.FATAL: self._on_fatal,
             Reply.RESULT: self._on_response,
             Reply.ERROR: self._on_response,
+            Reply.HEALTH: self._on_health,
+            Reply.TRACE: self._on_trace,
         }
         require_handlers(self._reply_handlers, Reply)
         self._listener = threading.Thread(
@@ -579,6 +616,18 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
 
     def _on_fatal(self, message: ReplyMessage) -> None:
         self._fail(RecMetricException(f"metric worker crashed:\n{message.payload}"))
+
+    def _on_health(self, message: ReplyMessage) -> None:
+        health = {
+            "trainer_seq": self._seq,
+            **message.payload,
+            **self._health.pop_report(),
+        }
+        logger.info(f"metric worker health: {health}")
+        self._log_event("health", health)
+
+    def _on_trace(self, message: ReplyMessage) -> None:
+        logger.info(f"ZORM worker trace (rank {self._rank}): {message.payload}")
 
     def _on_response(self, message: ReplyMessage) -> None:
         future = self._pending.pop(message.req_id, None)
@@ -640,10 +689,20 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
     def _request(self, kind: Control, *payload: Any) -> Any:
         return self._send(kind, *payload).result(timeout=_WORKER_REQUEST_TIMEOUT_SEC)
 
+    def _sync_worker_profiler(self) -> None:
+        """Starts or stops the worker's profiler at this update when the trainer's
+        profiler turns on or off."""
+        profiling = _profiler_enabled()
+        if self._follow_trainer_profiler and profiling != self._worker_profiling:
+            self._worker_profiling = profiling
+            self._send_control(Control.PROFILE, profiling)
+
     @override
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
-        with _annotate("## ZORM-MP:update ##"), torch.no_grad():
+        with _annotate(f"## ZORM-MP:update seq {self._seq} ##"), torch.no_grad():
+            start = time.monotonic()
             self._raise_if_failed()
+            self._sync_worker_profiler()
             if self._seq == 0:
                 self._warn_if_restarted_without_state()
             self._writer.release_retired()
@@ -674,6 +733,12 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
                 )
             self._wait_for_slot()
             self._writer.write(self._seq, layout, [t for _, t in items], timestamp)
+            # Consumed first: it never passes published, so the backlog is never negative.
+            consumed = self._writer.consumed()
+            published = self._writer.published()
+            self._health.update_ms.add_elapsed(start)
+            self._health.ring_in_flight.add(self._seq + 1 - published)
+            self._health.ring_backlog.add(published - consumed)
             self._seq += 1
             self.trained_batches += 1
 
@@ -722,6 +787,7 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
                         f"ZORM worker ring full at update {self._seq} "
                         f"(worker_ready={self._worker_ready.is_set()})"
                     )
+            self._health.ring_full_wait_ms.add_elapsed(start)
 
     @override
     def async_compute(self, *, _throughput_only: bool = False) -> DeferrableMetrics:
@@ -733,14 +799,24 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
                 future: concurrent.futures.Future[Any] = concurrent.futures.Future()
                 future.set_exception(RecMetricException("metric worker is shut down."))
                 return DeferrableMetrics(future)
+            sent = time.monotonic()
             future = self._send(Control.COMPUTE, _throughput_only)
             deferrable = DeferrableMetrics(future)
             if not _throughput_only:
+                future.add_done_callback(
+                    lambda done: self._record_compute_latency(done, sent)
+                )
                 self.compute_count += 1
                 state_values = self._state_metric_values()
                 if state_values:
                     deferrable.update(state_values)
             return deferrable
+
+    def _record_compute_latency(
+        self, future: concurrent.futures.Future[Any], sent: float
+    ) -> None:
+        if not future.cancelled() and future.exception() is None:
+            self._health.compute_latency_ms.add_elapsed(sent)
 
     def _state_metric_values(self) -> Dict[str, Any]:
         return {
