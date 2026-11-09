@@ -739,13 +739,15 @@ class TestECBucketMetadata(unittest.TestCase):
             return_value=my_rank,
         ):
             if expect_failure:
-                with self.assertRaises(AssertionError):
+                with self.assertRaisesRegex(
+                    AssertionError, "must be divisible by num_buckets"
+                ):
                     zch_kv_emb = ZeroCollisionKeyValueEmbedding(
-                        table_group, None, torch.device("cpu")
+                        table_group, None, torch.device("cuda")
                     )
             else:
                 zch_kv_emb = ZeroCollisionKeyValueEmbedding(
-                    table_group, None, torch.device("cpu")
+                    table_group, None, torch.device("cuda")
                 )
                 expected_tuple = [
                     (
