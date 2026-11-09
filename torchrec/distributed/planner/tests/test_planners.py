@@ -1596,6 +1596,25 @@ class TestExtractPlan(unittest.TestCase):
             self.assertEqual(result_so.feature_names, expected_so.feature_names)
             self.assertEqual(result_so.cache_params, expected_so.cache_params)
 
+    def test_extract_plan_preserves_enumerated_stash_and_num_poolings(self) -> None:
+        """Fields taken from the enumerated option survive the merge with a loaded plan."""
+        # pyrefly: ignore[missing-attribute]
+        enumerated_plan = self.planner._enumerator.last_stored_search_space
+        best_plan = none_throws(self.planner._best_plan)
+        loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
+        for so in enumerated_plan:
+            so.stash_weights = True
+            so.num_poolings = [2.0] * len(so.input_lengths)
+
+        result = extract_plan(enumerated_plan, loaded_sharding_options)
+
+        self.assertEqual(len(result), len(best_plan))
+        for result_so in result:
+            self.assertTrue(result_so.stash_weights)
+            self.assertEqual(
+                result_so.num_poolings, [2.0] * len(result_so.input_lengths)
+            )
+
     def test_extract_plan_duplicate_storage_hash_error(self) -> None:
         """Test extract_plan failure when duplicate storage hashes exist."""
         # Create search space with duplicate storage hashes by modifying sharding options

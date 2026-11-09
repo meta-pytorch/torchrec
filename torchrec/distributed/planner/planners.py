@@ -494,6 +494,8 @@ def extract_plan(
                     feature_names=so.feature_names,
                     output_dtype=so.output_dtype,
                     key_value_params=so.key_value_params,
+                    num_poolings=so.num_poolings,
+                    stash_weights=so.stash_weights,
                     num_twrw_groups=so.num_twrw_groups,
                 )
             )
