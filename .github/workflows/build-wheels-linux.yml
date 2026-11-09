@@ -16,13 +16,38 @@ on:
     tags:
       # Release candidate tags look like: v1.11.0-rc1
       - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
+  schedule:
+    # 11:30 UTC, the time pytorch/test-infra's trigger_nightly.yml used to cut
+    # our nightly branch for us. Builds main.
+    - cron: 30 11 * * *
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload the wheels to the nightly index, built from the selected branch
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
+  # The nightly is built straight from the tip of main: the `nightly` branch is no
+  # longer cut, because a push to it needs to get past the Meta CLA ruleset. Upload
+  # is allowed by `trigger-event: schedule`, not by the branch name.
+  source-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record the commit this build is made from
+        env:
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          {
+            echo "### Source commit"
+            echo "[\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "ref \`${GITHUB_REF_NAME}\`, event \`${GITHUB_EVENT_NAME}\`, publish \`${PUBLISH}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   generate-matrix:
     uses: pytorch/test-infra/.github/workflows/generate_binary_build_matrix.yml@main
     with:
@@ -59,7 +84,9 @@ jobs:
     uses: pytorch/test-infra/.github/workflows/build_wheels_linux.yml@main
     with:
       repository: meta-pytorch/torchrec
-      ref: ""
+      # Build the commit of this run (main on the schedule). The reusable workflow's
+      # `ref` defaults to the nightly branch, which is no longer cut.
+      ref: ${{ github.sha }}
       test-infra-repository: pytorch/test-infra
       test-infra-ref: main
       build-matrix: ${{ needs.filter-matrix.outputs.matrix }}
@@ -67,4 +94,7 @@ jobs:
       post-script: .github/scripts/install_libs.sh
       package-name: torchrec
       smoke-test-script: ""
-      trigger-event: ${{ github.event_name }}
+      # The reusable workflow uploads only for `schedule`, so a manual run that asks to
+      # publish is reported to it as one.
+      trigger-event:
+        ${{ (github.event_name == 'workflow_dispatch' && inputs.publish) && 'schedule' || github.event_name }}
