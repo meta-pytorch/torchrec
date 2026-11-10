@@ -20,7 +20,16 @@ from torchrec.distributed.fused_params import (
     is_fused_param_device_ro,
     tbe_fused_params,
 )
+from torchrec.modules.embedding_configs import DataType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+
+class QuantizeWeightTest(unittest.TestCase):
+    def test_unsupported_dtype_error_names_the_dtype(self) -> None:
+        state_dict = {"weight": torch.zeros(4, 8, dtype=torch.bfloat16)}
+
+        with self.assertRaisesRegex(Exception, r"Unsupported dtype: torch\.bfloat16"):
+            qek._quantize_weight(state_dict, DataType.INT8)
 
 
 class QuantBatchedEmbeddingBagDeviceRoTest(unittest.TestCase):

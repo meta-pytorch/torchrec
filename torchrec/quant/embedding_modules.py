@@ -277,7 +277,7 @@ def quantize_state_dict(
                         )
                     )
             else:
-                raise Exception("Unsupported dtype: {tensor.dtype}")
+                raise Exception(f"Unsupported dtype: {tensor.dtype}")
             if (
                 data_type == DataType.INT8
                 or data_type == DataType.INT4
