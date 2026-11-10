@@ -111,7 +111,7 @@ def _quantize_weight(
                 )
             )
         else:
-            raise Exception("Unsupported dtype: {weight.dtype}")
+            raise Exception(f"Unsupported dtype: {weight.dtype}")
 
         # weight and 4 byte scale shift (2xfp16)
         quant_weight = quantized_weights[:, :-4]
