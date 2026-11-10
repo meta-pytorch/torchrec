@@ -517,8 +517,8 @@ class TestMCH(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 2,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     @given(hash_size=st.sampled_from([0, 80]), keep_original_indices=st.booleans())
     @settings(max_examples=6, deadline=None)
@@ -595,8 +595,8 @@ class TestMCH(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 2,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     @given(hash_size=st.sampled_from([0, 80]))
     @settings(max_examples=5, deadline=None)
@@ -708,8 +708,8 @@ class TestMCH(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 2,
-        "Not enough GPUs, this test requires at least one GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     @given(hash_size=st.sampled_from([0, 80]))
     @settings(max_examples=5, deadline=None)
@@ -1260,7 +1260,7 @@ class TestMCH(unittest.TestCase):
     # Skipping this test because it is flaky on CI. TODO: T240185573 T240185565 investigate the flakiness and re-enable the test.
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_zch_hash_disable_fallback_disabled_in_oss_compatibility(self) -> None:
         m = HashZchManagedCollisionModule(
@@ -1381,7 +1381,7 @@ class TestMCH(unittest.TestCase):
 
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_zch_hash_zero_rows(self) -> None:
         # When disabling fallback, for missed ids we should return zero rows in output embeddings.
