@@ -1677,9 +1677,10 @@ class ShardedEmbeddingBagCollection(
             if sharding_type == ShardingType.DATA_PARALLEL.value:
                 pg = self._env.process_group
                 with torch.no_grad():
+                    src = dist.get_global_rank(pg, 0) if pg is not None else 0
                     #  `Union[Module, Tensor]`.
                     # pyrefly: ignore [bad-argument-type]
-                    dist.broadcast(param.data, src=0, group=pg)
+                    dist.broadcast(param.data, src=src, group=pg)
 
     def _create_input_dist(
         self,
