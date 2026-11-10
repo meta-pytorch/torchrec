@@ -170,6 +170,41 @@ class TwRwFeatureDistLayout:
     rank_order_indices: tuple[int, ...]
     features_per_rank: tuple[int, ...]
 
+    @classmethod
+    def from_feature_shards(
+        cls,
+        hash_sizes: tuple[int, ...],
+        shard_counts: tuple[int, ...],
+        feature_shards: list[tuple[int, int]],
+        features_per_rank: tuple[int, ...],
+    ) -> "TwRwFeatureDistLayout":
+        """Build a layout from `(feature, shard)` entries listed in destination-rank order.
+
+        Raises ValueError unless the entries name every shard of every feature exactly once.
+        """
+        expected = [
+            (feature, shard)
+            for feature, shard_count in enumerate(shard_counts)
+            for shard in range(shard_count)
+        ]
+        got = sorted(feature_shards)
+        if got != expected:
+            mismatch = next(
+                pair
+                for pair in itertools.zip_longest(got, expected)
+                if pair[0] != pair[1]
+            )
+            raise ValueError(
+                "feature_shards must list each (feature, shard) exactly once; "
+                f"first mismatch (got, expected): {mismatch}"
+            )
+        return cls(
+            hash_sizes=hash_sizes,
+            shard_counts=shard_counts,
+            rank_order_indices=_rank_order_indices(shard_counts, feature_shards),
+            features_per_rank=features_per_rank,
+        )
+
 
 @dataclass(frozen=True)
 class TwRwEmbeddingDistLayout:
@@ -234,18 +269,18 @@ def _rank_order_indices(
 def _uniform_feature_dist_layout(
     hash_sizes: List[int], features_per_rank: List[int], local_size: int
 ) -> TwRwFeatureDistLayout:
-    """Build the legacy uniform layout used by GRID's input distribution."""
+    """Build the uniform layout: shard `s` of every feature goes to the s-th rank of its group."""
     features_per_group = features_per_rank[::local_size]
     group_offsets = [0] + list(itertools.accumulate(features_per_group))
-    return TwRwFeatureDistLayout(
+    return TwRwFeatureDistLayout.from_feature_shards(
         hash_sizes=tuple(hash_sizes),
         shard_counts=(local_size,) * len(hash_sizes),
-        rank_order_indices=tuple(
-            shard * len(hash_sizes) + feature
+        feature_shards=[
+            (feature, shard)
             for group in range(len(features_per_group))
             for shard in range(local_size)
             for feature in range(group_offsets[group], group_offsets[group + 1])
-        ),
+        ],
         features_per_rank=tuple(features_per_rank),
     )
 
@@ -314,10 +349,10 @@ def _build_twrw_dist_layouts(
 
     shard_counts_tuple = tuple(shard_counts)
     return (
-        TwRwFeatureDistLayout(
+        TwRwFeatureDistLayout.from_feature_shards(
             hash_sizes=tuple(hash_sizes),
             shard_counts=shard_counts_tuple,
-            rank_order_indices=_rank_order_indices(shard_counts_tuple, feature_shards),
+            feature_shards=feature_shards,
             features_per_rank=tuple(features_per_rank),
         ),
         TwRwEmbeddingDistLayout(
@@ -647,9 +682,9 @@ class TwRwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
     Args:
         pg (dist.ProcessGroup): ProcessGroup for AlltoAll communication.
         local_size (int): number of ranks in each TWRW group.
-        features_per_rank (Optional[List[int]]): legacy GRID feature splits,
+        features_per_rank (Optional[List[int]]): uniform-layout feature splits,
             required only when `layout` is not provided.
-        feature_hash_sizes (Optional[List[int]]): legacy GRID hash sizes,
+        feature_hash_sizes (Optional[List[int]]): uniform-layout hash sizes,
             required only when `layout` is not provided.
         device (Optional[torch.device]): device on which buffers will be allocated.
         has_feature_processor (bool): existence of a feature processor (ie. position
@@ -657,7 +692,7 @@ class TwRwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         need_pos (bool): whether to bucketize positions, used in place of
             `has_feature_processor` once the features carry weights.
         layout (Optional[TwRwFeatureDistLayout]): hash sizes, shard counts, and
-            AlltoAll ordering. None builds GRID's legacy uniform layout.
+            AlltoAll ordering. None builds the uniform layout.
 
     Example::
 
