@@ -33,7 +33,7 @@
     <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=36fba2ff" />
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
-    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=6a604523" />
   
   <!-- Pre-loaded scripts that we'll load fully later -->
   <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
@@ -45,7 +45,7 @@
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=f281be69"></script>
-    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script data-sd-tabs-storage-prefix="sphinx-design-tab-id-" src="_static/design-tabs.js?v=fcb327ea"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'setup-torchrec';</script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
@@ -702,8 +702,8 @@ Therefore, specific versions of TorchRec and FBGEMM should correspond to a speci
 <p>Below we show installations for CUDA 12.1 as an example. For CPU, CUDA 11.8, or CUDA 12.4, swap <code class="docutils literal notranslate"><span class="pre">cu121</span></code> for <code class="docutils literal notranslate"><span class="pre">cpu</span></code>, <code class="docutils literal notranslate"><span class="pre">cu118</span></code>, or <code class="docutils literal notranslate"><span class="pre">cu124</span></code> respectively.</p>
 <div class="sd-tab-set docutils">
 <input checked="checked" id="sd-tab-item-0" name="sd-tab-set-0" type="radio">
-<label class="sd-tab-label" for="sd-tab-item-0">
-<strong>Stable via pytorch.org</strong></label><div class="sd-tab-content docutils">
+<label aria-controls="sd-tab-item-0-content" class="sd-tab-label" for="sd-tab-item-0">
+<strong>Stable via pytorch.org</strong></label><div class="sd-tab-content docutils" id="sd-tab-item-0-content">
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>torch<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu121
 pip<span class="w"> </span>install<span class="w"> </span>fbgemm-gpu<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu121
 pip<span class="w"> </span>install<span class="w"> </span><span class="nv">torchmetrics</span><span class="o">==</span><span class="m">1</span>.0.3
@@ -712,8 +712,8 @@ pip<span class="w"> </span>install<span class="w"> </span>torchrec<span class="w
 </div>
 </div>
 <input id="sd-tab-item-1" name="sd-tab-set-0" type="radio">
-<label class="sd-tab-label" for="sd-tab-item-1">
-<strong>Stable via PyPI (Only for CUDA 12.4)</strong></label><div class="sd-tab-content docutils">
+<label aria-controls="sd-tab-item-1-content" class="sd-tab-label" for="sd-tab-item-1">
+<strong>Stable via PyPI (Only for CUDA 12.4)</strong></label><div class="sd-tab-content docutils" id="sd-tab-item-1-content">
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>torch
 pip<span class="w"> </span>install<span class="w"> </span>fbgemm-gpu
 pip<span class="w"> </span>install<span class="w"> </span>torchrec
@@ -721,8 +721,8 @@ pip<span class="w"> </span>install<span class="w"> </span>torchrec
 </div>
 </div>
 <input id="sd-tab-item-2" name="sd-tab-set-0" type="radio">
-<label class="sd-tab-label" for="sd-tab-item-2">
-<strong>Nightly</strong></label><div class="sd-tab-content docutils">
+<label aria-controls="sd-tab-item-2-content" class="sd-tab-label" for="sd-tab-item-2">
+<strong>Nightly</strong></label><div class="sd-tab-content docutils" id="sd-tab-item-2-content">
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>torch<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/nightly/cu121
 pip<span class="w"> </span>install<span class="w"> </span>fbgemm-gpu<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/nightly/cu121
 pip<span class="w"> </span>install<span class="w"> </span><span class="nv">torchmetrics</span><span class="o">==</span><span class="m">1</span>.0.3
@@ -731,8 +731,8 @@ pip<span class="w"> </span>install<span class="w"> </span>torchrec<span class="w
 </div>
 </div>
 <input id="sd-tab-item-3" name="sd-tab-set-0" type="radio">
-<label class="sd-tab-label" for="sd-tab-item-3">
-<strong>Building From Source</strong></label><div class="sd-tab-content docutils">
+<label aria-controls="sd-tab-item-3-content" class="sd-tab-label" for="sd-tab-item-3">
+<strong>Building From Source</strong></label><div class="sd-tab-content docutils" id="sd-tab-item-3-content">
 <p>You also have the ability to build TorchRec from source to develop with the latest
 changes in TorchRec. To build from source, check out this <a class="reference external" href="https://github.com/pytorch/torchrec?tab=readme-ov-file#from-source">reference</a>.</p>
 </div>
