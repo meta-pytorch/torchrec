@@ -8,15 +8,62 @@
 # pyre-strict
 
 import unittest
-from unittest.mock import Mock
+from copy import deepcopy
+from unittest.mock import Mock, patch
 
 import torch
-from torchrec.optim.keyed import KeyedOptimizer
+from torchrec.optim.keyed import KeyedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.semi_sync import SemisyncOptimizer
 
 
 class TestSemisyncOptimizer(unittest.TestCase):
     """Test cases for SemisyncOptimizer."""
+
+    def test_rejects_checkpoint_metadata(self) -> None:
+        for child in (self.mock_local_optimizer, self.mock_global_optimizer):
+            with patch.object(
+                child,
+                "get_checkpoint_metadata",
+                return_value={"layout": torch.tensor(1)},
+            ):
+                with self.assertRaisesRegex(ValueError, "checkpoint metadata"):
+                    SemisyncOptimizer(
+                        self.global_params,
+                        self.mock_local_optimizer,
+                        self.mock_global_optimizer,
+                    )
+
+    def test_legacy_local_checkpoint_resume(self) -> None:
+        def make(value: torch.Tensor) -> tuple[torch.Tensor, SemisyncOptimizer]:
+            p = torch.nn.Parameter(value.clone())
+            local = KeyedOptimizerWrapper(
+                {"weight": p}, lambda ps: torch.optim.SGD(ps, lr=0.03, momentum=0.9)
+            )
+            global_opt = KeyedOptimizerWrapper(
+                {"weight": p}, lambda ps: torch.optim.SGD(ps, lr=0.1, momentum=0.8)
+            )
+            local.init_state()
+            global_opt.init_state()
+            return p, SemisyncOptimizer([p], local, global_opt, num_local_steps=16)
+
+        p, source = make(torch.tensor([1.0, -2.0]))
+        for step in range(4):
+            p.grad = torch.tensor([0.2 * (step + 1), -0.3])
+            source.step()
+        saved = deepcopy(source.state_dict())
+        self.assertEqual(set(saved), {"state"})
+        q, target = make(p.detach())
+        target.load_state_dict(saved)
+        torch.testing.assert_close(target.state_dict(), saved, rtol=0, atol=0)
+        for step in range(4, 9):
+            p.grad = torch.tensor([0.2 * (step + 1), -0.3])
+            q.grad = p.grad.clone()
+            source.step()
+            target.step()
+            torch.testing.assert_close(q, p, rtol=0, atol=0)
+            torch.testing.assert_close(
+                target.state_dict(), source.state_dict(), rtol=0, atol=0
+            )
 
     def setUp(self) -> None:
         """Set up test fixtures."""
@@ -29,6 +76,7 @@ class TestSemisyncOptimizer(unittest.TestCase):
 
         # Create mock local optimizer
         self.mock_local_optimizer = Mock(spec=KeyedOptimizer)
+        self.mock_local_optimizer.get_checkpoint_metadata.return_value = {}
         self.mock_local_optimizer.params = {
             "dense": self.dense_param,
             "dense2": self.dense_param2,
@@ -40,6 +88,7 @@ class TestSemisyncOptimizer(unittest.TestCase):
 
         # Create mock global optimizer
         self.mock_global_optimizer = Mock(spec=KeyedOptimizer)
+        self.mock_global_optimizer.get_checkpoint_metadata.return_value = {}
         self.mock_global_optimizer.params = {
             "dense": self.dense_param,
             "dense2": self.dense_param2,
@@ -333,11 +382,13 @@ class TestSemisyncOptimizerEdgeCases(unittest.TestCase):
     def test_empty_params_error(self) -> None:
         """Test SemisyncOptimizer with empty parameters raises IndexError."""
         mock_local = Mock(spec=KeyedOptimizer)
+        mock_local.get_checkpoint_metadata.return_value = {}
         mock_local.params = {}
         mock_local.param_groups = []
         mock_local.state = {}
 
         mock_global = Mock(spec=KeyedOptimizer)
+        mock_global.get_checkpoint_metadata.return_value = {}
         mock_global.params = {}
         mock_global.param_groups = []
         mock_global.state = {}
@@ -356,11 +407,13 @@ class TestSemisyncOptimizerEdgeCases(unittest.TestCase):
         """Test num_local_steps trigger behavior."""
         param = torch.nn.Parameter(torch.randn(3, 3))
         mock_local = Mock(spec=KeyedOptimizer)
+        mock_local.get_checkpoint_metadata.return_value = {}
         mock_local.params = {"param": param}
         mock_local.param_groups = [{"params": [param]}]
         mock_local.state = {}
 
         mock_global = Mock(spec=KeyedOptimizer)
+        mock_global.get_checkpoint_metadata.return_value = {}
         mock_global.params = {"param": param}
         mock_global.param_groups = [{"params": [param]}]
         mock_global.state = {}
@@ -387,11 +440,13 @@ class TestSemisyncOptimizerEdgeCases(unittest.TestCase):
         """Test step counter progression."""
         param = torch.nn.Parameter(torch.randn(2, 2))
         mock_local = Mock(spec=KeyedOptimizer)
+        mock_local.get_checkpoint_metadata.return_value = {}
         mock_local.params = {"param": param}
         mock_local.param_groups = [{"params": [param]}]
         mock_local.state = {}
 
         mock_global = Mock(spec=KeyedOptimizer)
+        mock_global.get_checkpoint_metadata.return_value = {}
         mock_global.params = {"param": param}
         mock_global.param_groups = [{"params": [param]}]
         mock_global.state = {}
@@ -417,11 +472,13 @@ class TestSemisyncOptimizerEdgeCases(unittest.TestCase):
         """Test step counter tensor properties."""
         param = torch.nn.Parameter(torch.randn(2, 2))
         mock_local = Mock(spec=KeyedOptimizer)
+        mock_local.get_checkpoint_metadata.return_value = {}
         mock_local.params = {"param": param}
         mock_local.param_groups = [{"params": [param]}]
         mock_local.state = {}
 
         mock_global = Mock(spec=KeyedOptimizer)
+        mock_global.get_checkpoint_metadata.return_value = {}
         mock_global.params = {"param": param}
         mock_global.param_groups = [{"params": [param]}]
         mock_global.state = {}

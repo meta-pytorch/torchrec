@@ -41,6 +41,8 @@ class SemisyncOptimizer(KeyedOptimizer):
     4. Periodically performs global aggregation steps using the logic of global optimizer
     5. Exposes combined state from both optimizers through KeyedOptimizer interface
 
+    Optimizers with nonempty checkpoint metadata are not supported.
+
     Args:
         global_params (ParamsT): Global parameters for SemisyncOptimizer
         optimizer (KeyedOptimizer): Local optimizer (typically Shampoo or Adam, wrapped in KeyedOptimizer)
@@ -61,6 +63,13 @@ class SemisyncOptimizer(KeyedOptimizer):
         offload_global_model: bool = False,
         non_blocking: bool = False,
     ) -> None:
+        if (
+            optimizer.get_checkpoint_metadata()
+            or global_optimizer.get_checkpoint_metadata()
+        ):
+            raise ValueError(
+                "SemisyncOptimizer does not support optimizer checkpoint metadata"
+            )
         # Store the optimizers
         self._optimizer: KeyedOptimizer = optimizer
         self._global_optimizer: KeyedOptimizer = global_optimizer
