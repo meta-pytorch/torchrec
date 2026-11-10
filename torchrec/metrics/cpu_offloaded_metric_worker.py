@@ -16,6 +16,7 @@ earlier update, which keeps the ordering of the in-process
 
 import collections
 import concurrent.futures
+import contextlib
 import ctypes
 import dataclasses
 import enum
@@ -33,6 +34,7 @@ from typing import Any, Callable, Mapping, NamedTuple, Optional, TypeVar
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 from torchrec.metrics.cpu_offloaded_metric_ipc import (
     load_counter,
     read_header,
@@ -44,6 +46,10 @@ from torchrec.metrics.cpu_offloaded_metric_ipc import (
     store_counter,
 )
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
+from torchrec.metrics.cpu_offloaded_metric_worker_profiler import (
+    TraceUploader,
+    WorkerProfiler,
+)
 from torchrec.metrics.metric_job_types import MetricUpdateJob, SynchronizationMarker
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import MetricsConfig
@@ -55,6 +61,9 @@ _PR_SET_PDEATHSIG: int = 1
 _RING_POLL_SEC: float = 0.005
 _INNER_POLL_SEC: float = 1.0
 _SHUTDOWN_BOUND_SEC: float = 30.0
+# Under the trainer's 30s join timeout, after which it terminates the worker.
+_TRACE_EXPORT_BOUND_SEC: float = 20.0
+_MS_PER_SEC: float = 1e3
 
 WorkerFactory = Callable[[Optional[dist.ProcessGroup]], RecMetricModule]
 
@@ -77,6 +86,9 @@ class WorkerArgs:
     worker_factory: WorkerFactory
     rendezvous: RendezvousInfo
     num_threads: int
+    profile_window: Optional[tuple[int, int]] = None
+    trace_uploader: Optional[TraceUploader] = None
+    health_interval_sec: float = 60.0
 
 
 # Returns the (target, args) the spawned worker process runs.
@@ -98,6 +110,7 @@ class Control(enum.Enum):
     LOAD_STATE_DICT = "load_state_dict"
     RESET = "reset"
     SHUTDOWN = "shutdown"
+    PROFILE = "profile"
 
 
 class Reply(enum.Enum):
@@ -108,6 +121,8 @@ class Reply(enum.Enum):
     ERROR = "error"
     FATAL = "fatal"
     COMPUTE_INTERVAL = "compute_interval"
+    HEALTH = "health"
+    TRACE = "trace"
 
 
 class ControlMessage(NamedTuple):
@@ -129,6 +144,38 @@ def require_handlers(handlers: Mapping[_Kind, object], kinds: type[_Kind]) -> No
     missing = [kind.name for kind in kinds if kind not in handlers]
     if missing:
         raise NotImplementedError(f"no handler for {kinds.__name__} {missing}")
+
+
+class WindowStat:
+    """Thread-safe count, mean and max of the samples added since the last report."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._lock = threading.Lock()
+        self._count = 0
+        self._total = 0.0
+        self._max = 0.0
+
+    def add(self, value: float) -> None:
+        with self._lock:
+            self._count += 1
+            self._total += value
+            self._max = max(self._max, value)
+
+    def add_elapsed(self, start: float) -> None:
+        """Adds the milliseconds since `start`, a `time.monotonic()` reading from
+        any process on this host."""
+        self.add((time.monotonic() - start) * _MS_PER_SEC)
+
+    def pop_report(self) -> dict[str, float]:
+        with self._lock:
+            count, total, peak = self._count, self._total, self._max
+            self._count, self._total, self._max = 0, 0.0, 0.0
+        return {
+            f"{self._name}_count": count,
+            f"{self._name}_mean": round(total / max(1, count), 3),
+            f"{self._name}_max": round(peak, 3),
+        }
 
 
 def build_oss_worker_module(
@@ -224,12 +271,21 @@ class _MetricWorker:
             concurrent.futures.Future[Any]
         ] = collections.deque()
         self._max_outstanding_computes: int = max(1, module.compute_queue.maxsize // 2)
+        self._next_health: float = time.monotonic() + args.health_interval_sec
+        self._consume_lag_ms = WindowStat("consume_lag_ms")
+        self._consume_ms = WindowStat("consume_ms")
         self._layouts: dict[int, SlotLayout] = {}
         self._compute_interval_sent: int = module.compute_interval_steps
         self._pending: collections.deque[ControlMessage] = collections.deque()
         self._send_lock = threading.Lock()
         self._next_seq = 0
         self._running = True
+        self._profiler = WorkerProfiler(
+            args.profile_window if args.rendezvous.rank == 0 else None,
+            args.rendezvous.rank,
+            args.trace_uploader,
+            on_uploaded=lambda url: self.reply(Reply.TRACE, payload=url),
+        )
         self._handlers: dict[Control, Callable[[ControlMessage], None]] = {
             Control.LAYOUT: self._on_layout,
             Control.DROP_LAYOUTS: self._on_drop_layouts,
@@ -240,6 +296,7 @@ class _MetricWorker:
             Control.LOAD_STATE_DICT: self._on_load_state_dict,
             Control.RESET: self._on_reset,
             Control.SHUTDOWN: self._on_shutdown,
+            Control.PROFILE: self._on_profile,
         }
         require_handlers(self._handlers, Control)
 
@@ -255,12 +312,16 @@ class _MetricWorker:
     def run(self) -> None:
         control = self._args.control_conn
         while self._running:
+            self._profiler.maybe_stop()
+            self._maybe_report_health()
             if self._step():
                 continue
             # A dead inner update thread would strand queued computes.
             self._check_inner_alive()
             if control.poll(_RING_POLL_SEC):
                 self._drain_control()
+        # The worker exits with os._exit, which would kill an in-flight trace export.
+        self._profiler.close(_TRACE_EXPORT_BOUND_SEC)
 
     def _step(self) -> bool:
         if self._pending and self._pending[0].seq <= self._next_seq:
@@ -274,6 +335,29 @@ class _MetricWorker:
             return True
         self._consume(self._next_seq % self._ring.num_slots)
         return True
+
+    def _maybe_report_health(self) -> None:
+        now = time.monotonic()
+        if now < self._next_health:
+            return
+        self._next_health = now + self._args.health_interval_sec
+        module = self._module
+        self.reply(
+            Reply.HEALTH,
+            payload={
+                "consumed": self._next_seq,
+                "updates_processed": module._total_updates_processed,
+                "update_queue": module.update_queue.qsize(),
+                "compute_queue": module.compute_queue.qsize(),
+                "outstanding_computes": sum(
+                    not f.done() for f in self._outstanding_computes
+                ),
+                "ring_slots": self._ring.num_slots,
+                "slot_bytes": self._ring.slot_bytes,
+                **self._consume_lag_ms.pop_report(),
+                **self._consume_ms.pop_report(),
+            },
+        )
 
     def _drain_control(self) -> None:
         conn = self._args.control_conn
@@ -289,12 +373,25 @@ class _MetricWorker:
             logger.warning("metric worker lost its trainer; shutting down")
             self._pending.append(ControlMessage(Control.SHUTDOWN, self._next_seq))
 
+    def _annotate(self, name: str) -> contextlib.AbstractContextManager[Any]:
+        return (
+            record_function(name) if self._profiler.active else contextlib.nullcontext()
+        )
+
     def _consume(self, slot: int) -> None:
+        self._profiler.on_seq(self._next_seq)
+        start = time.monotonic()
+        with self._annotate(f"## ZORM-MP:consume seq {self._next_seq} ##"):
+            self._consume_slot(slot)
+        self._consume_ms.add_elapsed(start)
+
+    def _consume_slot(self, slot: int) -> None:
         seq, layout_id, timestamp = read_header(self._ring.data[slot])
         if seq != self._next_seq:
             raise RuntimeError(
                 f"ring slot {slot} holds update {seq}, expected {self._next_seq}"
             )
+        self._consume_lag_ms.add_elapsed(timestamp)
         layout = self._layouts[layout_id]
         buffer = self._ring.data[slot, : layout.total_bytes].clone()
         store_counter(self._consumed, self._next_seq + 1)
@@ -391,9 +488,17 @@ class _MetricWorker:
         self._module._total_computes_enqueued += 1
         return future
 
-    def _on_compute(self, message: ControlMessage) -> None:
-        req_id, (throughput_only,) = message.req_id, message.payload
+    def _on_profile(self, message: ControlMessage) -> None:
+        if message.payload[0]:
+            self._profiler.start(message.seq)
+        else:
+            self._profiler.request_stop(message.seq)
 
+    def _on_compute(self, message: ControlMessage) -> None:
+        with self._annotate(f"## ZORM-MP:compute_request seq {message.seq} ##"):
+            self._enqueue_compute(message.req_id, message.payload[0])
+
+    def _enqueue_compute(self, req_id: int, throughput_only: bool) -> None:
         def _on_done(future: concurrent.futures.Future[Any]) -> None:
             try:
                 payload = future.result()
@@ -408,6 +513,7 @@ class _MetricWorker:
         future = self._enqueue_marker(throughput_only)
         if not throughput_only:
             self._outstanding_computes.append(future)
+            self._profiler.track_compute(future)
         future.add_done_callback(_on_done)
 
     def _report_compute_interval(self) -> None:

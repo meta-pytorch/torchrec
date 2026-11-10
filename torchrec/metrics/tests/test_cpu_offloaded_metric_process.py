@@ -5,8 +5,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import concurrent.futures
 import copy
 import dataclasses
+import glob
+import gzip
+import json
 import os
 import signal
 import tempfile
@@ -35,7 +39,9 @@ from torchrec.metrics.cpu_offloaded_metric_worker import (
     ControlMessage,
     oss_worker_factory,
     require_handlers,
+    WindowStat,
 )
+from torchrec.metrics.cpu_offloaded_metric_worker_profiler import WorkerProfiler
 from torchrec.metrics.metric_job_types import MetricUpdateJob
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import (
@@ -248,6 +254,10 @@ def _two_rank_trainer(rank: int, store_path: str) -> None:
     for module in restored:
         module.shutdown()
     dist.destroy_process_group()
+
+
+def _fake_trace_uploader(path: str, rank: int) -> str:
+    return f"trace-link://rank{rank}/{os.path.basename(path)}"
 
 
 def _process_gone(pid: int) -> bool:
@@ -582,6 +592,46 @@ class ProcessIsolatedCPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.assertGreater(len(resolved), 40)
             _assert_metrics_equal(self, actual.resolve(), resolved)
 
+    def test_worker_trace_follows_trainer_profiler_steps(self) -> None:
+        isolated = _process_module(_metrics_config())
+        for step in range(3):
+            isolated.update(_batch(step))
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            experimental_config=torch.profiler._ExperimentalConfig(
+                profile_all_threads=True
+            ),
+        ):
+            for step in range(3, 7):
+                isolated.update(_batch(step))
+            isolated.async_compute()
+        for step in range(7, 10):
+            isolated.update(_batch(step))
+        isolated.async_compute().resolve()
+        pattern = os.path.join(
+            tempfile.gettempdir(),
+            f"zorm_metric_worker_rank0_{isolated._process.pid}_*.pt.trace.json.gz",
+        )
+        for _ in range(200):
+            if glob.glob(pattern):
+                break
+            isolated.async_compute().resolve()
+        isolated.shutdown()
+        paths = glob.glob(pattern)
+        self.assertEqual(len(paths), 1)
+        with gzip.open(paths[0]) as f:
+            names = {e.get("name", "") for e in json.load(f)["traceEvents"]}
+        consumed = sorted(
+            int(n.split("seq ")[1].split(" ")[0])
+            for n in names
+            if n.startswith("## ZORM-MP:consume seq ")
+        )
+        # Starts at the trainer's first profiled step; may run past the window
+        # while the in-window compute finishes.
+        self.assertEqual(consumed[:4], [3, 4, 5, 6])
+        self.assertIn("## ZORM-MP:compute_request seq 7 ##", names)
+        self.assertTrue(any("CPUOffloadedRecMetricModule:compute" in n for n in names))
+
     def test_subscribe_callback_can_issue_control_requests(self) -> None:
         isolated = self._track(_process_module(_metrics_config()))
         isolated.update(_batch(0))
@@ -860,6 +910,57 @@ class ProcessIsolatedCPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertTrue(busy)
         self.assertLess(sum(busy.values()), 0.1, msg=f"worker threads: {busy}")
 
+    def test_health_heartbeat_logs_trainer_and_worker_counters(self) -> None:
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_process.EventLoggingHandler.log_event"
+        ) as log_event:
+            isolated = self._track(
+                _process_module(_metrics_config(), health_interval_sec=0.2)
+            )
+            for step in range(8):
+                isolated.update(_batch(step))
+            isolated.async_compute().resolve()
+            deadline = time.monotonic() + 60
+            health: list[dict[str, str]] = []
+            while not health and time.monotonic() < deadline:
+                time.sleep(0.1)
+                health = [
+                    call.kwargs["metadata"]
+                    for call in log_event.call_args_list
+                    if call.kwargs["event_name"].endswith(".health")
+                    and call.kwargs["metadata"]["trainer_update_ms_count"] != "0"
+                ]
+            isolated.shutdown()
+        self.assertTrue(health)
+        for key in (
+            "ring_in_flight_max",
+            "ring_backlog_max",
+            "ring_full_wait_ms_count",
+            "trainer_update_ms_mean",
+            "trainer_update_ms_max",
+            "compute_latency_ms_max",
+            "consume_lag_ms_max",
+            "consume_ms_max",
+            "ring_slots",
+            "update_queue",
+            "compute_queue",
+        ):
+            self.assertIn(key, health[0])
+        names = {call.kwargs["event_name"] for call in log_event.call_args_list}
+        self.assertIn("ProcessIsolatedCPUOffloadedRecMetricModule.ready", names)
+        self.assertIn("ProcessIsolatedCPUOffloadedRecMetricModule.shutdown", names)
+
+    def test_only_successful_computes_record_latency(self) -> None:
+        isolated = self._track(_process_module(_metrics_config()))
+        succeeded: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        failed: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        succeeded.set_result({})
+        failed.set_exception(RecMetricException("compute failed"))
+        for future in (succeeded, failed):
+            isolated._record_compute_latency(future, time.monotonic())
+        report = isolated._health.pop_report()
+        self.assertEqual(report["compute_latency_ms_count"], 1)
+
     def test_micro_batching_fails_closed(self) -> None:
         isolated = self._track(_process_module(_metrics_config()))
         isolated.set_under_micro_batching(False)
@@ -926,6 +1027,64 @@ class ProcessIsolatedCPUOffloadedRecMetricModuleTest(unittest.TestCase):
         with self.assertRaisesRegex(RecMetricException, "ring publisher failed"):
             isolated.update(_batch(0))
 
+    def test_worker_trace_link_logged_on_trainer(self) -> None:
+        isolated = self._track(
+            _process_module(
+                _metrics_config(),
+                trace_uploader=(
+                    "torchrec.metrics.tests.test_cpu_offloaded_metric_process:"
+                    "_fake_trace_uploader"
+                ),
+            )
+        )
+        with self.assertLogs(
+            "torchrec.metrics.cpu_offloaded_metric_process", level="INFO"
+        ) as logs:
+            isolated.update(_batch(0))
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                experimental_config=torch.profiler._ExperimentalConfig(
+                    profile_all_threads=True
+                ),
+            ):
+                for step in range(1, 4):
+                    isolated.update(_batch(step))
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline and not any(
+                "trace-link://rank0/" in line for line in logs.output
+            ):
+                isolated.update(_batch(0))
+                isolated.async_compute().resolve()
+                time.sleep(0.2)
+        links = [line for line in logs.output if "trace-link://rank0/" in line]
+        self.assertTrue(links)
+        uploaded = links[0].split("trace-link://rank0/")[1]
+        self.assertFalse(os.path.exists(os.path.join(tempfile.gettempdir(), uploaded)))
+
+
+class WindowStatTest(unittest.TestCase):
+    def test_pop_report_returns_count_mean_max_then_resets(self) -> None:
+        stat = WindowStat("update_ms")
+        for value in (1.0, 1.0, 1.0, 9.0):
+            stat.add(value)
+        self.assertEqual(
+            stat.pop_report(),
+            {"update_ms_count": 4, "update_ms_mean": 3.0, "update_ms_max": 9.0},
+        )
+        self.assertEqual(
+            stat.pop_report(),
+            {"update_ms_count": 0, "update_ms_mean": 0.0, "update_ms_max": 0.0},
+        )
+
+    def test_add_elapsed_records_milliseconds(self) -> None:
+        stat = WindowStat("wait_ms")
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_worker.time.monotonic",
+            return_value=12.5,
+        ):
+            stat.add_elapsed(10.0)
+        self.assertEqual(stat.pop_report()["wait_ms_max"], 2500.0)
+
 
 class MetricWorkerShutdownTest(unittest.TestCase):
     def _worker(
@@ -980,3 +1139,76 @@ class MetricWorkerControlTest(unittest.TestCase):
                 ControlMessage(Control.RING, 5, payload=(MagicMock(),))
             )
         reply.assert_not_called()
+
+
+class WorkerProfilerTest(unittest.TestCase):
+    @patch("torch.profiler.profile")
+    def test_on_seq_acts_only_at_fixed_window_bounds(self, profile: MagicMock) -> None:
+        following = WorkerProfiler(window=None, rank=0, uploader=None)
+        windowed = WorkerProfiler(window=(3, 2), rank=0, uploader=None)
+        for seq in range(3):
+            following.on_seq(seq)
+            windowed.on_seq(seq)
+        self.assertFalse(windowed.active)
+        windowed.on_seq(3)
+        self.assertTrue(windowed.active)
+        for seq in range(3, 8):
+            following.on_seq(seq)
+        self.assertFalse(following.active)
+        profile.assert_called_once()
+
+    @patch("torch.profiler.profile")
+    def test_failed_start_leaves_profiler_inactive(self, profile: MagicMock) -> None:
+        profiler = WorkerProfiler(window=None, rank=0, uploader=None)
+        profile.side_effect = TypeError("unsupported experimental_config")
+        profiler.start(1)
+        self.assertFalse(profiler.active)
+        profile.side_effect = None
+        profile.return_value.start.side_effect = RuntimeError("already enabled")
+        profiler.start(2)
+        self.assertFalse(profiler.active)
+
+    @patch.object(WorkerProfiler, "_export")
+    @patch("torch.profiler.profile")
+    def test_failed_stop_skips_export(
+        self, profile: MagicMock, export: MagicMock
+    ) -> None:
+        profile.return_value.stop.side_effect = RuntimeError("not running")
+        profiler = WorkerProfiler(window=None, rank=0, uploader=None)
+        profiler.start(1)
+        profiler.close(timeout=1.0)
+        self.assertFalse(profiler.active)
+        export.assert_not_called()
+
+    @patch.object(WorkerProfiler, "_export")
+    @patch("torch.profiler.profile")
+    def test_restart_during_pending_stop_starts_a_new_window(
+        self, profile: MagicMock, export: MagicMock
+    ) -> None:
+        first, second = MagicMock(), MagicMock()
+        profile.side_effect = [first, second]
+        profiler = WorkerProfiler(window=None, rank=0, uploader=None)
+        profiler.start(1)
+        profiler.track_compute(concurrent.futures.Future())
+        profiler.request_stop(2)
+        profiler.start(3)
+        first.stop.assert_called_once()
+        second.start.assert_called_once()
+        self.assertTrue(profiler.active)
+
+    def test_close_exports_an_active_window_before_returning(self) -> None:
+        uploaded: list[str] = []
+        profiler = WorkerProfiler(
+            window=None,
+            rank=0,
+            uploader=(
+                "torchrec.metrics.tests.test_cpu_offloaded_metric_process:"
+                "_fake_trace_uploader"
+            ),
+            on_uploaded=uploaded.append,
+        )
+        profiler.start(1)
+        profiler.track_compute(concurrent.futures.Future())
+        profiler.close(timeout=60.0)
+        self.assertFalse(profiler.active)
+        self.assertEqual(len(uploaded), 1)
