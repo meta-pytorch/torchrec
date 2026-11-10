@@ -80,6 +80,7 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
     EmbeddingPipelinedForward,
     InSyncPrefetchEmbeddingPipelinedForward,
     PipelinedForward,
+    PreserveForwardOrderPipelinedForward,
 )
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
@@ -1406,6 +1407,7 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
 
         dmp.assert_called_once()
         dmp.sync.assert_called_once()
+        dmp.enable_module_sync.assert_not_called()
 
     def test_sync_disabled_if_dmp_collection_is_not_used(self) -> None:
         dmp = MagicMock(spec=DistributedModelParallel)
@@ -1437,6 +1439,128 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
             pipeline.progress(data_iter)
 
         dmp.assert_called_once()
+
+    def test_module_sync_brackets_backward_without_global_sync(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        dmp.training = True
+        dmp.module_sync_uses_consumer_waits = True
+        dmp.return_value = (
+            torch.tensor(0.1, requires_grad=True),
+            torch.tensor(2),
+        )
+        pipeline = TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            dmp_collection_sync_interval_batches=10,
+            enable_dmp_collection_module_sync=True,
+        )
+        context = TrainPipelineContext(index=10)
+        mock_data = MagicMock(spec=Pipelineable)
+        for _ in range(3):
+            pipeline.batches.append(mock_data)
+            pipeline.contexts.append(context)
+
+        with self._mocked_pipeline(pipeline):
+            pipeline.progress(MagicMock())
+
+        dmp.enable_module_sync.assert_called_once_with(
+            preserve_forward_order=False,
+            consumer_waits=True,
+        )
+        dmp.begin_module_sync_step.assert_called_once_with(enabled=True)
+        dmp.finish_module_sync_step.assert_called_once_with()
+        dmp.wait_all_module_syncs.assert_not_called()
+        dmp.sync.assert_not_called()
+
+    def test_module_sync_preserve_forward_order_configuration(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        pipeline = TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            enable_dmp_collection_module_sync=True,
+            preserve_forward_order=True,
+        )
+
+        dmp.enable_module_sync.assert_called_once_with(
+            preserve_forward_order=True,
+            consumer_waits=True,
+        )
+        self.assertIs(
+            pipeline._pipelined_forward_type,
+            PreserveForwardOrderPipelinedForward,
+        )
+
+    def test_module_sync_can_disable_consumer_waits(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            enable_dmp_collection_module_sync=True,
+            enable_dmp_collection_consumer_waits=False,
+        )
+
+        dmp.enable_module_sync.assert_called_once_with(
+            preserve_forward_order=False,
+            consumer_waits=False,
+        )
+
+    def test_preserve_forward_order_requires_module_sync(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires module-granular sync"):
+            TrainPipelineSparseDist(
+                MagicMock(spec=DMPCollection),
+                MagicMock(spec=torch.optim.Optimizer),
+                device=torch.device("cpu"),
+                preserve_forward_order=True,
+            )
+
+    def test_preserve_forward_order_prioritizes_all_sparse_groups(self) -> None:
+        events: List[int] = []
+        outputs = []
+        for index in range(3):
+            forward = PreserveForwardOrderPipelinedForward.__new__(
+                PreserveForwardOrderPipelinedForward
+            )
+            forward._backward_sequence_nr = None
+            forward.set_backward_priority(3 - index)
+            output = torch.tensor(float(index + 1), requires_grad=True) * 2
+            forward._prioritize_backward(output)
+            output.register_hook(lambda grad, group=index: events.append(group) or grad)
+            outputs.append(output)
+
+        torch.stack(outputs).sum().backward()
+
+        self.assertEqual(events, [0, 1, 2])
+
+    def test_module_sync_flag_requires_dmp_collection(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a DMPCollection"):
+            TrainPipelineSparseDist(
+                MagicMock(spec=DistributedModelParallel),
+                MagicMock(spec=torch.optim.Optimizer),
+                device=torch.device("cpu"),
+                enable_dmp_collection_module_sync=True,
+            )
+
+    def test_module_sync_flag_requires_interval(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a sync interval"):
+            TrainPipelineSparseDist(
+                MagicMock(spec=DMPCollection),
+                MagicMock(spec=torch.optim.Optimizer),
+                device=torch.device("cpu"),
+                dmp_collection_sync_interval_batches=None,
+                enable_dmp_collection_module_sync=True,
+            )
+
+    def test_sync_interval_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "interval must be positive"):
+            TrainPipelineSparseDist(
+                MagicMock(spec=DMPCollection),
+                MagicMock(spec=torch.optim.Optimizer),
+                device=torch.device("cpu"),
+                dmp_collection_sync_interval_batches=0,
+            )
 
 
 class _NoConsumerWaitTrainPipelineSparseDist(TrainPipelineSparseDist):
