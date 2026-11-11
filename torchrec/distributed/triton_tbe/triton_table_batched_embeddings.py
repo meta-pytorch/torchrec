@@ -3263,6 +3263,12 @@ class TritonTBE(torch.autograd.Function):
         assert feature_weight_chunk_ids_tensor is not None
         assert feature_chunk_relative_table_offsets_tensor is not None
 
+        use_amd_contiguous_weights = (
+            is_amd()
+            and len(weight_ptrs) == 1
+            and weight.numel() == weight_ptrs[0].numel()
+        )
+
         # VBE support: use pre-computed metadata if available, otherwise compute
         vbe = batch_size_per_feature_per_rank is not None
         active_forward_block_limit = (
@@ -3438,6 +3444,7 @@ class TritonTBE(torch.autograd.Function):
 
         ctx.total_embedding_dim = total_embedding_dim
         ctx.num_weight_ptrs = len(weight_ptrs)
+        ctx.use_amd_contiguous_weights = use_amd_contiguous_weights
         ctx.weight_chunk_starts = weight_chunk_starts
         ctx.split_weight_row_starts = split_weight_row_starts
         ctx.total_hash_size_bits = total_hash_size_bits
@@ -3553,7 +3560,7 @@ class TritonTBE(torch.autograd.Function):
                     ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                     num_warps=num_warps,
                 )
-            elif is_amd():
+            elif use_amd_contiguous_weights:
                 _amd_fwd_weighted_kernel[(total_B,)](
                     output,
                     indices,
@@ -3769,7 +3776,7 @@ class TritonTBE(torch.autograd.Function):
                             num_warps=16,
                         )
                         feature_start = feature_end
-            elif is_amd():
+            elif use_amd_contiguous_weights:
                 _amd_fwd_unweighted_kernel[(B,)](
                     output,
                     indices,
@@ -4066,6 +4073,7 @@ class TritonTBE(torch.autograd.Function):
         weight_chunk_starts = ctx.weight_chunk_starts
         split_weight_row_starts = ctx.split_weight_row_starts
         enable_triton_tbe_optimizations = ctx.enable_triton_tbe_optimizations
+        _use_amd = ctx.use_amd_contiguous_weights
 
         stochastic_rounding = ctx.stochastic_rounding
         vbe = ctx.vbe
@@ -4245,7 +4253,7 @@ class TritonTBE(torch.autograd.Function):
         # CLC is an additive Blackwell feature and is deliberately decoupled
         # from grid sizing, so a target without it still gets the same grid
         # rather than being silently penalised for lacking the add-on.
-        use_clc = has_tlx and cfg.allow_clc
+        use_clc = has_tlx and not is_amd() and cfg.allow_clc
 
         # Common setup for 2-tier dispatch (both weighted and unweighted)
         max_num_runs = indices.numel()
@@ -4296,7 +4304,7 @@ class TritonTBE(torch.autograd.Function):
             bucket_rows_for_kernel = None
             num_buckets = 1
 
-        if is_amd():
+        if _use_amd:
             (
                 short_run_ids,
                 num_short_runs_t,
@@ -4343,8 +4351,6 @@ class TritonTBE(torch.autograd.Function):
             device=weight.device,
         )
 
-        # Select kernel variants based on hardware
-        _use_amd = is_amd()
         bwd_weight_args = (
             (weight,)
             if _use_amd
@@ -4354,7 +4360,7 @@ class TritonTBE(torch.autograd.Function):
         # TMA bulk atomic reduce (cp.reduce.async.bulk.tensor) for the fused
         # long-run partial-gradient accumulation. Blackwell-only, and only
         # reachable on the fused path, which is itself gated above.
-        use_tma_reduce = has_tlx and not _use_amd and cfg.allow_tma_reduce
+        use_tma_reduce = has_tlx and not is_amd() and cfg.allow_tma_reduce
         if use_tma_reduce:
 
             def _alloc_fn(size: int, align: int, stream: int) -> torch.Tensor:
@@ -5490,8 +5496,6 @@ class ChunkedTritonTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
         weight_chunk_sizes: Sequence[int],
         enable_triton_tbe_optimizations: bool = False,
     ) -> None:
-        if is_amd():
-            raise NotImplementedError("Chunked Triton TBE does not support AMD")
         if bag_size_hints is not None:
             raise NotImplementedError(
                 "Chunked Triton TBE does not support bag_size_hints"
