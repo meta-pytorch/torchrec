@@ -204,7 +204,7 @@ def group_batches_by_unique(
     indices: jax.Array,
     num_features: int,
     batch_size: int,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Gets a mapping from unique bags to which gradient it corresponds to.
 
@@ -213,9 +213,10 @@ def group_batches_by_unique(
     so that a sparseCore subcore can own one bag and sum its gradients effectively.
 
     Returns:
-        Tuple[jax.Array, jax.Array]:
+        Tuple[jax.Array, jax.Array, jax.Array]:
             - grad_rows: array size [F, B] corresponding to which index the bag corresponds to
             - bag_offsets: Offset boundaries inside `grad_rows` that corresponds to each bag.
+            - group_row_ids: Stored row IDs in group order, padded with -1 to [F, B].
 
     Examples:
 
@@ -226,23 +227,25 @@ def group_batches_by_unique(
     """
 
     indices = indices.reshape(num_features, batch_size)
-    # First do a 2-D argsort, e.g. feature-0 becomes [0, 1, 3, 2]
     grad_rows = jnp.argsort(indices, axis=1, stable=True)
-    # Found the boundaries that corresponds to each bag b=i
-    # e.g. feature_0 becomes [b=0, b=1] -> [[0, 1, 3], [2]]
-    # This can be done by adding how many duplicates each bag has
-    rows = jnp.arange(num_features)[:, None]
-    counts = jnp.zeros((num_features, batch_size), jnp.int32).at[rows, indices].add(1)
-    # Get the offsets to get the boundaries of the bags
-    # e.g. feature-0 becomes [0, 3, 4, 4, 4, 4]
-    bag_offsets = jnp.pad(
-        jnp.cumsum(counts, axis=1),
+    sorted_row_ids = jnp.take_along_axis(indices, grad_rows, axis=1)
+    is_group_start = jnp.concatenate(
         (
-            (0, 0),
-            (1, 0),
-        ),  # (before, after) per axis: no padding on axis 0, one 0 before axis 1
+            jnp.ones((num_features, 1), dtype=jnp.bool_),
+            sorted_row_ids[:, 1:] != sorted_row_ids[:, :-1],
+        ),
+        axis=1,
     )
-    return grad_rows, bag_offsets
+    group_ids = jnp.cumsum(is_group_start.astype(jnp.int32), axis=1) - 1
+    feature_ids = jnp.arange(num_features)[:, None]
+    counts = jnp.zeros((num_features, batch_size), jnp.int32)
+    counts = counts.at[feature_ids, group_ids].add(1)
+    bag_offsets = jnp.pad(jnp.cumsum(counts, axis=1), ((0, 0), (1, 0)))
+    group_row_ids = jnp.take_along_axis(
+        sorted_row_ids, jnp.minimum(bag_offsets[:, :-1], batch_size - 1), axis=1
+    )
+    group_row_ids = jnp.where(bag_offsets[:, :-1] < batch_size, group_row_ids, -1)
+    return grad_rows, bag_offsets, group_row_ids
 
 
 def batch_index_select_bwd_sc(
@@ -309,7 +312,7 @@ def batch_index_select_bwd_sc(
     ROW_TILE = 8
     if not permute_output_dim_0_1:
         raise NotImplementedError(
-            f"`permute_output_dim_0_1` is not implemented yet. Reach out to oncall."
+            "`permute_output_dim_0_1` is not implemented yet. Reach out to oncall."
         )
     # Typical sparse-core subcore information
     sc = pltpu.get_tpu_info().sparse_core  # pyrefly: ignore [missing-attribute]
@@ -327,8 +330,10 @@ def batch_index_select_bwd_sc(
     # Size of output
     output_shape = (output_size,)
 
-    # First get a mapping from (feature, bag index) -> [gradient index i that needs to be pooled]
-    grad_rows, bag_offsets = group_batches_by_unique(indices, num_features, batch_size)
+    # Group slots map to actual stored row IDs.
+    grad_rows, bag_offsets, group_row_ids = group_batches_by_unique(
+        indices, num_features, batch_size
+    )
 
     # Parallelism scheme: each subcore handles one deduped row, grabs the gradients, and pools them
     # Choose F*B for the number of blocks for now, but will have to optimize this later on
@@ -349,7 +354,7 @@ def batch_index_select_bwd_sc(
     deduped_offsets = jnp.repeat(output_offsets, NL)
     column_offsets = jnp.repeat(column_offsets, NL)
     bag_offsets = jnp.repeat(bag_offsets, NL)
-    rows = jnp.repeat(rows, NL)
+    group_row_ids = jnp.repeat(group_row_ids, NL)
     columns = jnp.repeat(columns, NL)
 
     # Reshape the gradient into COL_TILE-wide rows for indexed DMA.
@@ -361,7 +366,7 @@ def batch_index_select_bwd_sc(
     grad_rows = jnp.pad(grad_rows.reshape(-1), (0, NL))
 
     @pl.kernel(  # pyrefly: ignore [missing-attribute]
-        out_type=jax.ShapeDtypeStruct(output_shape, grad_output.dtype),
+        out_type=(),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
             use_tc_tiling_on_sc=False,  # pyrefly: ignore [unexpected-keyword]
@@ -372,7 +377,7 @@ def batch_index_select_bwd_sc(
             pltpu.VMEM((NL,), jnp.int32),  # grad_rows_vmem
             pltpu.VMEM((NL,), jnp.int32),  # bag_offsets_vmem
             pltpu.VMEM((NL,), jnp.int32),  # cols_offsets_vmem
-            pltpu.VMEM((NL,), jnp.int32),  # rows_vmem
+            pltpu.VMEM((NL,), jnp.int32),  # group_row_ids_vmem
             pltpu.VMEM((NL,), jnp.int32),  # columns_vmem
             pltpu.VMEM((NL,), jnp.int32),  # deduped_offsets_vmem
             pltpu.VMEM((COL_TILE,), grad_output.dtype),  # grad_buffer_vmem
@@ -385,7 +390,7 @@ def batch_index_select_bwd_sc(
         grad_rows_hbm,
         bag_offsets_hbm,
         cols_offsets_hbm,
-        rows_hbm,
+        group_row_ids_hbm,
         columns_hbm,
         deduped_offsets_hbm,
         out_hbm,
@@ -393,7 +398,7 @@ def batch_index_select_bwd_sc(
         grad_rows_vmem,
         bag_offsets_vmem,
         cols_offsets_vmem,
-        rows_vmem,
+        group_row_ids_vmem,
         columns_vmem,
         deduped_offsets_vmem,
         grad_buffer_vmem,
@@ -407,33 +412,29 @@ def batch_index_select_bwd_sc(
             # Grab the feature/batch assigned to this subcore.
             idx = pl.program_id(0) * num_subcores + subcore_id
 
-            # Only work if it's less than total number of expanded gradients
+            # Mask the rounded-up launch grid.
             @pl.when(idx < num_features * batch_size)
             def _valid_idx():
                 # Grab the feature and batch this subcore responsible for
                 feat_id = idx // batch_size
-                batch_id = idx % batch_size
+                group_id = idx % batch_size
                 feature_block_start = pl.multiple_of(feat_id * NL, NL)
 
-                # Need to make sure the batch id for this feature doesn't overextend
+                group_start = (feat_id * batch_size + group_id) * NL
                 pltpu.sync_copy(
-                    rows_hbm.at[pl.ds(feature_block_start, NL)],
-                    rows_vmem,
+                    group_row_ids_hbm.at[pl.ds(group_start, NL)], group_row_ids_vmem
                 )
+                row_id = group_row_ids_vmem[...][0]
 
-                @pl.when(batch_id < rows_vmem[...][0])
+                @pl.when(row_id >= 0)
                 def _get_gradients():
-                    # Based on feat_id, batch_id, pull the bag_offsets
-                    base = (feat_id * (batch_size + 1) + batch_id) * NL
+                    base = (feat_id * (batch_size + 1) + group_id) * NL
                     pltpu.sync_copy(
-                        bag_offsets_hbm.at[pl.ds(base, NL)],
-                        bag_offsets_vmem,
+                        bag_offsets_hbm.at[pl.ds(base, NL)], bag_offsets_vmem
                     )
                     start_bag = bag_offsets_vmem[...][0]
-
                     pltpu.sync_copy(
-                        bag_offsets_hbm.at[pl.ds(base + NL, NL)],
-                        bag_offsets_vmem,
+                        bag_offsets_hbm.at[pl.ds(base + NL, NL)], bag_offsets_vmem
                     )
                     end_bag = bag_offsets_vmem[...][0]
                     numb_grads_to_pool = end_bag - start_bag
@@ -509,9 +510,8 @@ def batch_index_select_bwd_sc(
                                 grad_buffer_vmem[...] += expanded_grad_vmem[grad_idx, :]
 
                         # Write gradient into the correct HBM location
-                        # Note that (f_i, b_i, d_j) |-> gradient output index (F, B, D) row-major = f_i * O[i] +  b_i * D[i] + d_j
                         out_start = pl.multiple_of(
-                            total_offset + batch_id * emb_dim + i * COL_TILE,
+                            total_offset + row_id * emb_dim + i * COL_TILE,
                             COL_TILE,
                         )
 
@@ -523,13 +523,15 @@ def batch_index_select_bwd_sc(
 
         _inner()
 
-    # The output should be in (F, B) row-major order
-    return _kernel(
+    output_ref = jax.new_ref(jnp.zeros(output_shape, grad_output.dtype))
+    _kernel(
         grad_output,
         grad_rows,
         bag_offsets,
         column_offsets,
-        rows,
+        group_row_ids,
         columns,
         deduped_offsets,
+        output_ref,
     )
+    return jax.freeze(output_ref)
