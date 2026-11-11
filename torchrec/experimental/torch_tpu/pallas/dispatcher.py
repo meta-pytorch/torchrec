@@ -252,17 +252,6 @@ def batch_index_select_dim0_tpu(
                 f"Instead it is {input_num_indices}."
             )
 
-        if (
-            torch.is_grad_enabled()
-            and inputs.requires_grad
-            and any(rows > batch_size for rows in input_rows)
-        ):
-            raise NotImplementedError(
-                "SparseCore batch-index backward requires input_rows <= batch_size; "
-                "stored rows beyond batch_size would have unwritten gradients. "
-                f"Got input_rows={input_rows}, batch_size={batch_size}."
-            )
-
         return impl.batch_index_select_dim0_tpu(
             inputs, indices, input_rows, input_columns
         )
