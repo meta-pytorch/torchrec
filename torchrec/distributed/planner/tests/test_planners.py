@@ -39,6 +39,7 @@ from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstima
 from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
     FixedAbsoluteStorageReservation,
+    FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
     SKUAwareStorageReservation,
 )
@@ -51,10 +52,12 @@ from torchrec.distributed.planner.types import (
     PlannerContextFingerprintError,
     PlannerError,
     PlannerErrorType,
+    Proposer,
     Shard,
     SharderData,
     ShardingOption,
     Storage,
+    StorageReservation,
     Topology,
 )
 from torchrec.distributed.sharding_plan import get_default_sharders
@@ -2561,3 +2564,162 @@ class TestFixedAbsoluteStorageReservation(unittest.TestCase):
         self.assertIn("0.5", error_message)
         # Should NOT contain percentage-based formatting
         self.assertNotIn("Storage reservation percentage", error_message)
+
+
+class SingleDeviceHBMOvercommitTest(unittest.TestCase):
+    def _model(self, embedding_dim: int = 64) -> TestSparseNN:
+        return TestSparseNN(
+            tables=[
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=embedding_dim,
+                    name=f"table_{i}",
+                    feature_names=[f"feature_{i}"],
+                )
+                for i in range(2)
+            ],
+            sparse_device=torch.device("meta"),
+        )
+
+    def _sharders(
+        self, kind: type[EmbeddingBagCollectionSharder] = TWSharder
+    ) -> list[ModuleSharder[nn.Module]]:
+        return [cast(ModuleSharder[nn.Module], kind())]
+
+    def _planner(
+        self,
+        allow: bool = False,
+        hbm_cap: int = 8 * 1024**2,
+        world_size: int = 1,
+        reservation: StorageReservation | None = None,
+        proposer: Proposer | None = None,
+    ) -> EmbeddingShardingPlanner:
+        return EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=world_size,
+                compute_device="cuda",
+                hbm_cap=hbm_cap,
+            ),
+            batch_size=1,
+            storage_reservation=(
+                reservation
+                if reservation is not None
+                else HeuristicalStorageReservation(
+                    percentage=0.25, dense_tensor_estimate=10 * 1024**2
+                )
+            ),
+            proposer=proposer,
+            allow_single_device_hbm_overcommit=allow,
+            stats=[],
+        )
+
+    def test_unique_plan_after_reservation_failure(self) -> None:
+        model = self._model()
+        with self.assertRaises(PlannerError) as raised:
+            self._planner().plan(model, self._sharders())
+        self.assertEqual(
+            raised.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+
+        planner = self._planner(allow=True)
+        actual = planner.plan(model, self._sharders())
+        expected = self._planner(hbm_cap=64 * 1024**2).plan(model, self._sharders())
+        self.assertEqual(actual.plan, expected.plan)
+        self.assertEqual(planner._topology.devices[0].storage.hbm, 8 * 1024**2)
+
+    def test_fixed_column_shards_after_placement_failure(self) -> None:
+        class ColumnSharder(TWSharder):
+            def sharding_types(self, compute_device_type: str) -> list[str]:
+                return [ShardingType.COLUMN_WISE.value]
+
+        model = self._model(embedding_dim=256)
+        constraints = {
+            f"table_{i}": ParameterConstraints(min_partition=128) for i in range(2)
+        }
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(world_size=1, compute_device="cuda", hbm_cap=1),
+            batch_size=1,
+            constraints=constraints,
+            storage_reservation=FixedPercentageStorageReservation(0.0),
+            allow_single_device_hbm_overcommit=True,
+            stats=[],
+        )
+        plan = planner.plan(model, self._sharders(ColumnSharder))
+        for table in cast(
+            EmbeddingModuleShardingPlan, plan.plan["sparse.ebc"]
+        ).values():
+            self.assertEqual(table.ranks, [0, 0])
+            self.assertIsNotNone(table.sharding_spec)
+            shards = cast(EnumerableShardingSpec, table.sharding_spec).shards
+            self.assertEqual([s.shard_sizes for s in shards], [[100, 128], [100, 128]])
+            self.assertEqual([s.shard_offsets for s in shards], [[0, 0], [0, 128]])
+
+    def test_ambiguous_choices_stay_strict(self) -> None:
+        class TwoKernelSharder(TWSharder):
+            def compute_kernels(
+                self, sharding_type: str, compute_device_type: str
+            ) -> list[str]:
+                return [
+                    EmbeddingComputeKernel.FUSED.value,
+                    EmbeddingComputeKernel.FUSED_UVM.value,
+                ]
+
+        for sharder in (TWvsRWSharder, TwoKernelSharder):
+            with (
+                self.subTest(sharder=sharder.__name__),
+                self.assertRaises(PlannerError),
+            ):
+                self._planner(allow=True).plan(self._model(), self._sharders(sharder))
+
+    def test_multiple_devices_stay_strict(self) -> None:
+        with self.assertRaises(PlannerError):
+            self._planner(allow=True, world_size=2).plan(
+                self._model(), self._sharders()
+            )
+
+    def test_host_memory_limit_stays_enforced(self) -> None:
+        class HostSharder(TWSharder):
+            def compute_kernels(
+                self, sharding_type: str, compute_device_type: str
+            ) -> list[str]:
+                return [EmbeddingComputeKernel.FUSED_UVM.value]
+
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=1, ddr_cap=1)
+        planner = EmbeddingShardingPlanner(
+            topology=topology,
+            batch_size=1,
+            storage_reservation=FixedPercentageStorageReservation(0.0),
+            allow_single_device_hbm_overcommit=True,
+            stats=[],
+        )
+        with self.assertRaises(PlannerError) as raised:
+            planner.plan(self._model(), self._sharders(HostSharder))
+        self.assertEqual(
+            raised.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+        self.assertEqual(topology.devices[0].storage.ddr, 1)
+
+    def test_dynamic_proposer_stays_strict(self) -> None:
+        planner = self._planner(allow=True, proposer=EmbeddingOffloadScaleupProposer())
+        with self.assertRaises(PlannerError):
+            planner.plan(self._model(), self._sharders())
+
+    def test_reuse_starts_with_the_original_reservation(self) -> None:
+        planner = self._planner(allow=True)
+        model = self._model()
+        self.assertTrue(planner.plan(model, self._sharders()).plan)
+        with self.assertRaises(PlannerError):
+            planner.plan(model, self._sharders(TWvsRWSharder))
+
+    def test_overcommitted_plan_has_a_distinct_fingerprint(self) -> None:
+        model = self._model()
+        overcommitted = self._planner(allow=True)
+        strict = self._planner(reservation=FixedPercentageStorageReservation(0.0))
+        self.assertEqual(
+            overcommitted.plan(model, self._sharders()).plan,
+            strict.plan(model, self._sharders()).plan,
+        )
+        self.assertNotEqual(
+            overcommitted.hash_planner_context_inputs_str(),
+            strict.hash_planner_context_inputs_str(),
+        )

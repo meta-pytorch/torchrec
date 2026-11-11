@@ -23,6 +23,7 @@ from torchrec.distributed.planner.proposers import GreedyProposer, UniformPropos
 from torchrec.distributed.planner.protocols import PlannerExecutor
 from torchrec.distributed.planner.provider import DefaultPlannerProvider
 from torchrec.distributed.planner.types import (
+    ParameterConstraints,
     Perf,
     PlannerConfig,
     PlannerSessionContext,
@@ -30,9 +31,14 @@ from torchrec.distributed.planner.types import (
     Shard,
     ShardingOption,
     ShardingPlanRequest,
+    Topology,
 )
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import ModuleSharder
+from torchrec.distributed.types import (
+    EmbeddingModuleShardingPlan,
+    ModuleSharder,
+    ShardingPlan,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
@@ -251,6 +257,50 @@ class BuildComponentsFromConfigTest(unittest.TestCase):
         self.provider.build_topology("H100", request, ctx)
         self.assertEqual(ctx.hw_source["H100"], "request_caps")
         self.assertIn("H100", ctx.hw_overrides_applied)
+
+    def test_build_planner_forwards_hbm_overcommit(self) -> None:
+        model = TestSparseNN(
+            tables=[
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=64,
+                    name="table",
+                    feature_names=["feature"],
+                )
+            ],
+            sparse_device=torch.device("meta"),
+        )
+        sharders = [cast(ModuleSharder[nn.Module], EmbeddingBagCollectionSharder())]
+        request = ShardingPlanRequest(
+            model=model,
+            sharders=sharders,
+            world_size=1,
+            local_world_size=1,
+            batch_size=1,
+            compute_device="cuda",
+            hbm_gb=8 / 1024,
+            constraints={
+                "table": ParameterConstraints(
+                    sharding_types=["table_wise"], compute_kernels=["fused"]
+                )
+            },
+            planner_config=PlannerConfig(
+                allow_single_device_hbm_overcommit=True,
+                dense_tensor_estimate=10 * 1024**2,
+                storage_reservation_percentage=0.25,
+            ),
+        )
+        ctx = PlannerSessionContext(request=request, results={})
+        ctx.stats = []
+        result = DefaultPlannerExecutor(provider=self.provider).run("A100", ctx)
+        self.assertTrue(result.success, result.planner_failure_reason)
+        self.assertIsNotNone(result.sharding_plan)
+        plan = cast(ShardingPlan, result.sharding_plan)
+        module_plan = cast(EmbeddingModuleShardingPlan, plan.plan["sparse.ebc"])
+        self.assertEqual(module_plan["table"].ranks, [0])
+        reserved = ctx.storage_reservations_used["A100"].last_reserved_topology
+        self.assertIsNotNone(reserved)
+        self.assertEqual(cast(Topology, reserved).devices[0].storage.hbm, 8 * 1024**2)
 
     def test_build_partitioner(self) -> None:
         self.assertIsInstance(
