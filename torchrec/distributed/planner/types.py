@@ -11,6 +11,7 @@ import abc
 import hashlib
 import logging
 import math
+import os
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -2196,6 +2197,14 @@ class ProposerConfig:
     groups: Tuple[ProposerGroup, ...] = ()
 
 
+def single_device_hbm_overcommit_enabled(configured: bool) -> bool:
+    """Resolve a framework setting and the opt-in test environment variable."""
+    return (
+        configured
+        or os.environ.get("TORCHREC_ALLOW_SINGLE_DEVICE_HBM_OVERCOMMIT") == "1"
+    )
+
+
 @dataclass(frozen=True)
 class PlannerConfig:
     """Plan-affecting knobs the trainer expresses per request.
@@ -2305,6 +2314,8 @@ class PlannerConfig:
     # existing digest. (Appended last to preserve positional construction of the
     # pre-existing fields.)
     grid_rowwise_shards: Optional[int] = None
+    # Allow only a fixed single-CUDA-device plan to exceed estimated HBM capacity.
+    allow_single_device_hbm_overcommit: bool = False
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
@@ -2571,6 +2582,11 @@ class ShardingPlanRequest:
                     ),
                     self.planner_config.request_hash_extension(),
                 ]
+                + (
+                    [("allow_single_device_hbm_overcommit", True)]
+                    if self.planner_config.allow_single_device_hbm_overcommit
+                    else []
+                )
             ),
             "x",
         )[:16]

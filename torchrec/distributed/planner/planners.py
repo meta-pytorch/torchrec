@@ -29,7 +29,10 @@ from torchrec.distributed.logging_handlers import (
 )
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
-from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
+from torchrec.distributed.planner.partitioners import (
+    GreedyPerfPartitioner,
+    MemoryBalancedPartitioner,
+)
 from torchrec.distributed.planner.perf_models import NoopPerfModel
 from torchrec.distributed.planner.proposers import (
     GreedyProposer,
@@ -39,7 +42,9 @@ from torchrec.distributed.planner.proposers import (
 from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
     FixedAbsoluteStorageReservation,
+    FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
+    InferenceStorageReservation,
     SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
@@ -162,6 +167,14 @@ except Exception:
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_SINGLE_DEVICE_HBM_RESERVATIONS: tuple[type[StorageReservation], ...] = (
+    FixedPercentageStorageReservation,
+    FixedAbsoluteStorageReservation,
+    HeuristicalStorageReservation,
+    InferenceStorageReservation,
+    SKUAwareStorageReservation,
+)
 
 
 def to_sharding_plan(
@@ -652,6 +665,10 @@ class EmbeddingPlannerBase(ShardingPlanner):
             self._constraints,
         )
 
+    def get_storage_reservation(self) -> StorageReservation:
+        """Return the reservation used by the latest planning attempt."""
+        return self._storage_reservation
+
     def get_selected_options(self) -> List[ShardingOption]:
         """The chosen per-shard ShardingOptions from the most recent ``plan()``.
 
@@ -680,6 +697,27 @@ class EmbeddingPlannerBase(ShardingPlanner):
         return None
 
 
+class _SingleDeviceHBMOvercommitReservation(FixedPercentageStorageReservation):
+    def __init__(self, original: StorageReservation, hbm_budget: int) -> None:
+        super().__init__(percentage=0.0)
+        self.original = original
+        self.hbm_budget = hbm_budget
+
+    def reserve(
+        self,
+        topology: Topology,
+        batch_size: int,
+        module: nn.Module,
+        sharders: list[ModuleSharder[nn.Module]],
+        constraints: dict[str, ParameterConstraints] | None = None,
+    ) -> Topology:
+        reserved = super().reserve(topology, batch_size, module, sharders, constraints)
+        reserved.devices[0].storage.hbm = max(
+            reserved.devices[0].storage.hbm, self.hbm_budget
+        )
+        return reserved
+
+
 class EmbeddingShardingPlanner(EmbeddingPlannerBase):
     """
     Provides an optimized sharding plan for a given module with shardable parameters
@@ -697,6 +735,9 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         constraints (Optional[Dict[str, ParameterConstraints]]): per table constraints
             for sharding.
         debug (bool): whether to print debug information.
+        allow_single_device_hbm_overcommit (bool): allow the only fixed candidate
+            on one CUDA rank to exceed estimated HBM capacity. Other storage and
+            plan constraints remain enforced.
 
     Example::
 
@@ -708,6 +749,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         )
 
     """
+
+    _allow_single_device_hbm_overcommit: bool = False
 
     @_torchrec_method_logger()
     def __init__(
@@ -727,6 +770,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         ] = None,
         timeout_seconds: Optional[int] = None,
         plan_loader: Optional[PlanLoader] = None,
+        allow_single_device_hbm_overcommit: bool = False,
     ) -> None:
         super().__init__(
             topology=topology,
@@ -760,6 +804,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         )
 
         self.plan_loader = plan_loader
+        self._allow_single_device_hbm_overcommit = allow_single_device_hbm_overcommit
 
         self._num_proposals: int = 0
         self._num_plans: int = 0
@@ -833,6 +878,79 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         Returns:
             ShardingPlan: the sharding plan for the module.
         """
+        try:
+            if type(self._storage_reservation) is _SingleDeviceHBMOvercommitReservation:
+                self._storage_reservation = self._storage_reservation.original
+            return self._plan_with_storage_reservation(module, sharders)
+        except PlannerError as error:
+            if error.error_type == PlannerErrorType.INSUFFICIENT_STORAGE:
+                reservation = self._single_device_overcommit_reservation(
+                    module, sharders
+                )
+                if reservation is not None:
+                    logger.warning(
+                        "Retrying the only single-device plan without the estimated "
+                        f"HBM limit (device capacity: {self._topology.devices[0].storage.hbm} "
+                        f"bytes, candidate HBM: {reservation.hbm_budget} bytes)"
+                    )
+                    self._storage_reservation = reservation
+                    try:
+                        return self._plan_with_storage_reservation(module, sharders)
+                    except PlannerError:
+                        self._storage_reservation = reservation.original
+                        raise error from None
+            raise
+
+    def _single_device_overcommit_reservation(
+        self,
+        module: nn.Module,
+        sharders: list[ModuleSharder[nn.Module]],
+    ) -> _SingleDeviceHBMOvercommitReservation | None:
+        """Relax HBM only when the complete search space has one fixed candidate."""
+        if (
+            not self._allow_single_device_hbm_overcommit
+            or type(self) is not EmbeddingShardingPlanner
+            or self._topology.compute_device != "cuda"
+            or self._topology.world_size != 1
+        ):
+            return None
+        if not all(
+            (
+                self._topology.local_world_size == 1,
+                len(self._topology.devices) == 1
+                and self._topology.devices[0].rank == 0,
+                type(self._enumerator) is EmbeddingEnumerator,
+                type(self._partitioner)
+                in (GreedyPerfPartitioner, MemoryBalancedPartitioner),
+                all(
+                    type(proposer)
+                    in (GridSearchProposer, GreedyProposer, UniformProposer)
+                    for proposer in self._proposers
+                ),
+                not self._callbacks,
+                self.plan_loader is None,
+                type(self._storage_reservation) in _SINGLE_DEVICE_HBM_RESERVATIONS,
+            )
+        ):
+            return None
+
+        search_space = self._enumerator.enumerate(module, sharders)
+        option_counts = Counter(option.fqn for option in search_space)
+        if not option_counts or any(count != 1 for count in option_counts.values()):
+            return None
+        validate_compute_kernels(search_space)
+
+        # These built-in reservations leave DDR and SSD unchanged on CUDA.
+        return _SingleDeviceHBMOvercommitReservation(
+            self._storage_reservation,
+            sum(option.total_storage.hbm for option in search_space),
+        )
+
+    def _plan_with_storage_reservation(  # noqa: C901
+        self,
+        module: nn.Module,
+        sharders: list[ModuleSharder[nn.Module]],
+    ) -> ShardingPlan:
         self._num_proposals = 0
         self._num_plans = 0
 
