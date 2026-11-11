@@ -30,6 +30,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     _gen_named_parameters_by_table_fused,
     _get_grid_shard_cw_count,
     _resolve_eviction_check_interval_batch,
+    BatchedTPUEmbeddingBag,
     EmbeddingFusedOptimizer,
     KeyValueEmbeddingFusedOptimizer,
 )
@@ -39,6 +40,10 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.sharding_plan import _calculate_grid_shard_sizes_and_offsets
+from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+    PallasTableBatchedEmbeddingBags,
+    PooledLookupKernel,
+)
 from torchrec.modules.embedding_configs import DataType, PoolingType
 
 
@@ -59,6 +64,63 @@ def _grid_shards(
             )
             row_offset += row_size
     return shards
+
+
+class StackedWeightInitializationTest(unittest.TestCase):
+    def test_seeded_initialization_preserves_parameters_and_cached_views(self) -> None:
+        specs = [(2, 16), (5, 16), (3, 16)]
+        bounds = [(-0.01, 0.01), (-0.02, 0.02), (-0.03, 0.03)]
+        tables = [
+            ShardedEmbeddingTable(
+                name=f"table_{i}",
+                num_embeddings=rows,
+                embedding_dim=dim,
+                feature_names=[f"feature_{i}"],
+                local_rows=rows,
+                local_cols=dim,
+                compute_kernel=EmbeddingComputeKernel.UNFUSED_TPU,
+                weight_init_min=lo,
+                weight_init_max=hi,
+            )
+            for i, ((rows, dim), (lo, hi)) in enumerate(zip(specs, bounds))
+        ]
+        kernel = BatchedTPUEmbeddingBag(
+            GroupedEmbeddingConfig(
+                data_type=DataType.FP32,
+                pooling=PoolingType.SUM,
+                is_weighted=False,
+                has_feature_processor=False,
+                compute_kernel=EmbeddingComputeKernel.UNFUSED_TPU,
+                embedding_tables=tables,
+            ),
+            device=torch.device("cpu"),
+            pooled_lookup_kernel=PooledLookupKernel.BATCHED_OFFSET,
+        )
+        pooled = kernel.emb_module
+        assert isinstance(pooled, PallasTableBatchedEmbeddingBags)
+        parameter = pooled.weights
+        views = kernel.split_embedding_weights()
+        for seed in (7, 13):
+            torch.manual_seed(seed)
+            expected = torch.zeros(parameter.numel())
+            offset = 0
+            for (rows, dim), (lo, hi) in zip(specs, bounds):
+                expected[offset : offset + rows * dim].uniform_(lo, hi)
+                offset += rows * dim
+            torch.manual_seed(seed)
+            kernel.init_parameters()
+            self.assertIs(pooled.weights, parameter)
+            self.assertTrue(parameter.requires_grad)
+            torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+            offset = 0
+            for view, (rows, dim) in zip(views, specs):
+                torch.testing.assert_close(
+                    view.flatten(),
+                    expected[offset : offset + rows * dim],
+                    rtol=0,
+                    atol=0,
+                )
+                offset += rows * dim
 
 
 class GridShardCwCountTest(unittest.TestCase):
