@@ -33,6 +33,7 @@ from typing import (
 import torch
 from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.logger import static_logger
 from torchrec.distributed.train_pipeline.bucket_view_zeroing import BucketViewZeroing
 from torchrec.distributed.train_pipeline.fsdp_sync_suppression import (
     FsdpSyncSuppression,
@@ -317,6 +318,18 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                 )
             # pyrefly: ignore[missing-attribute]: pipeline may not have _optimizer
             pipeline._optimizer = self._optimizer_wrapper
+
+        if config.is_enabled:
+            static_logger.info(
+                str(
+                    {
+                        "message": "gradient_accumulation_enabled",
+                        "ga_num_steps": config.num_steps,
+                        "ga_num_warmup_steps": config.num_warmup_steps,
+                        "ga_pipeline": type(pipeline).__name__,
+                    }
+                )
+            )
 
     def _should_sync_grad(self, is_last_batch: bool = False) -> bool:
         """Return whether this batch should synchronize distributed gradients."""
