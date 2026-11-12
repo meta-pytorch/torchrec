@@ -91,9 +91,8 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         )
         ebc = EmbeddingBagCollection(tables=[eb1_config, eb2_config])
 
-        #     0       1        2  <-- batch
-        # 0   [0,1] None    [2]
-        # 1   [3]    [4]    [5,6,7]
+        #     0       1        2        3        4        5  <-- batch
+        # 0   [0,1]   None    [2]       [3]     [4]      [5,6,7]
         # ^
         # feature
         features = KeyedJaggedTensor.from_offsets_sync(
@@ -391,9 +390,9 @@ class EmbeddingCollectionTest(unittest.TestCase):
             num_embeddings=10,
             feature_names=["f2"],
         )
-        #     0       1        2  <-- batch
-        # 0   [0,1] None    [2]
-        # 1   [3]    [4]    [5,6,7]
+        #     0       1  <-- batch
+        # 0   [0,1] [2]
+        # 1   None  [3]
         # ^
         # feature
         ec = EmbeddingCollection(
