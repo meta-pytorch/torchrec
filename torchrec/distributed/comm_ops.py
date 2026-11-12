@@ -250,6 +250,11 @@ class Request(Awaitable[W]):
         self.rsi = None  # type: ignore
         self.agi = None  # type: ignore
         self.wait_function = None  # type: ignore
+        # Variable-batch pooled all-to-all only, set and read by
+        # `VariableBatchPooledEmbeddingsAwaitable`: return a placeholder instead of
+        # decoding the MX4 output, and keep the encoded output in `payload`.
+        self.defer_decode: bool = False
+        self.payload: Optional[torch.Tensor] = None
 
         # This dummy tensor is used to build the autograd graph between
         # CommOp-Req and CommOp-Await. The actual forward tensors, and backwards gradient tensors
@@ -1992,6 +1997,39 @@ class Variable_Batch_All2All_Pooled_Req(Function):
         return (None, None, None, grad_input, None)
 
 
+def mx4_decode_not_deferrable_reason(
+    codecs: Optional[QuantizedCommCodecs],
+) -> Optional[str]:
+    """Why a variable-batch pooled all-to-all with `codecs` cannot defer its forward
+    decode, or None if it can."""
+    if codecs is None:
+        return "no quantized comm codec is set"
+    precision = getattr(codecs.forward, "_comm_precision", None)
+    if precision != SparseType.MX4:
+        return f"the forward comm codec is {precision}, not MX4"
+    return None
+
+
+def _deferred_mx4_placeholder(
+    myreq: Request[Tensor], encoded: Tensor, codec: Any
+) -> Tensor:
+    """Keeps the MX4 payload on `myreq` and returns what the decode would have,
+    as a zero-memory NaN placeholder: a value used without decoding shows up."""
+    group_size = none_throws(myreq.qcomm_ctx).mx_group_size
+    numel = encoded.numel() // (group_size // 2 + 1) * group_size
+    dtype = (
+        codec._output_dtype.as_dtype()
+        if codec._output_dtype is not None
+        else torch.float32
+    )
+    if encoded.device.type == "cuda":
+        encoded.record_stream(torch.get_device_module(encoded.device).current_stream())
+    myreq.payload = encoded
+    return torch.full((), float("nan"), dtype=dtype, device=encoded.device).expand(
+        numel
+    )
+
+
 class Variable_Batch_All2All_Pooled_Wait(Function):
     @staticmethod
     # pyrefly: ignore[bad-override]
@@ -2015,6 +2053,16 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
         # pyrefly: ignore[missing-attribute]
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
+            # pyrefly: ignore[missing-attribute]
+            codec = codecs.forward
+            if (
+                myreq.defer_decode
+                and codec._comm_precision == SparseType.MX4
+                and myreq.qcomm_ctx is not None
+            ):
+                return _deferred_mx4_placeholder(
+                    myreq, none_throws(sharded_output_embeddings), codec
+                )
             # pyrefly: ignore[missing-attribute]
             sharded_output_embeddings = codecs.forward.decode(
                 sharded_output_embeddings,

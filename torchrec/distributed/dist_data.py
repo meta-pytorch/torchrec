@@ -11,7 +11,7 @@ import itertools
 import logging
 import os
 from functools import lru_cache
-from typing import Callable, cast, Dict, List, Optional, Tuple
+from typing import Callable, cast, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -30,11 +30,13 @@ from torchrec.distributed.comm_ops import (
     fold_row_permute_into_seq_decode,
     get_gradient_division,
     is_fake_pg,
+    mx4_decode_not_deferrable_reason,
     pg_name,
     precompute_seq_a2a_send,
     reduce_scatter_base_pooled,
     reduce_scatter_v_per_feature_pooled,
     reduce_scatter_v_pooled,
+    Request,
     SeqA2APrecomputedSend,
     SIDE_STREAM_OUTPUT_ENCODE_ENV,
     variable_batch_alltoall_pooled,
@@ -1576,6 +1578,83 @@ class PooledEmbeddingsAwaitable(Awaitable[torch.Tensor]):
         return self._callbacks
 
 
+class MX4Payload(NamedTuple):
+    """The MX4-encoded output of an all-to-all whose decode was deferred: `payload`
+    holds groups of `group_size` values (`group_size // 2` bytes of 4-bit codes and one
+    exponent byte per group), in the order the decoded output would have."""
+
+    payload: torch.Tensor
+    group_size: int
+
+
+@lru_cache
+def _warn_mx4_decode_not_deferred(reason: str) -> None:
+    logger.warning(
+        "defer_forward_decode is set but the variable-batch pooled all-to-all "
+        f"decodes its output: {reason}."
+    )
+
+
+def _defers_mx4_decode(codecs: Optional[QuantizedCommCodecs]) -> bool:
+    """Whether the forward decode can be deferred: `defer_forward_decode` is set and
+    the forward codec is MX4. Warns once when it is set but cannot be honoured."""
+    if codecs is None or not codecs.defer_forward_decode:
+        return False
+    reason = mx4_decode_not_deferrable_reason(codecs)
+    if reason is not None:
+        _warn_mx4_decode_not_deferred(reason)
+        return False
+    return True
+
+
+class VariableBatchPooledEmbeddingsAwaitable(PooledEmbeddingsAwaitable):
+    """
+    Awaitable for the output of `VariableBatchPooledEmbeddingsAllToAll`.
+
+    With `defer_mx4_decode`, `wait()` returns a zero-memory NaN placeholder of the
+    decoded shape instead of decoding the MX4 output, and `take_mx4_payload()` returns
+    the encoded output. The placeholder carries the gradient back to the all-to-all.
+    The decode is not deferred when the awaitable has callbacks, which would read the
+    placeholder.
+
+    Args:
+        tensor_awaitable (Awaitable[torch.Tensor]): awaitable of the all-to-all.
+        defer_mx4_decode (bool): defer the decode of an MX4-encoded output.
+    """
+
+    def __init__(
+        self,
+        tensor_awaitable: Awaitable[torch.Tensor],
+        defer_mx4_decode: bool = False,
+    ) -> None:
+        super().__init__(tensor_awaitable=tensor_awaitable)
+        self._defer_mx4_decode = defer_mx4_decode
+        self._mx4_payload: Optional[MX4Payload] = None
+
+    def _wait_impl(self) -> torch.Tensor:
+        request = self._tensor_awaitable
+        if not isinstance(request, Request):
+            return request.wait()
+        if self._defer_mx4_decode:
+            if self.callbacks:
+                _warn_mx4_decode_not_deferred("the output has callbacks")
+            else:
+                request.defer_decode = True
+        ret = request.wait()
+        if request.payload is not None:
+            qcomm_ctx = request.qcomm_ctx
+            assert qcomm_ctx is not None
+            self._mx4_payload = MX4Payload(request.payload, qcomm_ctx.mx_group_size)
+            request.payload = None
+        return ret
+
+    def take_mx4_payload(self) -> Optional[MX4Payload]:
+        """After `wait()`: the encoded output the placeholder stands for, or None if
+        the output was decoded. Hands over the reference."""
+        payload, self._mx4_payload = self._mx4_payload, None
+        return payload
+
+
 class PooledEmbeddingsAllToAll(nn.Module):
     # TODO: potentially refactor to take KT instead of torch.Tensor: D29174501
     """
@@ -1715,7 +1794,9 @@ class VariableBatchPooledEmbeddingsAllToAll(nn.Module):
         device (Optional[torch.device]): device on which buffers will be allocated.
         callbacks (Optional[List[Callable[[torch.Tensor], torch.Tensor]]]): callback
             functions.
-        codecs (Optional[QuantizedCommCodecs]): quantized communication codecs.
+        codecs (Optional[QuantizedCommCodecs]): quantized communication codecs. With
+            `codecs.defer_forward_decode` and an MX4 forward codec, the output decode is
+            deferred to the consumer (see `VariableBatchPooledEmbeddingsAwaitable`).
 
     Example::
 
@@ -1799,13 +1880,14 @@ class VariableBatchPooledEmbeddingsAllToAll(nn.Module):
         if callbacks is not None:
             self._callbacks = callbacks
         self._codecs = codecs
+        self._defer_mx4_decode: bool = _defers_mx4_decode(codecs)
 
     def forward(
         self,
         local_embs: torch.Tensor,
         batch_size_per_rank_per_feature: List[List[int]],
         batch_size_per_feature_pre_a2a: List[int],
-    ) -> PooledEmbeddingsAwaitable:
+    ) -> VariableBatchPooledEmbeddingsAwaitable:
         """
         Performs AlltoAll pooled operation with variable batch size per feature on a
         pooled embeddings tensor.
@@ -1819,7 +1901,7 @@ class VariableBatchPooledEmbeddingsAllToAll(nn.Module):
                 Ordered by rank_0 feature, rank_1 feature, ...
 
         Returns:
-            PooledEmbeddingsAwaitable: awaitable of pooled embeddings.
+            VariableBatchPooledEmbeddingsAwaitable: awaitable of pooled embeddings.
         """
 
         padded_output = None
@@ -1867,8 +1949,13 @@ class VariableBatchPooledEmbeddingsAllToAll(nn.Module):
             )
         )
 
-        pooled_embedding_awaitable = PooledEmbeddingsAwaitable(
+        if self._defer_mx4_decode and not isinstance(tensor_awaitable, Request):
+            _warn_mx4_decode_not_deferred(
+                "the all-to-all is synchronous or has a single rank"
+            )
+        pooled_embedding_awaitable = VariableBatchPooledEmbeddingsAwaitable(
             tensor_awaitable=tensor_awaitable,
+            defer_mx4_decode=self._defer_mx4_decode,
         )
         pooled_embedding_awaitable.callbacks.extend(self._callbacks)
 
