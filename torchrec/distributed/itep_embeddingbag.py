@@ -82,6 +82,7 @@ class ShardedITEPEmbeddingBagCollection(
         ebc_sharder: EmbeddingBagCollectionSharder,
         env: ShardingEnv,
         device: torch.device,
+        module_fqn: Optional[str] = None,
     ) -> None:
         # pyrefly: ignore[missing-attribute]
         super().__init__()
@@ -100,6 +101,7 @@ class ShardedITEPEmbeddingBagCollection(
                 table_name_to_parameter_sharding,
                 env=env,
                 device=device,
+                module_fqn=module_fqn,
             )
         )
 
@@ -321,6 +323,7 @@ class ITEPEmbeddingBagCollectionSharder(
             ebc_sharder=self._ebc_sharder,
             env=env,
             device=device,
+            module_fqn=module_fqn,
         )
 
     def shardable_parameters(
@@ -361,6 +364,7 @@ class ShardedITEPEmbeddingCollection(
         ebc_sharder: EmbeddingCollectionSharder,
         env: ShardingEnv,
         device: torch.device,
+        module_fqn: Optional[str] = None,
     ) -> None:
         # pyrefly: ignore[missing-attribute]
         super().__init__()
@@ -381,6 +385,7 @@ class ShardedITEPEmbeddingCollection(
             table_name_to_parameter_sharding,
             env=env,
             device=device,
+            module_fqn=module_fqn,
         )
 
         self.table_name_to_sharding_type: Dict[str, str] = {}
@@ -580,6 +585,7 @@ class ITEPEmbeddingCollectionSharder(BaseEmbeddingSharder[ITEPEmbeddingCollectio
             ebc_sharder=self._ebc_sharder,
             env=env,
             device=device,
+            module_fqn=module_fqn,
         )
 
     def shardable_parameters(
