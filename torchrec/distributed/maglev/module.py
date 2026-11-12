@@ -689,6 +689,16 @@ class MaglevLayer(nn.Module, abc.ABC):
             )
         return self.dense
 
+    def pt2_compile_targets(self) -> Tuple[nn.Module, ...]:
+        """Return the modules compiled for layer-granularity PT2.
+
+        Split layers keep sparse input preparation eager and compile their dense
+        half. Legacy layers without a split retain whole-layer compilation.
+        Architectures with a finer dense boundary may override this method.
+        """
+        dense = self.dense
+        return (self,) if dense is None else (dense,)
+
     def dense_parameters(self) -> Iterator[nn.Parameter]:
         r"""dense_parameters() -> Iterator[nn.Parameter]
 
