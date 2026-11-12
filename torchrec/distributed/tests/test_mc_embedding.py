@@ -7,9 +7,11 @@
 
 # pyre-strict
 
+import contextlib
 import copy
 import unittest
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
@@ -48,6 +50,7 @@ from torchrec.distributed.test_utils.multi_process import (
 )
 from torchrec.distributed.tests.test_mc_embedding_utils import SparseArch
 from torchrec.distributed.types import (
+    EmbeddingEvent,
     ModuleSharder,
     ShardedTensor,
     ShardingEnv,
@@ -55,6 +58,8 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_modules import EmbeddingCollection
+from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingCollection
 from torchrec.modules.mc_modules import ManagedCollisionCollection
 from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
 from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
@@ -1644,8 +1649,6 @@ class TestMCModuleUtilityFunctions(unittest.TestCase):
         self.assertIn("b", result)
 
     def test_create_mc_sharding_unsupported(self) -> None:
-        from unittest.mock import MagicMock
-
         with self.assertRaises(ValueError):
             create_mc_sharding(
                 sharding_type=ShardingType.TABLE_WISE.value,
@@ -1680,8 +1683,6 @@ class TestMCModuleSharder(unittest.TestCase):
         self.assertEqual(sharder.module_type, ManagedCollisionCollection)
 
     def test_shardable_parameters_raises(self) -> None:
-        from unittest.mock import MagicMock
-
         sharder = ManagedCollisionCollectionSharder()
 
         with self.assertRaises(NotImplementedError):
@@ -1906,3 +1907,167 @@ class TestMccInputDistFxTracing(unittest.TestCase):
         results = gm(kjt)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].keys(), ["f0"])
+
+
+class ManagedCollisionEmbeddingCollectionModuleFqnTest(unittest.TestCase):
+    """Mirror of the bagged case for the unbagged inner module."""
+
+    @staticmethod
+    def _mock_instance_of(cls: type) -> MagicMock:
+        mock = MagicMock()
+        mock.__class__ = cls
+        return mock
+
+    def test_module_fqn_reaches_both_sharders(self) -> None:
+        module = self._mock_instance_of(ManagedCollisionEmbeddingCollection)
+        module._embedding_module.__class__ = EmbeddingCollection
+        ec_sharder = self._mock_instance_of(EmbeddingCollectionSharder)
+        sharded_ec = ec_sharder.shard.return_value
+        sharded_ec.__class__ = ShardedEmbeddingCollection
+        sharded_ec._sharding_type_to_sharding = {"row_wise": MagicMock()}
+        sharded_ec._sharding_types = ["row_wise"]
+        mc_sharder = self._mock_instance_of(ManagedCollisionCollectionSharder)
+
+        ShardedManagedCollisionEmbeddingCollection(
+            module,
+            {},
+            ec_sharder=ec_sharder,
+            mc_sharder=mc_sharder,
+            env=MagicMock(),
+            device=torch.device("cpu"),
+            module_fqn="sparse.mc_ec",
+        )
+
+        self.assertEqual(
+            ec_sharder.shard.call_args.kwargs["module_fqn"], "sparse.mc_ec"
+        )
+        mc_kwargs = mc_sharder.shard.call_args.kwargs
+        self.assertEqual(mc_kwargs["module_fqn"], "sparse.mc_ec")
+        self.assertEqual(mc_kwargs["sharding_types"], ["row_wise"])
+
+    @staticmethod
+    def _record_annotations(
+        events: List[Tuple[object, ...]],
+    ) -> "contextlib.AbstractContextManager[object]":
+        @contextlib.contextmanager
+        def fake_annotate(
+            event: EmbeddingEvent, fqn: Optional[str], sharding_type: Optional[str]
+        ) -> Generator[None, None, None]:
+            events.append(("enter", event, fqn, sharding_type))
+            yield
+            events.append(("exit",))
+
+        return patch(
+            "torchrec.distributed.mc_modules.maybe_annotate_embedding_event",
+            fake_annotate,
+        )
+
+    def _run_input_dist(
+        self,
+        events: List[Tuple[object, ...]],
+        sharding_types: List[str],
+        num_dists: int = 1,
+    ) -> None:
+        mc_collection = MagicMock(
+            _module_fqn="sparse.mc_ec",
+            _sharding_types=sharding_types,
+            _has_uninitialized_input_dists=False,
+            _has_uninitialized_write_input_dists=False,
+            _features_order=[],
+            need_preprocess=False,
+            _sharding_feature_splits=[1] * num_dists,
+            _use_index_dedup=False,
+            _input_dists=[
+                MagicMock(side_effect=lambda _: events.append(("dist",)))
+                for _ in range(num_dists)
+            ],
+        )
+        mc_collection._has_2d_weights.return_value = False
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=[f"f{i}" for i in range(num_dists)],
+            values=torch.arange(num_dists),
+            lengths=torch.ones(num_dists, dtype=torch.int64),
+        )
+        with self._record_annotations(events):
+            ShardedManagedCollisionCollection.input_dist(
+                mc_collection, MagicMock(sharding_contexts=[]), features
+            )
+
+    def _run_output_dist(
+        self,
+        events: List[Tuple[object, ...]],
+        sharding_types: List[str],
+        num_dists: int = 1,
+    ) -> None:
+        mc_collection = MagicMock(
+            _module_fqn="sparse.mc_ec",
+            _sharding_types=sharding_types,
+            _output_dists=[
+                MagicMock(side_effect=lambda *_: events.append(("dist",)))
+                for _ in range(num_dists)
+            ],
+            _embedding_names_per_sharding=[[f"f{i}"] for i in range(num_dists)],
+        )
+        mc_collection._kjt_list_to_tensor_list.return_value = [
+            torch.tensor([i]) for i in range(num_dists)
+        ]
+        with self._record_annotations(events):
+            ShardedManagedCollisionCollection.output_dist(
+                mc_collection,
+                MagicMock(sharding_contexts=[MagicMock() for _ in range(num_dists)]),
+                MagicMock(),
+            )
+
+    def test_input_dist_annotates_splits_dist(self) -> None:
+        events: List[Tuple[object, ...]] = []
+        self._run_input_dist(events, ["row_wise"])
+        self.assertEqual(
+            events,
+            [
+                ("enter", EmbeddingEvent.KJT_SPLITS_DIST, "sparse.mc_ec", "row_wise"),
+                ("dist",),
+                ("exit",),
+            ],
+        )
+
+    def test_input_dist_short_sharding_types_skip_extra_dists(self) -> None:
+        events: List[Tuple[object, ...]] = []
+        self._run_input_dist(events, ["row_wise"], num_dists=2)
+        self.assertEqual(
+            events,
+            [
+                ("enter", EmbeddingEvent.KJT_SPLITS_DIST, "sparse.mc_ec", "row_wise"),
+                ("dist",),
+                ("exit",),
+                ("enter", EmbeddingEvent.KJT_SPLITS_DIST, "sparse.mc_ec", None),
+                ("dist",),
+                ("exit",),
+            ],
+        )
+
+    def test_output_dist_annotates_output_dist(self) -> None:
+        events: List[Tuple[object, ...]] = []
+        self._run_output_dist(events, ["row_wise"])
+        self.assertEqual(
+            events,
+            [
+                ("enter", EmbeddingEvent.OUTPUT_DIST, "sparse.mc_ec", "row_wise"),
+                ("dist",),
+                ("exit",),
+            ],
+        )
+
+    def test_output_dist_short_sharding_types_skip_extra_dists(self) -> None:
+        events: List[Tuple[object, ...]] = []
+        self._run_output_dist(events, ["row_wise"], num_dists=2)
+        self.assertEqual(
+            events,
+            [
+                ("enter", EmbeddingEvent.OUTPUT_DIST, "sparse.mc_ec", "row_wise"),
+                ("dist",),
+                ("exit",),
+                ("enter", EmbeddingEvent.OUTPUT_DIST, "sparse.mc_ec", None),
+                ("dist",),
+                ("exit",),
+            ],
+        )

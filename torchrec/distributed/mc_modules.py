@@ -61,6 +61,7 @@ from torchrec.distributed.sharding.sequence_sharding import (
 )
 from torchrec.distributed.types import (
     Awaitable,
+    EmbeddingEvent,
     LazyAwaitable,
     NullShardedModuleContext,
     ParameterSharding,
@@ -71,7 +72,7 @@ from torchrec.distributed.types import (
     ShardingEnv2D,
     ShardingType,
 )
-from torchrec.distributed.utils import append_prefix
+from torchrec.distributed.utils import append_prefix, maybe_annotate_embedding_event
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.mc_modules import ManagedCollisionCollection
 from torchrec.modules.utils import construct_jagged_tensors
@@ -317,11 +318,15 @@ class ShardedManagedCollisionCollection(
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         use_index_dedup: bool = False,
         restore_dedup_feature_boundary: bool = True,
+        module_fqn: Optional[str] = None,
+        sharding_types: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         self.need_preprocess: bool = module.need_preprocess
         self._device = device
         self._env = env
+        self._module_fqn = module_fqn
+        self._sharding_types: List[str] = sharding_types or []
         self._table_name_to_parameter_sharding: Dict[str, ParameterSharding] = (
             copy.deepcopy(table_name_to_parameter_sharding)
         )
@@ -928,8 +933,13 @@ class ShardedManagedCollisionCollection(
             )
 
             awaitables = []
-            for feature_split, input_dist in zip(feature_splits, dists):
-                awaitables.append(input_dist(feature_split))
+            for i, (feature_split, input_dist) in enumerate(zip(feature_splits, dists)):
+                with maybe_annotate_embedding_event(
+                    EmbeddingEvent.KJT_SPLITS_DIST,
+                    self._module_fqn,
+                    self._sharding_types[i] if i < len(self._sharding_types) else None,
+                ):
+                    awaitables.append(input_dist(feature_split))
                 ctx.sharding_contexts.append(
                     SequenceShardingContext(
                         unbucketize_permute_tensor=(
@@ -949,7 +959,9 @@ class ShardedManagedCollisionCollection(
                     )
                 )
 
-        return KJTListSplitsAwaitable(awaitables, ctx)
+        return KJTListSplitsAwaitable(
+            awaitables, ctx, self._module_fqn, self._sharding_types
+        )
 
     def _kjt_list_to_tensor_list(
         self,
@@ -1176,12 +1188,19 @@ class ShardedManagedCollisionCollection(
         awaitables_per_sharding: List[Awaitable[torch.Tensor]] = []
         features_before_all2all_per_sharding: List[KeyedJaggedTensor] = []
 
-        for odist, remapped_ids, sharding_ctx in zip(
-            self._output_dists,
-            global_remapped,
-            ctx.sharding_contexts,
+        for i, (odist, remapped_ids, sharding_ctx) in enumerate(
+            zip(
+                self._output_dists,
+                global_remapped,
+                ctx.sharding_contexts,
+            )
         ):
-            awaitables_per_sharding.append(odist(remapped_ids, sharding_ctx))
+            with maybe_annotate_embedding_event(
+                EmbeddingEvent.OUTPUT_DIST,
+                self._module_fqn,
+                self._sharding_types[i] if i < len(self._sharding_types) else None,
+            ):
+                awaitables_per_sharding.append(odist(remapped_ids, sharding_ctx))
             features_before_all2all_per_sharding.append(
                 #  got `Optional[KeyedJaggedTensor]`.
                 # pyrefly: ignore[bad-argument-type]
@@ -1350,6 +1369,8 @@ class ManagedCollisionCollectionSharder(
         ],
         device: Optional[torch.device] = None,
         use_index_dedup: bool = False,
+        module_fqn: Optional[str] = None,
+        sharding_types: Optional[List[str]] = None,
     ) -> ShardedManagedCollisionCollection:
 
         if device is None:
@@ -1363,6 +1384,8 @@ class ManagedCollisionCollectionSharder(
             embedding_shardings=embedding_shardings,
             use_index_dedup=use_index_dedup,
             restore_dedup_feature_boundary=self._restore_dedup_feature_boundary,
+            module_fqn=module_fqn,
+            sharding_types=sharding_types,
         )
 
     def shardable_parameters(
