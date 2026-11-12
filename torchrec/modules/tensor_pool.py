@@ -39,6 +39,9 @@ class TensorPool(ObjectPool[torch.Tensor]):
         device (Optional[torch.device]): default device
         loaded_values (Optional[torch.Tensor]): pre-defined values to initialize the pool
         enable_uvm (bool): if set to true, the pool will be allocated on UVM
+        share_storage_with_shards (bool): if set to true, inference sharding into a
+            single shard on the pool's device and in its dtype uses the pool itself
+            as the shard instead of a copy of it
 
     Call Args:
         ids: 1D torch.Tensor of ids to look up
@@ -75,6 +78,7 @@ class TensorPool(ObjectPool[torch.Tensor]):
         device: Optional[torch.device] = None,
         loaded_values: Optional[torch.Tensor] = None,
         enable_uvm: bool = False,
+        share_storage_with_shards: bool = False,
     ) -> None:
         super().__init__()
         self._pool_size = pool_size
@@ -82,6 +86,7 @@ class TensorPool(ObjectPool[torch.Tensor]):
         self._device = device if device is not None else torch.device("meta")
         self._dim = dim
         self._enable_uvm = enable_uvm
+        self.share_storage_with_shards = share_storage_with_shards
         # TODO enable multiple lookup on unsharded module
 
         self.register_buffer(
