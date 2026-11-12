@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import unittest
 from typing import cast
@@ -22,6 +23,8 @@ from torchrec.distributed.test_utils.process_runner import (
     SingleProcessContext,
 )
 from torchrec.experimental.torch_tpu.uneven_all_to_all import (
+    _pad_segments,
+    _unpad_segments,
     maybe_all2all_pooled_uneven_tpu,
     maybe_kjt_a2a_uneven_tpu,
     maybe_variable_batch_all2all_pooled_uneven_tpu,
@@ -31,6 +34,84 @@ from torchrec.experimental.torch_tpu.uneven_all_to_all import (
 _BACKENDS: list[tuple[str, str]] = [("gloo", "cpu")]
 if importlib.util.find_spec("torch_tpu") is not None:
     _BACKENDS.append(("tpu_dist", "tpu"))
+
+
+def _reference_pad(
+    packed: torch.Tensor, splits: list[int], padded_size: int
+) -> torch.Tensor:
+    blocks = []
+    for segment in packed.split(splits, dim=0):
+        padding = packed.new_zeros((padded_size - segment.shape[0], *packed.shape[1:]))
+        blocks.append(torch.cat([segment, padding]))
+    return torch.cat(blocks)
+
+
+def _reference_unpad(
+    padded: torch.Tensor, splits: list[int], padded_size: int
+) -> torch.Tensor:
+    blocks = padded.split(padded_size, dim=0)
+    return torch.cat([block[:size] for block, size in zip(blocks, splits)])
+
+
+class PaddedLayoutTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ("uneven_1d", [3, 0, 5, 1], 5, ()),
+            ("uneven_2d", [2, 4, 1], 6, (3,)),
+            ("even", [2, 2, 2, 2], 2, ()),
+            ("all_empty", [0, 0, 0], 1, (2,)),
+            ("one_rank_full", [0, 7, 0], 7, ()),
+        ]
+    )
+    def test_matches_loop_reference(
+        self, _name: str, splits: list[int], padded_size: int, trailing: tuple[int, ...]
+    ) -> None:
+        for dtype in (torch.float32, torch.int64):
+            packed = (torch.arange(sum(splits) * math.prod(trailing)) + 1).to(dtype)
+            packed = packed.view(sum(splits), *trailing)
+            padded = _pad_segments(packed, splits, padded_size)
+            self.assertTrue(
+                torch.equal(padded, _reference_pad(packed, splits, padded_size))
+            )
+            self.assertTrue(
+                torch.equal(_unpad_segments(padded, splits, padded_size), packed)
+            )
+            self.assertTrue(
+                torch.equal(
+                    _unpad_segments(padded, splits, padded_size),
+                    _reference_unpad(padded, splits, padded_size),
+                )
+            )
+
+    def test_empty_input_keeps_gradient_connection(self) -> None:
+        for trailing in ((), (2,)):
+            with self.subTest(trailing=trailing):
+                packed = torch.empty((0, *trailing), requires_grad=True)
+                padded = _pad_segments(packed, [0, 0, 0], 1)
+                self.assertTrue(padded.requires_grad)
+                torch.testing.assert_close(padded, _reference_pad(packed, [0, 0, 0], 1))
+                padded.sum().backward()
+                self.assertIsNotNone(packed.grad)
+                torch.testing.assert_close(packed.grad, torch.zeros_like(packed))
+
+    def test_gradients_match_loop_reference(self) -> None:
+        splits, padded_size = [3, 0, 5, 1], 5
+        weights = torch.randn(len(splits) * padded_size, 2)
+        grads = []
+        for pad, unpad in (
+            (_pad_segments, _unpad_segments),
+            (_reference_pad, _reference_unpad),
+        ):
+            packed = torch.randn(
+                sum(splits), 2, generator=torch.Generator().manual_seed(0)
+            )
+            packed.requires_grad_()
+            padded = pad(packed, splits, padded_size)
+            (
+                unpad(padded * weights, splits, padded_size).sum() + padded.sum()
+            ).backward()
+            grads.append(packed.grad)
+        torch.testing.assert_close(grads[0], grads[1])
 
 
 class UnevenAllToAllTest(unittest.TestCase):
