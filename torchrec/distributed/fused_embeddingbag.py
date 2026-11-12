@@ -41,6 +41,7 @@ class ShardedFusedEmbeddingBagCollection(
         env: ShardingEnv,
         device: Optional[torch.device] = None,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
+        module_fqn: Optional[str] = None,
     ) -> None:
         optimizer_type = module.optimizer_type()
         optimizer_kwargs = module.optimizer_kwargs()
@@ -62,6 +63,7 @@ class ShardedFusedEmbeddingBagCollection(
             env=env,
             device=device,
             qcomm_codecs_registry=qcomm_codecs_registry,
+            module_fqn=module_fqn,
         )
 
         for index, (sharding, lookup) in enumerate(
@@ -105,6 +107,7 @@ class FusedEmbeddingBagCollectionSharder(
             env,
             device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
+            module_fqn=module_fqn,
         )
 
     def shardable_parameters(

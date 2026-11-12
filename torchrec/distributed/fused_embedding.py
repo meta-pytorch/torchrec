@@ -38,6 +38,7 @@ class ShardedFusedEmbeddingCollection(
         table_name_to_parameter_sharding: Dict[str, ParameterSharding],
         env: ShardingEnv,
         device: Optional[torch.device] = None,
+        module_fqn: Optional[str] = None,
     ) -> None:
         optimizer_type = module.optimizer_type()
         optimizer_kwargs = module.optimizer_kwargs()
@@ -59,6 +60,7 @@ class ShardedFusedEmbeddingCollection(
             fused_params=fused_params,
             env=env,
             device=device,
+            module_fqn=module_fqn,
         )
 
         for index, (sharding, lookup) in enumerate(
@@ -101,7 +103,9 @@ class FusedEmbeddingCollectionSharder(BaseEmbeddingSharder[FusedEmbeddingCollect
         module_fqn: Optional[str] = None,
     ) -> ShardedFusedEmbeddingCollection:
 
-        return ShardedFusedEmbeddingCollection(module, params, env, device)
+        return ShardedFusedEmbeddingCollection(
+            module, params, env, device, module_fqn=module_fqn
+        )
 
     def shardable_parameters(
         self, module: FusedEmbeddingCollection
