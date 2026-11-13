@@ -29,6 +29,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Sequence,
     Tuple,
     TYPE_CHECKING,
     TypeVar,
@@ -567,6 +568,68 @@ def _generate_init_range_for_virtual_tables(
         tbe_params["ssd_uniform_init_upper"] = sum(init_maxs) / num_tables
 
 
+def _resolve_eviction_check_interval_batch(
+    # KVZCHTBEConfig, left as Any because the fbgemm_gpu KVZCH types are behind
+    # the optional import above.
+    kvzch_tbe_config: Any,
+) -> Optional[int]:
+    """
+    Batches between eviction checks. The deprecated
+    `eviction_free_mem_check_interval_batch` is honoured only for free_mem (5),
+    the only mode that ever read it; other modes get the per-mode default.
+    """
+    explicit = getattr(kvzch_tbe_config, "eviction_check_interval_batch", None)
+    if explicit is not None:
+        return explicit
+    deprecated = kvzch_tbe_config.eviction_free_mem_check_interval_batch
+    if deprecated is None:
+        return None
+    if kvzch_tbe_config.kvzch_eviction_trigger_mode == 5:
+        return deprecated
+    logger.warning(
+        "eviction_free_mem_check_interval_batch is set to "
+        f"{kvzch_tbe_config.eviction_free_mem_check_interval_batch} but trigger "
+        f"mode is {kvzch_tbe_config.kvzch_eviction_trigger_mode}, not free_mem "
+        "(5). That field only ever applied to free_mem, so it is ignored here "
+        "and the per-mode default cadence applies. Set "
+        "eviction_check_interval_batch to pin a cadence for this mode."
+    )
+    return None
+
+
+def _eviction_coordination_kwargs(
+    # KVZCHTBEConfig, as above.
+    kvzch_tbe_config: Any,
+    eviction_policy_fields: Sequence[str],
+) -> Dict[str, Any]:
+    """
+    `EvictionPolicy` kwargs for the eviction timing set on `kvzch_tbe_config`.
+    OSS TorchRec can run against an older fbgemm_gpu whose config and
+    `EvictionPolicy` lack these fields, so unset ones are left out, and an
+    `EvictionPolicy` without `eviction_check_interval_batch` gets the
+    deprecated free_mem cadence field it still reads.
+    """
+    if "eviction_check_interval_batch" not in eviction_policy_fields:
+        kwargs = {
+            "eviction_free_mem_check_interval_batch": (
+                kvzch_tbe_config.eviction_free_mem_check_interval_batch
+            ),
+        }
+    else:
+        kwargs = {
+            "eviction_check_interval_batch": _resolve_eviction_check_interval_batch(
+                kvzch_tbe_config
+            ),
+            "eviction_insufficient_backoff_batch": getattr(
+                kvzch_tbe_config, "eviction_insufficient_backoff_batch", None
+            ),
+            "eviction_free_mem_floor_gb": getattr(
+                kvzch_tbe_config, "eviction_free_mem_floor_gb", None
+            ),
+        }
+    return {name: value for name, value in kwargs.items() if value is not None}
+
+
 def _populate_zero_collision_tbe_params(
     tbe_params: Dict[str, Any],
     sharded_local_buckets: List[Tuple[int, int, int]],
@@ -617,9 +680,16 @@ def _populate_zero_collision_tbe_params(
         tbe_params.pop("kvzch_tbe_config")
         eviction_trigger_mode = kvzch_tbe_config.kvzch_eviction_trigger_mode
         eviction_free_mem_threshold_gb = kvzch_tbe_config.eviction_free_mem_threshold_gb
-        eviction_free_mem_check_interval_batch = (
-            kvzch_tbe_config.eviction_free_mem_check_interval_batch
+        # Older fbgemm_gpu configs predate these two fields.
+        eviction_step_intervals = getattr(
+            kvzch_tbe_config, "eviction_step_intervals", None
         )
+        eviction_mem_threshold_gb = getattr(
+            kvzch_tbe_config, "eviction_mem_threshold_gb", None
+        )
+        if eviction_mem_threshold_gb is None:
+            # l2_cache_size is what mem_util has always used.
+            eviction_mem_threshold_gb = l2_cache_size
         threshold_calculation_bucket_stride = (
             kvzch_tbe_config.threshold_calculation_bucket_stride
         )
@@ -700,7 +770,8 @@ def _populate_zero_collision_tbe_params(
                     )
         eviction_policy = EvictionPolicy(
             eviction_trigger_mode=eviction_trigger_mode,
-            eviction_mem_threshold_gb=l2_cache_size,
+            eviction_mem_threshold_gb=eviction_mem_threshold_gb,
+            eviction_step_intervals=eviction_step_intervals,
             eviction_strategy=eviction_strategy,
             counter_thresholds=counter_thresholds,
             ttls_in_mins=ttls_in_mins,
@@ -711,7 +782,7 @@ def _populate_zero_collision_tbe_params(
             l2_weight_thresholds=l2_weight_thresholds,
             meta_header_lens=meta_header_lens,
             eviction_free_mem_threshold_gb=eviction_free_mem_threshold_gb,
-            eviction_free_mem_check_interval_batch=eviction_free_mem_check_interval_batch,
+            **_eviction_coordination_kwargs(kvzch_tbe_config, EvictionPolicy._fields),
             threshold_calculation_bucket_stride=threshold_calculation_bucket_stride,
             threshold_calculation_bucket_num=threshold_calculation_bucket_num,
             enable_eviction_for_feature_score_eviction_policy=enable_eviction_for_feature_score_eviction_policy,
@@ -2975,8 +3046,34 @@ class ZeroCollisionEmbeddingEnrichmentCache(ZeroCollisionKeyValueEmbedding):
     def update(self, embeddings: KeyedJaggedTensor) -> None:
         """
         Update the embedding table with the new embeddings.
+
+        An enrichment write carries each raw id as two float32 lanes; weights as
+        wide as the table are rows, and go to update_rows.
         """
+        weights = embeddings.weights_or_none()
+        if (
+            weights is not None
+            and weights.dim() == 2
+            and weights.size(1) == self._local_cols[0]
+        ):
+            self.update_rows(embeddings)
+            return
         self.emb_module.enrichment_query_id(
+            embeddings.values(), embeddings.offsets(), embeddings.weights()
+        )
+
+    def update_rows(self, embeddings: KeyedJaggedTensor) -> None:
+        """
+        Write rows of the table's width that the trainer already has (e.g. an
+        item embedding feature) through the enrichment write path, into keys
+        whose rows are absent or all-zero.
+        """
+        if not self.emb_module.ssd_db._has_method("set_embedding_cache_rows_cuda"):
+            raise RuntimeError(
+                "KVZCH row writes need an fbgemm_gpu build with "
+                "set_embedding_cache_rows_cuda; rebuild light_cli"
+            )
+        self.emb_module.enrichment_write_rows(
             embeddings.values(), embeddings.offsets(), embeddings.weights()
         )
 
@@ -6088,6 +6185,24 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
                     )
                 )
         self.init_parameters()
+
+    def init_parameters(self) -> None:
+        if not self._use_batched_lookup:
+            super().init_parameters()
+            return
+        weights = self._emb_module.weights
+        specs = self._emb_module.embedding_specs
+        assert len(specs) == len(self._weight_init_mins) == len(self._weight_init_maxs)
+        with torch.no_grad():
+            initialized = [
+                torch.empty(
+                    (rows, dim), dtype=weights.dtype, device=weights.device
+                ).uniform_(lo, hi)
+                for (rows, dim), lo, hi in zip(
+                    specs, self._weight_init_mins, self._weight_init_maxs
+                )
+            ]
+            weights.copy_(torch.cat(initialized, dim=0).flatten())
 
     @property
     # pyrefly: ignore [bad-override]

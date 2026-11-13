@@ -306,6 +306,19 @@
       "kernels.1"
     ]
   },
+  "dlrm": {
+    "state_dict_keys": [
+      "dense_arch.model._mlp.0._linear.bias",
+      "dense_arch.model._mlp.0._linear.weight",
+      "dense_arch.model._mlp.1._linear.bias",
+      "dense_arch.model._mlp.1._linear.weight",
+      "over_arch.model.0._mlp.0._linear.bias",
+      "over_arch.model.0._mlp.0._linear.weight",
+      "over_arch.model.1.bias",
+      "over_arch.model.1.weight",
+      "sparse_arch.embedding_bag_collection.embedding_bags.table1.weight"
+    ]
+  },
   "embedding_bag_collection": {
     "state_dict_keys": [
       "embedding_bags.table1.weight"
@@ -477,15 +490,47 @@
   "noop_metric_module": {
     "state_dict_keys": []
   },
+  "offloaded_rec_metric_module": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+    ]
+  },
   "perceptron": {
     "state_dict_keys": [
       "_linear.bias",
       "_linear.weight"
     ]
   },
+  "position_weighted_module": {
+    "state_dict_keys": [
+      "position_weights.feature1"
+    ]
+  },
   "position_weighted_module_collection": {
     "state_dict_keys": [
       "position_weights.feature1"
+    ]
+  },
+  "process_isolated_cpu_offloaded_rec_metric_module": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+    ]
+  },
+  "process_isolated_cpu_offloaded_rec_metric_module_with_throughput": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples",
+      "throughput_metric.time_lapse_after_warmup",
+      "throughput_metric.total_examples",
+      "throughput_metric.warmup_examples"
     ]
   },
   "rec_metric_module": {

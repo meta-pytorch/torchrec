@@ -265,14 +265,40 @@ def _get_recat_data(
     return recat, recat_tensor
 
 
+def _get_recat_tensor(
+    local_split: int,
+    num_splits: int,
+    stagger: int,
+    device: Optional[torch.device],
+) -> torch.Tensor:
+    feature_order = (
+        torch.arange(num_splits, device=device, dtype=torch.int32)
+        .view(stagger, -1)
+        .transpose(0, 1)
+        .flatten()
+    )
+    return (
+        torch.arange(local_split, device=device, dtype=torch.int32).unsqueeze(1)
+        + feature_order.unsqueeze(0) * local_split
+    ).flatten()
+
+
 @lru_cache(maxsize=128)
 def _get_recat_data_cached(
     local_split: int,
     num_splits: int,
     stagger: int,
     device: Optional[torch.device],
-) -> Tuple[Tuple[int, ...], torch.Tensor]:
-    return _get_recat_data(local_split, num_splits, stagger, device)
+) -> torch.Tensor:
+    return _get_recat_tensor(local_split, num_splits, stagger, device)
+
+
+def _check_stagger(num_splits: int, stagger: int) -> None:
+    if stagger < 1 or num_splits % stagger != 0:
+        raise ValueError(
+            f"stagger must be a positive divisor of the number of splits, got "
+            f"stagger={stagger}, num_splits={num_splits}"
+        )
 
 
 def _normalize_recat_device(
@@ -363,6 +389,85 @@ def _apply_variable_batch_per_rank_if_needed(
     )
 
 
+def _apply_variable_batch_per_rank_tensor_if_needed(
+    recat_tensor: torch.Tensor,
+    local_split: int,
+    batch_size_per_rank: Optional[List[int]],
+) -> torch.Tensor:
+    if batch_size_per_rank is None or is_torchdynamo_compiling():
+        return recat_tensor
+
+    vb_per_rank_condition = any(
+        bs != batch_size_per_rank[0] for bs in batch_size_per_rank
+    )
+
+    if not vb_per_rank_condition:
+        return recat_tensor
+
+    num_splits = len(batch_size_per_rank)
+    max_offset = sum(batch_size_per_rank) * local_split
+    if min(batch_size_per_rank) < 0 or max_offset > _INT32_MAX:
+        msg = (
+            "_get_recat: int32 tensor creation failed: offset overflow. "
+            f"batch_size_per_rank={batch_size_per_rank}, "
+            f"max_offset={max_offset}"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    _check_int_overflow(
+        "_get_recat",
+        batch_size_per_rank,
+        "batch_size_per_rank",
+        local_split=local_split,
+        num_splits=num_splits,
+    )
+    batch_size_per_feature = torch.tensor(
+        batch_size_per_rank,
+        device=recat_tensor.device,
+        dtype=torch.int32,
+    ).repeat_interleave(
+        local_split,
+        output_size=num_splits * local_split,
+    )
+    permuted_batch_size_per_feature = batch_size_per_feature[recat_tensor]
+    input_offset_tensor = torch.cat(
+        (
+            batch_size_per_feature.new_zeros(1),
+            batch_size_per_feature.cumsum(0, dtype=torch.int32),
+        )
+    )
+    output_offset_tensor = torch.cat(
+        (
+            permuted_batch_size_per_feature.new_zeros(1),
+            permuted_batch_size_per_feature.cumsum(0, dtype=torch.int32),
+        )
+    )
+
+    if _TORCHREC_OVERFLOW_DEBUG:
+        _check_int_overflow(
+            "_get_recat",
+            input_offset_tensor.tolist(),
+            "input_offset",
+            local_split=local_split,
+            num_splits=num_splits,
+        )
+        _check_int_overflow(
+            "_get_recat",
+            output_offset_tensor.tolist(),
+            "output_offset",
+            local_split=local_split,
+            num_splits=num_splits,
+        )
+
+    return torch.ops.fbgemm.expand_into_jagged_permute(
+        recat_tensor,
+        input_offset_tensor,
+        output_offset_tensor,
+        max_offset,
+    )
+
+
 def _get_recat(
     local_split: int,
     num_splits: int,
@@ -378,7 +483,8 @@ def _get_recat(
         local_split (int): number of features in local split.
         num_splits (int): number of splits (typically WORLD_SIZE).
         stagger (int): secondary reordering, (typically 1, but
-            `WORLD_SIZE/LOCAL_WORLD_SIZE` for TWRW).
+            `WORLD_SIZE/LOCAL_WORLD_SIZE` for TWRW). Must be a positive divisor of
+            `num_splits`.
         device (Optional[torch.device]): device on which buffer will be allocated.
         batch_size_per_rank (Optional[List[int]]): batch size per rank, needed for
             variable batch size.
@@ -400,24 +506,29 @@ def _get_recat(
     """
 
     with record_function("## all2all_data:recat_permute_gen ##"):
+        _check_stagger(num_splits, stagger)
         if local_split == 0:
             return None
 
         device = _normalize_recat_device(device)
         if cached:
-            recat, recat_tensor = _get_recat_data_cached(
+            recat_tensor = _get_recat_data_cached(
                 local_split,
                 num_splits,
                 stagger,
                 device,
             )
-        else:
-            recat, recat_tensor = _get_recat_data(
+            return _apply_variable_batch_per_rank_tensor_if_needed(
+                recat_tensor,
                 local_split,
-                num_splits,
-                stagger,
-                device,
+                batch_size_per_rank,
             )
+        recat, recat_tensor = _get_recat_data(
+            local_split,
+            num_splits,
+            stagger,
+            device,
+        )
         return _apply_variable_batch_per_rank_if_needed(
             recat,
             recat_tensor,
@@ -705,21 +816,25 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
-        input_list = _safe_tolist_2d(self._input_tensor.view(self.num_workers, -1).T)
-        # Strip tag row from input_list so overflow checks operate on real data
-        if self._tag_appended:
-            input_list = input_list[: self._num_original_tensors]
-        if input_list:
-            _check_int_overflow(
-                "SplitsAllToAllAwaitable",
-                input_list[-1],
-                "AllToAll input last_row (stride_per_rank)",
-                target_dtype=torch.int32,
-                num_workers=self.num_workers,
-                num_tensors=len(input_list),
-                input_tensor_shape=list(self._input_tensor.shape),
-                input_tensor_dtype=self._input_tensor.dtype,
+        input_list: List[List[int]] = []
+        if _TORCHREC_OVERFLOW_DEBUG:
+            input_list = _safe_tolist_2d(
+                self._input_tensor.view(self.num_workers, -1).T
             )
+            # Strip tag row from input_list so overflow checks operate on real data
+            if self._tag_appended:
+                input_list = input_list[: self._num_original_tensors]
+            if input_list:
+                _check_int_overflow(
+                    "SplitsAllToAllAwaitable",
+                    input_list[-1],
+                    "AllToAll input last_row (stride_per_rank)",
+                    target_dtype=torch.int32,
+                    num_workers=self.num_workers,
+                    num_tensors=len(input_list),
+                    input_tensor_shape=list(self._input_tensor.shape),
+                    input_tensor_dtype=self._input_tensor.dtype,
+                )
 
         # Check for int32 overflow in AllToAll output. Although the output
         # tensor may be int64, stride_per_rank values flow downstream to
@@ -833,7 +948,10 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         rank = dist.get_rank(self._pg)
 
         # Keep the experimental dependency out of non-TPU import and execution paths.
-        if getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+        if getattr(torch, "tpu", None) is not None and (
+            torch.accelerator.current_accelerator(check_available=True)
+            == torch.device("tpu")
+        ):
             from torchrec.experimental.torch_tpu.uneven_all_to_all import (
                 maybe_kjt_a2a_uneven_tpu,
             )
@@ -1166,7 +1284,7 @@ class KJEAllToAll(nn.Module):
             send to each pg.rank(). It is assumed the `KeyedJaggedTensor` is ordered by
             destination rank. Same for all ranks.
         stagger (int): stagger value to apply to recat tensor, see `_get_recat` function
-            for more detail.
+            for more detail. Must be a positive divisor of `len(splits)`.
 
     Example::
 
@@ -1213,6 +1331,7 @@ class KJEAllToAll(nn.Module):
     ) -> None:
         super().__init__()
         torch._check(len(splits) == pg.size())
+        _check_stagger(len(splits), stagger)
         self._pg: dist.ProcessGroup = pg
         self._splits = splits
         self._splits_cumsum: List[int] = [0] + list(itertools.accumulate(splits))
@@ -1272,7 +1391,7 @@ class KJTAllToAll(nn.Module):
             send to each pg.rank(). It is assumed the `KeyedJaggedTensor` is ordered by
             destination rank. Same for all ranks.
         stagger (int): stagger value to apply to recat tensor, see `_get_recat` function
-            for more detail.
+            for more detail. Must be a positive divisor of `len(splits)`.
 
     Example::
 
@@ -1318,6 +1437,7 @@ class KJTAllToAll(nn.Module):
     ) -> None:
         super().__init__()
         torch._check(len(splits) == pg.size())
+        _check_stagger(len(splits), stagger)
         self._pg: dist.ProcessGroup = pg
         self._splits = splits
         self._splits_cumsum: List[int] = [0] + list(itertools.accumulate(splits))
@@ -1703,7 +1823,10 @@ class VariableBatchPooledEmbeddingsAllToAll(nn.Module):
         """
 
         padded_output = None
-        if getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+        if getattr(torch, "tpu", None) is not None and (
+            torch.accelerator.current_accelerator(check_available=True)
+            == torch.device("tpu")
+        ):
             from torchrec.experimental.torch_tpu.uneven_all_to_all import (
                 maybe_variable_batch_all2all_pooled_uneven_tpu,
             )

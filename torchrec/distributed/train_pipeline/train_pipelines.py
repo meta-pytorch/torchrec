@@ -237,6 +237,14 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def reset(self) -> None:
         """
         Reset the pipeline state. Override in subclasses if custom reset logic is needed.
+
+        Call before switching to a new dataloader iterator when batches already
+        prefetched from the previous iterator must not be consumed, e.g. after a
+        warmup or compile phase. It drops all in-flight batches and their contexts
+        and clears the dataloader-exhausted state, so the next
+        `progress(new_iter)` only yields batches from `new_iter`. Without
+        `reset()`, a mid-stream iterator switch may still yield batches prefetched
+        from the previous iterator.
         """
         pass
 
@@ -1935,8 +1943,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         if self._model.training:
             # update
-            with record_function("## optimizer ##"):
-                self._optimizer.step()
+            self._optimizer_step()
 
         self.dequeue_batch()
         return output
@@ -2448,6 +2455,14 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
     )
+    def _wait_for_batch(self) -> None:
+        """Order the compute stream after the current batch's cache prefetch."""
+        with record_function("## wait_for_batch ##"):
+            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         Executes one training iteration with prefetch pipelining.
@@ -2482,8 +2497,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             with record_function("## zero_grad ##"):
                 self._optimizer.zero_grad()
 
-        with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+        self._wait_for_batch()
 
         # batch i+2: load data and copy to gpu
         self.enqueue_batch(dataloader_iter)
@@ -2517,8 +2531,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
         if self._model.training:
             # backward
-            with record_function("## backward ##"):
-                torch.sum(losses, dim=0).backward()
+            self._backward(losses)
 
             # update
             with record_function("## optimizer ##"):
@@ -3140,6 +3153,18 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
 
         if self.on_flush_end is not None:
             self.on_flush_end()
+
+    def reset(self) -> None:
+        """
+        Drops all in-flight stage outputs so the next `progress()` refills the
+        pipeline from the iterator it is given. State owned by the stages
+        themselves (e.g. `SparseDataDistUtil` contexts) is not reset.
+        """
+        self._stage_outputs = [None] * self.num_stages
+        self._initialized = False
+        self._dataloader_iter = None
+        self._dataloader_exhausted = False
+        self._flushing = False
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True

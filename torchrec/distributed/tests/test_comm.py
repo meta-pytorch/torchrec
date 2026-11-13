@@ -503,6 +503,79 @@ class TestAllToAll(unittest.TestCase):
             )
 
     @classmethod
+    def _test_variable_batch_alltoall_pooled_fp8_fwd_padding(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+        batch_size_per_rank: List[int],
+        dim_sum_per_rank: List[int],
+        use_sync: bool,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        pg = dist.distributed_c10d._get_default_group()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        comm_ops.set_use_sync_collectives(use_sync)
+
+        torch.manual_seed(rank)
+        pooled_embs = torch.randn(
+            sum(batch_size_per_rank), dim_sum_per_rank[rank], device=device
+        )
+
+        def fwd(codecs: Optional[QuantizedCommCodecs], padding: bool) -> Tensor:
+            os.environ["TORCHREC_ENABLE_FP8_ROWWISE_PADDING"] = str(int(padding))
+            # One feature per rank, each with every rank's batch size.
+            return comm_ops.variable_batch_alltoall_pooled(
+                pooled_embs.view(-1),
+                batch_size_per_rank_per_feature=[[b] for b in batch_size_per_rank],
+                batch_size_per_feature_pre_a2a=[batch_size_per_rank[rank]] * world_size,
+                emb_dim_per_rank_per_feature=[[d] for d in dim_sum_per_rank],
+                group=pg,
+                codecs=codecs,
+            ).wait()
+
+        fp8 = get_qcomm_codecs(
+            QCommsConfig(
+                forward_precision=CommType.FP8,
+                backward_precision=CommType.FP8,
+                fp8_quantize_dim=256,
+                fp8_quantize_dim_bwd=256,
+            )
+        )
+        padded = fwd(fp8, padding=True)
+        torch.testing.assert_close(padded, fwd(None, padding=False), rtol=0.1, atol=0.1)
+        if all(b * d % 256 == 0 for b in batch_size_per_rank for d in dim_sum_per_rank):
+            torch.testing.assert_close(padded, fwd(fp8, padding=False), rtol=0, atol=0)
+        comm_ops.set_use_sync_collectives(False)
+        dist.destroy_process_group()
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
+    )
+    def test_variable_batch_alltoall_pooled_fp8_fwd_padding(self) -> None:
+        for use_sync, (batch_size_per_rank, dim_sum_per_rank) in itertools.product(
+            [False, True],
+            [
+                # Every B_r * D_s split unaligned to 256.
+                ([3, 5], [36, 72]),
+                # Rank 0 sends aligned splits but receives a padded one.
+                ([4, 3], [64, 64]),
+                # Aligned splits: the comm is unchanged with padding on.
+                ([4, 4], [128, 256]),
+            ],
+        ):
+            self._run_multi_process_test(
+                world_size=self.WORLD_SIZE,
+                backend="nccl",
+                # pyrefly: ignore[bad-argument-type]
+                callable=self._test_variable_batch_alltoall_pooled_fp8_fwd_padding,
+                batch_size_per_rank=batch_size_per_rank,
+                dim_sum_per_rank=dim_sum_per_rank,
+                use_sync=use_sync,
+            )
+
+    @classmethod
     def _test_reduce_scatter_pooled(
         cls,
         rank: int,

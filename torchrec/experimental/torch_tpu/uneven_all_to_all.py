@@ -23,6 +23,44 @@ import torch.distributed as dist
 from torchrec.pt2.checks import is_torchdynamo_compiling
 
 
+def _padded_rows(
+    split_sizes: Sequence[int], padded_split_size: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map each row of the padded ``[world, padded_split_size]`` layout to its packed row.
+
+    Returns the packed row index and whether the padded row holds real data. Shapes
+    depend only on the world size and padded size, not on the individual splits.
+    """
+    sizes = torch.tensor(split_sizes, dtype=torch.int64, device=device)
+    starts = torch.cumsum(sizes, dim=0) - sizes
+    position = torch.arange(padded_split_size, dtype=torch.int64, device=device)
+    rows = (starts[:, None] + position[None, :]).reshape(-1)
+    valid = (position[None, :] < sizes[:, None]).reshape(-1)
+    return rows, valid
+
+
+def _pad_segments(
+    packed: torch.Tensor, split_sizes: Sequence[int], padded_split_size: int
+) -> torch.Tensor:
+    rows, valid = _padded_rows(split_sizes, padded_split_size, packed.device)
+    if packed.shape[0] == 0:
+        padding = packed.new_zeros((rows.numel(), *packed.shape[1:]))
+        return torch.cat([packed, padding], dim=0)
+    gathered = packed.index_select(0, torch.where(valid, rows, 0))
+    return gathered.masked_fill(~valid.view(-1, *[1] * (packed.ndim - 1)), 0)
+
+
+def _unpad_segments(
+    padded: torch.Tensor, split_sizes: Sequence[int], padded_split_size: int
+) -> torch.Tensor:
+    rows, valid = _padded_rows(split_sizes, padded_split_size, padded.device)
+    total = sum(split_sizes)
+    # Padding rows all land in one extra row that is sliced off.
+    destination = torch.where(valid, rows, total)
+    packed = padded.new_zeros((total + 1, *padded.shape[1:]))
+    return packed.index_copy(0, destination, padded)[:total]
+
+
 def _pad_dim0(tensor: torch.Tensor, size: int) -> torch.Tensor:
     rows = tensor.shape[0]
     if rows == size:
@@ -43,11 +81,14 @@ def padded_all_to_all_single(
     padded_split_size: int,
     *,
     even_all_to_all: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
+    vectorized: bool = True,
 ) -> torch.Tensor:
     """Implement uneven dim-0 all-to-all using an even padded collective.
 
     KJT uses the default raw collective. Pooled embeddings inject TorchRec's existing
     autograd-aware even collective to preserve backward behavior.
+
+    ``vectorized`` pads and unpads with index ops instead of a per-rank loop.
     """
     world_size = group.size()
     if input_tensor.ndim == 0:
@@ -61,13 +102,16 @@ def padded_all_to_all_single(
     if padded_split_size < max(1, *input_split_sizes, *output_split_sizes):
         raise ValueError("padded split size is smaller than a real segment")
 
-    padded_input = torch.cat(
-        [
-            _pad_dim0(segment, padded_split_size)
-            for segment in input_tensor.split(list(input_split_sizes), dim=0)
-        ],
-        dim=0,
-    )
+    if vectorized:
+        padded_input = _pad_segments(input_tensor, input_split_sizes, padded_split_size)
+    else:
+        padded_input = torch.cat(
+            [
+                _pad_dim0(segment, padded_split_size)
+                for segment in input_tensor.split(list(input_split_sizes), dim=0)
+            ],
+            dim=0,
+        )
     if even_all_to_all is None:
         padded_output = torch.empty_like(padded_input)
         dist.all_to_all_single(
@@ -85,6 +129,8 @@ def padded_all_to_all_single(
             f"expected {expected_shape}"
         )
 
+    if vectorized:
+        return _unpad_segments(padded_output, output_split_sizes, padded_split_size)
     source_blocks = padded_output.split(padded_split_size, dim=0)
     return torch.cat(
         [
@@ -201,6 +247,7 @@ def maybe_all2all_pooled_uneven_tpu(
         output_split_sizes,
         max(1, padded_split_size),
         even_all_to_all=even_all_to_all,
+        vectorized=True,
     )
     outputs_by_rank = sharded_output.split(output_split_sizes)
     return torch.cat(
@@ -226,13 +273,17 @@ def maybe_variable_batch_all2all_pooled_uneven_tpu(
     world_size = group.size()
     if has_codecs or is_torchdynamo_compiling() or world_size <= 1:
         return None
+
+    rank = group.rank()
+    if not batch_size_per_rank_per_feature and not emb_dim_per_rank_per_feature[rank]:
+        batch_size_per_rank_per_feature = [[] for _ in range(world_size)]
+    # TODO: Check if this condition is really needed and would not fail anyways
     if (
         len(batch_size_per_rank_per_feature) != world_size
         or len(emb_dim_per_rank_per_feature) != world_size
     ):
         raise ValueError("VBE metadata must match the process-group size")
 
-    rank = group.rank()
     input_split_sizes = [
         sum(
             batch_size * embedding_dim

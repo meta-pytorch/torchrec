@@ -73,12 +73,28 @@ from torchrec.metrics.calibration_with_recalibration import (
 )
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
+from torchrec.metrics.cpu_offloaded_metric_process import (
+    ProcessIsolatedCPUOffloadedRecMetricModule,
+)
+from torchrec.metrics.cpu_offloaded_metric_worker import oss_worker_factory
 from torchrec.metrics.ctr import CTRMetric
 from torchrec.metrics.gauc import GAUCMetric
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
 from torchrec.metrics.mae import MAEMetric
-from torchrec.metrics.metric_module import RecMetricModule
-from torchrec.metrics.metrics_config import BatchSizeStage, RecComputeMode, RecTaskInfo
+from torchrec.metrics.metric_module import (
+    generate_metric_module,
+    OffloadedRecMetricModule,
+    RecMetricModule,
+)
+from torchrec.metrics.metrics_config import (
+    BatchSizeStage,
+    MetricsConfig,
+    RecComputeMode,
+    RecMetricDef,
+    RecMetricEnum,
+    RecTaskInfo,
+    ThroughputDef,
+)
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.multi_label_precision import MultiLabelPrecisionMetric
 from torchrec.metrics.multiclass_recall import MulticlassRecallMetric
@@ -110,6 +126,7 @@ from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
+from torchrec.models.dlrm import DLRM
 from torchrec.modules.activation import SwishLayerNorm
 from torchrec.modules.crossnet import (
     CrossNet,
@@ -128,6 +145,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
+from torchrec.modules.feature_processor import PositionWeightedModule
 from torchrec.modules.feature_processor_ import PositionWeightedModuleCollection
 from torchrec.modules.fp_embedding_modules import FeatureProcessedEmbeddingBagCollection
 from torchrec.modules.hash_mc_evictions import (
@@ -317,6 +335,18 @@ class _GoldenCase:
     def key(self) -> str:
         return f"{self.stable_id}_{self.variant}" if self.variant else self.stable_id
 
+    def state_dict_keys(self) -> Set[str]:
+        module = self.build()
+        try:
+            assert type(module) is self.expected_class, (
+                type(module),
+                self.expected_class,
+            )
+            return set(module.state_dict())
+        finally:
+            if isinstance(module, ProcessIsolatedCPUOffloadedRecMetricModule):
+                module.shutdown()
+
     @classmethod
     def for_metric(
         cls,
@@ -431,6 +461,34 @@ def _make_cpu_offloaded_module(
         )
 
 
+def _make_process_isolated_module(
+    with_throughput: bool = False,
+) -> RecMetricModule:
+    tasks = [create_test_task("task1")]
+    config = MetricsConfig(
+        rec_tasks=tasks,
+        rec_metrics={RecMetricEnum.NE: RecMetricDef(rec_tasks=tasks, window_size=100)},
+        throughput_metric=(
+            ThroughputDef(window_size=100, warmup_steps=10) if with_throughput else None
+        ),
+    )
+    return generate_metric_module(
+        metric_class=ProcessIsolatedCPUOffloadedRecMetricModule,
+        metrics_config=config,
+        batch_size=32,
+        world_size=1,
+        my_rank=0,
+        state_metrics_mapping={},
+        device=torch.device("cpu"),
+        module_kwargs={
+            "model_out_device": torch.device("cpu"),
+            "worker_factory": oss_worker_factory(config, 32, 1, 0),
+            "num_slots": 4,
+            "slot_bytes": 1024,
+        },
+    )
+
+
 def _make_mch_module(policy: MCHEvictionPolicy) -> MCHManagedCollisionModule:
     return MCHManagedCollisionModule(
         zch_size=64,
@@ -513,6 +571,26 @@ def _make_fp_embedding_bag_collection() -> FeatureProcessedEmbeddingBagCollectio
     )
 
 
+def _make_dlrm() -> DLRM:
+    # DLRM requires the last dense layer to match the embedding dim.
+    return DLRM(
+        embedding_bag_collection=EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name=_TABLE_NAME,
+                    embedding_dim=4,
+                    num_embeddings=50,
+                    feature_names=[_FEATURE_NAME],
+                )
+            ],
+            device=torch.device("cpu"),
+        ),
+        dense_in_features=4,
+        dense_arch_layer_sizes=[8, 4],
+        over_arch_layer_sizes=[8, 1],
+    )
+
+
 class _ITEPEmbedding(torch.nn.Module):
     def __init__(self, table: ShardedEmbeddingTable) -> None:
         super().__init__()
@@ -583,6 +661,12 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
             **_module_fixture_kwargs(), throughput_metric=_make_throughput_metric()
         ),
     ),
+    _GoldenCase(
+        "offloaded_rec_metric_module",
+        OffloadedRecMetricModule,
+        "",
+        lambda: OffloadedRecMetricModule(**_module_fixture_kwargs()),
+    ),
     # state_dict() reads the comms tree and load_state_dict() writes the offloaded
     # one, but both carry the same keys, so this pins the shape and not which tree
     # a load reached. test_cpu_offloaded_metric_module covers the load direction.
@@ -599,6 +683,18 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         CPUOffloadedRecMetricModule,
         "with_throughput",
         lambda: _make_cpu_offloaded_module(_make_throughput_metric()),
+    ),
+    _GoldenCase(
+        "process_isolated_cpu_offloaded_rec_metric_module",
+        ProcessIsolatedCPUOffloadedRecMetricModule,
+        "",
+        _make_process_isolated_module,
+    ),
+    _GoldenCase(
+        "process_isolated_cpu_offloaded_rec_metric_module",
+        ProcessIsolatedCPUOffloadedRecMetricModule,
+        "with_throughput",
+        lambda: _make_process_isolated_module(with_throughput=True),
     ),
     # Buffer names come from the eviction policy, and DistanceLFU is the union
     # of the other two, so each policy needs its own row.
@@ -806,6 +902,14 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         "",
         lambda: PositionWeightedModuleCollection({_FEATURE_NAME: 8}),
     ),
+    # The older class in `feature_processor`, not the `feature_processor_` one
+    # the collection above is built from. Both store `position_weights`.
+    _GoldenCase(
+        "position_weighted_module",
+        PositionWeightedModule,
+        "",
+        lambda: PositionWeightedModule({_FEATURE_NAME: 8}),
+    ),
     _GoldenCase(
         "feature_processed_embedding_bag_collection",
         FeatureProcessedEmbeddingBagCollection,
@@ -844,6 +948,8 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         "",
         lambda: LowRankMixtureCrossNet(in_features=4, num_layers=2),
     ),
+    # A whole model. The arch attribute names prefix every key.
+    _GoldenCase("dlrm", DLRM, "", _make_dlrm),
 )
 
 
@@ -959,8 +1065,7 @@ class GoldenCaseTest(unittest.TestCase):
         cls.golden_snapshot = load_required_golden_snapshot()
 
     def _check_case(self, case: _GoldenCase) -> None:
-        module = case.build()
-        self.assertIs(type(module), case.expected_class)
+        current_keys = case.state_dict_keys()
 
         if case.key not in self.golden_snapshot:
             self.fail(
@@ -970,9 +1075,7 @@ class GoldenCaseTest(unittest.TestCase):
                 "whole file at once corrupt it."
             )
 
-        _validate_case_entry(
-            case, self.golden_snapshot[case.key], set(module.state_dict())
-        )
+        _validate_case_entry(case, self.golden_snapshot[case.key], current_keys)
 
     def test_golden_cases(self) -> None:
         for case in _SCHEMA_CASES:
@@ -1050,7 +1153,7 @@ class GoldenCaseTest(unittest.TestCase):
         by_id: Dict[str, List[FrozenSet[str]]] = {}
         for case in _SCHEMA_CASES:
             by_id.setdefault(case.stable_id, []).append(
-                frozenset(case.build().state_dict().keys())
+                frozenset(case.state_dict_keys())
             )
 
         for stable_id, entries in by_id.items():
@@ -1830,7 +1933,7 @@ def generate_schema_case_entries() -> Dict[str, Dict[str, Any]]:
                 "the other's golden entry."
             )
         entries[case.key] = {
-            "state_dict_keys": sorted(case.build().state_dict().keys()),
+            "state_dict_keys": sorted(case.state_dict_keys()),
         }
     return entries
 

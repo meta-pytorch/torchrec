@@ -93,6 +93,23 @@ def is_prefetch_pipelined(
     return prefetch_pipeline
 
 
+def is_prefetch_pipelined_for_table(
+    sharding_option: ShardingOption,
+    sharder_data: SharderData,
+) -> bool:
+    """Return whether prefetch pipelining is enabled for this table.
+
+    An explicit table setting, including False, takes precedence over the
+    sharder's fused prefetch_pipeline setting.
+    """
+    if (
+        sharding_option.cache_params is not None
+        and sharding_option.cache_params.prefetch_pipeline is not None
+    ):
+        return sharding_option.cache_params.prefetch_pipeline
+    return is_prefetch_pipelined(sharding_option, sharder_data)
+
+
 def extract_comm_data_type_size(
     sharding_option: ShardingOption,
     sharder_data: SharderData,

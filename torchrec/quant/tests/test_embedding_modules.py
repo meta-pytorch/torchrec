@@ -36,6 +36,7 @@ from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
     MODULE_ATTR_USE_UNFLATTENED_LENGTHS_FOR_BATCHING,
     quant_prep_enable_quant_state_dict_split_scale_bias,
+    quantize_state_dict,
 )
 from torchrec.sparse.jagged_tensor import (
     ComputeKJTToJTDict,
@@ -56,6 +57,17 @@ def load_required_dram_kv_embedding_libraries() -> bool:
     except Exception as e:
         logger.error(f"Failed to load dram_kv_embedding libraries, skipping test: {e}")
         return False
+
+
+class QuantizeStateDictTest(unittest.TestCase):
+    def test_unsupported_dtype_error_names_the_dtype(self) -> None:
+        module = torch.nn.Module()
+        module.embedding_bags = torch.nn.ModuleDict(
+            {"t1": torch.nn.EmbeddingBag(4, 8, dtype=torch.bfloat16)}
+        )
+
+        with self.assertRaisesRegex(Exception, r"Unsupported dtype: torch\.bfloat16"):
+            quantize_state_dict(module, {}, {"t1": DataType.INT8})
 
 
 class EmbeddingBagCollectionTest(unittest.TestCase):

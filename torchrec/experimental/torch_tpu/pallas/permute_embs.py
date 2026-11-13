@@ -167,9 +167,19 @@ def permute_pooled_embs_tc_bwd(
     offset_dim_list: jax.Array,
     permute_list: jax.Array,
 ) -> jax.Array:
-    """Gradient w.r.t. the input: scatter-add grad_out back to its source columns."""
+    """Gradient w.r.t. the input: grad_out's columns moved back to their sources.
+
+    ``col_perm`` is a bijection on ``[0, D)`` (subset permutations are rejected), so
+    each input column receives exactly one output column's gradient: a gather by the
+    inverse permutation, not a ``[B, D]`` scatter-add. XLA's TPU scatter lowering
+    overruns its scoped-VMEM limit for large pooled outputs
+    (``CompileTimeScopedVmemOom``), whatever the limit is set to.
+    """
     if permute_list.shape[0] != offset_dim_list.shape[0] - 1:
         raise NotImplementedError("Subset permutations are not supported")
-    B, D = grad_out.shape
+    D = grad_out.shape[1]
     col_perm = _permute_col_index(offset_dim_list, permute_list, D)
-    return jnp.zeros((B, D), grad_out.dtype).at[:, col_perm].add(grad_out)
+    inv_col_perm = (
+        jnp.zeros((D,), jnp.int32).at[col_perm].set(jnp.arange(D, dtype=jnp.int32))
+    )
+    return jnp.take(grad_out, inv_col_perm, axis=1)

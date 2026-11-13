@@ -29,26 +29,26 @@ def tpu_is_available() -> bool:
         _ = torch_tpu
     except ImportError:
         return False
-    tpu = getattr(torch, "tpu", None)
-    if tpu is None:
-        return False
-    is_available = getattr(tpu, "is_available", None)
-    if callable(is_available):
-        return bool(is_available())
-    return bool(getattr(tpu, "available", False))
+    return torch.accelerator.is_available()
 
 
-def _reference(pooled_embs: torch.Tensor) -> torch.Tensor:
-    blocks = torch.split(pooled_embs, EMBEDDING_DIMS, dim=1)
-    return torch.cat([blocks[index] for index in EMBEDDING_ORDER], dim=1)
+def _reference(
+    pooled_embs: torch.Tensor,
+    dims: list[int] = EMBEDDING_DIMS,
+    order: list[int] = EMBEDDING_ORDER,
+) -> torch.Tensor:
+    blocks = torch.split(pooled_embs, dims, dim=1)
+    return torch.cat([blocks[index] for index in order], dim=1)
 
 
-def _metadata(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _metadata(
+    device: torch.device,
+    dims: list[int] = EMBEDDING_DIMS,
+    order: list[int] = EMBEDDING_ORDER,
+) -> tuple[torch.Tensor, torch.Tensor]:
     return (
-        torch.tensor(
-            [0, *accumulate(EMBEDDING_DIMS)], dtype=torch.int32, device=device
-        ),
-        torch.tensor(EMBEDDING_ORDER, dtype=torch.int32, device=device),
+        torch.tensor([0, *accumulate(dims)], dtype=torch.int32, device=device),
+        torch.tensor(order, dtype=torch.int32, device=device),
     )
 
 
@@ -66,18 +66,23 @@ class PermutePooledEmbeddingsTest(unittest.TestCase):
         if not dist.is_initialized():
             dist.init_process_group(backend="tpu_dist")
 
-    def _check_forward_backward(self, device: torch.device) -> None:
+    def _check_forward_backward(
+        self,
+        device: torch.device,
+        dims: list[int] = EMBEDDING_DIMS,
+        order: list[int] = EMBEDDING_ORDER,
+        batch_size: int = BATCH_SIZE,
+    ) -> None:
         torch.manual_seed(0)
-        width = sum(EMBEDDING_DIMS)
-        pooled = torch.randn((BATCH_SIZE, width), dtype=torch.float32)
+        pooled = torch.randn((batch_size, sum(dims)), dtype=torch.float32)
         grad_seed = torch.randn_like(pooled)
 
         expected_input = pooled.clone().requires_grad_(True)
-        expected = _reference(expected_input)
+        expected = _reference(expected_input, dims, order)
         expected.backward(grad_seed)
 
         actual_input = pooled.to(device).requires_grad_(True)
-        offset_dim_list, permute_list = _metadata(device)
+        offset_dim_list, permute_list = _metadata(device, dims, order)
         actual = torch.ops.torchrec.permute_pooled_embs(
             actual_input, offset_dim_list, permute_list
         )
@@ -96,6 +101,14 @@ class PermutePooledEmbeddingsTest(unittest.TestCase):
     def test_tpu_forward_backward(self) -> None:
         self._setup_tpu()
         self._check_forward_backward(torch.device("tpu"))
+
+    def test_tpu_forward_backward_large(self) -> None:
+        # Rows x width of a permute that OmniFM v4 hits on TPU, where a [B, D]
+        # scatter-add backward fails to compile (CompileTimeScopedVmemOom).
+        self._setup_tpu()
+        self._check_forward_backward(
+            torch.device("tpu"), [128, 64, 192], [2, 0, 1], batch_size=61349
+        )
 
     def test_sparse_core_forward(self) -> None:
         self._setup_tpu()

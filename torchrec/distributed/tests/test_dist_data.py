@@ -11,6 +11,7 @@ import contextlib
 import itertools
 import os
 import random
+import tempfile
 import unittest
 import unittest.mock
 from typing import (
@@ -32,6 +33,7 @@ import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
 import torchrec.distributed.collective_utils as cu
+import torchrec.distributed.dist_data as dist_data
 import torchrec.distributed.embedding_sharding as embedding_sharding
 from hypothesis import given, settings
 from pyre_extensions import none_throws
@@ -50,6 +52,7 @@ from torchrec.distributed.dist_data import (
     _get_recat,
     _get_recat_data_cached,
     JaggedTensorAllToAll,
+    KJEAllToAll,
     KJTAllToAll,
     KJTAllToAllSplitsAwaitable,
     KJTAllToAllTensorsAwaitable,
@@ -1934,6 +1937,11 @@ class SideStreamOutputEncodeTest(MultiProcessTestBase):
 
 
 class GetRecatOverflowTest(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        _get_recat_data_cached.cache_clear()
+        self.addCleanup(_get_recat_data_cached.cache_clear)
+
     def test_get_recat_logs_and_raises_on_int32_overflow(self) -> None:
         """Verify that _get_recat raises RuntimeError and logs context when
         batch_size_per_rank contains values that overflow int32."""
@@ -1957,6 +1965,28 @@ class GetRecatOverflowTest(unittest.TestCase):
         self.assertIn(str(overflow_value), logged)
         self.assertIn("input_offset", logged)
         self.assertIn("output_offset", logged)
+
+    def test_cached_get_recat_logs_and_raises_on_int32_overflow(self) -> None:
+        overflow_value = 2_147_483_648  # INT32_MAX + 1
+        with self.assertRaises(RuntimeError) as ctx, self.assertLogs(
+            level="ERROR"
+        ) as log:
+            _get_recat(
+                local_split=2,
+                num_splits=4,
+                stagger=1,
+                device=torch.device("cpu"),
+                batch_size_per_rank=[32, overflow_value, 32, 32],
+                cached=True,
+            )
+
+        self.assertIn("overflow", str(ctx.exception).lower())
+
+        logged = "\n".join(log.output)
+        self.assertIn("_get_recat", logged)
+        self.assertIn("batch_size_per_rank", logged)
+        self.assertIn(str(overflow_value), logged)
+        self.assertIn("max_offset", logged)
 
     def test_get_recat_no_overflow_unchanged_behavior(self) -> None:
         """Verify that _get_recat still returns a valid recat tensor when
@@ -1999,7 +2029,135 @@ class GetRecatOverflowTest(unittest.TestCase):
         )
 
         self.assertIsNot(first, second)
-        self.assertTrue(torch.equal(none_throws(first), none_throws(second)))
+        expected = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], dtype=torch.int32)
+        self.assertTrue(torch.equal(none_throws(first), expected))
+        self.assertTrue(torch.equal(none_throws(second), expected))
+
+    def test_get_recat_rejects_invalid_stagger(self) -> None:
+        for stagger, local_split, cached in itertools.product(
+            [4, 7, 0, -2], [0, 2], [False, True]
+        ):
+            with self.subTest(
+                stagger=stagger, local_split=local_split, cached=cached
+            ), self.assertRaisesRegex(ValueError, "positive divisor"):
+                _get_recat(
+                    local_split=local_split,
+                    num_splits=6,
+                    stagger=stagger,
+                    device=torch.device("cpu"),
+                    cached=cached,
+                )
+
+    def test_kjt_all_to_all_rejects_invalid_stagger(self) -> None:
+        pg_mock = MagicMock()
+        pg_mock.size.return_value = 6
+        for module_cls, stagger in itertools.product(
+            [KJTAllToAll, KJEAllToAll], [4, 7, 0, -2]
+        ):
+            with self.subTest(
+                module=module_cls.__name__, stagger=stagger
+            ), self.assertRaisesRegex(ValueError, "positive divisor"):
+                module_cls(
+                    pg=cast(dist.ProcessGroup, pg_mock),
+                    splits=[1] * 6,
+                    stagger=stagger,
+                )
+
+        for module_cls, stagger in itertools.product(
+            [KJTAllToAll, KJEAllToAll], [1, 2, 3, 6]
+        ):
+            module = module_cls(
+                pg=cast(dist.ProcessGroup, pg_mock),
+                splits=[1] * 6,
+                stagger=stagger,
+            )
+            self.assertEqual(module._stagger, stagger)
+
+    @given(
+        local_split=st.integers(min_value=1, max_value=16),
+        split_config=st.sampled_from(
+            [
+                (num_splits, stagger)
+                for num_splits in range(1, 17)
+                for stagger in range(1, num_splits + 1)
+                if num_splits % stagger == 0
+            ]
+        ),
+        batch_sizes=st.lists(
+            st.integers(min_value=0, max_value=16), min_size=16, max_size=16
+        ),
+    )
+    @settings(max_examples=50, deadline=None)
+    def test_cached_get_recat_variable_batch_matches_uncached(
+        self,
+        local_split: int,
+        split_config: Tuple[int, int],
+        batch_sizes: List[int],
+    ) -> None:
+        num_splits, stagger = split_config
+        batch_size_per_rank = batch_sizes[:num_splits]
+        _get_recat_data_cached.cache_clear()
+
+        uncached = _get_recat(
+            local_split=local_split,
+            num_splits=num_splits,
+            stagger=stagger,
+            device=torch.device("cpu"),
+            batch_size_per_rank=batch_size_per_rank,
+        )
+        cached = _get_recat(
+            local_split=local_split,
+            num_splits=num_splits,
+            stagger=stagger,
+            device=torch.device("cpu"),
+            batch_size_per_rank=batch_size_per_rank,
+            cached=True,
+        )
+
+        self.assertTrue(torch.equal(none_throws(uncached), none_throws(cached)))
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_cached_get_recat_matches_uncached_cuda(self) -> None:
+        device = torch.device("cuda", torch.cuda.current_device())
+        for local_split, num_splits, stagger, batch_size_per_rank in [
+            (3, 4, 1, None),
+            (3, 4, 2, [8, 8, 8, 8]),
+            (3, 4, 1, [8, 16, 0, 4]),
+            (5, 8, 2, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (5, 8, 4, [0, 7, 0, 7, 3, 3, 9, 1]),
+        ]:
+            with self.subTest(
+                local_split=local_split,
+                num_splits=num_splits,
+                stagger=stagger,
+                batch_size_per_rank=batch_size_per_rank,
+            ):
+                uncached = none_throws(
+                    _get_recat(
+                        local_split=local_split,
+                        num_splits=num_splits,
+                        stagger=stagger,
+                        device=device,
+                        batch_size_per_rank=batch_size_per_rank,
+                    )
+                )
+                cached = none_throws(
+                    _get_recat(
+                        local_split=local_split,
+                        num_splits=num_splits,
+                        stagger=stagger,
+                        device=device,
+                        batch_size_per_rank=batch_size_per_rank,
+                        cached=True,
+                    )
+                )
+
+                self.assertEqual(cached.device, device)
+                self.assertEqual(cached.dtype, torch.int32)
+                self.assertTrue(torch.equal(uncached, cached))
 
     @given(
         local_split=st.integers(min_value=0, max_value=16),
@@ -2066,7 +2224,7 @@ class GetRecatOverflowTest(unittest.TestCase):
     def test_cached_recat_unchanged_after_dist_init(self) -> None:
         _get_recat_data_cached.cache_clear()
         self.addCleanup(_get_recat_data_cached.cache_clear)
-        _, cached_recat = _get_recat_data_cached(
+        cached_recat = _get_recat_data_cached(
             2,
             2,
             1,
@@ -2160,8 +2318,8 @@ class GetRecatOverflowTest(unittest.TestCase):
         with patch(
             "torchrec.distributed.dist_data._get_recat_data_cached",
             side_effect=[
-                ((0,), rank_zero_recat),
-                ((1,), rank_one_recat),
+                rank_zero_recat,
+                rank_one_recat,
             ],
         ) as get_recat_data, patch(
             "torch.cuda.current_device",
@@ -2206,6 +2364,47 @@ class GetRecatOverflowTest(unittest.TestCase):
                 unittest.mock.call(2, 4, 1, torch.device("cuda", 1)),
             ],
         )
+
+
+class SplitsAllToAllOverflowDebugGatingTest(unittest.TestCase):
+    """`_wait_impl` reads the input splits back only when `TORCHREC_OVERFLOW_DEBUG` is on."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        dist.init_process_group(
+            backend="gloo",
+            store=dist.FileStore(os.path.join(tmpdir.name, "store"), 1),
+            rank=0,
+            world_size=1,
+        )
+        self.addCleanup(dist.destroy_process_group)
+
+    def _count_reads(self, overflow_debug: bool) -> int:
+        real = dist_data._safe_tolist_2d
+        calls = 0
+
+        def counting(tensor: torch.Tensor) -> List[List[int]]:
+            nonlocal calls
+            calls += 1
+            return real(tensor)
+
+        with patch.object(dist_data, "_safe_tolist_2d", counting), patch.object(
+            dist_data, "_TORCHREC_OVERFLOW_DEBUG", overflow_debug
+        ):
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=[torch.tensor([3], dtype=torch.int64)],
+                pg=none_throws(dist.group.WORLD),
+            )
+            self.assertEqual(awaitable.wait(), [[3]])
+        return calls
+
+    def test_input_not_read_back_when_overflow_debug_off(self) -> None:
+        self.assertEqual(self._count_reads(overflow_debug=False), 1)
+
+    def test_input_read_back_when_overflow_debug_on(self) -> None:
+        self.assertEqual(self._count_reads(overflow_debug=True), 2)
 
 
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):

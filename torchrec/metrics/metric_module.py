@@ -1130,6 +1130,14 @@ class RecMetricModule(nn.Module):
         raise RecMetricException("async_compute is not supported in RecMetricModule")
 
 
+class OffloadedRecMetricModule(RecMetricModule):
+    """Base for metric modules that run update/compute off the trainer thread.
+
+    `async_compute()` is the primary API; results arrive through the returned
+    DeferrableMetrics, and `compute()` must not be used on the training path.
+    """
+
+
 def _generate_rec_metrics(
     metrics_config: MetricsConfig,
     world_size: int,

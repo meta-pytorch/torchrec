@@ -28,6 +28,7 @@ from collections.abc import Iterable, Iterator
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed.tensor as dt
 from torch import distributed as dist, nn
 from torchrec.experimental.torch_tpu.datasets.input_preprocessing import (
     KeyedSparseCorePreprocessedInput,
@@ -240,6 +241,8 @@ class SparseCoreTrainPipeline:
         else:
             self.dense_param_group = None
 
+        self._embedding_tables: Optional[Dict[str, torch.Tensor]] = None
+
         # Steady-state pipeline compilation
         if compile:
             os.environ.setdefault(
@@ -247,6 +250,10 @@ class SparseCoreTrainPipeline:
             )
             if hasattr(torch._dynamo.config, "trace_autograd_ops"):
                 torch._dynamo.config.trace_autograd_ops = True
+            if hasattr(torch._dynamo.config, "cache_size_limit"):
+                torch._dynamo.config.cache_size_limit = max(
+                    32, torch._dynamo.config.cache_size_limit
+                )
             compile_options: Dict[str, Any] = {
                 "fullgraph": True,
                 "dynamic": False,
@@ -310,12 +317,50 @@ class SparseCoreTrainPipeline:
             )
 
     def sync_model_weights(self) -> None:
-        """Copies trained dense parameters from dense_param_group back into model parameters."""
+        """Copies trained dense parameters and embedding tables back into model parameters."""
         if self.dense_param_group is not None:
             with torch.no_grad():
                 for name, param in self.model.named_parameters():
                     if name in self.dense_param_group.params:
                         param.copy_(self.dense_param_group.params[name])
+        if self._embedding_tables is not None and self.embedding_layer is not None:
+            if hasattr(self.embedding_layer, "update_table_weights"):
+                self.embedding_layer.update_table_weights(self._embedding_tables)
+            elif hasattr(self.embedding_layer, "table_weights"):
+                tb = getattr(self.embedding_layer, "table_weights")
+                if isinstance(tb, dict):
+                    with torch.no_grad():
+                        for k, new_t in self._embedding_tables.items():
+                            if k in tb and hasattr(tb[k], "copy_"):
+                                param = tb[k]
+                                if isinstance(param, dt.DTensor) and not isinstance(
+                                    new_t, dt.DTensor
+                                ):
+                                    param.to_local().copy_(new_t)
+                                elif not isinstance(param, dt.DTensor) and isinstance(
+                                    new_t, dt.DTensor
+                                ):
+                                    param.copy_(new_t.to_local())
+                                else:
+                                    param.copy_(new_t)
+            elif (
+                hasattr(self.embedding_layer, "table")
+                and "table" in self._embedding_tables
+            ):
+                with torch.no_grad():
+                    param = getattr(self.embedding_layer, "table")
+                    new_t = self._embedding_tables["table"]
+                    if hasattr(param, "copy_"):
+                        if isinstance(param, dt.DTensor) and not isinstance(
+                            new_t, dt.DTensor
+                        ):
+                            param.to_local().copy_(new_t)
+                        elif not isinstance(param, dt.DTensor) and isinstance(
+                            new_t, dt.DTensor
+                        ):
+                            param.copy_(new_t.to_local())
+                        else:
+                            param.copy_(new_t)
         for opt_state_dict_name in ("accumulators", "momentums", "velocities"):
             opt_dict = getattr(self.embedding_layer, opt_state_dict_name, None)
             if isinstance(opt_dict, nn.ParameterDict):
@@ -690,10 +735,10 @@ class SparseCoreTrainPipeline:
             self._dense_inputs_t1,
             self.dense_param_group,
         )
-        self._update_dense_params(new_pg)
-
         if new_tables is not None:
             self._embedding_tables = new_tables
+
+        self._update_dense_params(new_pg)
 
         self._sparse_inputs_t = self._sparse_features_t1
         self._embedding_gradients_t = grads_t1

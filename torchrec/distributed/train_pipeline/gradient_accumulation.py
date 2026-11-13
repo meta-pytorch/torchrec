@@ -31,8 +31,12 @@ from typing import (
 )
 
 import torch
+from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.train_pipeline.bucket_view_zeroing import BucketViewZeroing
+from torchrec.distributed.train_pipeline.fsdp_sync_suppression import (
+    FsdpSyncSuppression,
+)
 from torchrec.distributed.train_pipeline.pipeline_context import In, Out
 
 if TYPE_CHECKING:
@@ -180,6 +184,11 @@ class _GAOptimizerWrapper:
     def step(self, *args: Any, **kwargs: Any) -> None:
         """Run the optimizer at a scheduled or explicitly forced boundary."""
         if self._should_step() or self._force_step:
+            ga = self._ga_wrapper
+            if ga is not None:
+                # Deferred resharding may leave parameters unsharded between microbatches.
+                # Optimizers must read sharded parameters.
+                ga._fsdp_sync_suppression.ensure_sharded(ga._get_fsdp_targets())
             self._optimizer.step(*args, **kwargs)
             self._needs_zero_grad = True
 
@@ -289,6 +298,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         # Set after a synchronized backward establishes DDP bucket-view aliases.
         self._bucket_views_ready: bool = False
         self._bucket_view_zeroing: BucketViewZeroing = BucketViewZeroing()
+        self._fsdp_sync_suppression: FsdpSyncSuppression = FsdpSyncSuppression()
+        self._cached_fsdp_targets: list[FSDPModule] | None = None
         # Report optimizer completion without requiring callers to reproduce boundary logic.
         self._optimizer_step_completed: bool = False
 
@@ -364,6 +375,15 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         self._cached_ddp_modules = ddp_modules
         return ddp_modules
 
+    def _get_fsdp_targets(self) -> list[FSDPModule]:
+        """Cache native FSDP2 targets; attach() invalidates the cache.
+
+        fully_shard() modifies modules in place without changing their identities.
+        """
+        if self._cached_fsdp_targets is None:
+            self._cached_fsdp_targets = self._fsdp_sync_suppression.collect(self._model)
+        return self._cached_fsdp_targets
+
     @contextlib.contextmanager
     # pyre-ignore[3]: Return type must be annotated
     def _compose_no_sync_contexts(self):
@@ -378,6 +398,14 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             for ddp in ddp_modules:
                 stack.enter_context(ddp.no_sync())
             yield
+
+    def _discard_fsdp_window(self) -> None:
+        """Discard native FSDP2 gradients and pending reductions for an incomplete window.
+
+        zero_grad() leaves pending reduction buffers intact.
+        Use this only when discarding accumulated gradients.
+        """
+        self._fsdp_sync_suppression.clear_partial(self._get_fsdp_targets())
 
     def _window_start_zero_grad(self) -> None:
         """Clear gradients without dropping DDP bucket-view aliases.
@@ -402,6 +430,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             if self._partial_window_policy is PartialWindowPolicy.DISCARD:
                 self._optimizer_wrapper._needs_zero_grad = True
                 self._optimizer_wrapper.zero_grad(set_to_none=True)
+                self._fsdp_sync_suppression.clear_partial(self._get_fsdp_targets())
                 logger.warning(
                     "Discarded a partial gradient-accumulation window "
                     "(steps_accumulated=%d, num_steps=%d, remaining=%d) under "
@@ -455,6 +484,23 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                     remaining,
                     remaining,
                 )
+            targets = self._get_fsdp_targets()
+            if self._fsdp_sync_suppression.has_partial(targets):
+                # finalize_backward() rejects pending partial reductions.
+                # A new collective can hang if ranks exhaust at different times.
+                logger.warning(
+                    "Dropping the native-FSDP2 gradients of a partial gradient-accumulation "
+                    "window (steps_accumulated=%d, num_steps=%d, remaining=%d) under "
+                    "PartialWindowPolicy.STEP: their cross-replica all-reduce waits for the "
+                    "window's last micro-batch, which never ran. Other parameters still "
+                    "step. Pass is_last_batch=True on the final batch to apply them.",
+                    steps_accumulated,
+                    self.num_micro_batches_per_step,
+                    remaining,
+                )
+                self._fsdp_sync_suppression.clear_partial(targets)
+            self._fsdp_sync_suppression.restore(targets)
+            self._fsdp_sync_suppression.ensure_sharded(targets)
             self._optimizer_wrapper._optimizer.step()
             self._optimizer_wrapper._needs_zero_grad = True
             self._optimizer_wrapper.zero_grad(set_to_none=True)
@@ -482,7 +528,9 @@ class GradientAccumulationWrapper(Generic[In, Out]):
 
             return out
 
-        should_sync = self._should_sync_grad(is_last_batch=is_last_batch or False)
+        should_sync = not getattr(
+            self._model, "training", True
+        ) or self._should_sync_grad(is_last_batch=is_last_batch or False)
         # Reject an explicit partial window before the optimizer runs.
         if (
             is_last_batch
@@ -519,6 +567,12 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         ctx: ContextManager[None] = (
             contextlib.nullcontext() if should_sync else self._get_no_sync_context()
         )
+        # Native FSDP2 ignores no_sync(), so set its flags before backward.
+        fsdp_targets = self._get_fsdp_targets()
+        if should_sync:
+            self._fsdp_sync_suppression.restore(fsdp_targets)
+        else:
+            self._fsdp_sync_suppression.suppress(fsdp_targets)
 
         try:
             with ctx:
@@ -526,11 +580,30 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         except StopIteration:
             # No batch was processed, so current_step already reflects completed batches.
             if getattr(self._model, "training", True):
+                # Restore flags and sharded parameters before flushing accumulated gradients.
+                # Evaluation and checkpointing may read them before the next progress() call.
+                self._fsdp_sync_suppression.restore(fsdp_targets)
+                self._fsdp_sync_suppression.ensure_sharded(fsdp_targets)
                 if self._pending_uncommitted:
                     self._flush_accumulated_gradients(self.micro_batches_into_window)
                     self._pending_uncommitted = False
                 # Start the next training phase with a new accumulation window.
                 self._optimizer_wrapper.realign_window()
+            raise
+        except BaseException as original:
+            # Restarting a failed window invalidates all accumulated gradients.
+            # Clear dense gradients as well as FSDP2 state before retrying.
+            if getattr(self._model, "training", True):
+                try:
+                    self._discard_fsdp_window()
+                    self._fsdp_sync_suppression.restore(fsdp_targets)
+                    self._optimizer_wrapper._needs_zero_grad = True
+                    self._optimizer_wrapper.zero_grad(set_to_none=True)
+                    self._pending_uncommitted = False
+                    self._optimizer_wrapper.realign_window()
+                except BaseException as cleanup_error:  # noqa: B036 -- chained
+                    # Preserve the pipeline exception if cleanup fails, including on interruption.
+                    raise original from cleanup_error
             raise
 
         # Split optimizers bypass _GAOptimizerWrapper.step(), so update its clear state here.
@@ -568,6 +641,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                 "Complete the current window or pass drop_partial=True to discard it."
             )
         self._optimizer_wrapper.reset()
+        if self._pending_uncommitted:
+            self._discard_fsdp_window()
         self._pending_uncommitted = False
         if hasattr(self._pipeline, "reset"):
             self._pipeline.reset()
@@ -577,8 +652,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
     ) -> Any:
         """Delegate attachment while requiring the original model.
 
-        A different model needs a new wrapper because the optimizer and cached DDP topology
-        belong to the original model.
+        The optimizer and caches belong to the original model. Clear both caches because
+        its children can change in place (e.g. fully_shard) without replacing the root.
         """
         if model is not None and model is not self._model:
             raise RuntimeError(
@@ -592,6 +667,8 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                 f"{type(self._pipeline).__name__} does not provide attach(), which is "
                 "required by GradientAccumulationWrapper"
             )
+        self._cached_ddp_modules = None
+        self._cached_fsdp_targets = None
         return self._ga_hooks.attach(model, *args, **kwargs)
 
     @property
@@ -657,6 +734,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             )
             # Clear the discarded gradients when the next window starts.
             self._optimizer_wrapper._needs_zero_grad = True
+            self._discard_fsdp_window()
             self._pending_uncommitted = False
         self._optimizer_wrapper._k = k
         self._optimizer_wrapper.realign_window()
@@ -703,6 +781,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         if self._pending_uncommitted:
             # Clear the discarded gradients when the next window starts.
             self._optimizer_wrapper._needs_zero_grad = True
+            self._discard_fsdp_window()
             self._pending_uncommitted = False
         self._optimizer_wrapper.set_step(step)
 

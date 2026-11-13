@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     )
     from torchrec.experimental.torch_tpu.datasets.input_preprocessing import (
         KeyedSparseCorePreprocessedInput,
+        MinibatchingMode,
         SparseCoreInputPreprocessor,
         SparseCorePreprocessedInput,
     )
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
 
 _SYMBOL_TO_MODULE: dict[str, str] = {
     "KeyedSparseCorePreprocessedInput": "torchrec.experimental.torch_tpu.datasets.input_preprocessing",
+    "MinibatchingMode": "torchrec.experimental.torch_tpu.datasets.input_preprocessing",
     "PrefetchDataLoader": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreBatch": "torchrec.experimental.torch_tpu.datasets.dataloader",
     "SparseCoreDataLoader": "torchrec.experimental.torch_tpu.datasets.dataloader",
@@ -106,6 +108,7 @@ __all__ = [
     "SparseCoreInputPreprocessor",
     "KeyedSparseCorePreprocessedInput",
     "SparseCorePreprocessedInput",
+    "MinibatchingMode",
     "PrefetchDataLoader",
     "SparseCoreBatch",
     "SparseCoreDataLoader",

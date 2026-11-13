@@ -908,8 +908,17 @@ class MemoryStashingManager:
             if stash_done_events and not stash_done_events[-1].query():
                 stash_done_events[-1].synchronize()
 
+            # Re-allocate on the default stream rather than whatever stream is
+            # current when the restore hook fires (e.g. FSDP's reduce-scatter
+            # stream). The caching allocator only reuses a block on the stream
+            # it was allocated on, so a side-stream restore maps new memory the
+            # default stream can never reuse.
+            default_stream = torch.cuda.default_stream()
+
             try:
-                with record_function(f"restore {label} on device ({size_text})"):
+                with record_function(
+                    f"restore {label} on device ({size_text})"
+                ), torch.cuda.stream(default_stream):
                     for (
                         (hbm_ref, _cpu_buf, orig_storage_size),
                         orig_stor,
@@ -939,6 +948,9 @@ class MemoryStashingManager:
                     h2d_stream.wait_event(sync_event)
                 else:
                     h2d_stream.wait_stream(torch.cuda.current_stream())
+                # A block reused from the default stream's pool may still be in
+                # use by work queued on that stream, so the copy has to wait.
+                h2d_stream.wait_stream(default_stream)
 
                 with record_function(f"restore {label} from host ({size_text})"):
                     for hbm_ref, cpu_buf, _ in stash_data:

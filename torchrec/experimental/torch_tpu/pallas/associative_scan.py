@@ -18,5 +18,5 @@ def complete_cumsum_jax(array: jax.Array) -> jax.Array:
     array = array.astype(jnp.int32)
     if array.shape[0] == 0:
         return jnp.zeros((1,), dtype=jnp.int32)
-    prefix = jax.lax.associative_scan(jax.lax.add, array)
+    prefix = jnp.cumsum(array, axis=0)
     return jnp.concatenate([jnp.zeros((1,), dtype=jnp.int32), prefix])

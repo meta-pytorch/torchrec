@@ -1106,11 +1106,11 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
                         w1_id = sharded_w1_id.local_shards()[0].tensor
 
                         pmt1 = sharded_t1.local_shards()[0].tensor
-                        w1 = pmt1.get_weights_by_ids(w1_id)
+                        w1 = pmt1.full_tensor()
 
                         # write value into ssd for both emb module for later comparison
                         pmt2 = sharded_t2.local_shards()[0].tensor
-                        pmt2.wrapped.set_weights_and_ids(w1, w1_id.view(-1))
+                        pmt2.set_weights_and_ids(w1, w1_id.view(-1))
 
                     # purge after loading. This is needed, since we pass a batch
                     # through dmp when instantiating them.
@@ -1150,13 +1150,18 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
                     ) in ssd_emb_module.get_named_split_embedding_weights_snapshot():
                         weight_key = f"{t}.weight"
                         fused_sharded_t = fused_state_dict[weight_key]
-                        fused_weight = fused_sharded_t.local_shards()[0].tensor.to(
-                            "cpu"
+                        fused_shard = fused_sharded_t.local_shards()[0]
+                        fused_weight = fused_shard.tensor.to("cpu")
+                        row_start = fused_shard.metadata.shard_offsets[0]
+                        ids = torch.arange(
+                            row_start,
+                            row_start + fused_weight.size(0),
+                            dtype=torch.int64,
                         )
 
-                        # write value into ssd for both emb module for later comparison
+                        # Fused weights contain embeddings without checkpoint metadata.
                         pmt = sharded_t.local_shards()[0].tensor
-                        pmt.wrapped.set_range(0, 0, fused_weight.size(0), fused_weight)
+                        pmt.wrapped.set_weights_and_ids(fused_weight, ids)
 
                     # purge after loading. This is needed, since we pass a batch
                     # through dmp when instantiating them.
@@ -1588,11 +1593,11 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
                         w1_id = sharded_w1_id.local_shards()[0].tensor
 
                         pmt1 = sharded_t1.local_shards()[0].tensor
-                        w1 = pmt1.get_weights_by_ids(w1_id)
+                        w1 = pmt1.full_tensor()
 
                         # write value into ssd for both emb module for later comparison
                         pmt2 = sharded_t2.local_shards()[0].tensor
-                        pmt2.wrapped.set_weights_and_ids(w1, w1_id.view(-1))
+                        pmt2.set_weights_and_ids(w1, w1_id.view(-1))
 
                     # Remove the cache to force state dict read from backend again
                     emb_module1._split_weights_res = None
@@ -1633,13 +1638,18 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
                     ) in ssd_emb_module.get_named_split_embedding_weights_snapshot():
                         weight_key = f"{t}.weight"
                         fused_sharded_t = fused_state_dict[weight_key]
-                        fused_weight = fused_sharded_t.local_shards()[0].tensor.to(
-                            "cpu"
+                        fused_shard = fused_sharded_t.local_shards()[0]
+                        fused_weight = fused_shard.tensor.to("cpu")
+                        row_start = fused_shard.metadata.shard_offsets[0]
+                        ids = torch.arange(
+                            row_start,
+                            row_start + fused_weight.size(0),
+                            dtype=torch.int64,
                         )
 
-                        # write value into ssd for both emb module for later comparison
+                        # Fused weights contain embeddings without checkpoint metadata.
                         pmt = sharded_t.local_shards()[0].tensor
-                        pmt.wrapped.set_range(0, 0, fused_weight.size(0), fused_weight)
+                        pmt.wrapped.set_weights_and_ids(fused_weight, ids)
 
                     # purge after loading. This is needed, since we pass a batch
                     # through dmp when instantiating them.

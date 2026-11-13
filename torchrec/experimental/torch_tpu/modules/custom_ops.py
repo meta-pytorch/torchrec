@@ -39,6 +39,7 @@ def sparse_dense_matmul_sgd_fwd(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ) -> torch.Tensor:
     """Executes the forward pass of sparse-dense matrix multiplication for SGD."""
     return torch.tpu.ops.sparse_dense_matmul(
@@ -50,6 +51,7 @@ def sparse_dense_matmul_sgd_fwd(
         batch_size,
         max_ids_per_partition,
         max_unique_ids_per_partition,
+        enable_minibatching=enable_minibatching,
     )
 
 
@@ -69,6 +71,7 @@ def sparse_dense_matmul_sgd_bwd(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ) -> None:
     """Executes the backward pass and inplace SGD weight update."""
     updated_table = torch.tpu.ops.sparse_dense_matmul_grad_with_sgd(
@@ -83,6 +86,7 @@ def sparse_dense_matmul_sgd_bwd(
         max_ids_per_partition=max_ids_per_partition,
         max_unique_ids_per_partition=max_unique_ids_per_partition,
         computation_name=f"sgd_{table_name}",
+        enable_minibatching=enable_minibatching,
     )
     embedding_table.copy_(updated_table)
     return None
@@ -100,6 +104,7 @@ def _sgd_fwd_fake(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ):
     """Fake implementation for SGD forward pass during tracing."""
     return torch.empty(
@@ -122,6 +127,7 @@ def _sgd_bwd_fake(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ):
     """Fake implementation for SGD backward pass during tracing."""
     embedding_table.add_(0)
@@ -141,6 +147,7 @@ def _sgd_setup_context(ctx, inputs, output):
         max_ids_per_partition,
         max_unique_ids_per_partition,
         table_name,
+        enable_minibatching,
     ) = inputs
     ctx.save_for_backward(
         row_pointers,
@@ -154,6 +161,7 @@ def _sgd_setup_context(ctx, inputs, output):
     ctx.max_ids_per_partition = max_ids_per_partition
     ctx.max_unique_ids_per_partition = max_unique_ids_per_partition
     ctx.table_name = table_name
+    ctx.enable_minibatching = enable_minibatching
 
 
 def _sgd_backward(ctx, grad_output):
@@ -178,8 +186,9 @@ def _sgd_backward(ctx, grad_output):
         ctx.max_ids_per_partition,
         ctx.max_unique_ids_per_partition,
         ctx.table_name,
+        ctx.enable_minibatching,
     )
-    return (None,) * 10
+    return (None,) * 11
 
 
 sparse_dense_matmul_sgd_fwd.register_autograd(
@@ -204,6 +213,7 @@ def sparse_dense_matmul_adagrad_fwd(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ) -> torch.Tensor:
     """Executes the forward pass of sparse-dense matrix multiplication for Adagrad."""
     return torch.tpu.ops.sparse_dense_matmul(
@@ -215,6 +225,7 @@ def sparse_dense_matmul_adagrad_fwd(
         batch_size,
         max_ids_per_partition,
         max_unique_ids_per_partition,
+        enable_minibatching=enable_minibatching,
     )
 
 
@@ -236,6 +247,7 @@ def sparse_dense_matmul_adagrad_bwd(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ) -> None:
     """Executes the backward pass and inplace Adagrad weight and accumulator update."""
     updated_table, updated_accumulator = (
@@ -253,6 +265,7 @@ def sparse_dense_matmul_adagrad_bwd(
             max_ids_per_partition=max_ids_per_partition,
             max_unique_ids_per_partition=max_unique_ids_per_partition,
             computation_name=f"adagrad_{table_name}",
+            enable_minibatching=enable_minibatching,
         )
     )
     embedding_table.copy_(updated_table)
@@ -274,6 +287,7 @@ def _adagrad_fwd_fake(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ):
     """Fake implementation for Adagrad forward pass during tracing."""
     return torch.empty(
@@ -298,6 +312,7 @@ def _adagrad_bwd_fake(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ):
     """Fake implementation for Adagrad backward pass during tracing."""
     embedding_table.add_(0)
@@ -320,6 +335,7 @@ def _adagrad_setup_context(ctx, inputs, output):
         max_ids_per_partition,
         max_unique_ids_per_partition,
         table_name,
+        enable_minibatching,
     ) = inputs
     ctx.save_for_backward(
         row_pointers,
@@ -335,6 +351,7 @@ def _adagrad_setup_context(ctx, inputs, output):
     ctx.max_ids_per_partition = max_ids_per_partition
     ctx.max_unique_ids_per_partition = max_unique_ids_per_partition
     ctx.table_name = table_name
+    ctx.enable_minibatching = enable_minibatching
 
 
 def _adagrad_backward(ctx, grad_output):
@@ -362,8 +379,9 @@ def _adagrad_backward(ctx, grad_output):
         ctx.max_ids_per_partition,
         ctx.max_unique_ids_per_partition,
         ctx.table_name,
+        ctx.enable_minibatching,
     )
-    return (None,) * 12
+    return (None,) * 13
 
 
 sparse_dense_matmul_adagrad_fwd.register_autograd(
@@ -391,6 +409,7 @@ def sparse_dense_matmul_adam_fwd(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ) -> torch.Tensor:
     """Executes the forward pass of sparse-dense matrix multiplication for Adam."""
     return torch.tpu.ops.sparse_dense_matmul(
@@ -402,6 +421,7 @@ def sparse_dense_matmul_adam_fwd(
         batch_size,
         max_ids_per_partition,
         max_unique_ids_per_partition,
+        enable_minibatching=enable_minibatching,
     )
 
 
@@ -426,6 +446,7 @@ def sparse_dense_matmul_adam_bwd(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ) -> None:
     """Executes the backward pass and inplace Adam weight, momentum, and velocity update."""
     updated_table, updated_momentum, updated_velocity = (
@@ -446,6 +467,7 @@ def sparse_dense_matmul_adam_bwd(
             max_ids_per_partition=max_ids_per_partition,
             max_unique_ids_per_partition=max_unique_ids_per_partition,
             computation_name=f"adam_{table_name}",
+            enable_minibatching=enable_minibatching,
         )
     )
     embedding_table.copy_(updated_table)
@@ -471,6 +493,7 @@ def _adam_fwd_fake(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ):
     """Fake implementation for Adam forward pass during tracing."""
     return torch.empty(
@@ -498,6 +521,7 @@ def _adam_bwd_fake(
     max_ids_per_partition: int = 256,
     max_unique_ids_per_partition: int = 256,
     table_name: str = "table",
+    enable_minibatching: bool = False,
 ):
     """Fake implementation for Adam backward pass during tracing."""
     embedding_table.add_(0)
@@ -524,6 +548,7 @@ def _adam_setup_context(ctx, inputs, output):
         max_ids_per_partition,
         max_unique_ids_per_partition,
         table_name,
+        enable_minibatching,
     ) = inputs
     ctx.save_for_backward(
         row_pointers,
@@ -542,6 +567,7 @@ def _adam_setup_context(ctx, inputs, output):
     ctx.max_ids_per_partition = max_ids_per_partition
     ctx.max_unique_ids_per_partition = max_unique_ids_per_partition
     ctx.table_name = table_name
+    ctx.enable_minibatching = enable_minibatching
 
 
 def _adam_backward(ctx, grad_output):
@@ -573,8 +599,9 @@ def _adam_backward(ctx, grad_output):
         ctx.max_ids_per_partition,
         ctx.max_unique_ids_per_partition,
         ctx.table_name,
+        ctx.enable_minibatching,
     )
-    return (None,) * 15
+    return (None,) * 16
 
 
 sparse_dense_matmul_adam_fwd.register_autograd(

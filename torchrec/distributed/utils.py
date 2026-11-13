@@ -334,7 +334,9 @@ def get_device_type() -> str:
         device_type = "cuda"
     elif torch.mtia.is_available():
         device_type = "mtia"
-    elif hasattr(torch, "tpu") and torch.tpu.is_available():
+    elif hasattr(torch, "tpu") and torch.accelerator.current_accelerator(
+        check_available=True
+    ) == torch.device("tpu"):
         device_type = "tpu"
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         device_type = "xpu"

@@ -238,7 +238,6 @@ def batch_index_select_dim0_tpu(
     batch_size = input_num_indices[0]
     if (
         permute_output_dim_0_1
-        and batch_size % 16 == 0
         and all(size == batch_size for size in input_num_indices)
         and all(columns % 16 == 0 for columns in input_columns)
     ):

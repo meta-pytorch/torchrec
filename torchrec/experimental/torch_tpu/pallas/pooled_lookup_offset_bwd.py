@@ -32,7 +32,7 @@ def _rsqrt_sc(a: jax.Array) -> jax.Array:
     return y
 
 
-@functools.partial(jax.jit, static_argnames=["emb_dim", "lr", "eps"])
+@functools.partial(jax.jit, static_argnames=["emb_dim", "eps"])
 def fused_rowwise_adagrad_update(  # noqa: C901
     indices: jax.Array,
     bag_ids: jax.Array,
@@ -41,7 +41,7 @@ def fused_rowwise_adagrad_update(  # noqa: C901
     grad_out: jax.Array,
     emb_tables: jax.Array,
     momentum: jax.Array,
-    lr: float,
+    lr: jax.Array,
     eps: float,
     emb_dim: int,
 ) -> tuple[jax.Array, jax.Array]:
@@ -71,6 +71,7 @@ def fused_rowwise_adagrad_update(  # noqa: C901
     # Kernel parameters
     NUMB_BAGS_PER_ITERATION = 8
     LANE_SIZE = 16
+    lr = jnp.broadcast_to(jnp.asarray(lr, dtype=jnp.float32), (LANE_SIZE,))
     NUMB_IDS_PROCESSED_PER_BAG = 16
     TILE = 8
     assert emb_dim % LANE_SIZE == 0
@@ -120,6 +121,7 @@ def fused_rowwise_adagrad_update(  # noqa: C901
             pltpu.VMEM((LANE_SIZE,), momentum.dtype),
             pltpu.VMEM((LANE_SIZE, emb_dim), emb_tables.dtype),
             pltpu.VMEM((emb_dim,), emb_tables.dtype),
+            pltpu.VMEM((LANE_SIZE,), jnp.float32),
         ],
         name="rowwise_adagrad_sc_bwd",
         mesh=mesh,
@@ -132,6 +134,7 @@ def fused_rowwise_adagrad_update(  # noqa: C901
         grad_out_hbm,
         momentum_hbm,
         emb_tables_hbm,
+        lr_hbm,
         indices_vmem,
         bag_ids_vmem,
         run_offsets_vmem,
@@ -140,7 +143,10 @@ def fused_rowwise_adagrad_update(  # noqa: C901
         momentum_vmem,
         emb_tables_vmem,
         grad_buffer_vmem,
+        lr_vmem,
     ):
+        pltpu.sync_copy(lr_hbm, lr_vmem)
+
         @functools.partial(
             pltpu.emit_pipeline,
             grid=grid,
@@ -266,7 +272,7 @@ def fused_rowwise_adagrad_update(  # noqa: C901
                 sqrt_m = new_m * _rsqrt_sc(new_m)
 
                 # Update embedding table
-                step = jnp.full((LANE_SIZE,), lr, dtype=jnp.float32) / jnp.full(
+                step = lr_vmem[...] / jnp.full(
                     (LANE_SIZE,), sqrt_m + eps, dtype=jnp.float32
                 )
 
@@ -293,11 +299,12 @@ def fused_rowwise_adagrad_update(  # noqa: C901
         grad_out,
         momentum_ref,
         weights_ref,
+        lr,
     )
     return weights_ref[...], momentum_ref[...]
 
 
-@functools.partial(jax.jit, static_argnames=["lr", "eps", "emb_dim"])
+@functools.partial(jax.jit, static_argnames=["eps", "emb_dim"])
 def embedding_pooled_batched_lookup_fused_adagrad_bwd_jax(
     grad_out: jax.Array,
     indices: jax.Array,
@@ -305,7 +312,7 @@ def embedding_pooled_batched_lookup_fused_adagrad_bwd_jax(
     row_offsets: jax.Array,
     emb_tables: jax.Array,
     momentum: jax.Array,
-    lr: float,
+    lr: jax.Array,
     eps: float,
     emb_dim: int,
 ) -> tuple[jax.Array, jax.Array]:

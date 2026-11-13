@@ -3326,3 +3326,36 @@ class CPUOffloadedGradientAccumulationTest(unittest.TestCase):
                     torch.as_tensor(result["throughput-throughput|total_examples"]),
                     torch.tensor(2),
                 )
+
+
+class CPUOffloadedRecMetricModuleUnbatchedTest(unittest.TestCase):
+    def _module(self) -> CPUOffloadedRecMetricModule:
+        module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=1,
+            world_size=1,
+            rec_tasks=[],
+            rec_metrics=RecMetricList([]),
+            state_metrics={"state": _TestStateMetric()},
+            update_batch_size=1,
+        )
+        self.addCleanup(module.shutdown)
+        return module
+
+    def test_single_update_batch_applies_each_update_without_merging(self) -> None:
+        with patch.object(
+            CPUOffloadedRecMetricModule, "_do_batched_update_work"
+        ) as batched:
+            module = self._module()
+            for _ in range(3):
+                module.update({})
+            module.async_compute().resolve()
+        batched.assert_not_called()
+        self.assertEqual(module._total_updates_processed, 3)
+
+    def test_non_strict_load_reports_unexpected_keys(self) -> None:
+        result = self._module().load_state_dict(
+            {"not_a_metric_state": torch.zeros(1)}, strict=False
+        )
+        self.assertEqual(list(result.unexpected_keys), ["not_a_metric_state"])
+        self.assertEqual(list(result.missing_keys), [])

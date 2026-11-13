@@ -184,6 +184,12 @@ def embedding_pooled_batched_lookup_offset_fused_adagrad_tpu(
 def embedding_pooled_batched_lookup_offset_adagrad_update_tpu(
     grad_out, indices, offsets, row_offsets, weights, momentum, lr, eps
 ):
+    if grad_out.dtype != torch.float32:
+        raise NotImplementedError(
+            "Fused TPU rowwise Adagrad requires float32 gradients; "
+            f"got {grad_out.dtype}. Ask TorchRec for feature request."
+        )
+    lr = torch.tensor(lr, dtype=grad_out.dtype, device=weights.device)
     new_weights, new_momentum = _pooled_batched_offset_adagrad_update(
         grad_out=grad_out,
         indices=indices,

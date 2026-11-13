@@ -70,8 +70,7 @@ from torchrec.distributed.train_pipeline import (
 )
 from torchrec.distributed.types import DeviceToHostTensorAwaitable, ShardingStrategy
 from torchrec.distributed.utils import _group_sharded_modules
-from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.metrics.metric_module import OffloadedRecMetricModule, RecMetricModule
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
@@ -489,7 +488,7 @@ def runner(
                                 with record_function("## metric_compute ##"):
                                     if isinstance(
                                         initialized.metric_module,
-                                        CPUOffloadedRecMetricModule,
+                                        OffloadedRecMetricModule,
                                     ):
                                         initialized.metric_module.async_compute()
                                     else:

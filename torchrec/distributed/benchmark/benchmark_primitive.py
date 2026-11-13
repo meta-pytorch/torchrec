@@ -34,6 +34,12 @@ batch slice and receives the full gathered batch). Unlike the others it is not a
 ``output_dist`` for any sharder; it is exercised in TorchRec as the reduce-scatter backward
 and 2D fully-sharded weight reconstruction.
 
+Every primitive also runs on TPU (``--backend=tpu_dist``): the same ``dist_data`` modules
+dispatch to ``torch_tpu``'s ``tpu_dist`` collectives, and TorchRec pads uneven
+all-to-alls to the even splits ``tpu_dist`` requires
+(``experimental/torch_tpu/uneven_all_to_all.py``), so ``kjt_a2a`` with a ``num_values``
+that does not split evenly also times that padding.
+
 A follow-up launcher binary will call ``runner`` explicitly with options to run on
 MAST or locally.
 """
@@ -44,7 +50,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torchrec.distributed.benchmark.base import benchmark_func, BenchmarkResult
-from torchrec.distributed.benchmark.utils import as_bool
+from torchrec.distributed.benchmark.utils import (
+    as_bool,
+    default_index_dtype,
+    set_tpu_eager_mode,
+    synchronize_device,
+)
 from torchrec.distributed.dist_data import (
     KJTAllToAll,
     PooledEmbeddingsAllGather,
@@ -115,14 +126,13 @@ def _run_a2a(
     The input KJT is reused across iterations: ``_wait_impl`` does not free input storage
     (only the explicit ``clear_inputs()`` does), which we never call.
 
-    So we ``torch.cuda.synchronize()`` at the end to actually block the host on the
+    So we synchronize the device at the end to actually block the host on the
     collective inside the measured region; that is what makes the wall-clock timer reflect
-    end-to-end collective latency (GPU-event timing is unaffected either way).
+    end-to-end collective latency (GPU-event timing is unaffected either way; on TPU,
+    whose execution is lazy, the wall clock is the only timer).
     """
     out = a2a(kjt).wait().wait()
-    values = out.values()
-    if values.is_cuda:
-        torch.cuda.synchronize(values.device)
+    synchronize_device(out.values().device)
 
 
 def _benchmark_kjt_a2a(
@@ -147,14 +157,16 @@ def _benchmark_kjt_a2a(
                 ranks via ``KJTAllToAll`` splits). Default 256.
             num_values (int): total length of the ``values`` tensor -- the headline size
                 knob (with the default, ``50M * 8B (int64) ~= 400 MB`` of transport per
-                rank). Default 50_000_000.
+                rank, half that in int32 on TPU). Default 50_000_000.
             batch_size (int): stride; the lengths tensor has ``num_features * batch_size``
                 entries. Default 32 * 1024.
-            values_dtype (torch.dtype): dtype of the ``values`` tensor. Default int64.
+            values_dtype (torch.dtype): dtype of the ``values`` tensor. Default int64,
+                or int32 on TPU.
             num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
-            profile_dir (str): directory for chrome traces; empty disables profiling.
+            profile_dir (str): directory for chrome traces (a rank-0 xprof trace on
+                TPU); empty disables profiling.
             memory_snapshot (bool): capture a CUDA memory snapshot alongside the
                 profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "kjt_a2a".
@@ -165,7 +177,9 @@ def _benchmark_kjt_a2a(
     num_features: int = int(kwargs.get("num_features", 256))
     num_values: int = int(kwargs.get("num_values", 50_000_000))
     batch_size: int = int(kwargs.get("batch_size", 32 * 1024))
-    values_dtype: torch.dtype = kwargs.get("values_dtype", torch.int64)
+    values_dtype: torch.dtype = kwargs.get(
+        "values_dtype", default_index_dtype(ctx.device)
+    )
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 100))
     num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
@@ -263,14 +277,14 @@ def _run_pooled_a2a(
     (the collective runs async on the stream). The input tensor is reused across
     iterations.
 
-    So we ``torch.cuda.synchronize()`` at the end to actually block the host on the
+    So we synchronize the device at the end to actually block the host on the
     collective inside the measured region; that is what makes the wall-clock timer reflect
-    end-to-end collective latency (GPU-event timing is unaffected either way).
+    end-to-end collective latency (GPU-event timing is unaffected either way; on TPU,
+    whose execution is lazy, the wall clock is the only timer).
     """
     out = a2a(local_embs).wait()
     out.numel()
-    if local_embs.is_cuda:
-        torch.cuda.synchronize(local_embs.device)
+    synchronize_device(local_embs.device)
 
 
 def _benchmark_kt_a2a(
@@ -308,7 +322,8 @@ def _benchmark_kt_a2a(
             num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
-            profile_dir (str): directory for chrome traces; empty disables profiling.
+            profile_dir (str): directory for chrome traces (a rank-0 xprof trace on
+                TPU); empty disables profiling.
             memory_snapshot (bool): capture a CUDA memory snapshot alongside the
                 profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "kt_a2a".
@@ -414,14 +429,14 @@ def _run_reduce_scatter(
     on CUDA -- no host sync (the collective runs async on the stream). The input tensor is
     reused across iterations.
 
-    So we ``torch.cuda.synchronize()`` at the end to actually block the host on the
+    So we synchronize the device at the end to actually block the host on the
     collective inside the measured region; that is what makes the wall-clock timer reflect
-    end-to-end collective latency (GPU-event timing is unaffected either way).
+    end-to-end collective latency (GPU-event timing is unaffected either way; on TPU,
+    whose execution is lazy, the wall clock is the only timer).
     """
     out = rs(local_embs).wait()
     out.numel()
-    if local_embs.is_cuda:
-        torch.cuda.synchronize(local_embs.device)
+    synchronize_device(local_embs.device)
 
 
 def _benchmark_reduce_scatter(
@@ -456,7 +471,8 @@ def _benchmark_reduce_scatter(
             num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
-            profile_dir (str): directory for chrome traces; empty disables profiling.
+            profile_dir (str): directory for chrome traces (a rank-0 xprof trace on
+                TPU); empty disables profiling.
             memory_snapshot (bool): capture a CUDA memory snapshot alongside the
                 profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "reduce_scatter".
@@ -557,14 +573,14 @@ def _run_all_gather(
     host sync (the collective runs async on the stream). The input tensor is reused across
     iterations.
 
-    So we ``torch.cuda.synchronize()`` at the end to actually block the host on the
+    So we synchronize the device at the end to actually block the host on the
     collective inside the measured region; that is what makes the wall-clock timer reflect
-    end-to-end collective latency (GPU-event timing is unaffected either way).
+    end-to-end collective latency (GPU-event timing is unaffected either way; on TPU,
+    whose execution is lazy, the wall clock is the only timer).
     """
     out = ag(local_embs).wait()
     out.numel()
-    if local_embs.is_cuda:
-        torch.cuda.synchronize(local_embs.device)
+    synchronize_device(local_embs.device)
 
 
 def _benchmark_all_gather(
@@ -600,7 +616,8 @@ def _benchmark_all_gather(
             num_benchmarks (int): number of measured iterations. Default 100.
             num_profiles (int): number of profiled iterations (requires profile_dir).
                 Default 5.
-            profile_dir (str): directory for chrome traces; empty disables profiling.
+            profile_dir (str): directory for chrome traces (a rank-0 xprof trace on
+                TPU); empty disables profiling.
             memory_snapshot (bool): capture a CUDA memory snapshot alongside the
                 profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "all_gather".
@@ -701,7 +718,8 @@ def benchmark_runner(
         world_size: total number of ranks.
         name: the primitive benchmark to run; one of :func:`available_primitives`.
         **kwargs: forwarded to the benchmark (see its docstring). Keys it does not
-            use are ignored by its own lookups.
+            use are ignored by its own lookups. On TPU, ``tpu_eager_mode`` (str) sets
+            ``torch_tpu``'s eager execution mode first. Default ``"defer_never"``.
 
     Returns:
         This rank's ``BenchmarkResult``.
@@ -713,4 +731,6 @@ def benchmark_runner(
         socket.gethostname(),
         name,
     )
+    if ctx.device.type == "tpu":
+        set_tpu_eager_mode(str(kwargs.get("tpu_eager_mode", "defer_never")))
     return _BENCHMARKS[name](ctx, rank, world_size, name=name, **kwargs)

@@ -65,11 +65,12 @@ class _RealForwardPipeline(TrainPipeline[Any, torch.Tensor]):
 
     def progress(self, dataloader_iter: Iterator[torch.Tensor]) -> torch.Tensor:
         batch = next(dataloader_iter)
+        # Clear before backward so each window keeps its first micro-batch's gradient.
+        self._optimizer.zero_grad()
         output = self._model(batch)
         loss = output.sum()
         loss.backward()
         self._optimizer.step()
-        self._optimizer.zero_grad()
         self._progress_count += 1
         return loss
 
@@ -443,6 +444,289 @@ class NoSyncContextTest(unittest.TestCase):
         # Should not raise
         with wrapper._get_no_sync_context():
             pass
+
+
+class FsdpSyncSuppressionSeamTest(unittest.TestCase):
+    """Test FSDP2 flag ordering and cleanup in GradientAccumulationWrapper."""
+
+    def _make(
+        self, policy: PartialWindowPolicy = PartialWindowPolicy.STEP
+    ) -> GradientAccumulationWrapper:
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        return GradientAccumulationWrapper(
+            _RealForwardPipeline(model, optimizer),
+            optimizer,
+            model,
+            config,
+            partial_window_policy=policy,
+        )
+
+    @contextlib.contextmanager
+    def _record(
+        self, wrapper: GradientAccumulationWrapper, calls: List[str]
+    ) -> Iterator[None]:
+        """Record which suppression method the wrapper calls, in order."""
+        suppression = wrapper._fsdp_sync_suppression
+        with contextlib.ExitStack() as stack:
+            for name in ("suppress", "restore", "clear_partial", "ensure_sharded"):
+                stack.enter_context(
+                    patch.object(
+                        suppression,
+                        name,
+                        side_effect=lambda _targets, name=name: calls.append(name),
+                    )
+                )
+            yield
+
+    def test_restore_precedes_the_syncing_micro_batch(self) -> None:
+        # Check when restore() runs; ensure_sharded() can mask late resharding.
+        wrapper = self._make()
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            with patch.object(
+                wrapper._pipeline,
+                "progress",
+                side_effect=lambda _it: calls.append("progress") or torch.zeros(1),
+            ):
+                for _ in range(4):
+                    wrapper.progress(iter([torch.randn(2, 10)]))
+        # The first window synchronizes the warmup and final microbatches.
+        self.assertEqual(
+            calls,
+            [
+                "restore",
+                "progress",
+                "suppress",
+                "progress",
+                "suppress",
+                "progress",
+                "restore",
+                "progress",
+            ],
+        )
+
+    def test_ensure_sharded_runs_before_the_optimizer_step(self) -> None:
+        wrapper = self._make()
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            with patch.object(
+                wrapper.optimizer_wrapper._optimizer,
+                "step",
+                side_effect=lambda *a, **k: calls.append("optimizer.step"),
+            ):
+                for _ in range(4):
+                    wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertIn("ensure_sharded", calls)
+        self.assertLess(calls.index("ensure_sharded"), calls.index("optimizer.step"))
+
+    def test_suppression_follows_the_no_sync_boundaries(self) -> None:
+        wrapper = self._make()
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            for _ in range(8):
+                wrapper.progress(iter([torch.randn(2, 10)]))
+        # Compare synchronization flags independently of optimizer validation.
+        flags = [c for c in calls if c in ("suppress", "restore")]
+        # Warmup synchronizes the first microbatch.
+        # Subsequent windows synchronize only their final microbatch.
+        self.assertEqual(
+            flags,
+            [
+                "restore",
+                "suppress",
+                "suppress",
+                "restore",
+                "suppress",
+                "suppress",
+                "suppress",
+                "restore",
+            ],
+        )
+
+    def test_the_targets_are_collected_once(self) -> None:
+        wrapper = self._make()
+        with patch.object(
+            wrapper._fsdp_sync_suppression, "collect", return_value=[]
+        ) as collect:
+            for _ in range(4):
+                wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertEqual(collect.call_count, 1)
+
+    def test_attach_drops_the_cached_targets(self) -> None:
+        wrapper = self._make()
+        wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertIsNotNone(wrapper._cached_fsdp_targets)
+
+        with patch.object(wrapper._pipeline, "attach", create=True, return_value=None):
+            wrapper.attach(wrapper._model)
+
+        self.assertIsNone(wrapper._cached_fsdp_targets)
+
+    def test_discard_clears_the_pending_reduction(self) -> None:
+        wrapper = self._make(PartialWindowPolicy.DISCARD)
+        for _ in range(2):
+            wrapper.progress(iter([torch.randn(2, 10)]))
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            self.assertFalse(wrapper._flush_accumulated_gradients(2))
+        self.assertEqual(calls, ["clear_partial"])
+
+    def test_step_partial_window_restores_and_reshards_before_stepping(self) -> None:
+        wrapper = self._make(PartialWindowPolicy.STEP)
+        for _ in range(2):
+            wrapper.progress(iter([torch.randn(2, 10)]))
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            with patch.object(
+                wrapper.optimizer_wrapper._optimizer,
+                "step",
+                side_effect=lambda *a, **k: calls.append("optimizer.step"),
+            ):
+                self.assertTrue(wrapper._flush_accumulated_gradients(2))
+        self.assertEqual(calls[:2], ["restore", "ensure_sharded"])
+        self.assertLess(calls.index("ensure_sharded"), calls.index("optimizer.step"))
+
+    def test_step_drops_a_pending_fsdp_partial_with_a_warning(self) -> None:
+        wrapper = self._make(PartialWindowPolicy.STEP)
+        for _ in range(2):
+            wrapper.progress(iter([torch.randn(2, 10)]))
+        calls: List[str] = []
+        with self._record(wrapper, calls), patch.object(
+            wrapper._fsdp_sync_suppression, "has_partial", return_value=True
+        ), self.assertLogs(
+            "torchrec.distributed.train_pipeline.gradient_accumulation", "WARNING"
+        ) as logs:
+            self.assertTrue(wrapper._flush_accumulated_gradients(2))
+        self.assertEqual(calls[:3], ["clear_partial", "restore", "ensure_sharded"])
+        self.assertIn("Dropping the native-FSDP2 gradients", "\n".join(logs.output))
+
+    def test_every_discard_api_drops_the_pending_reduction(self) -> None:
+        # zero_grad() leaves FSDP2 reduction buffers intact.
+        # Every discard API must reset them before the next window.
+        for api in ("reset", "set_step", "set_k"):
+            with self.subTest(api=api):
+                wrapper = self._make()
+                wrapper.progress(iter([torch.randn(2, 10)]))
+                calls: List[str] = []
+                with self._record(wrapper, calls):
+                    if api == "reset":
+                        wrapper.reset(drop_partial=True)
+                    elif api == "set_step":
+                        wrapper.set_step(0, drop_partial=True)
+                    else:
+                        wrapper.set_num_micro_batches_per_step(
+                            2, allow_open_window=True
+                        )
+                self.assertIn("clear_partial", calls)
+
+    def test_reset_touches_fsdp_state_only_with_an_open_window(self) -> None:
+        completed = self._make()
+        for _ in range(4):
+            completed.progress(iter([torch.randn(2, 10)]))
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        disabled = GradientAccumulationWrapper(
+            _RealForwardPipeline(model, optimizer),
+            optimizer,
+            model,
+            GradientAccumulationConfig(),
+        )
+        for name, wrapper in (("completed window", completed), ("disabled", disabled)):
+            with self.subTest(name):
+                calls: List[str] = []
+                with self._record(wrapper, calls):
+                    wrapper.reset()
+                self.assertNotIn("clear_partial", calls)
+
+    def test_a_failed_micro_batch_resets_fsdp_state(self) -> None:
+        wrapper = self._make()
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            with patch.object(
+                wrapper._pipeline, "progress", side_effect=RuntimeError("boom")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertIn("clear_partial", calls)
+        self.assertIn("restore", calls)
+        # Restarting a failed window must discard dense and FSDP2 gradients together.
+        self.assertFalse(wrapper._pending_uncommitted)
+
+    def test_a_failed_window_does_not_leak_dense_gradients(self) -> None:
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        wrapper = GradientAccumulationWrapper(
+            _RealForwardPipeline(model, optimizer),
+            optimizer,
+            model,
+            GradientAccumulationConfig(is_enabled=True, num_steps=4),
+        )
+        batch = torch.ones(2, 10)
+        wrapper.progress(iter([batch]))
+        self.assertIsNotNone(model.weight.grad)
+        one_micro_batch = cast(torch.Tensor, model.weight.grad).clone()
+        wrapper.progress(iter([batch]))
+        torch.testing.assert_close(model.weight.grad, 2 * one_micro_batch)
+        with patch.object(
+            wrapper._pipeline, "progress", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                wrapper.progress(iter([batch]))
+        wrapper.progress(iter([batch]))
+        # The retry must contain only gradients from its new microbatch.
+        torch.testing.assert_close(model.weight.grad, one_micro_batch)
+
+    def test_eval_batch_restores_fsdp_flags(self) -> None:
+        wrapper = self._make()
+        wrapper.set_step(4)
+        wrapper._model.eval()
+        calls: List[str] = []
+        with self._record(wrapper, calls), patch.object(
+            wrapper._pipeline, "progress", return_value=torch.zeros(1)
+        ):
+            wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertEqual(
+            [c for c in calls if c in ("suppress", "restore")], ["restore"]
+        )
+
+    def test_eval_exhaustion_restores_fsdp_flags(self) -> None:
+        wrapper = self._make()
+        wrapper.set_step(4)
+        wrapper._model.eval()
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            with self.assertRaises(StopIteration):
+                wrapper.progress(iter([]))
+        self.assertEqual(
+            [c for c in calls if c in ("suppress", "restore")], ["restore"]
+        )
+
+    def test_exhaustion_unsuppresses_the_window(self) -> None:
+        # Restore flags at exhaustion before evaluation or checkpointing reads parameters.
+        wrapper = self._make(PartialWindowPolicy.DISCARD)
+        wrapper.progress(iter([torch.randn(2, 10)]))
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            with self.assertRaises(StopIteration):
+                wrapper.progress(iter([]))
+        self.assertIn("restore", calls)
+        self.assertLess(calls.index("restore"), calls.index("clear_partial"))
+
+    def test_cleanup_failure_does_not_mask_the_pipeline_error(self) -> None:
+        wrapper = self._make()
+        with patch.object(
+            wrapper, "_discard_fsdp_window", side_effect=ValueError("cleanup")
+        ):
+            with patch.object(
+                wrapper._pipeline, "progress", side_effect=RuntimeError("boom")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom") as caught:
+                    wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertIsInstance(caught.exception.__cause__, ValueError)
 
 
 class StopIterationHandlingTest(unittest.TestCase):

@@ -191,7 +191,7 @@ except Exception:  # noqa: BLE001
     # Warn loudly: this is a timing harness, so a silent fallback risks publishing
     # numbers that only measure dispatch. The fallback below still blocks, but say so.
     logging.warning(
-        "torch_tpu._internal.sync unavailable; falling back to torch.tpu.synchronize() "
+        "torch_tpu._internal.sync unavailable; falling back to torch.accelerator.synchronize() "
         "for step-boundary flushes. Verify reported ms/step before trusting it."
     )
 
@@ -200,9 +200,7 @@ except Exception:  # noqa: BLE001
         # with no argument purely to drain pending TPU work before the clock is read,
         # so a no-op here would silently report meaningless step times.
         if tensor is None:
-            # pyre-ignore[16]: torch.tpu is registered at runtime by torch_tpu, which
-            # is a pod-only dependency and so is invisible to the type checker.
-            torch.tpu.synchronize()
+            torch.accelerator.synchronize()
         else:
             tensor.detach().to("cpu")
 
@@ -381,9 +379,11 @@ def _skip_ddp_shape_verify_on_tpu() -> None:
     unaffected (the check already passes there). The durable fix belongs in torch_tpu's
     device->CPU lowering; this unblocks the multi-host benchmark run.
     """
-    # pyre-ignore[16]: torch.tpu is registered at runtime by torch_tpu, which is a
-    # pod-only dependency and so is invisible to the type checker.
-    if not (hasattr(torch, "tpu") and torch.tpu.is_available()):
+    if not (
+        hasattr(torch, "tpu")
+        and torch.accelerator.current_accelerator(check_available=True)
+        == torch.device("tpu")
+    ):
         return
     import torch.nn.parallel.distributed as _ddp
 

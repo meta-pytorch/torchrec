@@ -319,6 +319,39 @@ class LocalShardPool(torch.nn.Module):
         _ = update(self._shard, rank_ids, values)
 
 
+def _local_shard(
+    module: TensorPool,
+    offset: int,
+    rows: int,
+    dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Storage for the shard holding rows ``[offset, offset + rows)`` of ``module``'s
+    pool.
+
+    A pool that opted in with ``share_storage_with_shards`` is its own shard when
+    the shard is the whole pool, on the pool's device and in its dtype. Any other
+    shard is allocated on ``device`` and, unless the pool is on the meta device,
+    filled with its rows. A pool without the attribute, such as one deserialized
+    from an artifact saved before the option existed, has not opted in.
+    """
+    pool = module._pool
+    if (
+        getattr(module, "share_storage_with_shards", False)
+        and rows == pool.size(0)
+        and pool.shape[1:] == (dim,)
+        and pool.dtype == dtype
+        and pool.device == device
+    ):
+        return pool
+    shard = torch.empty((rows, dim), dtype=dtype, device=device, requires_grad=False)
+    if pool.device != torch.device("meta"):
+        shard.copy_(pool[offset : offset + rows])
+    return shard
+
+
 class ShardedInferenceTensorPool(
     ShardedObjectPool[torch.Tensor, List[torch.Tensor], ObjectPoolShardingContext],
 ):
@@ -386,23 +419,16 @@ class ShardedInferenceTensorPool(
 
             self._local_shard_pools.append(
                 LocalShardPool(
-                    torch.empty(
-                        (
-                            this_rank_size,
-                            self._dim,
-                        ),
-                        dtype=self._dtype,
-                        device=shard_device,
-                        requires_grad=False,
-                    ),
+                    _local_shard(
+                        module,
+                        offset,
+                        this_rank_size,
+                        self._dim,
+                        self._dtype,
+                        shard_device,
+                    )
                 )
             )
-
-            if module._pool.device != torch.device("meta"):
-                local_shard = module._pool[offset : offset + this_rank_size]
-                # pyrefly: ignore[not-callable]
-                self._local_shard_pools[rank]._shard.copy_(local_shard)
-
             offset += this_rank_size
 
         self._lookup_ids_dist_impl: InferRwObjectPoolInputDist = (

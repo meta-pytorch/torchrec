@@ -656,6 +656,8 @@ def group_tables(
                 table.use_virtual_table if is_inference else None,
                 table.enable_embedding_update,
                 table.stash_weights,
+                # A served TBE decodes every table with one row format.
+                table.grouped_int4_group_size if is_inference else None,
             )
             # micromanage the order of we traverse the groups to ensure backwards compatibility
             if grouping_key not in groups:
@@ -673,6 +675,7 @@ def group_tables(
                 _,
                 use_virtual_table,
                 enable_embedding_update,
+                _,
                 _,
             ) = grouping_key
             grouped_tables = groups[grouping_key]

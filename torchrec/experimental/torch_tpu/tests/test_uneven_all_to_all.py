@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import importlib.util
+import math
 import os
 import unittest
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
@@ -21,13 +23,130 @@ from torchrec.distributed.test_utils.process_runner import (
     SingleProcessContext,
 )
 from torchrec.experimental.torch_tpu.uneven_all_to_all import (
+    _pad_segments,
+    _unpad_segments,
     maybe_all2all_pooled_uneven_tpu,
     maybe_kjt_a2a_uneven_tpu,
     maybe_variable_batch_all2all_pooled_uneven_tpu,
 )
 
 
+_BACKENDS: list[tuple[str, str]] = [("gloo", "cpu")]
+if importlib.util.find_spec("torch_tpu") is not None:
+    _BACKENDS.append(("tpu_dist", "tpu"))
+
+
+def _reference_pad(
+    packed: torch.Tensor, splits: list[int], padded_size: int
+) -> torch.Tensor:
+    blocks = []
+    for segment in packed.split(splits, dim=0):
+        padding = packed.new_zeros((padded_size - segment.shape[0], *packed.shape[1:]))
+        blocks.append(torch.cat([segment, padding]))
+    return torch.cat(blocks)
+
+
+def _reference_unpad(
+    padded: torch.Tensor, splits: list[int], padded_size: int
+) -> torch.Tensor:
+    blocks = padded.split(padded_size, dim=0)
+    return torch.cat([block[:size] for block, size in zip(blocks, splits)])
+
+
+class PaddedLayoutTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ("uneven_1d", [3, 0, 5, 1], 5, ()),
+            ("uneven_2d", [2, 4, 1], 6, (3,)),
+            ("even", [2, 2, 2, 2], 2, ()),
+            ("all_empty", [0, 0, 0], 1, (2,)),
+            ("one_rank_full", [0, 7, 0], 7, ()),
+        ]
+    )
+    def test_matches_loop_reference(
+        self, _name: str, splits: list[int], padded_size: int, trailing: tuple[int, ...]
+    ) -> None:
+        for dtype in (torch.float32, torch.int64):
+            packed = (torch.arange(sum(splits) * math.prod(trailing)) + 1).to(dtype)
+            packed = packed.view(sum(splits), *trailing)
+            padded = _pad_segments(packed, splits, padded_size)
+            self.assertTrue(
+                torch.equal(padded, _reference_pad(packed, splits, padded_size))
+            )
+            self.assertTrue(
+                torch.equal(_unpad_segments(padded, splits, padded_size), packed)
+            )
+            self.assertTrue(
+                torch.equal(
+                    _unpad_segments(padded, splits, padded_size),
+                    _reference_unpad(padded, splits, padded_size),
+                )
+            )
+
+    def test_empty_input_keeps_gradient_connection(self) -> None:
+        for trailing in ((), (2,)):
+            with self.subTest(trailing=trailing):
+                packed = torch.empty((0, *trailing), requires_grad=True)
+                padded = _pad_segments(packed, [0, 0, 0], 1)
+                self.assertTrue(padded.requires_grad)
+                torch.testing.assert_close(padded, _reference_pad(packed, [0, 0, 0], 1))
+                padded.sum().backward()
+                self.assertIsNotNone(packed.grad)
+                torch.testing.assert_close(packed.grad, torch.zeros_like(packed))
+
+    def test_gradients_match_loop_reference(self) -> None:
+        splits, padded_size = [3, 0, 5, 1], 5
+        weights = torch.randn(len(splits) * padded_size, 2)
+        grads = []
+        for pad, unpad in (
+            (_pad_segments, _unpad_segments),
+            (_reference_pad, _reference_unpad),
+        ):
+            packed = torch.randn(
+                sum(splits), 2, generator=torch.Generator().manual_seed(0)
+            )
+            packed.requires_grad_()
+            padded = pad(packed, splits, padded_size)
+            (
+                unpad(padded * weights, splits, padded_size).sum() + padded.sum()
+            ).backward()
+            grads.append(packed.grad)
+        torch.testing.assert_close(grads[0], grads[1])
+
+
 class UnevenAllToAllTest(unittest.TestCase):
+    @parameterized.expand([(8,), (64,)])
+    def test_variable_batch_empty_rank_receives_embeddings(
+        self, world_size: int
+    ) -> None:
+        group = MagicMock()
+        group.size.return_value = world_size
+        group.rank.return_value = world_size - 1
+        dims = [[16] for _ in range(4)] + [[] for _ in range(world_size - 4)]
+        even_all_to_all = MagicMock(
+            return_value=torch.arange(world_size * 32, dtype=torch.float32)
+        )
+        with patch(
+            "torchrec.experimental.torch_tpu.uneven_all_to_all._global_padding_metadata",
+            return_value=([32], True),
+        ) as padding_metadata:
+            output = maybe_variable_batch_all2all_pooled_uneven_tpu(
+                group,
+                torch.empty(0),
+                [],
+                [2] * 4,
+                dims,
+                has_codecs=False,
+                even_all_to_all=even_all_to_all,
+            )
+        self.assertIsNotNone(output)
+        torch.testing.assert_close(output, torch.arange(128, dtype=torch.float32))
+        even_all_to_all.assert_called_once()
+        padded_input, split_size = even_all_to_all.call_args.args
+        self.assertEqual(split_size, 32)
+        torch.testing.assert_close(padded_input, torch.zeros(world_size * 32))
+        padding_metadata.assert_called_once_with(group, [32], True, torch.device("cpu"))
+
     def test_variable_batch_rejects_invalid_rank_metadata(self) -> None:
         group = MagicMock()
         group.size.return_value = 2
@@ -39,6 +158,7 @@ class UnevenAllToAllTest(unittest.TestCase):
         for batch_sizes, embedding_dims in (
             (valid_batch_sizes[:-1], valid_embedding_dims),
             (valid_batch_sizes, valid_embedding_dims[:-1]),
+            ([], valid_embedding_dims),
         ):
             with self.subTest(
                 batch_size_rank_count=len(batch_sizes),
@@ -210,6 +330,7 @@ class UnevenAllToAllTest(unittest.TestCase):
         world_size: int,
         group: dist.ProcessGroup,
         device: torch.device,
+        empty_ranks: bool = False,
     ) -> None:
         def even_all_to_all(tensor: torch.Tensor, split_size: int) -> torch.Tensor:
             splits = [split_size] * world_size
@@ -220,15 +341,25 @@ class UnevenAllToAllTest(unittest.TestCase):
                 ),
             )
 
-        emb_dim_per_rank_per_feature = [[source + 1] for source in range(world_size)]
-        batch_size_per_rank_per_feature = [
-            [destination + 1] for destination in range(world_size)
+        emb_dim_per_rank_per_feature = [
+            [source + 1] if not empty_ranks or source == 0 else []
+            for source in range(world_size)
         ]
-        batch_size_per_feature_pre_a2a = [rank + 1] * world_size
+        local_dim = sum(emb_dim_per_rank_per_feature[rank])
+        batch_size_per_rank_per_feature = (
+            [[destination + 1] for destination in range(world_size)]
+            if local_dim
+            else []
+        )
+        batch_size_per_feature_pre_a2a = [
+            rank + 1 for dims in emb_dim_per_rank_per_feature for _ in dims
+        ]
         input_splits = [
-            (rank + 1) * (destination + 1) for destination in range(world_size)
+            local_dim * (destination + 1) for destination in range(world_size)
         ]
-        output_splits = [(source + 1) * (rank + 1) for source in range(world_size)]
+        output_splits = [
+            sum(dims) * (rank + 1) for dims in emb_dim_per_rank_per_feature
+        ]
         input_blocks = [
             torch.arange(size, device=device).float() + rank * 1000 + destination * 100
             for destination, size in enumerate(input_splits)
@@ -278,7 +409,13 @@ class UnevenAllToAllTest(unittest.TestCase):
         elif test_kind == "pooled":
             cls._assert_pooled_all_to_all(rank, world_size, group, device)
         else:
-            cls._assert_variable_batch_all_to_all(rank, world_size, group, device)
+            cls._assert_variable_batch_all_to_all(
+                rank,
+                world_size,
+                group,
+                device,
+                empty_ranks=test_kind == "variable_batch_empty",
+            )
 
     def _run_backend(self, backend: str, device_type: str, test_kind: str) -> bool:
         if backend == "gloo":
@@ -309,16 +446,22 @@ class UnevenAllToAllTest(unittest.TestCase):
             )
         return True
 
-    @parameterized.expand([("gloo", "cpu"), ("tpu_dist", "tpu")])
+    @parameterized.expand(_BACKENDS)
     def test_kjt_forward(self, backend: str, device_type: str) -> None:
         self.assertTrue(self._run_backend(backend, device_type, "kjt"))
 
-    @parameterized.expand([("gloo", "cpu"), ("tpu_dist", "tpu")])
+    @parameterized.expand(_BACKENDS)
     def test_pooled_forward_and_backward(self, backend: str, device_type: str) -> None:
         self.assertTrue(self._run_backend(backend, device_type, "pooled"))
 
-    @parameterized.expand([("gloo", "cpu"), ("tpu_dist", "tpu")])
+    @parameterized.expand(_BACKENDS)
     def test_variable_batch_forward_and_backward(
         self, backend: str, device_type: str
     ) -> None:
         self.assertTrue(self._run_backend(backend, device_type, "variable_batch"))
+
+    @parameterized.expand(_BACKENDS)
+    def test_variable_batch_empty_rank_forward_and_backward(
+        self, backend: str, device_type: str
+    ) -> None:
+        self.assertTrue(self._run_backend(backend, device_type, "variable_batch_empty"))

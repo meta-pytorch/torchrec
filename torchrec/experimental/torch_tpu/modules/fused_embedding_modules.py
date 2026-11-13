@@ -29,13 +29,11 @@ import torch.distributed as dist
 import torch.distributed.tensor as dt
 from torch import nn
 from torchrec.experimental.torch_tpu.datasets import input_preprocessing
-from torchrec.experimental.torch_tpu.modules import custom_ops, table_stacking
+from torchrec.experimental.torch_tpu.modules import custom_ops, table_stacking, utils
 from torchrec.experimental.torch_tpu.modules.embedding_configs import (
     SparseCoreEmbeddingConfig,
     StackedSparseCoreEmbeddingConfig,
 )
-
-# import torch_tpu._internal.device_utils.annotations as tpu_annotations
 from torchrec.modules import embedding_configs
 from torchrec.optim import fused, keyed
 from torchrec.sparse import jagged_tensor
@@ -51,6 +49,7 @@ JaggedTensor = jagged_tensor.JaggedTensor
 EmbeddingBagConfig = embedding_configs.EmbeddingBagConfig
 
 _DISPATCH_TABLE = {
+    None: custom_ops.sparse_dense_matmul_sgd_fwd,
     torch.optim.SGD: custom_ops.sparse_dense_matmul_sgd_fwd,
     torch.optim.Adagrad: custom_ops.sparse_dense_matmul_adagrad_fwd,
     torch.optim.Adam: custom_ops.sparse_dense_matmul_adam_fwd,
@@ -127,18 +126,19 @@ def run_sparse_dense_matmul(
     sample_ids: torch.Tensor,
     gains: torch.Tensor,
     embedding_table: torch.Tensor,
-    learning_rate: torch.Tensor,
-    batch_size: int,
-    max_ids_per_partition: int,
-    max_unique_ids_per_partition: int,
-    optimizer_type: type[torch.optim.Optimizer],
-    table_name: str,
+    learning_rate: Optional[torch.Tensor] = None,
+    batch_size: int = 1,
+    max_ids_per_partition: int = 256,
+    max_unique_ids_per_partition: int = 256,
+    optimizer_type: Optional[Type[torch.optim.Optimizer]] = None,
+    table_name: str = "table",
     accumulator: Optional[torch.Tensor] = None,
     momentum: Optional[torch.Tensor] = None,
     velocity: Optional[torch.Tensor] = None,
     epsilon: float = 1e-10,
     beta1: float = 0.9,
     beta2: float = 0.999,
+    enable_minibatching: bool = False,
 ) -> torch.Tensor:
     """Runs SparseCore SparseDenseMatmul with the given optimizer.
 
@@ -160,6 +160,7 @@ def run_sparse_dense_matmul(
       epsilon: Numerical stability constant for Adagrad / Adam.
       beta1: Adam exponential decay rate for first moment estimates.
       beta2: Adam exponential decay rate for second moment estimates.
+      enable_minibatching: Whether to enable SparseCore minibatching.
 
     Returns:
       Output activation tensor from SparseDenseMatmul lookup.
@@ -174,7 +175,11 @@ def run_sparse_dense_matmul(
             " 'adam' are supported."
         )
     op = _DISPATCH_TABLE[optimizer_type]
-    if optimizer_type == torch.optim.SGD:
+    if optimizer_type is None or optimizer_type == torch.optim.SGD:
+        if learning_rate is None:
+            learning_rate = torch.tensor(
+                0.0, dtype=torch.float32, device=embedding_table.device
+            )
         return op(
             row_pointers,
             embedding_ids,
@@ -186,6 +191,7 @@ def run_sparse_dense_matmul(
             max_ids_per_partition,
             max_unique_ids_per_partition,
             table_name,
+            enable_minibatching,
         )
     elif optimizer_type == torch.optim.Adagrad:
         if accumulator is None:
@@ -203,6 +209,7 @@ def run_sparse_dense_matmul(
             max_ids_per_partition,
             max_unique_ids_per_partition,
             table_name,
+            enable_minibatching,
         )
     elif optimizer_type == torch.optim.Adam:
         if momentum is None:
@@ -225,6 +232,7 @@ def run_sparse_dense_matmul(
             max_ids_per_partition,
             max_unique_ids_per_partition,
             table_name,
+            enable_minibatching,
         )
 
 
@@ -247,6 +255,7 @@ def run_sparse_dense_matmul_bwd(
     epsilon: float = 1e-10,
     beta1: float = 0.9,
     beta2: float = 0.999,
+    enable_minibatching: bool = False,
 ) -> None:
     """Runs SparseCore backward pass and in-place optimizer update."""
     if optimizer_type not in _DISPATCH_TABLE_BWD:
@@ -268,6 +277,7 @@ def run_sparse_dense_matmul_bwd(
             max_ids_per_partition,
             max_unique_ids_per_partition,
             table_name,
+            enable_minibatching,
         )
     elif optimizer_type == torch.optim.Adagrad:
         if accumulator is None:
@@ -286,6 +296,7 @@ def run_sparse_dense_matmul_bwd(
             max_ids_per_partition,
             max_unique_ids_per_partition,
             table_name,
+            enable_minibatching,
         )
     elif optimizer_type == torch.optim.Adam:
         if momentum is None:
@@ -309,6 +320,7 @@ def run_sparse_dense_matmul_bwd(
             max_ids_per_partition,
             max_unique_ids_per_partition,
             table_name,
+            enable_minibatching,
         )
 
 
@@ -357,9 +369,9 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
     def __init__(
         self,
         tables: List[SparseCoreEmbeddingConfig],
-        optimizer_type: Type[torch.optim.Optimizer],
-        optimizer_kwargs: Dict[str, Any],
-        weight_dict_name: str,
+        optimizer_type: Optional[Type[torch.optim.Optimizer]] = None,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        weight_dict_name: str = "embeddings",
         batch_size: int = 1,
         global_device_count: int = 1,
         num_sc_per_device: int = 2,
@@ -421,9 +433,14 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         )
 
         for stack_config in self._stacked_configs:
+            lr_value = (
+                0.0
+                if self._optimizer_type is None
+                else self._optimizer_kwargs.get("lr", 0.01)
+            )
             self.learning_rates[stack_config.stack_name] = nn.Parameter(
                 torch.tensor(
-                    self._optimizer_kwargs.get("lr", 0.01),
+                    lr_value,
                     dtype=torch.float32,
                     device=self._device,
                 ),
@@ -485,7 +502,9 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                 num_sc_per_device=self._num_sc_per_device,
             )[stack_config.stack_name]
 
-            embedding_table_device = sharded_stacked.to(self._device)
+            embedding_table_device = utils.to_device_in_sparsecore_layout(
+                sharded_stacked, self._device
+            )
 
             if self._device_mesh is not None:
                 sharded_weight = dt.DTensor.from_local(
@@ -497,21 +516,24 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             else:
                 weight_param = nn.Parameter(embedding_table_device)
 
-            weight_param._in_backward_optimizers = [self._optimizer_type]
+            if self._optimizer_type is not None:
+                weight_param._in_backward_optimizers = [self._optimizer_type]
 
             weight_modules[stack_config.stack_name] = torch.nn.Module()
             weight_modules[stack_config.stack_name].register_parameter(
                 "weight", weight_param
             )
 
-            if self._optimizer_type == torch.optim.SGD:
+            if self._optimizer_type is None or self._optimizer_type == torch.optim.SGD:
                 pass
             elif self._optimizer_type == torch.optim.Adagrad:
                 accumulator = torch.full(
                     stack_shape,
                     self._optimizer_kwargs.get("initial_accumulator_value", 0.0),
                     dtype=torch.float32,
-                    device=self._device,
+                )
+                accumulator = utils.to_device_in_sparsecore_layout(
+                    accumulator, self._device
                 )
                 if self._device_mesh is not None:
                     sharded_accumulator = dt.DTensor.from_local(
@@ -527,12 +549,10 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                         accumulator
                     )
             elif self._optimizer_type == torch.optim.Adam:
-                momentum = torch.zeros(
-                    stack_shape, dtype=torch.float32, device=self._device
-                )
-                velocity = torch.zeros(
-                    stack_shape, dtype=torch.float32, device=self._device
-                )
+                momentum = torch.zeros(stack_shape, dtype=torch.float32)
+                momentum = utils.to_device_in_sparsecore_layout(momentum, self._device)
+                velocity = torch.zeros(stack_shape, dtype=torch.float32)
+                velocity = utils.to_device_in_sparsecore_layout(velocity, self._device)
                 if self._device_mesh is not None:
                     sharded_momentum = dt.DTensor.from_local(
                         momentum,
@@ -566,6 +586,11 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
 
     @property
     def fused_optimizer(self) -> KeyedOptimizer:
+        if self._optimizer_type is None:
+            raise RuntimeError(
+                "fused_optimizer is not available when optimizer_type is None"
+                " (inference mode)."
+            )
         return SparseCoreFusedOptimizer(self)
 
     @property
@@ -576,7 +601,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
     def stacked_configs(self) -> List[StackedSparseCoreEmbeddingConfig]:
         return self._stacked_configs
 
-    def optimizer_type(self) -> Type[torch.optim.Optimizer]:
+    def optimizer_type(self) -> Optional[Type[torch.optim.Optimizer]]:
         return self._optimizer_type
 
     def optimizer_kwargs(self) -> Dict[str, Any]:
@@ -710,6 +735,16 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             velocity.to_local() if isinstance(velocity, dt.DTensor) else velocity
         )
 
+        max_ids = (
+            stack_inputs.max_ids_per_partition
+            if stack_inputs.max_ids_per_partition is not None
+            else stack_config.max_ids_per_partition
+        )
+        max_unique_ids = (
+            stack_inputs.max_unique_ids_per_partition
+            if stack_inputs.max_unique_ids_per_partition is not None
+            else stack_config.max_unique_ids_per_partition
+        )
         return run_sparse_dense_matmul(
             stack_inputs.row_pointers,
             stack_inputs.embedding_ids,
@@ -718,8 +753,8 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             local_weight,
             self.learning_rates[stack_config.stack_name],
             batch_size,
-            stack_config.max_ids_per_partition,
-            stack_config.max_unique_ids_per_partition,
+            max_ids,
+            max_unique_ids,
             self._optimizer_type,
             stack_config.stack_name,
             local_accumulator,
@@ -728,6 +763,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             self._optimizer_kwargs.get("eps", 1e-10),
             self._optimizer_kwargs.get("beta1", 0.9),
             self._optimizer_kwargs.get("beta2", 0.999),
+            stack_inputs.enable_minibatching,
         )
 
     @property
@@ -735,6 +771,32 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         """Returns dictionary mapping stack names to current stacked table weights."""
         weight_dict = getattr(self, self._weight_dict_name)
         return {name: mod.weight for name, mod in weight_dict.items()}
+
+    def update_table_weights(self, new_tables: Dict[str, torch.Tensor]) -> None:
+        """Updates module parameter weights in-place from updated table tensors."""
+        with torch.no_grad():
+            weight_modules = getattr(self, self._weight_dict_name, None)
+            if weight_modules is None:
+                return
+            for stack_name, new_table in new_tables.items():
+                if stack_name in weight_modules and hasattr(
+                    weight_modules[stack_name], "weight"
+                ):
+                    param = weight_modules[stack_name].weight
+                    if isinstance(param, dt.DTensor) and not isinstance(
+                        new_table, dt.DTensor
+                    ):
+                        param.to_local().copy_(new_table)
+                    elif isinstance(param, dt.DTensor) and isinstance(
+                        new_table, dt.DTensor
+                    ):
+                        param.copy_(new_table)
+                    elif not isinstance(param, dt.DTensor) and isinstance(
+                        new_table, dt.DTensor
+                    ):
+                        param.copy_(new_table.to_local())
+                    else:
+                        param.copy_(new_table)
 
     def get_unstacked_table_weights(self) -> Dict[str, torch.Tensor]:
         """Returns individual unstacked and unsharded table weights."""
@@ -756,17 +818,16 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
         self, table_weights: Dict[str, torch.Tensor]
     ) -> None:
         """Sets individual table weights by stacking and sharding them into the parameters."""
-        device_table_weights = {
-            name: w.to(self._device) for name, w in table_weights.items()
-        }
         stacked_weights = table_stacking.stack_and_shard_tables(
-            device_table_weights,
+            {name: w.cpu() for name, w in table_weights.items()},
             self._stacked_configs,
             global_device_count=self._global_device_count,
             num_sc_per_device=self._num_sc_per_device,
         )
         weight_dict = getattr(self, self._weight_dict_name)
         for stack_name, w in stacked_weights.items():
+            # Copying from a TPU tensor keeps its layout, unlike copying from the CPU.
+            w = utils.to_device_in_sparsecore_layout(w, self._device)
             with torch.no_grad():
                 param = weight_dict[stack_name].weight
                 if hasattr(param, "to_local"):
@@ -947,8 +1008,16 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             )
 
             lr = self.learning_rates[stack_name]
-            max_ids = stack_config.max_ids_per_partition
-            max_unique_ids = stack_config.max_unique_ids_per_partition
+            max_ids = (
+                table_inputs.max_ids_per_partition
+                if table_inputs.max_ids_per_partition is not None
+                else stack_config.max_ids_per_partition
+            )
+            max_unique_ids = (
+                table_inputs.max_unique_ids_per_partition
+                if table_inputs.max_unique_ids_per_partition is not None
+                else stack_config.max_unique_ids_per_partition
+            )
 
             if self._optimizer_type == torch.optim.SGD:
                 new_table = torch.tpu.ops.sparse_dense_matmul_grad_with_sgd(
@@ -963,6 +1032,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                     max_ids_per_partition=max_ids,
                     max_unique_ids_per_partition=max_unique_ids,
                     computation_name=f"sgd_{stack_name}",
+                    enable_minibatching=table_inputs.enable_minibatching,
                 )
             elif self._optimizer_type == torch.optim.Adagrad:
                 if local_accumulator is None:
@@ -985,6 +1055,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                         max_ids_per_partition=max_ids,
                         max_unique_ids_per_partition=max_unique_ids,
                         computation_name=f"adagrad_{stack_name}",
+                        enable_minibatching=table_inputs.enable_minibatching,
                     )
                 )
                 self._update_param_state(
@@ -1017,6 +1088,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                         max_ids_per_partition=max_ids,
                         max_unique_ids_per_partition=max_unique_ids,
                         computation_name=f"adam_{stack_name}",
+                        enable_minibatching=table_inputs.enable_minibatching,
                     )
                 )
                 self._update_param_state(
@@ -1117,8 +1189,8 @@ class SparseCoreFusedEmbeddingBagCollection(
     def __init__(
         self,
         tables: List[SparseCoreEmbeddingConfig],
-        optimizer_type: Type[torch.optim.Optimizer],
-        optimizer_kwargs: Dict[str, Any],
+        optimizer_type: Optional[Type[torch.optim.Optimizer]] = None,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
         batch_size: int = 1,
         global_device_count: int = 1,
         num_sc_per_device: int = 2,
@@ -1187,7 +1259,7 @@ class SparseCoreFusedEmbeddingCollection(
     def __init__(
         self,
         tables: List[SparseCoreEmbeddingConfig],
-        optimizer_type: Type[torch.optim.Optimizer] = torch.optim.SGD,
+        optimizer_type: Optional[Type[torch.optim.Optimizer]] = None,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         batch_size: int = 1,
         global_device_count: int = 1,
@@ -1197,7 +1269,7 @@ class SparseCoreFusedEmbeddingCollection(
         use_custom_embedding_formatting: bool = True,
     ) -> None:
         if optimizer_kwargs is None:
-            optimizer_kwargs = {"lr": 0.01}
+            optimizer_kwargs = {} if optimizer_type is None else {"lr": 0.01}
         else:
             optimizer_kwargs = dict(optimizer_kwargs)
 
