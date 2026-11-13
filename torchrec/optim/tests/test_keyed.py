@@ -233,6 +233,81 @@ class TestKeyedOptimizer(unittest.TestCase):
                 reload_opt.state_dict()[k],
             )
 
+    def test_init_state_does_not_advance_adam_step(self) -> None:
+        """
+        Regression test for https://github.com/pytorch/torchrec/issues/4985:
+
+        ``init_state()`` runs a dummy optimizer step, which must not advance
+        the step counter of params that already carry state (e.g. restored
+        from a checkpoint), and freshly initialized params must start at
+        step 0 so the first real update still uses t=1.
+        """
+        p = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float64))
+        dense = KeyedOptimizerWrapper(
+            {"weight": p},
+            lambda params: torch.optim.Adam(
+                params,
+                lr=1e-3,
+                betas=(0.95, 0.999),
+                eps=1e-8,
+                weight_decay=0,
+            ),
+        )
+        opt = CombinedOptimizer([("dense", dense)])
+
+        # Simulate checkpoint-restored state before init_state().
+        state = dense.state[p]
+        state["step"] = torch.tensor(5.0, dtype=torch.float64)
+        state["exp_avg"] = torch.tensor([0.123], dtype=torch.float64)
+        state["exp_avg_sq"] = torch.tensor([0.456], dtype=torch.float64)
+
+        opt.init_state()
+
+        # Checkpointed state must be untouched by the dummy step.
+        self.assertEqual(state["step"].item(), 5.0)
+        self.assertEqual(state["exp_avg"].tolist(), [0.123])
+        self.assertEqual(state["exp_avg_sq"].tolist(), [0.456])
+
+        # First real update must use t=1.
+        p.grad = torch.ones_like(p)
+        opt.step()
+        self.assertEqual(state["step"].item(), 6.0)
+
+        # Freshly initialized params start at step 0.
+        p2 = torch.nn.Parameter(torch.tensor([2.0], dtype=torch.float64))
+        dense2 = KeyedOptimizerWrapper(
+            {"w2": p2},
+            lambda params: torch.optim.Adam(
+                params,
+                lr=1e-3,
+                betas=(0.95, 0.999),
+                eps=1e-8,
+                weight_decay=0,
+            ),
+        )
+        opt2 = CombinedOptimizer([("d2", dense2)])
+        opt2.init_state()
+        self.assertEqual(dense2.state[p2]["step"].item(), 0.0)
+
+        dense = torch.nn.Parameter(torch.ones((2, 3), dtype=torch.float))
+        sparse = torch.nn.Parameter(torch.ones((1, 4), dtype=torch.float))
+        opt = KeyedOptimizerWrapper(
+            {"dense": dense, "sparse": sparse},
+            lambda params: torch.optim.SGD(params, lr=0.1),
+        )
+        opt.init_state({"sparse"})
+
+        bytesIO = io.BytesIO()
+        torch.save(opt, bytesIO)
+        bytesIO.seek(0)
+        reload_opt = torch.load(bytesIO, weights_only=False)
+
+        for k in reload_opt.state_dict():
+            self.assertEqual(
+                opt.state_dict()[k],
+                reload_opt.state_dict()[k],
+            )
+
 
 class TestCombinedOptimizer(unittest.TestCase):
     def test_pickle(self) -> None:
