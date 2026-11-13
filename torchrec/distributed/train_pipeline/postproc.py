@@ -6,14 +6,16 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+import dataclasses
 import logging
 from collections import OrderedDict
-from typing import Any, Dict, Iterable, Iterator, Optional, Set, Tuple, Union
+from typing import Any, cast, Dict, Iterable, Iterator, Optional, Set, Tuple, Union
 
 import torch
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.profiler import record_function
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
+from torchrec.distributed.train_pipeline.pipeline_dataclass import is_pipeline_dataclass
 from torchrec.distributed.train_pipeline.types import CallArgs
 from torchrec.streamable import Pipelineable
 
@@ -176,7 +178,9 @@ class PipelinedPostproc(torch.nn.Module):
             elif self._default_stream and self._dist_stream:
                 self._default_stream.wait_stream(self._dist_stream)
 
-                if isinstance(res, (torch.Tensor, Pipelineable, Iterable, Dict)):
+                if isinstance(
+                    res, (torch.Tensor, Pipelineable, Iterable, Dict)
+                ) or is_pipeline_dataclass(type(res)):
                     # Result from module forward might be a complex type such as
                     # Tuple[KeyedJaggedTensor, Dict[str, torch.Tensor]]
                     # In this case, we need to first iterate over each element of tuple
@@ -189,7 +193,7 @@ class PipelinedPostproc(torch.nn.Module):
                     logger.warning(
                         f"Result of postproc module {self._fqn} is of type {type(res)}. "
                         "We currently expect it to be a Tensor, Pipelineable, Iterable, "
-                        "or Dict to handle memory safety. If your output is not of this "
+                        "Dict or @pipeline_dataclass to handle memory safety. If your output is not of this "
                         "type, please add support for it above. Otherwise you might run "
                         "into NaNs or CUDA Illegal Memory issues during training!"
                     )
@@ -287,3 +291,8 @@ class PipelinedPostproc(torch.nn.Module):
         elif isinstance(res, dict):
             for v in res.values():
                 PipelinedPostproc.recursive_record_stream(v, stream)
+        elif is_pipeline_dataclass(type(res)):
+            for field in dataclasses.fields(cast(Any, res)):
+                PipelinedPostproc.recursive_record_stream(
+                    getattr(res, field.name), stream
+                )

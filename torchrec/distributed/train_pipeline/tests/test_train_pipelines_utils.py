@@ -8,9 +8,20 @@
 # pyre-strict
 
 import copy
+import dataclasses
 import enum
 import unittest
-from typing import cast, List, NamedTuple, Optional, Protocol, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+)
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -31,11 +42,13 @@ from torchrec.distributed.test_utils.test_model import (
     TestNegSamplingModule,
     TestSparseNN,
 )
+from torchrec.distributed.test_utils.test_sharding import copy_state_dict
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
     PrefetchEmbeddingTrainPipelineContext,
     TrainPipelineContext,
 )
+from torchrec.distributed.train_pipeline.pipeline_dataclass import pipeline_dataclass
 from torchrec.distributed.train_pipeline.runtime_forwards import (
     EmbeddingPipelinedForward,
     InSyncPrefetchEmbeddingPipelinedForward,
@@ -44,7 +57,13 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
 )
-from torchrec.distributed.train_pipeline.tracing import CallArgs, PipelinedPostproc
+from torchrec.distributed.train_pipeline.tracing import (
+    CallArgs,
+    NodeArgsHelper,
+    PipelineDataclassArgInfoStep,
+    PipelinedPostproc,
+)
+from torchrec.distributed.train_pipeline.types import ArgInfo
 from torchrec.distributed.train_pipeline.utils import (
     _is_data_loading_retriable,
     _rewrite_model,
@@ -65,7 +84,7 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
-from torchrec.streamable import Multistreamable
+from torchrec.streamable import Multistreamable, Pipelineable
 
 _UTILS_LOGGER_NAME: str = "torchrec.distributed.train_pipeline.utils"
 
@@ -574,6 +593,326 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         self.assertIn(ebc, pipelined_b, diagnostics)
         self.assertNotIn("sparse.ebc", non_pipelined_b, diagnostics)
         self.assertIn("Module 'sparse.ebc' will be pipelined", arm_b_output)
+
+
+@pipeline_dataclass
+class _PostprocInput:
+    model_input: ModelInput
+    scale: float = 1.0
+
+
+@pipeline_dataclass
+class _PostprocInputWithExtras:
+    model_input: ModelInput
+    extras: Any
+
+
+@pipeline_dataclass
+class _OuterPostprocInput:
+    model_input: ModelInput
+
+
+@pipeline_dataclass
+class _DenseFeatures:
+    dense: torch.Tensor
+
+
+@dataclasses.dataclass
+class _PlainPostprocInput:
+    model_input: ModelInput
+
+
+@dataclasses.dataclass
+class _PlainDenseFeatures:
+    dense: torch.Tensor
+
+
+class _PassThroughPostproc(torch.nn.Module):
+    """Holds no sharded module, so it is a leaf and fx materializes its argument."""
+
+    def forward(self, postproc_input: Any) -> ModelInput:
+        return postproc_input.model_input
+
+
+class _ScalingPostproc(torch.nn.Module):
+    """Uses `scale`, so a wrongly rebuilt field changes the model output."""
+
+    def forward(self, postproc_input: _PostprocInput) -> ModelInput:
+        model_input = postproc_input.model_input
+        return dataclasses.replace(
+            model_input,
+            float_features=model_input.float_features * postproc_input.scale,
+        )
+
+
+class PipelineDataclassRewriteTest(TrainPipelineSparseDistTestBase):
+    def _build_model(
+        self,
+        make_input: Callable[[ModelInput], object],
+        postproc: Optional[torch.nn.Module] = None,
+        chained: bool = False,
+    ) -> TestSparseNN:
+        """
+        `TestSparseNN` whose postproc takes `make_input(batch)`. With `chained`, a
+        second postproc takes the first one's output, wrapped in another pipeline
+        dataclass.
+        """
+
+        class Model(TestSparseNN):
+            def forward(
+                self, input: ModelInput
+            ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                # pyrefly: ignore[not-callable, bad-assignment]
+                input = self.postproc_module(make_input(input))
+                if chained:
+                    # pyrefly: ignore[not-callable, bad-assignment]
+                    input = self.outer_postproc(_OuterPostprocInput(model_input=input))
+                return self.dense_forward(input, self.sparse_forward(input))
+
+        model = Model(
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            dense_device=self.device,
+            sparse_device=torch.device("meta"),
+            postproc_module=postproc or _PassThroughPostproc(),
+        )
+        # A top-level child, so it is a leaf to the rewrite tracer.
+        model.outer_postproc = _PassThroughPostproc()
+        return model
+
+    def _shard(
+        self, model: TestSparseNN
+    ) -> Tuple[torch.nn.Module, torch.optim.Optimizer]:
+        return self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            {},
+        )
+
+    def _rewrite(self, model: TestSparseNN) -> Any:
+        """Returns the inner module of the rewritten sharded model."""
+        sharded_model, _ = self._shard(model)
+        _rewrite_model(
+            model=sharded_model,
+            batch=None,
+            context=TrainPipelineContext(),
+            dist_stream=None,
+            pipeline_postproc=True,
+        )
+        return cast(Any, sharded_model).module
+
+    def _rebuild_postproc_input(self, module: Any) -> Tuple[ModelInput, Any]:
+        """Replays the rewritten postproc's argument on a fresh batch."""
+        postproc = module.postproc_module
+        self.assertIsInstance(postproc, PipelinedPostproc)
+        step = postproc._args.args[0].steps[0]
+        self.assertIsInstance(step, PipelineDataclassArgInfoStep)
+        batch = self._generate_data(num_batches=1)[0]
+        return batch, step.process(batch)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_pipeline_dataclass_is_pipelined(self) -> None:
+        module = self._rewrite(
+            self._build_model(lambda b: _PostprocInput(model_input=b, scale=2.0))
+        )
+
+        self.assertIsInstance(module.sparse.ebc.forward, PipelinedForward)
+        self.assertIsInstance(module.sparse.weighted_ebc.forward, PipelinedForward)
+
+        batch, rebuilt = self._rebuild_postproc_input(module)
+        self.assertIsInstance(rebuilt, _PostprocInput)
+        self.assertIs(rebuilt.model_input, batch)
+        self.assertEqual(rebuilt.scale, 2.0)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_chained_pipeline_dataclasses_are_pipelined(self) -> None:
+        module = self._rewrite(
+            self._build_model(lambda b: _PostprocInput(model_input=b), chained=True)
+        )
+
+        self.assertIsInstance(module.sparse.ebc.forward, PipelinedForward)
+        self.assertIsInstance(module.postproc_module, PipelinedPostproc)
+        self.assertIsInstance(module.outer_postproc, PipelinedPostproc)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_plain_dataclass_is_not_pipelined(self) -> None:
+        with self.assertLogs(
+            "torchrec.distributed.train_pipeline.tracing", level="WARNING"
+        ) as logs:
+            module = self._rewrite(
+                self._build_model(lambda b: _PlainPostprocInput(model_input=b))
+            )
+
+        self.assertNotIsInstance(module.sparse.ebc.forward, PipelinedForward)
+        self.assertTrue(any("@pipeline_dataclass" in line for line in logs.output))
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_nested_container_field_is_rebuilt(self) -> None:
+        module = self._rewrite(
+            self._build_model(
+                lambda b: _PostprocInputWithExtras(
+                    model_input=b, extras={"dense": [b.float_features, b.label]}
+                )
+            )
+        )
+
+        self.assertIsInstance(module.sparse.ebc.forward, PipelinedForward)
+        batch, rebuilt = self._rebuild_postproc_input(module)
+        self.assertIs(rebuilt.extras["dense"][0], batch.float_features)
+        self.assertIs(rebuilt.extras["dense"][1], batch.label)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_nested_pipeline_dataclass_is_rebuilt(self) -> None:
+        # The inner dataclass is built inside `forward`, so it is rebuilt too.
+        module = self._rewrite(
+            self._build_model(
+                lambda b: _PostprocInputWithExtras(
+                    model_input=b, extras=_DenseFeatures(dense=b.float_features)
+                )
+            )
+        )
+
+        self.assertIsInstance(module.sparse.ebc.forward, PipelinedForward)
+        batch, rebuilt = self._rebuild_postproc_input(module)
+        self.assertIsInstance(rebuilt.extras, _DenseFeatures)
+        self.assertIs(rebuilt.extras.dense, batch.float_features)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_unrebuildable_field_is_not_pipelined(self) -> None:
+        # `extras` holds something created inside the model, a tuple of fx nodes, or
+        # a plain dataclass built inside `forward`; none may be rebuilt.
+        cases = {
+            "tensor": lambda b: _PostprocInputWithExtras(
+                model_input=b, extras=torch.rand(1)
+            ),
+            "nested element": lambda b: _PostprocInputWithExtras(
+                model_input=b, extras={"dense": [b.float_features, torch.rand(1)]}
+            ),
+            "tuple": lambda b: _PostprocInputWithExtras(
+                model_input=b, extras=(b.float_features, b.label)
+            ),
+            "plain dataclass": lambda b: _PostprocInputWithExtras(
+                model_input=b, extras=_PlainDenseFeatures(dense=b.float_features)
+            ),
+        }
+        for name, make_input in cases.items():
+            with self.subTest(name):
+                module = self._rewrite(self._build_model(make_input))
+                self.assertNotIsInstance(module.sparse.ebc.forward, PipelinedForward)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_pipelined_matches_unpipelined(self) -> None:
+        for chained in (False, True):
+            with self.subTest(chained=chained):
+                self._check_pipelined_matches_unpipelined(chained)
+
+    def _check_pipelined_matches_unpipelined(self, chained: bool) -> None:
+        def build() -> TestSparseNN:
+            return self._build_model(
+                lambda b: _PostprocInput(model_input=b, scale=2.0),
+                postproc=_ScalingPostproc(),
+                chained=chained,
+            )
+
+        pipelined_model, pipelined_optimizer = self._shard(build())
+        plain_model, plain_optimizer = self._shard(build())
+        copy_state_dict(plain_model.state_dict(), pipelined_model.state_dict())
+
+        data = self._generate_data(num_batches=5, batch_size=32)
+        dataloader = iter(data)
+        pipeline = self.pipeline_class(
+            pipelined_model,
+            pipelined_optimizer,
+            self.device,
+            pipeline_postproc=True,
+        )
+
+        # Optimizer steps between batches, so any divergence would compound.
+        for batch in data[:-2]:
+            batch = batch.to(self.device)
+            plain_optimizer.zero_grad()
+            loss, pred = plain_model(batch)
+            loss.backward()
+            plain_optimizer.step()
+
+            pred_pipelined = pipeline.progress(dataloader)
+            torch.testing.assert_close(pred_pipelined.cpu(), pred.cpu(), rtol=0, atol=0)
+
+        # Without this the comparison would pass trivially if pipelining were lost.
+        module = cast(Any, pipelined_model).module
+        self.assertIsInstance(module.postproc_module, PipelinedPostproc)
+        if chained:
+            self.assertIsInstance(module.outer_postproc, PipelinedPostproc)
+
+
+class _StreamRecorder(Pipelineable):
+    def __init__(self) -> None:
+        self.streams: List[torch.Stream] = []
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        self.streams.append(stream)
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> "_StreamRecorder":
+        return self
+
+
+@pipeline_dataclass
+class _PostprocOutput:
+    first: _StreamRecorder
+    rest: List[_StreamRecorder]
+
+
+class PipelineDataclassWalkerTest(unittest.TestCase):
+    def test_positional_constructor_args_are_rejected(self) -> None:
+        graph = torch.fx.Graph()
+        batch = graph.placeholder("batch")
+        node = graph.call_function(_PostprocInput, (batch,))
+        helper = NodeArgsHelper(
+            model=torch.nn.Module(),
+            context=TrainPipelineContext(),
+            pipeline_postproc=True,
+        )
+
+        self.assertIsNone(
+            helper._handle_dataclass_constructor(
+                node, ArgInfo([]), for_postproc_module=True
+            )
+        )
+
+
+class PipelineDataclassRecordStreamTest(unittest.TestCase):
+    def test_records_every_field(self) -> None:
+        first, second = _StreamRecorder(), _StreamRecorder()
+        stream = cast(torch.Stream, object())
+
+        PipelinedPostproc.recursive_record_stream(
+            cast(Any, _PostprocOutput(first=first, rest=[second])), stream
+        )
+
+        self.assertEqual(first.streams, [stream])
+        self.assertEqual(second.streams, [stream])
 
 
 # ~50ms on a modern GPU: long enough that a consumer on an unordered stream
