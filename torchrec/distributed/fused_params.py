@@ -31,6 +31,10 @@ FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER: str = (
 FUSED_PARAM_LENGTHS_TO_OFFSETS_LOOKUP: str = "__register_lengths_to_offsets_lookup"
 FUSED_PARAM_IS_DEVICE_RO: str = "__register_is_device_ro"
 
+# Concatenate checkpoint shards into host memory during state-dict loading. This
+# is consumed by ShardedEmbeddingBagCollection and must not reach TBE kernels.
+FUSED_PARAM_CHECKPOINT_LOAD_CONCAT_ON_CPU: str = "checkpoint_load_concat_on_cpu"
+
 # Fused param storing list of cpu embedding tables offloaded to ssd to scale
 # the embedding table size
 FUSED_PARAM_SSD_TABLE_LIST: str = "__register_ssd_table_list"

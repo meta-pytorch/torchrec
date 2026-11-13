@@ -22,6 +22,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -62,6 +63,7 @@ from torchrec.distributed.feature_score_utils import (
     may_collect_feature_scores,
 )
 from torchrec.distributed.fused_params import (
+    FUSED_PARAM_CHECKPOINT_LOAD_CONCAT_ON_CPU,
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
 )
@@ -145,6 +147,26 @@ except OSError:
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _concatenate_tensors_on_cpu(
+    tensors: Sequence[torch.Tensor], dim: int
+) -> torch.Tensor:
+    """Concatenate tensors into one CPU allocation without per-shard copies."""
+    if not tensors:
+        raise ValueError("Expected at least one tensor to concatenate")
+
+    output_size = list(tensors[0].size())
+    output_size[dim] = sum(tensor.size(dim) for tensor in tensors)
+    output = torch.empty(output_size, dtype=tensors[0].dtype, device="cpu")
+
+    offset = 0
+    with torch.no_grad():
+        for tensor in tensors:
+            length = tensor.size(dim)
+            output.narrow(dim, offset, length).copy_(tensor)
+            offset += length
+    return output
 
 
 def _pin_and_move(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -660,6 +682,15 @@ class ShardedEmbeddingBagCollection(
     ) -> None:
         # pyrefly: ignore [missing-attribute]
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
+        fused_params = dict(fused_params or {})
+        self._checkpoint_load_concat_on_cpu: bool = bool(
+            fused_params.pop(FUSED_PARAM_CHECKPOINT_LOAD_CONCAT_ON_CPU, False)
+        )
+        if self._checkpoint_load_concat_on_cpu:
+            logger.info(
+                "[TorchRec] Concatenating checkpoint shards on CPU during "
+                "ShardedEmbeddingBagCollection state-dict loading"
+            )
         self._module_fqn = module_fqn
         # Opt-out of the DATA_PARALLEL DDP gradient reducer (see embedding_modules).
         self._skip_data_parallel_grad_sync: bool = should_skip_data_parallel_grad_sync(
@@ -1149,8 +1180,13 @@ class ShardedEmbeddingBagCollection(
                     dim = state_dict[key].metadata().shards_metadata[0].shard_sizes[1]
                     # CW multiple shards are merged
                     if len(local_shards) > 1:
-                        state_dict[key] = torch.cat(
-                            [s.tensor.view(-1) for s in local_shards], dim=0
+                        flattened_shards = [
+                            shard.tensor.view(-1) for shard in local_shards
+                        ]
+                        state_dict[key] = (
+                            _concatenate_tensors_on_cpu(flattened_shards, dim=0)
+                            if self._checkpoint_load_concat_on_cpu
+                            else torch.cat(flattened_shards, dim=0)
                         ).view(-1, dim)
                     else:
                         state_dict[key] = local_shards[0].tensor.view(-1, dim)
@@ -1163,8 +1199,11 @@ class ShardedEmbeddingBagCollection(
                     dim = shards_wrapper.local_sizes()[0][1]
                     # CW multiple shards are merged
                     if len(local_shards) > 1:
-                        state_dict[key] = torch.cat(
-                            [s.view(-1) for s in local_shards], dim=0
+                        flattened_shards = [shard.view(-1) for shard in local_shards]
+                        state_dict[key] = (
+                            _concatenate_tensors_on_cpu(flattened_shards, dim=0)
+                            if self._checkpoint_load_concat_on_cpu
+                            else torch.cat(flattened_shards, dim=0)
                         ).view(-1, dim)
                     else:
                         state_dict[key] = local_shards[0].view(-1, dim)
@@ -1200,7 +1239,11 @@ class ShardedEmbeddingBagCollection(
                 state_dict[key] = (
                     torch.empty(0)
                     if not local_shards
-                    else torch.cat(local_shards, dim=0)
+                    else (
+                        _concatenate_tensors_on_cpu(local_shards, dim=0)
+                        if self._checkpoint_load_concat_on_cpu and len(local_shards) > 1
+                        else torch.cat(local_shards, dim=0)
+                    )
                 )
             else:
                 raise RuntimeError(
