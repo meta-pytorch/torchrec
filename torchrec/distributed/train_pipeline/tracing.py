@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+import dataclasses
 import logging
 from itertools import chain
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -21,6 +22,7 @@ from torch.fx.node import Node
 from torchrec.distributed.logger import static_logger
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
+from torchrec.distributed.train_pipeline.pipeline_dataclass import is_pipeline_dataclass
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
 from torchrec.distributed.train_pipeline.types import (
     ArgInfo,
@@ -99,6 +101,23 @@ class DictArgInfoStep(BaseArgInfoStep):
         }
 
 
+class PipelineDataclassArgInfoStep(BaseArgInfoStep):
+    """
+    Rebuilds a `@pipeline_dataclass` instance from the batch by replaying its
+    constructor, with each field resolved by its own `ArgInfo`.
+    """
+
+    def __init__(self, cls: type, fields: Dict[str, ArgInfo]) -> None:
+        super().__init__()
+        self.cls = cls
+        self.fields = fields
+
+    def process(self, arg) -> Any:
+        return self.cls(
+            **{name: info.process_steps(arg) for name, info in self.fields.items()}
+        )
+
+
 class ArgInfoStepFactory:
     """
     Convenience class to reduce the amount of imports the external uses will have.
@@ -134,6 +153,26 @@ class ArgInfoStepFactory:
     @classmethod
     def from_dict(cls, value: Dict[str, object]) -> DictArgInfoStep:
         return DictArgInfoStep(value)
+
+    @classmethod
+    def from_pipeline_dataclass(
+        cls, dataclass_type: type, fields: Dict[str, ArgInfo]
+    ) -> PipelineDataclassArgInfoStep:
+        return PipelineDataclassArgInfoStep(dataclass_type, fields)
+
+
+def _contains_node(value: torch.fx.node.Argument) -> bool:
+    nodes: List[Node] = []
+    torch.fx.node.map_arg(value, nodes.append)
+    return bool(nodes)
+
+
+def _is_dataclass_or_namedtuple(target: object) -> bool:
+    """Dataclasses and NamedTuples, which fx materializes as constructor nodes."""
+    return isinstance(target, type) and (
+        dataclasses.is_dataclass(target)
+        or (issubclass(target, tuple) and hasattr(target, "_fields"))
+    )
 
 
 def _check_args_for_call_module(
@@ -406,6 +445,89 @@ class NodeArgsHelper:
 
         return None
 
+    def _handle_dataclass_constructor(
+        self,
+        child_node: torch.fx.Node,
+        arg_info: ArgInfo,
+        for_postproc_module: bool,
+    ) -> Optional[ArgInfo]:
+        """
+        Handles a node constructing a dataclass or NamedTuple, which fx emits when one
+        is passed to a leaf module. Only a `@pipeline_dataclass` is rebuilt; anything
+        else stops the walk, leaving the consuming module unpipelined.
+        """
+        dataclass_type = child_node.target
+        assert isinstance(dataclass_type, type)
+
+        if not is_pipeline_dataclass(dataclass_type):
+            logger.warning(
+                f"{dataclass_type} is a plain dataclass or NamedTuple, which the train "
+                "pipeline cannot rebuild safely, so the module consuming it will not be "
+                "pipelined. Define it with `@pipeline_dataclass` from "
+                "`torchrec.distributed.train_pipeline.pipeline_dataclass` instead."
+            )
+            return None
+
+        # fx passes dataclass fields as kwargs (`TracerBase.create_arg`). Fail closed
+        # rather than rebuild without a positional argument if that ever changes.
+        if child_node.args:
+            logger.warning(
+                f"{dataclass_type.__qualname__} was constructed with positional "
+                "arguments, so it cannot be rebuilt during sparse data dist"
+            )
+            return None
+
+        fields: Dict[str, ArgInfo] = {}
+        for name, value in child_node.kwargs.items():
+            field_info = self._resolve_dataclass_field(value, for_postproc_module)
+            if field_info is None:
+                logger.warning(
+                    f"Field '{name}' of {dataclass_type.__qualname__} cannot be derived "
+                    "from the train batch input, so it cannot be rebuilt during sparse "
+                    "data dist"
+                )
+                return None
+            fields[name] = field_info
+
+        arg_info.add_step(
+            ArgInfoStepFactory.from_pipeline_dataclass(dataclass_type, fields)
+        )
+        return arg_info
+
+    def _resolve_dataclass_field(
+        self, value: Any, for_postproc_module: bool
+    ) -> Optional[ArgInfo]:
+        """
+        Resolves one field of a `@pipeline_dataclass`, failing if any part of it
+        cannot be derived from the batch. Unlike the generic collection handling it
+        recurses into nested lists and dicts, never substitutes `None` for an element
+        it cannot resolve, and rejects other containers holding fx nodes (such as
+        tuples), which it cannot rebuild.
+        """
+        if isinstance(value, Node):
+            return self._get_node_args_helper_inner(value, for_postproc_module)
+
+        if isinstance(value, fx_immutable_list):
+            items: List[object] = [
+                self._resolve_dataclass_field(v, for_postproc_module) for v in value
+            ]
+            if any(item is None for item in items):
+                return None
+            return ArgInfo([ArgInfoStepFactory.from_list(items)])
+
+        if isinstance(value, fx_immutable_dict):
+            entries: Dict[str, object] = {
+                k: self._resolve_dataclass_field(v, for_postproc_module)
+                for k, v in value.items()
+            }
+            if any(entry is None for entry in entries.values()):
+                return None
+            return ArgInfo([ArgInfoStepFactory.from_dict(entries)])
+
+        if _contains_node(value):
+            return None
+        return ArgInfo([ArgInfoStepFactory.from_scalar(value)])
+
     def _get_node_args_helper_inner(
         self,
         arg,
@@ -491,6 +613,12 @@ class NodeArgsHelper:
                 # pyrefly: ignore[bad-argument-type]
                 arg_info.add_step(ArgInfoStepFactory.get_item(child_node.args[1]))
                 arg = child_node.args[0]
+            elif child_node.op == "call_function" and _is_dataclass_or_namedtuple(
+                child_node.target
+            ):
+                return self._handle_dataclass_constructor(
+                    child_node, arg_info, for_postproc_module
+                )
             else:
                 logger.warning(
                     f"fx node {child_node.name, child_node.op, child_node.target} "
