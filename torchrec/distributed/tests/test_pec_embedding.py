@@ -11,6 +11,7 @@ import unittest
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, cast, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
@@ -105,6 +106,39 @@ class PECEmbeddingCollectionSharderTest(unittest.TestCase):
 
         self.assertIn("table_0", params)
         self.assertEqual(params["table_0"].shape, (16, 8))
+
+    def test_sharder_forwards_module_fqn(self) -> None:
+        with patch(
+            "torchrec.distributed.pec_embedding.ShardedPECEmbeddingCollection"
+        ) as sharded:
+            PECEmbeddingCollectionSharder(ec_sharder=MagicMock()).shard(
+                MagicMock(),
+                {},
+                env=MagicMock(),
+                device=torch.device("cpu"),
+                module_fqn="sparse.pec_ec",
+            )
+        self.assertEqual(sharded.call_args.kwargs["module_fqn"], "sparse.pec_ec")
+
+    def test_sharded_ec_forwards_module_fqn_to_inner_sharder(self) -> None:
+        inner_sharder = MagicMock()
+        inner_sharder.shard.side_effect = _StopAfterInnerShard
+        with self.assertRaises(_StopAfterInnerShard):
+            ShardedPECEmbeddingCollection(
+                MagicMock(),
+                {},
+                ec_sharder=inner_sharder,
+                env=MagicMock(),
+                device=torch.device("cpu"),
+                module_fqn="sparse.pec_ec",
+            )
+        self.assertEqual(
+            inner_sharder.shard.call_args.kwargs["module_fqn"], "sparse.pec_ec"
+        )
+
+
+class _StopAfterInnerShard(Exception):
+    pass
 
 
 # =============================================================================
