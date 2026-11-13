@@ -566,10 +566,13 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
             # 0 means the metric has no window buffer (nothing to over-evict).
             per_rank_window = getattr(metric, "_window_size", 0)
             batch = getattr(metric, "_batch_size", 0)
+            # pyrefly: ignore [unsupported-operation]
             if per_rank_window > 0 and batch > 0:
+                # pyrefly: ignore [unsupported-operation]
                 metric_cap = per_rank_window // batch
                 if metric_cap < cap:
                     cap = metric_cap
+                    # pyrefly: ignore [bad-assignment]
                     limiter = (type(metric).__name__, per_rank_window, batch)
         cap = max(1, cap)
         if cap < requested:
@@ -584,6 +587,7 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
                 f"CPUOffloadedRecMetricModule: update_batch_size={cap} "
                 f"(requested={requested}, uncapped; per-rank window has headroom)."
             )
+        # pyrefly: ignore [bad-return]
         return cap
 
     def _protected_model_out_keys(self) -> set[str]:
