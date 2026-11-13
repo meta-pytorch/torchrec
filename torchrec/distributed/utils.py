@@ -338,6 +338,8 @@ def get_device_type() -> str:
         check_available=True
     ) == torch.device("tpu"):
         device_type = "tpu"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device_type = "xpu"
     else:
         device_type = "cpu"
     return device_type

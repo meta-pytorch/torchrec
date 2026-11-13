@@ -580,7 +580,7 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
             ShardingType.COLUMN_WISE.value,
             ShardingType.TABLE_COLUMN_WISE.value,
         ]
-        if compute_device_type in {"cuda", "tpu"}:
+        if compute_device_type in {"cuda", "tpu", "xpu"}:
             types += [
                 ShardingType.ROW_WISE.value,
                 ShardingType.TABLE_ROW_WISE.value,

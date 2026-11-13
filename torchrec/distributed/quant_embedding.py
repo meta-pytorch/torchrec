@@ -215,7 +215,7 @@ def create_infer_embedding_sharding(
         get_device_from_sharding_infos(sharding_infos)
     )
 
-    if storage_device_type_from_sharding_infos in ["cuda", "mtia"]:
+    if storage_device_type_from_sharding_infos in ["cuda", "mtia", "xpu"]:
         if sharding_type == ShardingType.TABLE_WISE.value:
             assert isinstance(
                 storage_device_type_from_sharding_infos, str

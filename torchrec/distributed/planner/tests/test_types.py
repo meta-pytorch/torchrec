@@ -1909,6 +1909,12 @@ class TestHardwareConfig(unittest.TestCase):
             )
             self.assertTrue(any("hbm_cap_bytes" in i for i in issues))
 
+        with self.subTest("issues_hbm_zero_xpu_flagged"):
+            issues = HardwareConfig(hbm_cap_bytes=0).get_validation_issues(
+                compute_device="xpu"
+            )
+            self.assertTrue(any("hbm_cap_bytes" in i for i in issues))
+
         with self.subTest("issues_hbm_zero_cpu_skipped"):
             # CPU host has no HBM device; hbm=0 must not be flagged there.
             self.assertEqual(
@@ -2087,6 +2093,9 @@ class TestKernelConfig(unittest.TestCase):
             config = KernelConfig()
             self.assertFalse(config.use_hardware_based_bandwidth)
 
+        with self.subTest("validate_accepts_xpu"):
+            KernelConfig(compute_device="xpu").validate()
+
         with self.subTest("validate_raises_for_invalid_device"):
             config = KernelConfig(compute_device="invalid_device")
             with self.assertRaises(ValueError) as context:
@@ -2150,6 +2159,17 @@ class TestTopologyFactory(unittest.TestCase):
             self.assertEqual(topology.world_size, 8)
             self.assertEqual(topology.local_world_size, 8)
             self.assertEqual(topology.compute_device, "cuda")
+
+        with self.subTest("create_topology_xpu"):
+            topology = TopologyFactory.create_topology(
+                trainer_config=TrainerConfig(world_size=2, local_world_size=2),
+                kernel_config=KernelConfig(compute_device="xpu"),
+            )
+
+            self.assertEqual(topology.compute_device, "xpu")
+            self.assertEqual(len(topology.devices), 2)
+            for device in topology.devices:
+                self.assertGreater(device.storage.hbm, 0)
 
         with self.subTest("create_topology_with_hardware_config"):
             trainer_config = TrainerConfig(world_size=8, local_world_size=8)

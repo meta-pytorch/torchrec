@@ -742,6 +742,34 @@ class ConstructParameterShardingTest(unittest.TestCase):
             "cpu",
         )
 
+    def test_xpu_row_wise_uneven_placement(self) -> None:
+        embedding_bag_config = [
+            EmbeddingBagConfig(
+                name="table_0",
+                feature_names=["feature_0"],
+                embedding_dim=64,
+                num_embeddings=4096,
+            )
+        ]
+        module_sharding_plan = construct_module_sharding_plan(
+            EmbeddingBagCollection(tables=embedding_bag_config),
+            per_param_sharding={
+                "table_0": row_wise(sizes_placement=([2048, 1024, 1024], "xpu")),
+            },
+            local_size=3,
+            world_size=3,
+            device_type="xpu",
+        )
+
+        self.assertEqual(
+            [
+                str(shard.placement)
+                # pyrefly: ignore[missing-attribute]
+                for shard in module_sharding_plan["table_0"].sharding_spec.shards
+            ],
+            ["rank:0/xpu:0", "rank:1/xpu:1", "rank:2/xpu:2"],
+        )
+
     @given(data_type=st.sampled_from([DataType.FP32, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
     def test_row_wise_set_heterogenous_device(self, data_type: DataType) -> None:
