@@ -98,6 +98,57 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         ]
 
     @staticmethod
+    def _fill_fused_optimizer_states(
+        model: DistributedModelParallel, seed: int
+    ) -> dict[str, torch.Tensor]:
+        """
+        Fills state i of every table with values drawn from [i + 1, i + 2) and
+        returns a CPU copy of each state, keyed by its fused optimizer state key.
+        """
+        torch.manual_seed(seed)
+        expected: dict[str, torch.Tensor] = {}
+        for param_state in model.fused_optimizer.state.values():
+            for i, (key, state) in enumerate(param_state.items()):
+                (shard,) = state.local_shards()
+                shard.tensor.uniform_(i + 1, i + 2)
+                expected[key] = shard.tensor.detach().cpu().clone()
+        return expected
+
+    def _assert_tbe_adam_states(
+        self, model: DistributedModelParallel, expected: dict[str, torch.Tensor]
+    ) -> None:
+        """
+        Reads both Adam moments back from each TBE and compares them with
+        `expected`, keyed by the fused optimizer state keys.
+        """
+        num_tables = 0
+        # pyrefly: ignore[missing-attribute]
+        for lookup in model.module.sparse.ebc._lookups:
+            for emb_module in lookup._emb_modules:
+                tbe = emb_module._emb_module
+                tbe_states = (
+                    tbe.get_optimizer_state(sorted_id_tensor=None)
+                    if isinstance(tbe, SSDTableBatchedEmbeddingBags)
+                    else tbe.get_optimizer_state()
+                )
+                for table, state in zip(emb_module.config.embedding_tables, tbe_states):
+                    self.assertEqual(list(state.keys()), ["exp_avg", "exp_avg_sq"])
+                    torch.testing.assert_close(
+                        state["exp_avg"].cpu(),
+                        expected[f"{table.name}.momentum1"],
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(
+                        state["exp_avg_sq"].cpu(),
+                        expected[f"{table.name}.exp_avg_sq"],
+                        rtol=0,
+                        atol=0,
+                    )
+                    num_tables += 1
+        self.assertEqual(num_tables, len(self.tables))
+
+    @staticmethod
     def _compare_ssd_fused_optimizer(m1: DistributedModelParallel) -> None:
         """
         Util function to compare optimizer weights from SSD TBE and DistributedModelParallel.
@@ -141,22 +192,16 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
                         optimizer_weights_from_emb_bag,
                         optimizer_weights_from_optim_list,
                     ):
-                        optim_weight_from_emb_tensor = list(
-                            weight_from_emb_bag.values()
-                        )[0]
-
-                        optim_weight_from_optim_tensor = [
-                            shard.tensor
-                            for shard in (list(weight_from_optim.values()))[
-                                0
-                            ].local_shards()
-                        ][0]
-                        torch.testing.assert_close(
-                            optim_weight_from_emb_tensor,
-                            optim_weight_from_optim_tensor,
-                            rtol=0,
-                            atol=0,
-                        )
+                        assert len(weight_from_emb_bag) == len(weight_from_optim)
+                        for optim_weight_from_emb_tensor, optim_state in zip(
+                            weight_from_emb_bag.values(), weight_from_optim.values()
+                        ):
+                            torch.testing.assert_close(
+                                optim_weight_from_emb_tensor,
+                                optim_state.local_shards()[0].tensor,
+                                rtol=0,
+                                atol=0,
+                            )
 
     @staticmethod
     def _copy_ssd_emb_modules(
@@ -608,7 +653,8 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
     def test_ssd_key_value_fused_optimizer_multi_state(self) -> None:
         """
         KeyValueEmbeddingFusedOptimizer must support sparse optimizers with more
-        than one state (PARTIAL_ROWWISE_ADAM keeps momentum1+momentum2).
+        than one state (PARTIAL_ROWWISE_ADAM keeps momentum1+exp_avg_sq,
+        matching the UVM fused path's checkpoint-facing key names).
         Regression test: per-table optimizer state keys were appended as a
         single keys() view instead of flattened, so the second state raised
         IndexError during DMP construction.
@@ -651,7 +697,127 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
                 if key.startswith(f"{table.name}.")
             ]
             self.assertIn(f"{table.name}.momentum1", table_keys)
-            self.assertIn(f"{table.name}.momentum2", table_keys)
+            self.assertIn(f"{table.name}.exp_avg_sq", table_keys)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @given(
+        optimizer=st.sampled_from(
+            [EmbOptimType.PARTIAL_ROWWISE_ADAM, EmbOptimType.ADAM]
+        ),
+        uvm_kernel=st.sampled_from(
+            [
+                EmbeddingComputeKernel.FUSED.value,
+                EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            ]
+        ),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
+    def test_ssd_key_value_fused_optimizer_uvm_round_trip(
+        self, optimizer: EmbOptimType, uvm_kernel: str
+    ) -> None:
+        """
+        An Adam fused optimizer state_dict loads from UVM into KEY_VALUE tables
+        and back, and both moments land in the target TBE.
+        """
+        sharding_type = ShardingType.TABLE_WISE.value
+
+        def build(kernel: str) -> DistributedModelParallel:
+            constraints = {
+                table.name: ParameterConstraints(
+                    sharding_types=[sharding_type],
+                    compute_kernels=[kernel],
+                    key_value_params=(
+                        KeyValueParams(bulk_init_chunk_size=1024)
+                        if kernel == EmbeddingComputeKernel.KEY_VALUE.value
+                        else None
+                    ),
+                )
+                for table in self.tables
+            }
+            sharders = [
+                cast(
+                    ModuleSharder[nn.Module],
+                    create_test_sharder(
+                        SharderType.EMBEDDING_BAG_COLLECTION.value,
+                        sharding_type,
+                        kernel,
+                        fused_params={"optimizer": optimizer, "learning_rate": 0.1},
+                    ),
+                ),
+            ]
+            models, _ = self._generate_dmps_and_batch(sharders, constraints=constraints)
+            return models[0]
+
+        uvm_model = build(uvm_kernel)
+        ssd_model = build(EmbeddingComputeKernel.KEY_VALUE.value)
+
+        expected = self._fill_fused_optimizer_states(uvm_model, seed=0)
+        ssd_model.fused_optimizer.load_state_dict(
+            uvm_model.fused_optimizer.state_dict()
+        )
+        self._assert_tbe_adam_states(ssd_model, expected)
+
+        expected = self._fill_fused_optimizer_states(ssd_model, seed=1)
+        uvm_model.fused_optimizer.load_state_dict(
+            ssd_model.fused_optimizer.state_dict()
+        )
+        self._assert_tbe_adam_states(uvm_model, expected)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_ssd_key_value_fused_optimizer_adagrad_passthrough_keys(
+        self,
+    ) -> None:
+        """
+        Non-Adam optimizers keep state_names() verbatim: EXACT_ROWWISE_ADAGRAD
+        persists {table}.momentum1 with no exp_avg/exp_avg_sq keys.
+        """
+        kernel_type = EmbeddingComputeKernel.KEY_VALUE.value
+        sharding_type = ShardingType.TABLE_WISE.value
+        constraints = {
+            table.name: ParameterConstraints(
+                sharding_types=[sharding_type],
+                compute_kernels=[kernel_type],
+                key_value_params=KeyValueParams(bulk_init_chunk_size=1024),
+            )
+            for _, table in enumerate(self.tables)
+        }
+        sharders = [
+            create_test_sharder(
+                SharderType.EMBEDDING_BAG_COLLECTION.value,
+                sharding_type,
+                kernel_type,
+                fused_params={
+                    "optimizer": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+                    "learning_rate": 0.1,
+                },
+            ),
+        ]
+        models, _ = self._generate_dmps_and_batch(
+            # pyrefly: ignore[bad-argument-type]
+            sharders,
+            constraints=constraints,
+        )
+        model, _ = models
+
+        self._compare_ssd_fused_optimizer(model)
+
+        for table in self.tables:
+            table_keys = [
+                key
+                for param_state in model._optim.state.values()
+                for key in param_state.keys()
+                if key.startswith(f"{table.name}.")
+            ]
+            self.assertIn(f"{table.name}.momentum1", table_keys)
+            self.assertNotIn(f"{table.name}.momentum2", table_keys)
+            self.assertNotIn(f"{table.name}.exp_avg", table_keys)
+            self.assertNotIn(f"{table.name}.exp_avg_sq", table_keys)
 
     @unittest.skipIf(
         not torch.cuda.is_available(),
