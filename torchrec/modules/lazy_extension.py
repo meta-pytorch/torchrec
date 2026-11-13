@@ -29,6 +29,7 @@ def _apply_functions_after_first_forward(
     _functions_to_lazy_apply = getattr(module, "_functions_to_lazy_apply", None)
     if _functions_to_lazy_apply is not None:
         #  function.
+        # pyrefly: ignore [not-iterable]
         for fn in _functions_to_lazy_apply:
             module.apply(fn)
         delattr(module, "_functions_to_lazy_apply")
