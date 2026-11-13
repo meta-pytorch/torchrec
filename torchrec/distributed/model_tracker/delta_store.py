@@ -155,7 +155,7 @@ class DeltaStoreTrec(DeltaStore):
     """
 
     def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
-        # pyrefly: ignore[missing-attribute]
+        # pyrefly: ignore [abstract-method-call, missing-attribute]
         super().__init__(updateMode)
         self.updateMode = updateMode
         self.per_fqn_lookups: Dict[str, List[IndexedLookup]] = {}
@@ -279,7 +279,7 @@ class RawIdTrackerStore(DeltaStore):
     """
 
     def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
-        # pyrefly: ignore[missing-attribute]
+        # pyrefly: ignore [abstract-method-call, missing-attribute]
         super().__init__(updateMode)
         self.updateMode = updateMode
         self.per_fqn_lookups: Dict[str, List[RawIndexedLookup]] = {}

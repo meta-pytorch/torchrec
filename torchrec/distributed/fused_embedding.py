@@ -94,6 +94,7 @@ class ShardedFusedEmbeddingCollection(
 
 class FusedEmbeddingCollectionSharder(BaseEmbeddingSharder[FusedEmbeddingCollection]):
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: FusedEmbeddingCollection,

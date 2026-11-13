@@ -402,6 +402,7 @@ class ShardedQuantEmbeddingBagCollection(
 class QuantEmbeddingBagCollectionSharder(
     BaseQuantEmbeddingSharder[QuantEmbeddingBagCollection]
 ):
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: QuantEmbeddingBagCollection,
@@ -547,6 +548,7 @@ class QuantFeatureProcessedEmbeddingBagCollectionSharder(
     ) -> List[str]:
         return [EmbeddingComputeKernel.QUANT.value]
 
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: QuantFeatureProcessedEmbeddingBagCollection,
@@ -959,6 +961,7 @@ class QuantManagedCollisionEmbeddingBagCollectionSharder(
         # TODO: to be deprecate after planner get cache_load_factor from ParameterConstraints
         return self._e_sharder.fused_params
 
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: QuantManagedCollisionEmbeddingBagCollection,

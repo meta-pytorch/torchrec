@@ -146,6 +146,7 @@ def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
         collect(submodule)
         # Sharded embedding modules keep per-sharding lookups in a plain list,
         # so those DDP wrappers are not visible to nn.Module.modules().
+        # pyrefly: ignore [not-iterable]
         for lookup in getattr(submodule, "_lookups", ()):
             collect(lookup)
 
