@@ -419,6 +419,7 @@ class ShardedPECEmbeddingCollection(
         env: ShardingEnv,
         device: torch.device,
         qcomm_codecs_registry: Dict[str, QuantizedCommCodecs] | None = None,
+        module_fqn: str | None = None,
     ) -> None:
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
 
@@ -427,6 +428,7 @@ class ShardedPECEmbeddingCollection(
             table_name_to_parameter_sharding,
             env=env,
             device=device,
+            module_fqn=module_fqn,
         )
         self._env: ShardingEnv = env
 
@@ -875,4 +877,5 @@ class PECEmbeddingCollectionSharder(BaseEmbeddingSharder[PECEmbeddingCollection]
             env=env,
             device=device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
+            module_fqn=module_fqn,
         )
