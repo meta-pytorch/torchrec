@@ -22,7 +22,13 @@ from torchrec.distributed.logger import static_logger
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
-from torchrec.distributed.train_pipeline.types import ArgInfo, BaseArgInfoStep, CallArgs
+from torchrec.distributed.train_pipeline.types import (
+    ArgInfo,
+    BaseArgInfoStep,
+    CallArgs,
+    PipeliningDiagnostic,
+    PipeliningDiagnosticReason,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -146,6 +152,15 @@ def _check_args_for_call_module(
     return False
 
 
+def _fx_target_name(node: torch.fx.Node) -> str:
+    target = node.target
+    if isinstance(target, str):
+        return target
+    module = getattr(target, "__module__", "none")
+    name = getattr(target, "__name__", type(target).__name__)
+    return f"{module}.{name}"
+
+
 def _check_postproc_pipelineable(
     module: torch.nn.Module,
 ) -> bool:
@@ -222,21 +237,32 @@ class NodeArgsHelper:
         self,
         arg: Any,
         arg_info: ArgInfo,
+        diagnostics: List[PipeliningDiagnostic],
         for_postproc_module: bool = False,
     ) -> Optional[ArgInfo]:
         if not self._pipeline_postproc:
+            diagnostics.append(
+                PipeliningDiagnostic(
+                    reason=PipeliningDiagnosticReason.POSTPROC_DISABLED
+                )
+            )
             return None
 
         if isinstance(arg, fx_immutable_dict):
             step = ArgInfoStepFactory.from_dict(
                 {
-                    k: self._handle_collection_element(v, for_postproc_module)
+                    k: self._handle_collection_element(
+                        v, diagnostics, for_postproc_module
+                    )
                     for k, v in arg.items()
                 }
             )
         elif isinstance(arg, fx_immutable_list):
             step = ArgInfoStepFactory.from_list(
-                [self._handle_collection_element(v, for_postproc_module) for v in arg]
+                [
+                    self._handle_collection_element(v, diagnostics, for_postproc_module)
+                    for v in arg
+                ]
             )
         else:
             step = ArgInfoStepFactory.from_scalar(arg)
@@ -246,6 +272,7 @@ class NodeArgsHelper:
     def _handle_collection_element(
         self,
         arg: Any,
+        diagnostics: List[PipeliningDiagnostic],
         for_postproc_module: bool = False,
     ) -> Any:
         if not isinstance(arg, torch.fx.Node):
@@ -253,6 +280,7 @@ class NodeArgsHelper:
 
         arg_info_nested = self._get_node_args_helper_inner(
             arg,
+            diagnostics,
             for_postproc_module,
         )
         return arg_info_nested
@@ -282,12 +310,24 @@ class NodeArgsHelper:
         return arg_info
 
     def _handle_module(
-        self, child_node: torch.fx.Node, arg_info: ArgInfo
+        self,
+        child_node: torch.fx.Node,
+        arg_info: ArgInfo,
+        diagnostics: List[PipeliningDiagnostic],
     ) -> Optional[ArgInfo]:
         postproc_module_fqn = str(child_node.target)
         postproc_module = _find_postproc_module_recursive(
             self._model, postproc_module_fqn
         )
+
+        def record(reason: PipeliningDiagnosticReason) -> None:
+            diagnostics.append(
+                PipeliningDiagnostic(
+                    reason=reason,
+                    fx_node=child_node.name,
+                    fx_target=postproc_module_fqn,
+                )
+            )
 
         if not self._pipeline_postproc:
             logger.warning(
@@ -297,10 +337,12 @@ class NodeArgsHelper:
                 "To allow torchrec to check if this module can be safely pipelined, "
                 "please set `pipeline_postproc=True`"
             )
+            record(PipeliningDiagnosticReason.POSTPROC_DISABLED)
             return None
 
         if not postproc_module:
             # Could not find such module, should not happen
+            record(PipeliningDiagnosticReason.POSTPROC_NOT_FOUND)
             return None
 
         if isinstance(postproc_module, PipelinedPostproc):
@@ -313,16 +355,19 @@ class NodeArgsHelper:
             logger.warning(
                 f"Expected postproc_module to be nn.Module but was {type(postproc_module)}"
             )
+            record(PipeliningDiagnosticReason.POSTPROC_NOT_MODULE)
             return None
 
         # check if module is safe to pipeline i.e.no trainable param
         if not _check_postproc_pipelineable(postproc_module):
+            record(PipeliningDiagnosticReason.POSTPROC_TRAINABLE_PARAMS)
             return None
 
         # For module calls, `self` isn't counted
         total_num_args = len(child_node.args) + len(child_node.kwargs)
         if total_num_args == 0:
             # module call without any args, assume KJT modified
+            record(PipeliningDiagnosticReason.POSTPROC_NO_INPUT)
             return None
 
         # recursive call to check that all inputs to this postproc module
@@ -331,6 +376,7 @@ class NodeArgsHelper:
         postproc_args, num_found_safe_postproc_args = self.get_node_args(
             child_node,
             for_postproc_module=True,
+            diagnostics=diagnostics,
         )
         if num_found_safe_postproc_args == total_num_args:
             logger.info(
@@ -363,19 +409,22 @@ class NodeArgsHelper:
     def _get_node_args_helper_inner(
         self,
         arg,
+        diagnostics: List[PipeliningDiagnostic],
         for_postproc_module: bool = False,
     ) -> Optional[ArgInfo]:
         arg_info = ArgInfo([])
         while True:
             if not isinstance(arg, torch.fx.Node):
-                return self._handle_constant(arg, arg_info, for_postproc_module)
+                return self._handle_constant(
+                    arg, arg_info, diagnostics, for_postproc_module
+                )
 
             child_node = arg
 
             if child_node.op == "placeholder":
                 return self._handle_placeholder(arg, arg_info)
             elif child_node.op == "call_module":
-                return self._handle_module(arg, arg_info)
+                return self._handle_module(arg, arg_info, diagnostics)
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "builtins"
@@ -424,6 +473,13 @@ class NodeArgsHelper:
                         break
 
                 if call_module_found:
+                    diagnostics.append(
+                        PipeliningDiagnostic(
+                            reason=PipeliningDiagnosticReason.POSTPROC_KJT_FROM_MODULE,
+                            fx_node=child_node.name,
+                            fx_target=_fx_target_name(child_node),
+                        )
+                    )
                     break
 
                 if "values" in child_node.kwargs:
@@ -440,6 +496,13 @@ class NodeArgsHelper:
                     f"fx node {child_node.name, child_node.op, child_node.target} "
                     "can't be handled correctly for postproc module"
                 )
+                diagnostics.append(
+                    PipeliningDiagnostic(
+                        reason=PipeliningDiagnosticReason.POSTPROC_FX_UNTRACEABLE,
+                        fx_node=child_node.name,
+                        fx_target=_fx_target_name(child_node),
+                    )
+                )
                 break
 
         # if we couldn't hit one of the "decisive" outcomes (constant, placeholder or module), return "not found"
@@ -448,6 +511,7 @@ class NodeArgsHelper:
     def _get_node_args_helper(
         self,
         arguments,
+        diagnostics: List[PipeliningDiagnostic],
         # Add `None` constants to arg info only for postproc modules
         # Defaults to False for backward compatibility
         for_postproc_module: bool = False,
@@ -466,6 +530,7 @@ class NodeArgsHelper:
                 continue
             arg_info = self._get_node_args_helper_inner(
                 arg,
+                diagnostics,
                 for_postproc_module,
             )
             if arg_info is not None:
@@ -477,13 +542,23 @@ class NodeArgsHelper:
         self,
         node: Node,
         for_postproc_module: bool = False,
+        *,
+        diagnostics: Optional[List[PipeliningDiagnostic]] = None,
     ) -> Tuple[CallArgs, int]:
+        """
+        Failure sites below this call append to `diagnostics`, including those
+        in the nested walks of postproc modules feeding `node`.
+        """
+        if diagnostics is None:
+            diagnostics = []
         pos_arg_info_list, args_found = self._get_node_args_helper(
             node.args,
+            diagnostics,
             for_postproc_module,
         )
         kwargs_arg_info_list, kwargs_found = self._get_node_args_helper(
             node.kwargs.values(),
+            diagnostics,
             for_postproc_module,
         )
 
