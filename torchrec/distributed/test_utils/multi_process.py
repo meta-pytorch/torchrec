@@ -14,8 +14,10 @@ import logging
 import multiprocessing
 import os
 import sys
+import threading
 import traceback
 import unittest
+from multiprocessing.pool import Pool
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -48,6 +50,18 @@ def _picklable_exception_wrapper(
         raise RuntimeError(
             f"Worker raised {type(e).__name__}: {e}\n{traceback.format_exc()}"
         ) from None
+
+
+def _close_and_join_pool(pool: Pool, timeout: float = 60.0) -> None:
+    """Lets pool workers exit on their own so they can save test coverage.
+
+    Leaving a ``with Pool()`` block calls ``terminate()``, which kills workers
+    while they save. A worker still alive after ``timeout`` falls through to it.
+    """
+    pool.close()
+    joiner = threading.Thread(target=pool.join, daemon=True)
+    joiner.start()
+    joiner.join(timeout)
 
 
 class MultiProcessContext:
@@ -201,7 +215,6 @@ class MultiProcessTestBase(unittest.TestCase):
         ctx = multiprocessing.get_context(self._mp_init_mode)
         async_results = []
         exceptions = []
-        unsuccessful_count = 0
 
         with ctx.Pool(processes=world_size) as pool:
 
@@ -210,32 +223,22 @@ class MultiProcessTestBase(unittest.TestCase):
                 kwargs["rank"] = i
                 async_result = pool.apply_async(
                     functools.partial(_picklable_exception_wrapper, callable, **kwargs),
-                    error_callback=lambda e: exceptions.append(e),
+                    error_callback=exceptions.append,
                 )
                 async_results.append(async_result)
 
+            # Wait for the tasks first, so the timeout only bounds the exit.
             for async_result in async_results:
                 async_result.wait()
+            _close_and_join_pool(pool)
 
-                if not async_result.successful():
-                    unsuccessful_count += 1
-
-            exception_msgs = [
-                "\n".join(
-                    traceback.format_exception(
-                        type(exception), exception, exception.__traceback__
-                    )
+        if exceptions:
+            self.fail(
+                "Detected unsuccessful runs:\n"
+                + "\n".join(
+                    "".join(traceback.format_exception(type(e), e, e.__traceback__))
+                    for e in exceptions
                 )
-                + "\n"
-                for exception in exceptions
-            ]
-
-            self.assertEqual(
-                unsuccessful_count,
-                0,
-                "Detected at least one unsuccessful run, example errors are: \n{}".format(
-                    "\n".join(exception_msgs)
-                ),
             )
 
     def _run_multi_process_test_per_rank(
@@ -314,6 +317,8 @@ def run_multi_process_func(
 
     # Create a pool of worker processes for each rank
     with ctx.Pool(processes=world_size) as pool:
-        results = pool.map(_wrapper_func_for_multiprocessing, args_list)
-
-    return results
+        # `map` would raise a worker's error here and skip the graceful exit.
+        async_result = pool.map_async(_wrapper_func_for_multiprocessing, args_list)
+        async_result.wait()
+        _close_and_join_pool(pool)
+    return async_result.get()
