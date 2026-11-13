@@ -127,15 +127,28 @@ jobs:
           index_url=https://download.pytorch.org/whl/${{ inputs.channel }}/cpu
         fi
         echo "index_url: $index_url"
+        torch_spec=torch
+        fbgemm_spec=fbgemm-gpu
+        pip_index="--index-url $index_url"
+        if [ -z "${{ inputs.channel }}" ] && [[ "${{ matrix.python.version }}" != "3.10" ]]; then
+          # TODO(T<TBD>): temporary pin to the last nightly with torch.jit.script (no py3.10 wheel).
+          py="cp$(echo "${{ matrix.python.version }}" | tr -d .)"
+          whl="${py}-${py}${{ matrix.python.free_threaded && 't' || '' }}-manylinux_2_28_x86_64.whl"
+          torch_spec="https://download.pytorch.org/whl/nightly/cpu/torch-2.16.0.dev20261109%2Bcpu-$whl"
+          fbgemm_spec="https://download.pytorch.org/whl/nightly/cpu/fbgemm_gpu-2026.10.12%2Bcpu-$whl"
+          pip_index=""
+          printf 'torch @ %s\nfbgemm-gpu @ %s\n' "$torch_spec" "$fbgemm_spec" > /tmp/pin.txt
+          export PIP_CONSTRAINT=/tmp/pin.txt
+        fi
         conda run -n build_binary \
-          pip install torch --index-url $index_url
+          pip install "$torch_spec" $pip_index
         conda run -n build_binary \
           python -c "import torch; print(torch.__version__)"
         echo "torch succeeded"
         conda run -n build_binary \
           python -c "import torch.distributed"
         conda run -n build_binary \
-          pip install fbgemm-gpu --index-url $index_url
+          pip install "$fbgemm_spec" $pip_index
         conda run -n build_binary \
           python -c "import fbgemm_gpu; print(fbgemm_gpu.__version__)"
         echo "fbgemm_gpu succeeded"
