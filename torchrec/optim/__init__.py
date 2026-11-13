@@ -21,6 +21,7 @@ from torchrec.optim.apply_optimizer_in_backward import (  # noqa
 )
 
 from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer  # noqa
+from torchrec.optim.ftrl import FTRL  # noqa
 from torchrec.optim.fused import FusedOptimizer, FusedOptimizerModule  # noqa
 from torchrec.optim.keyed import (  # noqa
     CombinedOptimizer,
@@ -44,6 +45,7 @@ from torchrec.optim.warmup import WarmupOptimizer, WarmupPolicy, WarmupStage  # 
 from . import (  # noqa  # noqa  # noqa  # noqa
     apply_optimizer_in_backward,
     clipping,
+    ftrl,
     fused,
     keyed,
     optimizers,
