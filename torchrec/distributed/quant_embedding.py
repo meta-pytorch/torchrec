@@ -1079,6 +1079,7 @@ class QuantEmbeddingCollectionSharder(
     This implementation uses non-fused EmbeddingCollection
     """
 
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: QuantEmbeddingCollection,
@@ -1493,6 +1494,7 @@ class QuantManagedCollisionEmbeddingCollectionSharder(
         # TODO: to be deprecate after planner get cache_load_factor from ParameterConstraints
         return self._e_sharder.fused_params
 
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: QuantManagedCollisionEmbeddingCollection,

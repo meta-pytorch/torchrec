@@ -110,6 +110,7 @@ class ManagedCollisionEmbeddingCollectionSharder(
         )
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: ManagedCollisionEmbeddingCollection,

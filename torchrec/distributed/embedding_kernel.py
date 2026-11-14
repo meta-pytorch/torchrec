@@ -396,6 +396,7 @@ def _weights_may_be_off_plan_device(kernel: nn.Module) -> bool:
     rename on the FBGEMM side cannot silently turn every realignment into a no-op.
     Wrappers that never accept the argument (dense, SSD/KV) do not record it.
     """
+    # pyrefly: ignore [bad-return]
     return getattr(kernel, "_weight_init_on_cpu", False)
 
 
@@ -406,6 +407,7 @@ def _any_weights_off_plan_device(module: nn.Module) -> bool:
     metadata needs realigning. Lookups hold their kernels in a plain list rather
     than as child modules, so `named_modules()` does not reach them.
     """
+    # pyrefly: ignore [not-iterable]
     for lookup in getattr(module, "_lookups", []):
         for kernel in getattr(lookup, "_emb_modules", []):
             if _weights_may_be_off_plan_device(kernel):

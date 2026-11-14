@@ -125,6 +125,7 @@ class TestFusedOptim(unittest.TestCase):
             # pyrefly: ignore[missing-attribute]
             param._in_backward_optimizers = [
                 WarmupOptimizer(
+                    # pyrefly: ignore [missing-attribute]
                     param._in_backward_optimizers[0],
                     [
                         WarmupStage(

@@ -304,6 +304,7 @@ class ITEPEmbeddingBagCollectionSharder(
         )
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: ITEPEmbeddingBagCollection,
@@ -566,6 +567,7 @@ class ITEPEmbeddingCollectionSharder(BaseEmbeddingSharder[ITEPEmbeddingCollectio
         )
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: ITEPEmbeddingCollection,

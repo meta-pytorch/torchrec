@@ -274,6 +274,7 @@ class Request(Awaitable[W]):
             ret.record_stream(torch.get_device_module(ret.device).current_stream())
         self.req = None
         self.tensor = None
+        # pyrefly: ignore [bad-return]
         return ret
 
 

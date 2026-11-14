@@ -1741,6 +1741,7 @@ def _stashed_embedding_tables(model: nn.Module) -> Dict[str, str]:
     num_bytes = 0
     for module in model.modules():
         # ``_lookups`` is a plain list, so ``modules()`` never visits it.
+        # pyrefly: ignore [not-iterable]
         for lookup in getattr(module, "_lookups", None) or []:
             inner = lookup.module if hasattr(lookup, "module") else lookup
             for emb_module in getattr(inner, "_emb_modules", None) or []:

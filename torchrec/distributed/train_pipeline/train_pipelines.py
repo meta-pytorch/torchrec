@@ -3267,6 +3267,7 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
         # it will check this path on model to inject configuration other than
         # the default one.
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore [bad-assignment]
         self.compiled_autograd_options: Dict[str, Union[str, bool]] = getattr(
             model,
             "_compiled_autograd_options",
