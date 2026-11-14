@@ -1936,6 +1936,30 @@ class SideStreamOutputEncodeTest(MultiProcessTestBase):
         )
 
 
+class EmbeddingsAllToOneTest(unittest.TestCase):
+    def test_world_size_1_has_no_merge_module(self) -> None:
+        module = dist_data.EmbeddingsAllToOne(
+            torch.device("cpu"), world_size=1, cat_dim=1
+        )
+        self.assertIsNone(module.merge_pooled_embeddings)
+        t = torch.rand(4, 8)
+        torch.testing.assert_close(module([t]), t, rtol=0, atol=0)
+        module.set_device("cpu")  # no merge module to update; must not raise
+
+    def test_world_size_2_calls_merge_module(self) -> None:
+        module = dist_data.EmbeddingsAllToOne(
+            torch.device("cpu"), world_size=2, cat_dim=1
+        )
+        self.assertIsNotNone(module.merge_pooled_embeddings)
+        merged = torch.rand(4, 16)
+        with unittest.mock.patch.object(
+            module.merge_pooled_embeddings, "forward", return_value=merged
+        ) as merge:
+            out = module([torch.rand(4, 8), torch.rand(4, 8)])
+        merge.assert_called_once()
+        torch.testing.assert_close(out, merged)
+
+
 class GetRecatOverflowTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
