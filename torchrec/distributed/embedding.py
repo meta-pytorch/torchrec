@@ -1939,6 +1939,7 @@ class EmbeddingCollectionSharder(BaseEmbeddingSharder[EmbeddingCollection]):
         self._use_packed_jagged_tensor = use_packed_jagged_tensor
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: EmbeddingCollection,

@@ -391,6 +391,7 @@ def find_ddp_modules(module: nn.Module) -> List[DistributedDataParallel]:
         if isinstance(module, DistributedDataParallel):
             ddp_modules.append(module)
         lookups = getattr(module, "_lookups", None) or ()
+        # pyrefly: ignore [not-iterable]
         for child in (*module.children(), *lookups):
             if isinstance(child, nn.Module):
                 _visit(child)
@@ -2090,6 +2091,7 @@ class DMPCollection(DistributedModelParallel):
                         parent_module, "get_sync_weight_tensors", None
                     )
                     sync_weights = (
+                        # pyrefly: ignore [not-callable]
                         get_sync_weight_tensors()
                         if get_sync_weight_tensors is not None
                         else sync_kernel.split_embedding_weights()

@@ -2398,6 +2398,7 @@ class EmbeddingBagCollectionSharder(BaseEmbeddingSharder[EmbeddingBagCollection]
     supports_fused_triton: bool = True
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: EmbeddingBagCollection,
@@ -2701,6 +2702,7 @@ class EmbeddingBagSharder(BaseEmbeddingSharder[nn.EmbeddingBag]):
     """
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: nn.EmbeddingBag,
