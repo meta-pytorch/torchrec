@@ -1953,7 +1953,6 @@ class PlanDebugStats:
 
     planner_type: str
     timeout_seconds: Optional[int]
-    enable_uvm_cache_dimension_padding: bool = field(default=False, kw_only=True)
 
 
 class Stats(abc.ABC):
@@ -3228,8 +3227,6 @@ def _build_hashable_list(
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
     canonicalize_intra_group_size: bool = False,
-    *,
-    enable_uvm_cache_dimension_padding: bool = False,
 ) -> List[Any]:
     """Build the canonical hashable list for planner context inputs.
 
@@ -3276,7 +3273,7 @@ def _build_hashable_list(
         )
     )
 
-    hashable_list: List[Any] = [
+    return [
         hashed_topology,
         batch_size,
         [
@@ -3303,9 +3300,6 @@ def _build_hashable_list(
             else None
         ),
     ]
-    if enable_uvm_cache_dimension_padding:
-        hashable_list.append(("uvm_cache_dimension_padding", 1))
-    return hashable_list
 
 
 class PlannerContextFingerprintError(RuntimeError):
@@ -3320,8 +3314,6 @@ def hash_planner_context_inputs(
     constraints: Optional[Dict[str, ParameterConstraints]],
     canonicalize_intra_group_size: bool = False,
     hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
-    *,
-    enable_uvm_cache_dimension_padding: bool = False,
 ) -> int:
     hashable_list = _build_hashable_list(
         topology,
@@ -3330,7 +3322,6 @@ def hash_planner_context_inputs(
         storage_reservation,
         constraints,
         canonicalize_intra_group_size,
-        enable_uvm_cache_dimension_padding=enable_uvm_cache_dimension_padding,
     )
     return hash_function(hashable_list)
 
@@ -3343,8 +3334,6 @@ def hash_planner_context_inputs_str(
     constraints: Optional[Dict[str, ParameterConstraints]],
     canonicalize_intra_group_size: bool = False,
     hash_function: Callable[[List[Any]], str] = hash_sha256_str,
-    *,
-    enable_uvm_cache_dimension_padding: bool = False,
 ) -> str:
     hashable_list = _build_hashable_list(
         topology,
@@ -3353,7 +3342,6 @@ def hash_planner_context_inputs_str(
         storage_reservation,
         constraints,
         canonicalize_intra_group_size,
-        enable_uvm_cache_dimension_padding=enable_uvm_cache_dimension_padding,
     )
     return hash_function(hashable_list)
 
