@@ -316,6 +316,7 @@ def _test_compile_rank_fn(
         model = mi.model
 
         planner = EmbeddingShardingPlanner(
+            # pyrefly: ignore [missing-attribute]
             topology=Topology(world_size, device.type, local_world_size=local_size),
             constraints=None,
         )
@@ -634,6 +635,7 @@ def _test_compile_fake_pg_fn(
     model = mi.model
 
     planner = EmbeddingShardingPlanner(
+        # pyrefly: ignore [missing-attribute]
         topology=Topology(world_size, device.type),
         constraints=None,
     )

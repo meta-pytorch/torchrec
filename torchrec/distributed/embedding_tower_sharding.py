@@ -181,7 +181,10 @@ class ShardedEmbeddingTower(
         #  Tensor]`.
         # pyrefly: ignore[bad-override]
         self._output_dists: nn.ModuleList = (
-            self.embedding._output_dists if self.embedding else nn.ModuleList()
+            # pyrefly: ignore [bad-assignment]
+            self.embedding._output_dists
+            if self.embedding
+            else nn.ModuleList()
         )
 
     def _create_input_dist(
@@ -885,6 +888,7 @@ class ShardedEmbeddingTowerCollection(
 
 class EmbeddingTowerSharder(BaseEmbeddingSharder[EmbeddingTower]):
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: EmbeddingTower,
@@ -987,6 +991,7 @@ class EmbeddingTowerCollectionSharder(BaseEmbeddingSharder[EmbeddingTowerCollect
         )
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
+    # pyrefly: ignore [bad-override]
     def shard(
         self,
         module: EmbeddingTowerCollection,
