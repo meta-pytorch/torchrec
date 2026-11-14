@@ -3025,8 +3025,8 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             KeyedJaggedTensor: permuted KeyedJaggedTensor.
         """
         if indices_tensor is None:
-            indices_tensor = torch.tensor(
-                indices, dtype=torch.int, device=self.device()
+            indices_tensor = _pin_and_move(
+                torch.tensor(indices, dtype=torch.int), self.device()
             )
 
         length_per_key = self.length_per_key()
