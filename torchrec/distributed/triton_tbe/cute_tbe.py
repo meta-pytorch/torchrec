@@ -858,6 +858,40 @@ class TbeForward:
         return out_base + Int64(k) * total_D * 4
 
 
+@dsl_user_op
+def _fmix32(x, *, loc=None, ip=None):
+    """MurmurHash3's 32-bit finalizer: a well-mixed hash of x."""
+    x = cutlass.Uint32(x)
+    x = x ^ (x >> cutlass.Uint32(16))
+    x = x * cutlass.Uint32(0x85EBCA6B)
+    x = x ^ (x >> cutlass.Uint32(13))
+    x = x * cutlass.Uint32(0xC2B2AE35)
+    return x ^ (x >> cutlass.Uint32(16))
+
+
+@dsl_user_op
+def _f16_sr(x, noise, *, loc=None, ip=None):
+    """fp32 -> fp16 with stochastic rounding, as FBGEMM's CUDA TBE does it: add
+    13 random bits (noise's low bits) below fp16 precision, then round toward
+    zero. P(round away from zero) is the dropped fraction, so the result is
+    unbiased for values in fp16's normal range (fp16 subnormals, |x| < 6.1e-5,
+    round toward zero slightly more often)."""
+    res = llvm.inline_asm(
+        T.f16(),
+        [
+            Float32(x).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(noise).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n.reg .b32 t;\n.reg .f32 f;\nmov.b32 t, $1;\nand.b32 $2, $2, 8191;\n"
+        "add.u32 t, t, $2;\nmov.b32 f, t;\ncvt.rz.f16.f32 $0, f;\n}",
+        "=h,f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Float16(res)
+
+
 class RowwiseAdagrad:
     """Exact row-wise Adagrad (Triton's EXACT_ROWWISE_ADAGRAD), the optimizer the
     backward kernels apply by default: one fp32 state (momentum) per row,
@@ -876,12 +910,32 @@ class RowwiseAdagrad:
     def store_state(self, mState, state):
         mState[0] = state
 
+    def __init__(self, stochastic_rounding: bool = False):
+        # fp16 weights only; the seed comes per step (Triton's
+        # stochastic_rounding_seed).
+        self.sr = stochastic_rounding
+
     @cute.jit
-    def update(self, g, w, state, live, log2_lanes: cutlass.Constexpr, D, lr, eps):
+    def update(
+        self,
+        g,
+        w,
+        mState,
+        state,
+        live,
+        log2_lanes: cutlass.Constexpr,
+        D,
+        lr,
+        eps,
+        sr_seed,
+        lane,
+    ):
         """Updates the lane's weight fragment w in place from its gradient
-        fragment g and returns the row's new state. A row spans a butterfly group
-        of 2^log2_lanes lanes; ``live`` masks lanes whose g is not part of it
-        (None: every lane's g is, possibly zero)."""
+        fragment g and returns the row's new state (mState: where the kernel
+        keeps it). A row spans a butterfly group of 2^log2_lanes lanes; ``live``
+        masks lanes whose g is not part of it (None: every lane's g is, possibly
+        zero). With stochastic rounding each element's random bits hash
+        (sr_seed, the row's state address, lane, element)."""
         sq = Float32(0.0)
         for i in cutlass.range_constexpr(VEC):
             sq = sq + g[i] * g[i]
@@ -891,7 +945,19 @@ class RowwiseAdagrad:
             sq = sq + cute.arch.shuffle_sync_bfly(sq, 1 << sh)
         state = state + sq / Float32(D)
         alr = lr / (cute.math.sqrt(state) + eps)
-        w.store((w.load().to(Float32) - g.load() * alr).to(w.element_type))
+        new = w.load().to(Float32) - g.load() * alr
+        if const_expr(self.sr):
+            f = cute.make_rmem_tensor((VEC,), Float32)
+            f.store(new)
+            addr = Int64(mState.iterator.toint())
+            key = _fmix32(cutlass.Uint32(sr_seed) ^ cutlass.Uint32(addr))
+            key = _fmix32(key ^ cutlass.Uint32(addr >> 32))
+            key = _fmix32(key ^ cutlass.Uint32(lane))
+            for i in cutlass.range_constexpr(VEC):
+                noise = _fmix32(key + cutlass.Uint32(i * 0x9E3779B9 % (1 << 32)))
+                w[i] = _f16_sr(f[i], noise)
+        else:
+            w.store(new.to(w.element_type))
         return state
 
 
@@ -936,6 +1002,7 @@ class TbeBackwardShortRun:
         info_B_mask: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
         grid: Int32,
         stream: cuda.CUstream,
     ):
@@ -960,6 +1027,7 @@ class TbeBackwardShortRun:
             info_B_mask,
             lr,
             eps,
+            sr_seed,
         ).launch(
             grid=[grid, 1, 1],
             block=[WARP * self.warps, 1, 1],
@@ -989,6 +1057,7 @@ class TbeBackwardShortRun:
         info_B_mask: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -1096,15 +1165,30 @@ class TbeBackwardShortRun:
                                 acc.store(acc.load() + frags[u].load())
                 _reduce_slots(acc, lane, nch, rpw)
                 self._step(
-                    acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps
+                    acc,
+                    w_row,
+                    mom,
+                    mMom,
+                    w_addr,
+                    w_addr_hi,
+                    slot,
+                    lane,
+                    D,
+                    lr,
+                    eps,
+                    sr_seed,
                 )
             batch = cute.arch.shuffle_sync(nxt, 0)
 
     @cute.jit
-    def _step(self, acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps):
+    def _step(
+        self, acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps, sr_seed
+    ):
         """Optimizer step for one row; slot-0 lanes (the whole warp's row) hold
         the summed gradient."""
-        mom = self.opt.update(acc, w_row, mom, slot == 0, 5, D, lr, eps)
+        mom = self.opt.update(
+            acc, w_row, mMom, mom, slot == 0, 5, D, lr, eps, sr_seed, lane
+        )
         if lane == 0:
             self.opt.store_state(mMom, mom)
         if slot == 0:
@@ -1172,6 +1256,7 @@ class TbeBackwardPacked:
         info_B_mask: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
         grid: Int32,
         stream: cuda.CUstream,
     ):
@@ -1197,6 +1282,7 @@ class TbeBackwardPacked:
             info_B_mask,
             lr,
             eps,
+            sr_seed,
         ).launch(
             grid=[grid, 1, 1],
             block=[WARP * self.warps, 1, 1],
@@ -1225,6 +1311,7 @@ class TbeBackwardPacked:
         info_B_mask: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % WARP
@@ -1373,16 +1460,25 @@ class TbeBackwardPacked:
                         jj = jj + self.unroll
                     j = j + self.G
                 # Optimizer step; the run's row spans the lane group.
+                mState = cute.make_tensor(mom_ptr + m_k, cute.make_layout(1))
                 mom = self.opt.update(
-                    acc, w_row, mom, act, self.log2_G, cutlass.max(D_k, 1), lr, eps
+                    acc,
+                    w_row,
+                    mState,
+                    mom,
+                    act,
+                    self.log2_G,
+                    cutlass.max(D_k, 1),
+                    lr,
+                    eps,
+                    sr_seed,
+                    lane,
                 )
                 if act:
                     _copy4(w_addr, w_row, 0, self.w_dtype, True)
                     _copy4(w_addr + half * wsz, w_row, 4, self.w_dtype, True)
                 if ok & (c == 0):
-                    self.opt.store_state(
-                        cute.make_tensor(mom_ptr + m_k, cute.make_layout(1)), mom
-                    )
+                    self.opt.store_state(mState, mom)
             b0 = cute.arch.shuffle_sync(nxt, 0)
 
 
@@ -1427,6 +1523,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
         T: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
         grid: Int32,
         stream: cuda.CUstream,
     ):
@@ -1446,6 +1543,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
             T,
             lr,
             eps,
+            sr_seed,
         ).launch(
             grid=[grid, 1, 1],
             block=[WARP * self.warps, 1, 1],
@@ -1471,6 +1569,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
         T: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % WARP
@@ -1568,6 +1667,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
                                 D,
                                 lr,
                                 eps,
+                                sr_seed,
                             )
                         else:
                             if lane < D // VEC:
@@ -1631,6 +1731,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
         info_B_num_bits: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
         grid: Int32,
         stream: cuda.CUstream,
     ):
@@ -1652,6 +1753,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
             info_B_num_bits,
             lr,
             eps,
+            sr_seed,
         ).launch(grid=[grid, 1, 1], block=[WARP * self.warps, 1, 1], stream=stream)
 
     @cute.kernel
@@ -1669,6 +1771,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
         info_B_num_bits: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -1712,7 +1815,20 @@ class TbeBackwardTiled(TbeBackwardShortRun):
                 _copy4(p_lo, frag, 0, Float32)
                 _copy4(p_lo + half * 4, frag, 4, Float32)
                 acc.store(acc.load() + frag.load())
-            self._step(acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps)
+            self._step(
+                acc,
+                w_row,
+                mom,
+                mMom,
+                w_addr,
+                w_addr_hi,
+                slot,
+                lane,
+                D,
+                lr,
+                eps,
+                sr_seed,
+            )
 
 
 class TileRunsPrep:
@@ -2749,6 +2865,7 @@ class TbeLongRunApply:
         info_B_num_bits: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
         grid: Int32,
         stream: cuda.CUstream,
     ):
@@ -2770,6 +2887,7 @@ class TbeLongRunApply:
             info_B_num_bits,
             lr,
             eps,
+            sr_seed,
         ).launch(grid=[grid, 1, 1], block=[WARP * self.warps, 1, 1], stream=stream)
 
     @cute.kernel
@@ -2792,6 +2910,7 @@ class TbeLongRunApply:
         info_B_num_bits: Int32,
         lr: Float32,
         eps: Float32,
+        sr_seed: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -2839,7 +2958,17 @@ class TbeLongRunApply:
                     _copy4(g_addr + half * 4, grad, 4, Float32)
             # Inactive lanes hold a zero gradient, so the whole warp is the row.
             mom = self.opt.update(
-                grad, w_row, self.opt.load_state(mMom), None, 5, D, lr, eps
+                grad,
+                w_row,
+                mMom,
+                self.opt.load_state(mMom),
+                None,
+                5,
+                D,
+                lr,
+                eps,
+                sr_seed,
+                lane,
             )
             if act:
                 _copy4(w_addr, w_row, 0, self.w_dtype, True)
@@ -3296,6 +3425,14 @@ def _partial_cap():
     return int(os.environ.get("CUTE_TBE_BWD_PARTIAL_CAP", 1 << 20))
 
 
+def _optimizer(weights, stochastic_rounding_seed):
+    """The backward kernels' optimizer and runtime seed: exact row-wise Adagrad,
+    with stochastic rounding when given Triton's per-step seed (fp16 weights)."""
+    sr = stochastic_rounding_seed is not None
+    assert not sr or weights.dtype == torch.float16, "stochastic rounding: fp16 only"
+    return RowwiseAdagrad(stochastic_rounding=sr), int(stochastic_rounding_seed or 0)
+
+
 def tbe_backward_short_runs(
     dout,
     weights,
@@ -3319,6 +3456,7 @@ def tbe_backward_short_runs(
     per_sample_weights=None,
     vbe_B_offsets=None,
     vbe_row_output_offsets=None,
+    stochastic_rounding_seed=None,
 ):
     """Short-run backward. Default: TbeBackwardPacked (row order, several runs
     per warp instruction; needs the launch's block_size). With
@@ -3329,6 +3467,7 @@ def tbe_backward_short_runs(
     per_sample_weights (weighted TBE, sorted like the lookups) and VBE (flat
     dout; vbe_B_offsets int32, vbe_row_output_offsets int64): packed only."""
     assert dout.dtype == torch.float32 and dout.is_contiguous()
+    opt, sr_seed = _optimizer(weights, stochastic_rounding_seed)
     warps = int(os.environ.get("CUTE_TBE_BWD_WARPS", warps))
     tile_b = int(os.environ.get("CUTE_TBE_BWD_TILE_B", 0)) if B else 0
     assert tile_b & (tile_b - 1) == 0, "tile size must be a power of 2"
@@ -3370,6 +3509,7 @@ def tbe_backward_short_runs(
             tile_b,
             grid,
             warps,
+            stochastic_rounding_seed,
         )
 
     if (
@@ -3407,6 +3547,7 @@ def tbe_backward_short_runs(
             Int32(info_B_mask),
             Float32(lr),
             Float32(eps),
+            Int32(sr_seed),
             Int32(pgrid),
         )
         key = (
@@ -3422,6 +3563,7 @@ def tbe_backward_short_runs(
             G,
             warps,
             os.environ.get("CUTE_TBE_BWD_MIN_WARPS_PER_SM"),
+            opt.sr,
         )
         _compiled(
             key,
@@ -3433,6 +3575,7 @@ def tbe_backward_short_runs(
                 punroll,
                 weighted,
                 vbe,
+                optimizer=opt,
             ),
             args,
         )
@@ -3452,6 +3595,7 @@ def tbe_backward_short_runs(
         warps,
         small_T,
         os.environ.get("CUTE_TBE_BWD_MIN_WARPS_PER_SM"),
+        opt.sr,
     )
     args = (
         _ptr(dout),
@@ -3471,12 +3615,18 @@ def tbe_backward_short_runs(
         Int32(info_B_mask),
         Float32(lr),
         Float32(eps),
+        Int32(sr_seed),
         Int32(grid),
     )
     _compiled(
         key,
         partial(
-            TbeBackwardShortRun, _TORCH_TO_CUTE[weights.dtype], unroll, warps, small_T
+            TbeBackwardShortRun,
+            _TORCH_TO_CUTE[weights.dtype],
+            unroll,
+            warps,
+            small_T,
+            optimizer=opt,
         ),
         args,
     )
@@ -3504,7 +3654,9 @@ def _backward_tiled(
     tile_b,
     grid,
     warps,
+    stochastic_rounding_seed=None,
 ):
+    opt, sr_seed = _optimizer(weights, stochastic_rounding_seed)
     unroll = int(os.environ.get("CUTE_TBE_BWD_UNROLL", 2))
     batch = int(os.environ.get("CUTE_TBE_BWD_BATCH", 8))
     sms = torch.cuda.get_device_properties(dout.device).multi_processor_count
@@ -3530,7 +3682,7 @@ def _backward_tiled(
     assert all(d % VEC == 0 and d <= ROW_MAX for d in dims), dims
     _dims_ok.add(_tensor_key(meta))
     wdt = _TORCH_TO_CUTE[weights.dtype]
-    op_fn = partial(TbeBackwardTiled, wdt, unroll, warps, batch)
+    op_fn = partial(TbeBackwardTiled, wdt, unroll, warps, batch, optimizer=opt)
     p = r["ptrs"]
     args = (
         _ptr(dout),
@@ -3542,10 +3694,12 @@ def _backward_tiled(
         Int32(meta.shape[0]),
         Float32(lr),
         Float32(eps),
+        Int32(sr_seed),
         Int32(grid),
     )
     key = (
         "bwd_tiled",
+        opt.sr,
         weights.dtype,
         unroll,
         warps,
@@ -3565,10 +3719,12 @@ def _backward_tiled(
         Int32(bits),
         Float32(lr),
         Float32(eps),
+        Int32(sr_seed),
         Int32(grid),
     )
     fkey = (
         "bwd_fin",
+        opt.sr,
         weights.dtype,
         warps,
         infos_sorted.dtype,
@@ -3739,8 +3895,10 @@ def tbe_long_run_apply(
     lr,
     eps,
     warps=8,
+    stochastic_rounding_seed=None,
 ):
     """TbeLongRunApply: Adagrad on the num_long_runs (device) long-run rows."""
+    opt, sr_seed = _optimizer(weights, stochastic_rounding_seed)
     sms = torch.cuda.get_device_properties(weights.device).multi_processor_count
     i32 = lambda t: _ptr(t, t.element_size())  # noqa: E731
     tensors = (
@@ -3764,8 +3922,10 @@ def tbe_long_run_apply(
         Int32(info_B_num_bits),
         Float32(lr),
         Float32(eps),
+        Int32(sr_seed),
         Int32(sms * max(32 // warps, 1)),
     )
-    key = ("long_apply", weights.dtype, warps) + tuple(t.dtype for t in tensors)
-    key += (rows_cumsum.dtype,)
-    _compiled(key, partial(TbeLongRunApply, _TORCH_TO_CUTE[weights.dtype], warps), args)
+    key = ("long_apply", opt.sr, weights.dtype, warps)
+    key += tuple(t.dtype for t in tensors) + (rows_cumsum.dtype,)
+    op = partial(TbeLongRunApply, _TORCH_TO_CUTE[weights.dtype], warps, optimizer=opt)
+    _compiled(key, op, args)
