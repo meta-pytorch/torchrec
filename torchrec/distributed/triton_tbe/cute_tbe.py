@@ -858,6 +858,43 @@ class TbeForward:
         return out_base + Int64(k) * total_D * 4
 
 
+class RowwiseAdagrad:
+    """Exact row-wise Adagrad (Triton's EXACT_ROWWISE_ADAGRAD), the optimizer the
+    backward kernels apply by default: one fp32 state (momentum) per row,
+    m' = m + mean(g^2) over the row, w -= g * lr / (sqrt(m') + eps).
+
+    Kernels own the addressing: they build a 1-element tensor at the row's state
+    and hand each lane its fp32 gradient and weight fragments; the optimizer
+    supplies the state load / store and the update. Another optimizer is a new
+    class with the same three methods, passed as the kernels' ``optimizer``."""
+
+    @cute.jit
+    def load_state(self, mState):
+        return Float32(mState[0])
+
+    @cute.jit
+    def store_state(self, mState, state):
+        mState[0] = state
+
+    @cute.jit
+    def update(self, g, w, state, live, log2_lanes: cutlass.Constexpr, D, lr, eps):
+        """Updates the lane's weight fragment w in place from its gradient
+        fragment g and returns the row's new state. A row spans a butterfly group
+        of 2^log2_lanes lanes; ``live`` masks lanes whose g is not part of it
+        (None: every lane's g is, possibly zero)."""
+        sq = Float32(0.0)
+        for i in cutlass.range_constexpr(VEC):
+            sq = sq + g[i] * g[i]
+        if const_expr(live is not None):
+            sq = cutlass.select_(live, sq, Float32(0.0))
+        for sh in cutlass.range_constexpr(log2_lanes):
+            sq = sq + cute.arch.shuffle_sync_bfly(sq, 1 << sh)
+        state = state + sq / Float32(D)
+        alr = lr / (cute.math.sqrt(state) + eps)
+        w.store((w.load().to(Float32) - g.load() * alr).to(w.element_type))
+        return state
+
+
 class TbeBackwardShortRun:
     """Unweighted short-run backward + exact row-wise Adagrad. One warp per run.
 
@@ -869,8 +906,9 @@ class TbeBackwardShortRun:
     load before its gradient row, weight row and momentum are all in flight.
     """
 
-    def __init__(self, w_dtype, unroll: int, warps: int, small_T: bool):
+    def __init__(self, w_dtype, unroll: int, warps: int, small_T: bool, optimizer=None):
         self.w_dtype = w_dtype
+        self.opt = optimizer or RowwiseAdagrad()
         self.unroll = unroll
         self.warps = warps
         self.small_T = small_T
@@ -1022,7 +1060,7 @@ class TbeBackwardShortRun:
                 mMom = cute.make_tensor(mom_ptr + mom_idx, cute.make_layout(1))
                 _copy4(w_addr, w_row, 0, self.w_dtype)
                 _copy4(w_addr_hi, w_row, 4, self.w_dtype)
-                mom = Float32(mMom[0])
+                mom = self.opt.load_state(mMom)
 
                 acc = cute.make_rmem_tensor((VEC,), Float32)
                 acc.fill(0.0)
@@ -1057,31 +1095,21 @@ class TbeBackwardShortRun:
                             if oks[u]:
                                 acc.store(acc.load() + frags[u].load())
                 _reduce_slots(acc, lane, nch, rpw)
-                self._adagrad(
+                self._step(
                     acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps
                 )
             batch = cute.arch.shuffle_sync(nxt, 0)
 
     @cute.jit
-    def _adagrad(
-        self, acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps
-    ):
-        # Row-wise Adagrad: mean of grad^2 over the row (slot-0 lanes hold it).
-        sq = Float32(0.0)
-        for i in cutlass.range_constexpr(VEC):
-            sq = sq + acc[i] * acc[i]
-        sq = cutlass.select_(slot == 0, sq, Float32(0.0))
-        for sh in cutlass.range_constexpr(5):
-            sq = sq + cute.arch.shuffle_sync_bfly(sq, 1 << sh)
-        mom_new = mom + sq / Float32(D)
-        alr = lr / (cute.math.sqrt(mom_new) + eps)
+    def _step(self, acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps):
+        """Optimizer step for one row; slot-0 lanes (the whole warp's row) hold
+        the summed gradient."""
+        mom = self.opt.update(acc, w_row, mom, slot == 0, 5, D, lr, eps)
         if lane == 0:
-            mMom[0] = mom_new
+            self.opt.store_state(mMom, mom)
         if slot == 0:
-            upd = cute.make_rmem_tensor((VEC,), self.w_dtype)
-            upd.store((w_row.load().to(Float32) - acc.load() * alr).to(self.w_dtype))
-            _copy4(w_addr, upd, 0, self.w_dtype, True)
-            _copy4(w_addr_hi, upd, 4, self.w_dtype, True)
+            _copy4(w_addr, w_row, 0, self.w_dtype, True)
+            _copy4(w_addr_hi, w_row, 4, self.w_dtype, True)
 
 
 class TbeBackwardPacked:
@@ -1101,8 +1129,16 @@ class TbeBackwardPacked:
     """
 
     def __init__(
-        self, w_dtype, G: int, warps: int, unroll: int, weighted: bool, vbe: bool
+        self,
+        w_dtype,
+        G: int,
+        warps: int,
+        unroll: int,
+        weighted: bool,
+        vbe: bool,
+        optimizer=None,
     ):
+        self.opt = optimizer or RowwiseAdagrad()
         self.weighted = weighted
         self.vbe = vbe  # dout is the flat VBE output (see _dout_row)
         self.w_dtype = w_dtype
@@ -1289,8 +1325,8 @@ class TbeBackwardPacked:
                     if const_expr(self.weighted):
                         acc.store(acc.load() * pw_k)
                 if ok:
-                    mom = Float32(
-                        cute.make_tensor(mom_ptr + m_k, cute.make_layout(1))[0]
+                    mom = self.opt.load_state(
+                        cute.make_tensor(mom_ptr + m_k, cute.make_layout(1))
                     )
                 # Further lookups, G at a time: lane c of the group decodes lookup
                 # j + c's dout offset (its own feature: a run of a shared table can
@@ -1336,24 +1372,17 @@ class TbeBackwardPacked:
                                     acc.store(acc.load() + frags[v].load())
                         jj = jj + self.unroll
                     j = j + self.G
-                # Row-wise Adagrad: mean of grad^2 over the row, reduced in-group.
-                sq = Float32(0.0)
-                for e in cutlass.range_constexpr(VEC):
-                    sq = sq + acc[e] * acc[e]
-                sq = cutlass.select_(act, sq, Float32(0.0))
-                for sh in cutlass.range_constexpr(self.log2_G):
-                    sq = sq + cute.arch.shuffle_sync_bfly(sq, 1 << sh)
-                mom_new = mom + sq / Float32(cutlass.max(D_k, 1))
-                alr = lr / (cute.math.sqrt(mom_new) + eps)
+                # Optimizer step; the run's row spans the lane group.
+                mom = self.opt.update(
+                    acc, w_row, mom, act, self.log2_G, cutlass.max(D_k, 1), lr, eps
+                )
                 if act:
-                    upd = cute.make_rmem_tensor((VEC,), self.w_dtype)
-                    upd.store(
-                        (w_row.load().to(Float32) - acc.load() * alr).to(self.w_dtype)
-                    )
-                    _copy4(w_addr, upd, 0, self.w_dtype, True)
-                    _copy4(w_addr + half * wsz, upd, 4, self.w_dtype, True)
+                    _copy4(w_addr, w_row, 0, self.w_dtype, True)
+                    _copy4(w_addr + half * wsz, w_row, 4, self.w_dtype, True)
                 if ok & (c == 0):
-                    cute.make_tensor(mom_ptr + m_k, cute.make_layout(1))[0] = mom_new
+                    self.opt.store_state(
+                        cute.make_tensor(mom_ptr + m_k, cute.make_layout(1)), mom
+                    )
             b0 = cute.arch.shuffle_sync(nxt, 0)
 
 
@@ -1376,8 +1405,8 @@ class TbeBackwardTiled(TbeBackwardShortRun):
     unrolled loop so it is emitted once.
     """
 
-    def __init__(self, w_dtype, unroll: int, warps: int, batch: int):
-        super().__init__(w_dtype, unroll, warps, small_T=False)
+    def __init__(self, w_dtype, unroll: int, warps: int, batch: int, optimizer=None):
+        super().__init__(w_dtype, unroll, warps, small_T=False, optimizer=optimizer)
         self.batch = batch
 
     @cute.jit
@@ -1527,7 +1556,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
                     if c0 + j == cur_end:
                         mMom = cute.make_tensor(mom_ptr + m_idx, cute.make_layout(1))
                         if pslot < 0:
-                            self._adagrad(
+                            self._step(
                                 acc,
                                 w_row,
                                 mom,
@@ -1581,7 +1610,9 @@ class TbeBackwardTiled(TbeBackwardShortRun):
         if pslot < 0:
             _copy4(w_addr, w_row, 0, self.w_dtype)
             _copy4(w_addr + Int64(D // 2) * wsz, w_row, 4, self.w_dtype)
-            mom = Float32(cute.make_tensor(mom_ptr + m_idx, cute.make_layout(1))[0])
+            mom = self.opt.load_state(
+                cute.make_tensor(mom_ptr + m_idx, cute.make_layout(1))
+            )
         return w_addr, m_idx, pslot, mom, D, col
 
     @cute.jit
@@ -1672,7 +1703,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
             mMom = cute.make_tensor(
                 mom_ptr + Int64(mMeta[t, META_ROWS_CUMSUM]) + row, cute.make_layout(1)
             )
-            mom = Float32(mMom[0])
+            mom = self.opt.load_state(mMom)
             acc = cute.make_rmem_tensor((VEC,), Float32)
             acc.fill(0.0)
             frag = cute.make_rmem_tensor((VEC,), Float32)
@@ -1681,9 +1712,7 @@ class TbeBackwardTiled(TbeBackwardShortRun):
                 _copy4(p_lo, frag, 0, Float32)
                 _copy4(p_lo + half * 4, frag, 4, Float32)
                 acc.store(acc.load() + frag.load())
-            self._adagrad(
-                acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps
-            )
+            self._step(acc, w_row, mom, mMom, w_addr, w_addr_hi, slot, lane, D, lr, eps)
 
 
 class TileRunsPrep:
@@ -2695,9 +2724,10 @@ class TbeLongRunApply:
     warp per real run (grid-stride to the device-side count), same math. The
     row layout matches TbeLongRunAccum (one or two 4-element pieces per lane)."""
 
-    def __init__(self, w_dtype, warps: int = 8):
+    def __init__(self, w_dtype, warps: int = 8, optimizer=None):
         self.w_dtype = w_dtype
         self.warps = warps
+        self.opt = optimizer or RowwiseAdagrad()
 
     @cute.jit
     def __call__(
@@ -2807,24 +2837,16 @@ class TbeLongRunApply:
                 if two:
                     _copy4(w_addr + half * wsz, w_row, 4, self.w_dtype)
                     _copy4(g_addr + half * 4, grad, 4, Float32)
-            mom = Float32(mMom[0])
-            sq = Float32(0.0)
-            for e in cutlass.range_constexpr(VEC):
-                sq = sq + grad[e] * grad[e]
-            for sh in cutlass.range_constexpr(5):
-                sq = sq + cute.arch.shuffle_sync_bfly(sq, 1 << sh)
-            mom_new = mom + sq / Float32(D)
-            alr = lr / (cute.math.sqrt(mom_new) + eps)
+            # Inactive lanes hold a zero gradient, so the whole warp is the row.
+            mom = self.opt.update(
+                grad, w_row, self.opt.load_state(mMom), None, 5, D, lr, eps
+            )
             if act:
-                upd = cute.make_rmem_tensor((VEC,), self.w_dtype)
-                upd.store(
-                    (w_row.load().to(Float32) - grad.load() * alr).to(self.w_dtype)
-                )
-                _copy4(w_addr, upd, 0, self.w_dtype, True)
+                _copy4(w_addr, w_row, 0, self.w_dtype, True)
                 if two:
-                    _copy4(w_addr + half * wsz, upd, 4, self.w_dtype, True)
+                    _copy4(w_addr + half * wsz, w_row, 4, self.w_dtype, True)
             if lane == 0:
-                mMom[0] = mom_new
+                self.opt.store_state(mMom, mom)
 
 
 @cute.jit
