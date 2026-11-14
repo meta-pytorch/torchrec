@@ -4482,6 +4482,7 @@ class TritonBatchedFusedEmbeddingBag(
         enable_triton_tbe_optimizations: bool = fused_params.get(
             "enable_triton_tbe_optimizations", False
         )
+        cute_kernels: bool = fused_params.get("cute_kernels", False)
         forward_block_limit: int = fused_params.get("forward_block_limit", 0)
         vbe_forward_block_limit: int = fused_params.get("vbe_forward_block_limit", 0)
         cache_load_factor: Optional[float] = fused_params.get("cache_load_factor")
@@ -4536,6 +4537,11 @@ class TritonBatchedFusedEmbeddingBag(
                 else TritonTableBatchedEmbeddingBags
             )
             triton_tbe_kwargs = {}
+        if cute_kernels:
+            # CuTe DSL kernels (Blackwell): HBM weights only.
+            if uses_uvm:
+                raise ValueError("cute_kernels requires compute kernel FUSED_TRITON")
+            triton_tbe_kwargs["cute_kernels"] = True
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = triton_tbe_class(
