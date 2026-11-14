@@ -20,7 +20,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
 )
 
 try:
-    from fbgemm_gpu.tbe.config.embedding_config import (
+    from fbgemm_gpu.tbe.config.embedding_config import (  # @manual
         BoundsCheckMode,
         EmbeddingLocation,
         PoolingMode,
