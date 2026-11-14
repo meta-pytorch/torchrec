@@ -14,6 +14,7 @@ import torch
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_modules import (
+    _mch_remap,
     average_threshold_filter,
     DistanceLFU_EvictionPolicy,
     dynamic_threshold_filter,
@@ -28,6 +29,57 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 class TestEvictionPolicy(unittest.TestCase):
+    @unittest.skipIf(torch.cuda.device_count() < 1, "CUDA required")
+    def test_mch_cuda_remap_matches_tensor_path(self) -> None:
+        for num_slots in (1, 4, 257):
+            with self.subTest(num_slots=num_slots):
+                raw_ids = torch.arange(num_slots - 1, dtype=torch.int64) * 17 + 2**40
+                sorted_ids = torch.cat(
+                    [raw_ids, torch.tensor([torch.iinfo(torch.int64).max])]
+                )
+                mapping = torch.randperm(num_slots, dtype=torch.int64) + 100
+                values = torch.cat(
+                    [
+                        raw_ids,
+                        raw_ids[:1],
+                        torch.tensor([-1, 0, 2**40 + 1, torch.iinfo(torch.int64).max]),
+                    ]
+                )
+
+                def features(device: torch.device) -> Dict[str, JaggedTensor]:
+                    return {
+                        "ids": JaggedTensor(
+                            values=values.to(device),
+                            lengths=torch.tensor([values.numel()], device=device),
+                            weights=torch.arange(values.numel(), device=device).float(),
+                        ),
+                        "empty": JaggedTensor(
+                            values=torch.empty(0, dtype=torch.int64, device=device),
+                            lengths=torch.tensor([0], device=device),
+                        ),
+                    }
+
+                expected = _mch_remap(
+                    features(torch.device("cpu")), sorted_ids, mapping, 999
+                )
+                actual = _mch_remap(
+                    features(torch.device("cuda")),
+                    sorted_ids.cuda(),
+                    mapping.cuda(),
+                    999,
+                )
+                for name in expected:
+                    torch.testing.assert_close(
+                        actual[name].values().cpu(), expected[name].values()
+                    )
+                    torch.testing.assert_close(
+                        actual[name].lengths().cpu(), expected[name].lengths()
+                    )
+                    if name == "ids":
+                        torch.testing.assert_close(
+                            actual[name].weights().cpu(), expected[name].weights()
+                        )
+
     def test_lfu_eviction(self) -> None:
         mc_module = MCHManagedCollisionModule(
             zch_size=5,
