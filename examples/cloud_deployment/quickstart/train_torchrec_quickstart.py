@@ -397,6 +397,7 @@ def create_model(
                 world_size=world_size,
                 compute_device="cuda",
             ),
+            # pyrefly: ignore [missing-argument]
             enumerator=EmbeddingEnumerator(
                 topology=Topology(
                     world_size=world_size,
