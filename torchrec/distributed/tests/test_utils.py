@@ -877,12 +877,14 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
                 "fused_bounds_check": True,
                 "enable_triton_tbe_optimizations": True,
                 "tbe_chunk_size_limit": 1024**3,
+                "cute_kernels": True,
             },
             self.parameter_sharding,
         )
         self.assertNotIn("fused_bounds_check", fused_params)
         self.assertNotIn("enable_triton_tbe_optimizations", fused_params)
         self.assertNotIn("tbe_chunk_size_limit", fused_params)
+        self.assertNotIn("cute_kernels", fused_params)
 
         triton_sharding = ParameterSharding(
             sharding_type=ShardingType.TABLE_WISE.value,
@@ -894,12 +896,14 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
                 "fused_bounds_check": True,
                 "enable_triton_tbe_optimizations": True,
                 "tbe_chunk_size_limit": 1024**3,
+                "cute_kernels": True,
             },
             triton_sharding,
         )
         self.assertTrue(fused_params["fused_bounds_check"])
         self.assertTrue(fused_params["enable_triton_tbe_optimizations"])
         self.assertEqual(fused_params["tbe_chunk_size_limit"], 1024**3)
+        self.assertTrue(fused_params["cute_kernels"])
 
     def test_fs_2d_allgather_param_is_only_forwarded_to_supported_kernels(
         self,
