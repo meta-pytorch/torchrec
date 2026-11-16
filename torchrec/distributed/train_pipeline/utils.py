@@ -205,8 +205,13 @@ def _to_device(
         )
 
 
+@attributed_logger("wait_for_batch", owner_kwarg="context")
 def _wait_for_batch(
-    batch: In, stream: Optional[torch.Stream], record_stream: bool = True
+    batch: In,
+    stream: Optional[torch.Stream],
+    record_stream: bool = True,
+    *,
+    context: Optional[TrainPipelineContext] = None,
 ) -> None:
     """
     As mentioned in
