@@ -2164,6 +2164,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         self._stash_gradients = stash_gradients
         logger.debug(f"Starting semi-sync run at batch: {self._start_batch}")
         self._gradients: Dict[str, torch.Tensor] = {}
+        self._active_batch_context: Optional[EmbeddingTrainPipelineContext] = None
         self._strict = strict
 
     def _grad_swap(self) -> None:
@@ -2230,6 +2231,13 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             return
         self._optimizer.step()
 
+    @attributed_logger(
+        "backward",
+        owner=lambda self: self._active_batch_context,
+    )
+    def _backward(self, losses: torch.Tensor) -> None:
+        torch.sum(losses, dim=0).backward()
+
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
     )
@@ -2282,11 +2290,20 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             self.wait_sparse_data_dist(self.contexts[1])
 
         if self._model.training:
-            with record_function(f"## backward {iteration} ##"):
-                torch.sum(losses, dim=0).backward()
-            with record_function(f"## emb_backward {iteration} ##"):
-                # pyrefly: ignore [bad-argument-type]
-                self.embedding_backward(context)
+            self._active_batch_context = (
+                cast(EmbeddingTrainPipelineContext, context)
+                if not self._stash_gradients
+                else None
+            )
+            try:
+                with record_function(f"## backward {iteration} ##"):
+                    self._backward(losses)
+                with record_function(f"## emb_backward {iteration} ##"):
+                    self.embedding_backward(
+                        cast(EmbeddingTrainPipelineContext, context)
+                    )
+            finally:
+                self._active_batch_context = None
 
             self.sync_embeddings(
                 self._model,
@@ -2323,6 +2340,10 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             )
             return self._model_fwd(batch)
 
+    @attributed_logger(
+        "backward",
+        owner=lambda self: self._active_batch_context,
+    )
     def embedding_backward(self, context: EmbeddingTrainPipelineContext) -> None:
         assert len(context.embedding_features) == len(context.embedding_tensors)
         for emb_tensors, embedding_features, detached_emb_tensors in zip(
