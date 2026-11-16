@@ -2225,7 +2225,16 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             return self.contexts[0].index >= self._start_batch
         return False
 
-    def _mlp_optimizer_step(self, current_batch: int) -> None:
+    @attributed_logger(
+        "optimizer",
+        owner_kwarg="context",
+    )
+    def _mlp_optimizer_step(
+        self,
+        current_batch: int,
+        *,
+        context: Optional[TrainPipelineContext] = None,
+    ) -> None:
         # special case: not all optimizers support optim.step() on null gradidents
         if current_batch == self._start_batch and self._stash_gradients:
             return
@@ -2310,12 +2319,21 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
                 self._dmp_collection_sync_interval_batches,
                 context,
             )
+            optimizer_context = (
+                TrainPipelineContext(
+                    index=context.index,
+                    version=context.version,
+                    batch_metadata=context.batch_metadata,
+                )
+                if not self._stash_gradients and context.batch_metadata is not None
+                else None
+            )
             del context  # context is no longer needed, deleting to free up memory
 
             with record_function(f"## optimizer {iteration - 1} ##"):
                 if is_semi_sync and self._stash_gradients:
                     self._grad_swap()
-                self._mlp_optimizer_step(iteration)
+                self._mlp_optimizer_step(iteration, context=optimizer_context)
 
             with record_function(f"## zero_grad {iteration - 1} ##"):
                 self._optimizer.zero_grad()

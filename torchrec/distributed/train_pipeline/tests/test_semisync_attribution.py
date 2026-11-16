@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Callable
 
 import torch
 from torch import nn
@@ -71,6 +72,7 @@ class SemiSyncAttributionTest(unittest.TestCase):
         source: torch.Tensor,
         metadata: object | None,
         stash_gradients: bool = False,
+        iteration: int = 73,
     ) -> _CpuSemiSync:
         embedding = source * 4
         detached = embedding.detach().requires_grad_()
@@ -86,14 +88,14 @@ class SemiSyncAttributionTest(unittest.TestCase):
         pipeline.batches.extend([_Batch(detached), _Batch()])
 
         current_context = EmbeddingTrainPipelineContext(
-            index=73,
+            index=iteration,
             version=1,
             embedding_tensors=[[embedding]],
             embedding_features=[["feature"]],
             detached_embedding_tensors=[[detached]],
         )
         current_context.batch_metadata = metadata
-        next_context = EmbeddingTrainPipelineContext(index=74, version=1)
+        next_context = EmbeddingTrainPipelineContext(index=iteration + 1, version=1)
         next_context.batch_metadata = object()
         pipeline.contexts.extend([current_context, next_context])
         return pipeline
@@ -150,6 +152,93 @@ class SemiSyncAttributionTest(unittest.TestCase):
             [torch.tensor([4.0 if embedding_failure else 2.0], device="cpu")],
         )
         return error
+
+    def _assert_no_stale_optimizer_attribution(
+        self,
+        pipeline: _CpuSemiSync,
+    ) -> None:
+        error = self._progress_with_failing_optimizer(
+            pipeline,
+            lambda: pipeline._mlp_optimizer_step(0),
+        )
+
+        self.assertIsNone(get_exception_attribution(error))
+
+    def _progress_with_failing_optimizer(
+        self,
+        pipeline: _CpuSemiSync,
+        call: Callable[[], object],
+    ) -> ValueError:
+        error = ValueError("optimizer failed")
+
+        def fail_step(
+            _optimizer: torch.optim.Optimizer,
+            _args: tuple[object, ...],
+            _kwargs: dict[str, object],
+        ) -> None:
+            raise error
+
+        handle = pipeline._optimizer.register_step_pre_hook(fail_step)
+        self.addCleanup(handle.remove)
+        try:
+            with self.assertRaises(ValueError) as raised:
+                call()
+        finally:
+            handle.remove()
+
+        self.assertIs(error, raised.exception)
+        return error
+
+    def _assert_optimizer_attribution(
+        self,
+        error: ValueError,
+        metadata: object,
+        batch_index: int,
+    ) -> None:
+        attribution = get_exception_attribution(error)
+        self.assertIsNotNone(attribution)
+        assert attribution is not None
+        self.assertEqual("optimizer", attribution.operation)
+        self.assertIs(metadata, attribution.metadata)
+        self.assertEqual(batch_index, attribution.batch_index)
+
+    def _run_optimizer_failure(
+        self,
+        metadata: object | None,
+        *,
+        stash_gradients: bool,
+        iteration: int,
+    ) -> tuple[ValueError, _CpuSemiSync]:
+        model = _Model()
+        source = torch.ones(1, device="cpu", requires_grad=True)
+        pipeline = self._make_pipeline(
+            model,
+            source,
+            metadata,
+            stash_gradients=stash_gradients,
+            iteration=iteration,
+        )
+        error = self._progress_with_failing_optimizer(
+            pipeline,
+            lambda: pipeline.progress(iter(())),
+        )
+        return error, pipeline
+
+    def _assert_optimizer_failure_is_unattributed(
+        self,
+        metadata: object | None,
+        *,
+        stash_gradients: bool,
+        iteration: int,
+    ) -> None:
+        error, pipeline = self._run_optimizer_failure(
+            metadata,
+            stash_gradients=stash_gradients,
+            iteration=iteration,
+        )
+
+        self.assertIsNone(get_exception_attribution(error))
+        self._assert_no_stale_optimizer_attribution(pipeline)
 
     def test_attributed_dequeued_backward_failures_use_saved_context(self) -> None:
         for embedding_failure in (False, True):
@@ -265,3 +354,56 @@ class SemiSyncAttributionTest(unittest.TestCase):
             model.weight.detach(), torch.tensor([0.8], device="cpu")
         )
         self.assertIsNone(model.weight.grad)
+
+    def test_optimizer_failure_uses_current_batch_context(self) -> None:
+        for iteration in (72, 73):
+            with self.subTest(iteration=iteration):
+                metadata = object()
+                error, pipeline = self._run_optimizer_failure(
+                    metadata,
+                    stash_gradients=False,
+                    iteration=iteration,
+                )
+
+                self._assert_optimizer_attribution(error, metadata, iteration)
+                self._assert_no_stale_optimizer_attribution(pipeline)
+
+    def test_raw_and_stashed_optimizer_failures_are_unattributed(self) -> None:
+        cases = (
+            ("raw", None, False, 73),
+            ("stashed_before_start", object(), True, 72),
+            ("stashed_after_start", object(), True, 74),
+        )
+        for case, metadata, stash_gradients, iteration in cases:
+            with self.subTest(
+                case=case,
+                stash_gradients=stash_gradients,
+                iteration=iteration,
+            ):
+                self._assert_optimizer_failure_is_unattributed(
+                    metadata,
+                    stash_gradients=stash_gradients,
+                    iteration=iteration,
+                )
+
+    def test_optimizer_attribution_advances_after_success(self) -> None:
+        model = _Model()
+        source = torch.ones(1, device="cpu", requires_grad=True)
+        pipeline = self._make_pipeline(model, source, object())
+        next_metadata = object()
+        pipeline.contexts[1].batch_metadata = next_metadata
+
+        output = pipeline.progress(iter(()))
+
+        self.assertIs(model.output, output)
+        torch.testing.assert_close(
+            model.weight.detach(),
+            torch.tensor([0.8], device="cpu"),
+        )
+        self._assert_no_stale_optimizer_attribution(pipeline)
+        error = self._progress_with_failing_optimizer(
+            pipeline,
+            lambda: pipeline.progress(iter(())),
+        )
+        self._assert_optimizer_attribution(error, next_metadata, 74)
+        self._assert_no_stale_optimizer_attribution(pipeline)
