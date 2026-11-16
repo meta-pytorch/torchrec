@@ -60,7 +60,7 @@ def main():
     new_matrix_entries = []
 
     for entry in full_matrix["include"]:
-        if entry["desired_cuda"] in ("cu132", "cu134"):
+        if entry["desired_cuda"] in ("cu132", "cu134", "cu135"):
             # Keep TorchRec's matrix within FBGEMM wheel support.
             continue
         if entry["python_version"] in ("3.16", "3.16t"):
