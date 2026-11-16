@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 from torch.utils.data import DataLoader
 from torchrec.datasets.movielens import DEFAULT_RATINGS_COLUMN_NAMES
