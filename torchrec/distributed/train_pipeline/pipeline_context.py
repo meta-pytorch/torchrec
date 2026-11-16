@@ -51,6 +51,8 @@ class TrainPipelineContext:
         delayed_backward_tensors: Output-dist tensors whose upstream backward is
             delayed until a later pipeline stage.
         delay_backward: Whether output-dist backward is delayed for this batch.
+        batch_metadata: Opaque attribution metadata paired with this batch, or
+            ``None`` when the batch is unattributed.
     """
 
     input_dist_splits_requests: Dict[str, Awaitable[Any]] = field(default_factory=dict)
@@ -74,6 +76,7 @@ class TrainPipelineContext:
     )
     delayed_backward_tensors: List[DelayedBackwardTensor] = field(default_factory=list)
     delay_backward: bool = True
+    batch_metadata: object | None = field(default=None, kw_only=True)
 
 
 @dataclass
