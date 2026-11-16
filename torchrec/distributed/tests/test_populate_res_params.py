@@ -59,6 +59,7 @@ class PopulateResParamsTest(unittest.TestCase):
     _HBM_KNOBS: Dict[str, Any] = {
         "enable_hbm_streaming": True,
         "res_hbm_drain_interval": 200,
+        "res_hbm_drain_interval_per_table": '{"t0": 40}',
         "res_use_copy_done_token": True,
     }
 
@@ -74,6 +75,7 @@ class PopulateResParamsTest(unittest.TestCase):
         self.assertTrue(enable_res)
         self.assertTrue(res_params.enable_hbm_streaming)
         self.assertEqual(res_params.res_hbm_drain_interval, 200)
+        self.assertEqual(res_params.res_hbm_drain_interval_per_table, {"t0": 40})
         self.assertTrue(res_params.res_use_copy_done_token)
 
     def test_knobs_are_removed_even_when_res_is_disabled(self) -> None:
