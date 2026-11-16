@@ -86,6 +86,7 @@ except Exception:
             pass
 
 
+from torchrec.distributed.attributed_logging import attributed_logger
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.backward_injection import (
     BackwardHookWork,
@@ -399,13 +400,17 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                     self._device,
                     non_blocking=True,
                     data_copy_stream=self._memcpy_stream,
+                    context=self._cur_context,
                 )
         else:
             with record_function("## copy_batch_to_gpu ##"):
                 # pyrefly: ignore [bad-argument-type]
                 with self._stream_context(self._memcpy_stream):
                     self._cur_batch = _to_device(
-                        cur_batch, self._device, non_blocking=True
+                        cur_batch,
+                        self._device,
+                        non_blocking=True,
+                        context=self._cur_context,
                     )
 
     @EventLoggingHandler.event_logger(
@@ -516,6 +521,10 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         self._cur_batch: Optional[In] = None
         self._cur_context: Optional[TrainPipelineContext] = None
 
+    @attributed_logger("preprocessing", owner=lambda self: self._cur_context)
+    def _apply_input_transformer(self, batch: In) -> In:
+        return self._input_transformer(batch)
+
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
     )
@@ -537,12 +546,17 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         self._cur_batch, self._cur_context = cur_batch, context
 
         with record_function("## copy_batch_to_gpu ##"):
-            self._cur_batch = _to_device(cur_batch, self._device, non_blocking=False)
+            self._cur_batch = _to_device(
+                cur_batch,
+                self._device,
+                non_blocking=False,
+                context=context,
+            )
 
         # Input transformer here is used also for pt2 hints to compiler, that should happen on exact object passed to model.compile.
         # Do not move it before _to_device
         if self._input_transformer:
-            self._cur_batch = self._input_transformer(self._cur_batch)
+            self._cur_batch = self._apply_input_transformer(self._cur_batch)
 
         if self._model.training:
             with record_function("## zero_grad ##"):
@@ -1186,7 +1200,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                     dataloader_iter
                 )
                 if batch is not None:
-                    batch = _to_device(batch, self._device, non_blocking=True)
+                    batch = _to_device(
+                        batch,
+                        self._device,
+                        non_blocking=True,
+                        context=context,
+                    )
                 elif not self._execute_all_batches:
                     logger.info(
                         "copy_batch_to_gpu: raising StopIteration for None Batch (execute_all_batches=False)"
@@ -1227,7 +1246,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                         cast(
                             In,
                             self._submit_inplace_copy(
-                                batch, self._device, self._memcpy_stream
+                                batch,
+                                self._device,
+                                self._memcpy_stream,
+                                context=context,
                             ),
                         ),
                         context,
@@ -1237,6 +1259,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                     self._device,
                     non_blocking=True,
                     data_copy_stream=self._memcpy_stream,
+                    context=context,
                 )
             elif not self._execute_all_batches:
                 logger.info(
@@ -2278,9 +2301,14 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             with self._stream_context(self._memcpy_stream):
                 batch, batch_metadata = self._next_batch_with_metadata(dataloader_iter)
                 if batch is not None:
-                    batch = _to_device(batch, self._device, non_blocking=True)
                     context = self._create_context()
                     context.batch_metadata = batch_metadata
+                    batch = _to_device(
+                        batch,
+                        self._device,
+                        non_blocking=True,
+                        context=context,
+                    )
                     event = torch.get_device_module(self._device).Event()
                     event.record()
                     context.events.append(event)
