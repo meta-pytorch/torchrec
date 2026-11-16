@@ -293,6 +293,12 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         enable_inplace_copy_batch: bool = False,
     ) -> None:
         self._model = model
+        self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
+            attributed_logger(
+                "forward",
+                owner=lambda _batch: self._cur_context,
+            )(model)
+        )
         self._optimizer = optimizer
         self._device = device
         self._memcpy_stream: Optional[torch.Stream] = (
@@ -458,7 +464,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         # model will need to handle if cur_batch is empty; this is needed if there's
         # communicative ops
         with record_function("## forward ##"):
-            (losses, output) = self._model(cur_batch)
+            (losses, output) = self._model_fwd(cur_batch)
 
             # clear the current batch after forward pass (so current batch can be freed)
             self._cur_batch = cur_batch = next_batch
@@ -509,6 +515,12 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         input_transformer: Optional[Callable[[In], In]] = None,
     ) -> None:
         self._model = model
+        self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
+            attributed_logger(
+                "forward",
+                owner=lambda _batch: self._cur_context,
+            )(model)
+        )
         self._optimizer = optimizer
         self._device = device
         self._compile_configs: TorchCompileConfig = (
@@ -590,7 +602,7 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
                 if self._post_compile_fn:
                     self._post_compile_fn(self._model)
 
-            (losses, output) = self._model(self._cur_batch)
+            (losses, output) = self._model_fwd(self._cur_batch)
             self._iter += 1
 
         if self._model.training:
@@ -747,8 +759,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             async_inplace_copy, device, async_next_batch=async_next_batch
         )
 
+        model_fwd = custom_model_fwd if custom_model_fwd else model
         self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
-            custom_model_fwd if custom_model_fwd else model
+            attributed_logger(
+                "forward",
+                owner=lambda _batch: self.contexts[0] if self.contexts else None,
+            )(model_fwd)
         )
         if self._clear_data_dist_inputs:
             PipelinedForward._use_main_stream_for_dist_init = True
@@ -2812,9 +2828,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
         # forward
         with record_function("## forward ##"):
-            losses, output = cast(
-                Tuple[torch.Tensor, Out], self._model(self.batches[0])
-            )
+            losses, output = self._model_fwd(self.batches[0])
 
         if len(self.batches) >= 2:
             self.wait_sparse_data_dist(self.contexts[1])
