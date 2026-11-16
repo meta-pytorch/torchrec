@@ -7,7 +7,6 @@
 
 #!/usr/bin/env python3
 
-# pyre-strict
 
 import unittest
 from typing import Dict, List, Optional

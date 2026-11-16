@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 # COPY of the code from torch.distributed._tensor._shards_wrapper - for package compat
 
