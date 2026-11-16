@@ -160,12 +160,8 @@ class PSCollection:
             table_name = key.split(".")[1]
             param_plan = params_plan.pop(table_name)
             tensors = [tensor]
-            # This is really hardcoded right now...
             optimizer_state = optimizer_state_dict[key]
-            if f"{table_name}.momentum1" in optimizer_state:
-                tensors.append(optimizer_state[f"{table_name}.momentum1"])
-            if f"{table_name}.momentum2" in optimizer_state:
-                tensors.append(optimizer_state[f"{table_name}.momentum2"])
+            tensors.extend(optimizer_state.values())
             tensor_infos[table_name] = (param_plan, tensors)
 
         assert (
