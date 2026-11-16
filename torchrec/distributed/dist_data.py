@@ -1941,7 +1941,9 @@ class EmbeddingsAllToOne(nn.Module):
         cat_dim: int,
     ) -> None:
         super().__init__()
-        self.merge_pooled_embeddings = MergePooledEmbeddingsModule(device)
+        self.merge_pooled_embeddings: Optional[MergePooledEmbeddingsModule] = (
+            MergePooledEmbeddingsModule(device) if world_size > 1 else None
+        )
         self._world_size = world_size
         self._cat_dim = cat_dim
         self._device = device
@@ -1951,7 +1953,8 @@ class EmbeddingsAllToOne(nn.Module):
     @torch.jit.export
     def set_device(self, device_str: str) -> None:
         self._device = torch.device(device_str)
-        self.merge_pooled_embeddings.set_device(device_str)
+        if self.merge_pooled_embeddings is not None:
+            self.merge_pooled_embeddings.set_device(device_str)
 
     def forward(self, tensors: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -1967,7 +1970,7 @@ class EmbeddingsAllToOne(nn.Module):
 
         is_target_device_cpu: bool = self._device.type == "cpu"
 
-        if self._world_size == 1:
+        if self.merge_pooled_embeddings is None:
             merge = tensors[0]
         else:
             merge = self.merge_pooled_embeddings(
