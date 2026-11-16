@@ -381,6 +381,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                 self._memcpy_stream,
                 # no need to record stream when using in-place copy
                 record_stream=not self._enable_inplace_copy_batch,
+                context=self._cur_context,
             )
 
     def _backward(self, losses: torch.Tensor) -> None:
@@ -964,6 +965,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                 record_stream=not (
                     self._enable_inplace_copy_batch or self._skip_batch_record_stream
                 ),
+                context=self.contexts[0] if self.contexts else None,
             )
 
     def _backward(self, losses: torch.Tensor) -> None:
@@ -1327,6 +1329,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                     batch,
                     self._memcpy_stream,
                     record_stream=not self._skip_batch_record_stream,
+                    context=context,
                 )
 
                 # Temporarily set context for next iter to populate cache
@@ -1554,7 +1557,11 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         """
         batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
         with record_function(f"## wait_for_batch {batch_id} ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._memcpy_stream)
+            _wait_for_batch(
+                cast(In, self.batches[0]),
+                self._memcpy_stream,
+                context=self.contexts[0] if self.contexts else None,
+            )
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -2546,7 +2553,11 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     def _wait_for_batch(self) -> None:
         """Order the compute stream after the current batch's cache prefetch."""
         with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+            _wait_for_batch(
+                cast(In, self.batches[0]),
+                self._prefetch_stream,
+                context=self.contexts[0],
+            )
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -2782,7 +2793,11 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             raise StopIteration
 
         with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._data_dist_stream)
+            _wait_for_batch(
+                cast(In, self.batches[0]),
+                self._data_dist_stream,
+                context=self.contexts[0],
+            )
 
         if self._clear_data_dist_inputs:
             self.clear_sparse_data_dist_inputs(self.contexts[0])
@@ -3118,7 +3133,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             # If there is no previous event, data is entering the pipeline
             if event is not None:
                 event.wait(stream)
-                inputs.record_stream(stream)
+                self._record_stream(inputs, stream, context=context)
 
             output = (
                 runnable(inputs, context=context)
@@ -3128,6 +3143,16 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             new_event = torch.get_device_module(stream.device).Event()
             new_event.record(stream)
             return (output, new_event)
+
+    @attributed_logger("record_stream", owner_kwarg="context")
+    def _record_stream(
+        self,
+        inputs: In,
+        stream: torch.Stream,
+        *,
+        context: Optional[TrainPipelineContext],
+    ) -> None:
+        inputs.record_stream(stream)
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
         """
@@ -3353,8 +3378,12 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             # Since model forward() is expected to run outside the pipeline,
             # we need to explicitly wait for the last stage to finish
             event.wait(self._compute_stream)
-            # pyrefly: ignore [missing-attribute]
-            out.record_stream(self._compute_stream)
+            if out is not None:
+                self._record_stream(
+                    out,
+                    self._compute_stream,
+                    context=self._last_output_context,
+                )
 
         if out is None and self._flushing:
             # We have exhausted all stages due to flushing
@@ -3475,7 +3504,11 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
                 self._optimizer.zero_grad()
 
         with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._data_dist_stream)
+            _wait_for_batch(
+                cast(In, self.batches[0]),
+                self._data_dist_stream,
+                context=self.contexts[0],
+            )
 
         if self._clear_data_dist_inputs:
             self.clear_sparse_data_dist_inputs(self.contexts[0])
