@@ -26,7 +26,10 @@ Out = TypeVar("Out")
 @dataclass
 class TrainPipelineContext:
     """
-    Context information for a `TrainPipelineSparseDist` instance.
+    Per-batch context for a training pipeline.
+
+    Pipelines may use only the batch identity fields or populate the sparse
+    distribution state below as the batch advances through additional stages.
 
     Attributes:
         input_dist_splits_requests (Dict[str, Awaitable[Any]]): Stores input dist
