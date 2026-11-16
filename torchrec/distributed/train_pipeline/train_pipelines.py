@@ -210,6 +210,10 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
         """Return the batch context owning the current optimizer operation."""
         return None
 
+    def get_optimizer_context(self) -> Optional[TrainPipelineContext]:
+        """Return the batch context owning the current optimizer operation."""
+        return None
+
     def sync_embeddings(
         self,
         model: torch.nn.Module,
