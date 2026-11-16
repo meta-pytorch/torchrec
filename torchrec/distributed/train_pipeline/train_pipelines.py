@@ -206,6 +206,10 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
         logger.info(f"TrainPipeline class: {type(self)}")
         one_time_rank0_logger.info(f"TrainPipeline class: {type(self)}")
 
+    def get_optimizer_context(self) -> Optional[TrainPipelineContext]:
+        """Return the batch context owning the current optimizer operation."""
+        return None
+
     def sync_embeddings(
         self,
         model: torch.nn.Module,
@@ -398,6 +402,13 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         with record_function("## backward ##"):
             torch.sum(losses, dim=0).backward()
 
+    def get_optimizer_context(self) -> Optional[TrainPipelineContext]:
+        return self._prev_context
+
+    @attributed_logger("optimizer", owner=lambda self: self.get_optimizer_context())
+    def _optimizer_step(self) -> None:
+        self._optimizer.step()
+
     def _copy_batch_to_gpu(self, cur_batch: In) -> None:
         if self._enable_inplace_copy_batch:
             if not self._inplace_copy_batch_size_logged:
@@ -485,7 +496,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             # Update
             if self._model.training:
                 with record_function("## optimizer ##"):
-                    self._optimizer.step()
+                    self._optimizer_step()
         finally:
             self._prev_context = None
 
@@ -551,6 +562,13 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         with record_function("## backward ##"):
             self._state = PipelineState.CALL_BWD
             torch.sum(losses).backward()
+
+    def get_optimizer_context(self) -> Optional[TrainPipelineContext]:
+        return self._cur_context
+
+    @attributed_logger("optimizer", owner=lambda self: self.get_optimizer_context())
+    def _optimizer_step(self) -> None:
+        self._optimizer.step()
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -622,7 +640,7 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
             self._backward(losses)
 
             with record_function("## optimizer ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         return output
 
@@ -1081,14 +1099,18 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             )
 
             # update
-            self._optimizer_step()
+            with record_function(f"## optimizer {self.contexts[0].index} ##"):
+                self._optimizer_step()
 
         self.dequeue_batch()
         return output
 
+    def get_optimizer_context(self) -> Optional[TrainPipelineContext]:
+        return self.contexts[0] if self.contexts else None
+
+    @attributed_logger("optimizer", owner=lambda self: self.get_optimizer_context())
     def _optimizer_step(self) -> None:
-        with record_function(f"## optimizer {self.contexts[0].index} ##"):
-            self._optimizer.step()
+        self._optimizer.step()
 
     def _create_context(self) -> TrainPipelineContext:
         context = self._context_type(index=self._next_index, version=1)
@@ -1645,7 +1667,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
 
         if self._model.training:
             with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         self.dequeue_batch()
 
@@ -2064,7 +2086,8 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         if self._model.training:
             # update
-            self._optimizer_step()
+            with record_function(f"## optimizer {self.contexts[0].index} ##"):
+                self._optimizer_step()
 
         self.dequeue_batch()
         return output
@@ -2669,7 +2692,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
             # update
             with record_function("## optimizer ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         # Start sparse data dist for batch i+2 at the end, so it overlaps
         # with the next iteration's early phases.
@@ -3568,7 +3591,7 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
             # update
             with record_function("## optimizer ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         self.dequeue_batch()
         return output
