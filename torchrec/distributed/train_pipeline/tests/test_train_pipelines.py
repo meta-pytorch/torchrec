@@ -88,6 +88,7 @@ from torchrec.distributed.train_pipeline.train_pipelines import (
     EvalPipelineSparseDist,
     PrefetchTrainPipelineSparseDist,
     StagedTrainPipeline,
+    TorchCompileConfig,
     TrainPipelineBase,
     TrainPipelinePT2,
     TrainPipelineSemiSync,
@@ -251,6 +252,86 @@ class TrainPipelineBaseTest(unittest.TestCase):
         self.assertTrue(torch.equal(prefetched_output, expected_prefetched_output))
         self.assertTrue(torch.equal(new_output, expected_new_output))
 
+    def test_context_follows_prefetched_batch(self) -> None:
+        class ContextRecordingPipeline(
+            TrainPipelineBase[ModelInputSimple, torch.Tensor]
+        ):
+            def __init__(
+                self,
+                model: torch.nn.Module,
+                optimizer: torch.optim.Optimizer,
+                device: torch.device,
+            ) -> None:
+                self.copied_contexts: List[Tuple[int, TrainPipelineContext]] = []
+                super().__init__(model, optimizer, device)
+
+            def _copy_batch_to_gpu(self, cur_batch: ModelInputSimple) -> None:
+                context = self._cur_context
+                if context is None:
+                    raise AssertionError("batch must have a context before copy")
+                self.copied_contexts.append(
+                    (int(cur_batch.float_features[0].item()), context)
+                )
+                super()._copy_batch_to_gpu(cur_batch)
+
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        model.eval()
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = ContextRecordingPipeline(model, optimizer, device)
+        data = [
+            ModelInputSimple(
+                float_features=torch.full((10,), float(index)),
+                label=torch.zeros(1),
+            )
+            for index in range(2)
+        ]
+
+        dataloader = iter(data)
+        pipeline.progress(dataloader)
+        pipeline.progress(dataloader)
+
+        self.assertEqual(
+            [(batch, context.index) for batch, context in pipeline.copied_contexts],
+            [(0, 0), (1, 1)],
+        )
+        first_context = pipeline.copied_contexts[0][1]
+        self.assertIsNot(first_context, pipeline.copied_contexts[1][1])
+        self.assertIsNone(pipeline._cur_context)
+
+        pipeline.reset()
+        self.assertIsNone(pipeline._cur_context)
+        pipeline.progress(
+            iter(
+                [
+                    ModelInputSimple(
+                        float_features=torch.full((10,), 2.0),
+                        label=torch.zeros(1),
+                    )
+                ]
+            )
+        )
+        self.assertIsNot(first_context, pipeline.copied_contexts[-1][1])
+
+    def test_none_batch_has_context_but_exhaustion_does_not(self) -> None:
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelineBase(model, optimizer, device)
+
+        pipeline._connect(iter([cast(ModelInputSimple, None)]))
+
+        self.assertFalse(pipeline._data_iter_stopped)
+        self.assertIsNone(pipeline._cur_batch)
+        self.assertIsNotNone(pipeline._cur_context)
+        self.assertEqual(cast(TrainPipelineContext, pipeline._cur_context).index, 0)
+
+        pipeline.reset()
+        pipeline._connect(iter(cast(List[ModelInputSimple], [])))
+
+        self.assertTrue(pipeline._data_iter_stopped)
+        self.assertIsNone(pipeline._cur_context)
+
 
 class TrainPipelinePT2Test(unittest.TestCase):
     def setUp(self) -> None:
@@ -275,6 +356,69 @@ class TrainPipelinePT2Test(unittest.TestCase):
                 feature_names=[weighted_prefix + "f1"],
             ),
         ]
+
+    def test_context_per_iteration(self) -> None:
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        model.eval()
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelinePT2(
+            model,
+            optimizer,
+            device,
+            compile_configs=TorchCompileConfig(compile_on_iter=100),
+        )
+        dataloader = iter(
+            [
+                ModelInputSimple(
+                    float_features=torch.full((10,), float(index)),
+                    label=torch.zeros(1),
+                )
+                for index in range(2)
+            ]
+        )
+
+        pipeline.progress(dataloader)
+        first_context = pipeline._cur_context
+        pipeline.progress(dataloader)
+        second_context = pipeline._cur_context
+
+        self.assertIsNotNone(first_context)
+        self.assertIsNotNone(second_context)
+        self.assertIsNot(first_context, second_context)
+        self.assertEqual(cast(TrainPipelineContext, first_context).index, 0)
+        self.assertEqual(cast(TrainPipelineContext, second_context).index, 1)
+
+        with self.assertRaises(StopIteration):
+            pipeline.progress(dataloader)
+        self.assertIsNone(pipeline._cur_batch)
+        self.assertIsNone(pipeline._cur_context)
+
+        pipeline.reset()
+        self.assertIsNone(pipeline._cur_context)
+
+    def test_context_stays_paired_when_copy_fails(self) -> None:
+        class FailingModelInput(ModelInputSimple):
+            def to(self, device: torch.device, non_blocking: bool) -> ModelInputSimple:
+                raise RuntimeError("copy failed")
+
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelinePT2(model, optimizer, device)
+        batch = FailingModelInput(
+            float_features=torch.zeros(10),
+            label=torch.zeros(1),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            pipeline.progress(iter([batch]))
+
+        self.assertIs(pipeline._cur_batch, batch)
+        self.assertEqual(
+            cast(TrainPipelineContext, pipeline._cur_context).index,
+            0,
+        )
 
     def gen_model(
         self, device: torch.device, ebc_list: List[EmbeddingBagConfig]
