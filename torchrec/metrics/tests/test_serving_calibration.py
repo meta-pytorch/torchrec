@@ -6,8 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 
-# pyre-strict
-
 import unittest
 from typing import Dict, Optional, Type
 

@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """Triton replacement for `fbgemm.permute_2D_sparse_data`, for the two regimes
 where fbgemm's per-segment launch shape costs more than the copy itself.

@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """
 Shared helpers for the CUDA Graphs dense-path work on ``DLRM``: building a small

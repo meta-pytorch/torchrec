@@ -6,8 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 
-# pyre-strict
-
 from enum import Enum
 from typing import Dict, List
 
