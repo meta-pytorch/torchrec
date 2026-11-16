@@ -114,6 +114,10 @@ jobs:
         else
           conda create -y --name build_binary "${conda_channel_args[@]}" python=${{ matrix.python.version }}
         fi
+        conda_prefix=$(conda run -n build_binary printenv CONDA_PREFIX)
+        : "${conda_prefix:?Failed to resolve build_binary CONDA_PREFIX}"
+        conda env config vars set -n build_binary \
+          LD_LIBRARY_PATH="${conda_prefix}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
         conda run -n build_binary \
           python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}') if sys.version >= '3.13' else print('python GIL enabled: true')"
         conda info
