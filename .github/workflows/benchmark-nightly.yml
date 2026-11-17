@@ -33,7 +33,7 @@ jobs:
       matrix:
         cuda-tag: ["cu126", "cu130"]
         os:
-          - linux.g5.12xlarge.nvidia.gpu
+          - mt-l-x86aavx2-45-167-a10g-4
         python:
           - version: "3.13"
             tag: "py313"
@@ -42,7 +42,7 @@ jobs:
         exclude:
           - is_pr: true
             cuda-tag: "cu126"
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
     permissions:
       id-token: write
       contents: read
