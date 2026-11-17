@@ -9,8 +9,21 @@
 
 import itertools
 import logging
+import os
+import weakref
 from contextlib import nullcontext
-from typing import cast, Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    cast,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import torch
 from torch import distributed as dist
@@ -21,7 +34,11 @@ from torch.profiler import record_function
 # old PackageImporter resolves dist_data from the frozen snapshot which may
 # predate this helper.
 try:
-    from torchrec.distributed.dist_data import _check_int_overflow
+    from torchrec.distributed.dist_data import (
+        _check_int_overflow,
+        _get_kjt_input_split_tensors,
+        _list_to_device,
+    )
 except ImportError:
     torch._C._log_api_usage_once(
         "torchrec.distributed.train_pipeline.import_failure._check_int_overflow"
@@ -29,6 +46,19 @@ except ImportError:
 
     def _check_int_overflow(*args: object, **kwargs: object) -> bool:  # type: ignore[misc]
         return False
+
+    def _get_kjt_input_split_tensors(  # type: ignore[misc]
+        *args: object,
+        **kwargs: object,
+    ) -> Optional[List[torch.Tensor]]:
+        return None
+
+    def _list_to_device(  # type: ignore[misc]
+        data: List[int],
+        device: Optional[torch.device],
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        return torch.tensor(data, device=device, dtype=dtype)
 
 
 from torchrec.distributed.embedding_sharding import KJTSplitsAllToAllMeta
@@ -102,13 +132,191 @@ class BaseForward(Generic[TForwardContext]):
     def get_context(self) -> TForwardContext:
         return self._context
 
+    def _write_with_reused_input_dist_if_requested(
+        self,
+        ctx: Multistreamable,
+        inputs: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> None:
+        if kwargs.get("write") is not True:
+            return
+        features = inputs[0] if inputs else kwargs.get("features")
+        if not isinstance(features, KeyedJaggedTensor):
+            raise ValueError("write=True requires a KeyedJaggedTensor forward input")
+        write_with_reused_input_dist = getattr(
+            self._module, "write_with_reused_input_dist", None
+        )
+        if not callable(write_with_reused_input_dist):
+            raise ValueError(
+                "write=True requires a sharded module with routing reuse support"
+            )
+        write_with_reused_input_dist(features, ctx)
+
+
+# Set when TORCHREC_PIPELINED_FWD_EVENT_REUSE_CHECK sees a mismatch.
+_dist_event_reuse_disabled = False
+
+
+def _dist_wait_is_launch_free(request: Awaitable[Any], stream: torch.Stream) -> bool:
+    """
+    True only if `request.wait()`, run with `stream` current, enqueues no kernel,
+    copy or stream wait: a callback-free KJTListAwaitable whose members are
+    callback-free NoWait KJTs (with no device-side stride_per_key_per_rank to read
+    back) or KJTAllToAllTensorsAwaitables prefetched on `stream`, whose wait only
+    host-synchronizes the prefetch event. Must run before `wait()`, which consumes
+    the prefetch. Freeing the pinned length_per_key buffer in that wait can still
+    record a caching-host-allocator event on `stream`; no stream waits on it.
+    """
+    try:
+        from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
+        from torchrec.distributed.embedding_sharding import KJTListAwaitable
+        from torchrec.distributed.types import NoWait
+    except ImportError:
+        return False
+    if type(request) is not KJTListAwaitable or request.callbacks:
+        return False
+    for awaitable in request.awaitables:
+        if awaitable.callbacks:
+            return False
+        if type(awaitable) is NoWait:
+            kjt = awaitable._obj
+            if type(kjt) is not KeyedJaggedTensor:
+                return False
+            stride_per_key_per_rank = kjt._stride_per_key_per_rank
+            if (
+                kjt.variable_stride_per_key()
+                and stride_per_key_per_rank is not None
+                and stride_per_key_per_rank.device.type != "cpu"
+            ):
+                return False
+        elif type(awaitable) is KJTAllToAllTensorsAwaitable:
+            prefetched = getattr(awaitable, "_prefetched", None)
+            if awaitable._workers == 1 or prefetched is None or prefetched[4] != stream:
+                return False
+        else:
+            return False
+    return True
+
 
 class PipelinedForward(BaseForward[TrainPipelineContext]):
     """
     This pipeline is used in TrainPipelineSparseDist
+
+    With TORCHREC_PIPELINED_FWD_EVENT_REUSE=1 the current stream waits on the
+    dist-stream event that an earlier pipelined forward of the same batch recorded
+    when `request.wait()` enqueues nothing and the request was already pending at
+    that record; otherwise it records a new event, as `wait_stream` does.
+    Requests that cannot be hashed or weakly referenced never reuse an event.
+
+    The reuse requires that, between that record and the reusing wait, nothing
+    other than these launch-free waits enqueues work (kernels, copies, in-place
+    writes) on the dist stream or makes the dist stream wait on another stream.
+    TrainPipelineSparseDist meets this: its dist-stream work
+    (start_sparse_data_dist, wait_sparse_data_dist,
+    clear_sparse_data_dist_inputs) runs outside the model forward.
     """
 
     _use_main_stream_for_dist_init = False
+    _dist_event_reuse_logged = False
+    _dist_event_reuse_check_batches = 3
+
+    def _dist_ready_events(
+        self,
+    ) -> Optional[Dict[torch.Stream, Tuple[torch.Event, "weakref.WeakSet[Any]"]]]:
+        """
+        Per dist stream, the last event recorded for this batch and the requests
+        pending at that record; None when the event reuse is off for this call.
+        """
+        if (
+            torch.compiler.is_compiling()
+            or os.environ.get("TORCHREC_PIPELINED_FWD_EVENT_REUSE", "1") != "1"
+            or _dist_event_reuse_disabled
+            or self._stream is None
+            or self._use_main_stream_for_dist_init
+        ):
+            return None
+        index = self._context.index
+        if index is None:
+            return None
+        state = getattr(self._context, "_pipelined_fwd_dist_ready_events", None)
+        if state is None or state[0] != index:
+            state = (index, {})
+            # pyrefly: ignore[missing-attribute]
+            self._context._pipelined_fwd_dist_ready_events = state
+        return state[1]
+
+    def _wait_dist_ready(
+        self,
+        ready_events: Dict[torch.Stream, Tuple[torch.Event, "weakref.WeakSet[Any]"]],
+        reusable: Optional[torch.Event],
+        data: Multistreamable,
+    ) -> None:
+        stream = cast(torch.Stream, self._stream)
+        cur_stream = torch.get_device_module(self._device).current_stream()
+        if reusable is None:
+            pending: "weakref.WeakSet[Any]" = weakref.WeakSet()
+            for r in self._context.input_dist_tensors_requests.values():
+                if isinstance(r, Awaitable):
+                    try:
+                        pending.add(r)
+                    except TypeError:
+                        pass
+            event = stream.record_event()
+            cur_stream.wait_event(event)
+            ready_events[stream] = (event, pending)
+        else:
+            cur_stream.wait_event(reusable)
+            if (
+                cast(int, self._context.index) < self._dist_event_reuse_check_batches
+                and os.environ.get("TORCHREC_PIPELINED_FWD_EVENT_REUSE_CHECK", "1")
+                == "1"
+            ):
+                self._check_dist_ready(data)
+        if not self._dist_event_reuse_logged:
+            self._dist_event_reuse_logged = True
+            logger.info(
+                f"PipelinedForward {self._name}: dist-stream event "
+                f"{'recorded' if reusable is None else 'reused'} at batch "
+                f"{self._context.index} (TORCHREC_PIPELINED_FWD_EVENT_REUSE)"
+            )
+
+    def _check_dist_ready(self, data: Multistreamable) -> None:
+        """
+        Compares the bytes of the KJT tensors as the current stream reads them
+        right after the reused event with their bytes after a device synchronize,
+        so NaNs with equal bit patterns compare equal.
+        """
+        global _dist_event_reuse_disabled
+        tensors = [
+            t
+            for kjt in cast(Iterable[KeyedJaggedTensor], data)
+            for t in (
+                kjt.values(),
+                kjt.lengths_or_none(),
+                kjt.offsets_or_none(),
+                kjt.weights_or_none(),
+            )
+            if t is not None
+        ]
+        seen = [t.clone() for t in tensors]
+        torch.get_device_module(self._device).synchronize()
+        if all(
+            torch.equal(
+                a.contiguous().reshape(-1).view(torch.uint8),
+                b.contiguous().reshape(-1).view(torch.uint8),
+            )
+            for a, b in zip(seen, tensors)
+        ):
+            logger.info(
+                f"PipelinedForward {self._name}: dist-stream event reuse check "
+                f"passed at batch {self._context.index} ({len(tensors)} tensors)"
+            )
+        else:
+            _dist_event_reuse_disabled = True
+            logger.error(
+                f"PipelinedForward {self._name}: dist-stream event reuse check "
+                f"failed at batch {self._context.index}; event reuse disabled"
+            )
 
     def __call__(self, *input, **kwargs) -> Awaitable:
         if self._name not in self._context.input_dist_tensors_requests:
@@ -127,6 +335,18 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
         # once in the model's forward pass. For more details: https://github.com/meta-pytorch/torchrec/pull/3294
         request = self._context.input_dist_tensors_requests.pop(self._name)
         assert isinstance(request, Awaitable)
+        ready_events = self._dist_ready_events()
+        reusable: Optional[torch.Event] = None
+        if ready_events is not None:
+            stream = cast(torch.Stream, self._stream)
+            recorded = ready_events.get(stream)
+            if recorded is not None:
+                try:
+                    was_pending = request in recorded[1]
+                except TypeError:
+                    was_pending = False
+                if was_pending and _dist_wait_is_launch_free(request, stream):
+                    reusable = recorded[0]
         with record_function("## runtime_forward_assemble_KJT ##"):
             stream_ctx = (
                 nullcontext()
@@ -143,9 +363,12 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
         ctx = self._context.module_contexts.pop(self._name)
 
         if self._stream is not None:
-            torch.get_device_module(self._device).current_stream().wait_stream(
-                self._stream
-            )
+            if ready_events is None:
+                torch.get_device_module(self._device).current_stream().wait_stream(
+                    self._stream
+                )
+            else:
+                self._wait_dist_ready(ready_events, reusable, data)
             cur_stream = torch.get_device_module(self._device).current_stream()
 
             assert isinstance(
@@ -154,7 +377,9 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
             data.record_stream(cur_stream)
             ctx.record_stream(cur_stream)
 
-        return self._module.compute_and_output_dist(ctx, data)
+        output = self._module.compute_and_output_dist(ctx, data)
+        self._write_with_reused_input_dist_if_requested(ctx, input, kwargs)
+        return output
 
 
 class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
@@ -209,6 +434,8 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
             embeddings = (
                 awaitable.wait()
             )  # trigger awaitable manually for type checking
+
+        self._write_with_reused_input_dist_if_requested(ctx, input, kwargs)
 
         # pyrefly: ignore[bad-argument-type]
         self.detach_embeddings(embeddings=embeddings, cur_stream=cur_stream)
@@ -512,15 +739,24 @@ class KJTAllToAllForward:
             local_keys = input.keys()[
                 self._splits_cumsum[rank] : self._splits_cumsum[rank + 1]
             ]
-            input_splits = input.dist_splits(self._splits)
             device = input.values().device
-            splits_tensors = [
-                torch.tensor(splits, device=device) for splits in input_splits
-            ]
+            input_split_tensors = _get_kjt_input_split_tensors(input, self._splits)
+            input_splits = (
+                input.dist_splits(self._splits) if input_split_tensors is None else []
+            )
+            splits_tensors = (
+                [_list_to_device(splits, device) for splits in input_splits]
+                if input_split_tensors is None
+                else input_split_tensors
+            )
             if not input.variable_stride_per_key():
                 input_stride = input.stride()
                 splits_tensors.append(
-                    torch.tensor([input_stride] * self._pg.size(), device=device)
+                    _list_to_device(
+                        [input_stride] * self._pg.size(),
+                        device,
+                        splits_tensors[0].dtype,
+                    )
                 )
                 # Log corrupted input stride before it enters the
                 # AllToAll pipeline.
@@ -557,4 +793,5 @@ class KJTAllToAllForward:
                 keys=local_keys,
                 device=device,
                 stagger=self._stagger,
+                input_splits_are_tensors=input_split_tensors is not None,
             )

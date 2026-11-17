@@ -23,6 +23,7 @@ from torchrec.distributed._collective_tag import (
 )
 from torchrec.distributed.collective_utils import validate_collectives_enabled
 from torchrec.distributed.comm_ops import (
+    _is_fbgemm_mx4_codec,
     all_gather_base_pooled,
     alltoall_pooled,
     alltoall_sequence,
@@ -35,6 +36,7 @@ from torchrec.distributed.comm_ops import (
     reduce_scatter_base_pooled,
     reduce_scatter_v_per_feature_pooled,
     reduce_scatter_v_pooled,
+    Request,
     SeqA2APrecomputedSend,
     SIDE_STREAM_OUTPUT_ENCODE_ENV,
     variable_batch_alltoall_pooled,
@@ -48,7 +50,7 @@ from torchrec.distributed.types import (
     rank_device,
 )
 from torchrec.fx.utils import fx_marker
-from torchrec.pt2.checks import is_torchdynamo_compiling
+from torchrec.pt2.checks import is_pt2_compiling, is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 # _safe_tolist and _cuda_to_cpu_safe were added in D101235037 / D101269943.
@@ -158,6 +160,7 @@ _DTYPE_MAX: Dict[torch.dtype, int] = {
 }
 
 _TORCHREC_OVERFLOW_DEBUG: bool = os.environ.get("TORCHREC_OVERFLOW_DEBUG", "0") == "1"
+_LOGGED_ASYNC_LENGTH_PER_KEY: bool = False
 
 
 def _safe_tolist_2d(tensor: torch.Tensor) -> List[List[int]]:
@@ -235,6 +238,21 @@ def _check_int_overflow(
     return False
 
 
+def _list_to_device(
+    data: List[int],
+    device: Optional[torch.device],
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    if device is None or device.type != "cuda" or is_pt2_compiling():
+        return torch.tensor(data, device=device, dtype=dtype)
+    # A copy from pageable memory blocks the host until queued GPU work drains.
+    # Consumers run on the current stream or wait on an all-to-all issued after
+    # this copy on it.
+    return torch.tensor(data, dtype=dtype, pin_memory=True).to(
+        device, non_blocking=True
+    )
+
+
 def _get_recat_data(
     local_split: int,
     num_splits: int,
@@ -250,7 +268,7 @@ def _get_recat_data(
         i + j * local_split for i in range(local_split) for j in feature_order
     )
     try:
-        recat_tensor = torch.tensor(recat, device=device, dtype=torch.int32)
+        recat_tensor = _list_to_device(list(recat), device, torch.int32)
     except RuntimeError as e:
         recat_sample = recat if len(recat) <= 16 else recat[:8] + recat[-8:]
         logger.error(
@@ -360,15 +378,11 @@ def _apply_variable_batch_per_rank_if_needed(
     )
 
     try:
-        input_offset_tensor = torch.tensor(
-            input_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
+        input_offset_tensor = _list_to_device(
+            input_offset, recat_tensor.device, torch.int32
         )
-        output_offset_tensor = torch.tensor(
-            output_offset,
-            device=recat_tensor.device,
-            dtype=torch.int32,
+        output_offset_tensor = _list_to_device(
+            output_offset, recat_tensor.device, torch.int32
         )
     except RuntimeError as e:
         logger.error(
@@ -422,10 +436,10 @@ def _apply_variable_batch_per_rank_tensor_if_needed(
         local_split=local_split,
         num_splits=num_splits,
     )
-    batch_size_per_feature = torch.tensor(
+    batch_size_per_feature = _list_to_device(
         batch_size_per_rank,
-        device=recat_tensor.device,
-        dtype=torch.int32,
+        recat_tensor.device,
+        torch.int32,
     ).repeat_interleave(
         local_split,
         output_size=num_splits * local_split,
@@ -629,6 +643,8 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         self._collective_tag = collective_tag
         self._collective_tag_parts = collective_tag_parts
         self._num_original_tensors = len(input_tensors)
+        self._input_list: Optional[List[List[int]]] = None
+        self._wait_complete: bool = False
 
         # Append tag tensor for collective mismatch validation.
         # Requires non-empty input_tensors to inherit device/dtype.
@@ -650,10 +666,8 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     f"(max={torch.iinfo(dtype).max}). "
                     f"Splits tensors should be int32 or int64."
                 )
-            tag_tensor = torch.tensor(
-                [collective_tag] * self.num_workers,
-                device=input_tensors[0].device,
-                dtype=dtype,
+            tag_tensor = _list_to_device(
+                [collective_tag] * self.num_workers, input_tensors[0].device, dtype
             )
             input_tensors = input_tensors + [tag_tensor]
             self._tag_appended = True
@@ -852,12 +866,25 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                 input_last_row=input_list[-1] if input_list else None,
             )
 
+        if input_list:
+            self._input_list = input_list
+        self._wait_complete = True
+
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
             for i in range(len(ret)):
                 for j in range(len(ret[i])):
                     torch._check_is_size(ret[i][j])
 
         return ret
+
+    def input_list(self) -> List[List[int]]:
+        if not self._wait_complete:
+            raise RuntimeError("wait() must complete before reading input splits")
+        if self._input_list is None:
+            self._input_list = _safe_tolist_2d(
+                self._input_tensor.view(self.num_workers, -1).T
+            )[: self._num_original_tensors]
+        return self._input_list
 
 
 class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
@@ -911,6 +938,17 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         self._keys = keys
         self._stagger = stagger
         self._stride_per_rank = stride_per_rank
+        # (lengths, values, weights, length_per_key on pinned host, stream, event)
+        self._prefetched: Optional[
+            Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                Optional[torch.Tensor],
+                torch.Tensor,
+                torch.Stream,
+                torch.Event,
+            ]
+        ] = None
 
         if stride_per_rank is not None:
             _check_int_overflow(
@@ -1063,6 +1101,109 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         # So no need to copy
         return self.__recat
 
+    def prefetch_length_per_key(self) -> None:
+        """
+        Runs `dist_init`'s recat right behind the AlltoAll on the current stream and
+        copies the output length_per_key into pinned host memory without blocking,
+        so `wait()` returns the same synced KJT without draining queued GPU work.
+
+        A no-op where `dist_init` would take another path.
+        """
+        stride_per_rank = self._stride_per_rank
+        if (
+            type(self) is not KJTAllToAllTensorsAwaitable
+            or self._workers == 1
+            or is_torchdynamo_compiling()
+            or self._device.type != "cuda"
+            or type(self._input) is not KeyedJaggedTensor
+            or self._input.variable_stride_per_key()
+            or stride_per_rank is None
+            or self.__recat is None
+            or len(self._keys) == 0
+            or len(self._output_tensors) not in (2, 3)
+            or len(self._awaitables) != len(self._output_tensors)
+        ):
+            return
+        stride = sum(stride_per_rank)
+        if stride == 0:
+            return
+
+        stream = torch.get_device_module(self._device).current_stream()
+        for awaitable in self._awaitables:
+            awaitable.wait()
+        lengths = self._output_tensors[0]
+        values = self._output_tensors[1]
+        weights = self._output_tensors[2] if len(self._output_tensors) == 3 else None
+        with record_function("## dist_init:recat_values ##"):
+            if all(s == stride_per_rank[0] for s in stride_per_rank):
+                (
+                    lengths,
+                    values,
+                    weights,
+                ) = torch.ops.fbgemm.permute_2D_sparse_data(
+                    self.__recat,
+                    lengths.view(-1, stride_per_rank[0]),
+                    values,
+                    weights,
+                    values.numel(),
+                )
+                lengths = lengths.view(-1)
+            else:
+                (
+                    lengths,
+                    values,
+                    weights,
+                ) = torch.ops.fbgemm.permute_1D_sparse_data(
+                    self.__recat,
+                    lengths.view(-1),
+                    values,
+                    weights,
+                    values.numel(),
+                )
+        length_per_key = torch.sum(lengths.view(len(self._keys), stride), dim=1)
+        length_per_key_host = torch.empty(
+            length_per_key.shape, dtype=length_per_key.dtype, pin_memory=True
+        )
+        length_per_key_host.copy_(length_per_key, non_blocking=True)
+        self._prefetched = (
+            lengths,
+            values,
+            weights,
+            length_per_key_host,
+            stream,
+            stream.record_event(),
+        )
+        for tensor in self._output_tensors:
+            tensor.record_stream(stream)
+        self._output_tensors = []
+        global _LOGGED_ASYNC_LENGTH_PER_KEY
+        if not _LOGGED_ASYNC_LENGTH_PER_KEY:
+            _LOGGED_ASYNC_LENGTH_PER_KEY = True
+            logger.info(
+                f"KJTAllToAllTensorsAwaitable: async length_per_key prefetch active "
+                f"({len(self._keys)} keys, stride {stride})"
+            )
+
+    def _wait_prefetched(self) -> KeyedJaggedTensor:
+        assert self._prefetched is not None and self._stride_per_rank is not None
+        lengths, values, weights, length_per_key_host, stream, ready = self._prefetched
+        self._prefetched = None
+        ready.synchronize()
+        current_stream = torch.get_device_module(self._device).current_stream()
+        if current_stream != stream:
+            current_stream.wait_event(ready)
+            for tensor in (lengths, values, weights):
+                if tensor is not None:
+                    tensor.record_stream(current_stream)
+        return KeyedJaggedTensor(
+            keys=self._keys,
+            values=values,
+            weights=weights,
+            lengths=lengths,
+            stride=sum(self._stride_per_rank),
+            length_per_key=length_per_key_host.tolist(),
+        ).sync()
+
     def _wait_impl(self) -> KeyedJaggedTensor:
         """
         Overwrites wait function as we don't handle callbacks here.
@@ -1074,6 +1215,9 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         if self._workers == 1:
             self._input.sync()
             return self._input
+
+        if self._prefetched is not None:
+            return self._wait_prefetched()
 
         if not is_torchdynamo_compiling():
             # dist.Work.wait() is idempotent, so this is safe even if
@@ -1121,6 +1265,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
         keys: List[str],
         device: torch.device,
         stagger: int,
+        input_split_tensors: Optional[List[torch.Tensor]] = None,
     ) -> None:
         super().__init__()
         self._workers: int = pg.size()
@@ -1133,6 +1278,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
         self._input_tensors = input_tensors
         self._keys = keys
         self._stagger = stagger
+        self._input_splits_are_tensors: bool = input_split_tensors is not None
         self._output_splits: List[List[int]] = self._input_splits
         self._stride_per_rank: Optional[List[int]] = (
             None
@@ -1156,12 +1302,18 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
         if self._workers == 1:
             return
 
-        input_tensors = [
-            torch.tensor(splits, device=device) for splits in self._input_splits
-        ]
+        split_tensors = (
+            [_list_to_device(splits, device) for splits in self._input_splits]
+            if input_split_tensors is None
+            else input_split_tensors
+        )
         if not self._input.variable_stride_per_key():
-            input_tensors.append(
-                torch.tensor([input.stride()] * self._workers, device=device)
+            split_tensors.append(
+                _list_to_device(
+                    [input.stride()] * self._workers,
+                    device,
+                    split_tensors[0].dtype,
+                )
             )
 
         # Log all input split tensors being sent into the AllToAll.
@@ -1202,7 +1354,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
                 ],
             )
         self._splits_awaitable = SplitsAllToAllAwaitable(
-            input_tensors,
+            split_tensors,
             self._pg,
             collective_tag=collective_tag,
             collective_tag_parts=tag_parts,
@@ -1218,6 +1370,13 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
 
         if self._workers > 1:
             output_list = self._splits_awaitable.wait()
+            if self._input_splits_are_tensors:
+                input_list = self._splits_awaitable.input_list()
+                self._input_splits = (
+                    input_list
+                    if self._input.variable_stride_per_key()
+                    else input_list[:-1]
+                )
             if self._input.variable_stride_per_key():
                 self._output_splits = output_list
             else:
@@ -1263,6 +1422,88 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
             stagger=self._stagger,
             stride_per_rank=self._stride_per_rank,
         )
+
+
+def _get_kjt_input_split_tensors(
+    input: KeyedJaggedTensor,
+    splits: List[int],
+) -> Optional[List[torch.Tensor]]:
+    """Build contiguous feature splits without materializing GPU data on CPU.
+
+    TORCHREC_KJT_DEVICE_INPUT_SPLITS=1 (read per call) turns this on. Off by
+    default: with device split tensors, KJTSplitsAllToAllMeta.input_splits stays
+    empty until the splits all-to-all completes."""
+    if os.environ.get("TORCHREC_KJT_DEVICE_INPUT_SPLITS", "0") != "1":
+        return None
+    if len(splits) <= 1 or any(split < 0 for split in splits):
+        return None
+
+    lengths = input.lengths()
+    feature_offsets = [0] + list(itertools.accumulate(splits))
+    equal_splits = all(split == splits[0] for split in splits)
+    key_splits = (
+        torch.full(
+            (len(splits),),
+            splits[0],
+            dtype=torch.int64,
+            device=lengths.device,
+        )
+        if equal_splits
+        else torch.tensor(
+            splits,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=lengths.device.type != "cpu",
+        ).to(device=lengths.device, non_blocking=True)
+    )
+    if input.variable_stride_per_key():
+        stride_per_key_per_rank = input._stride_per_key_per_rank
+        if stride_per_key_per_rank is not None:
+            stride_per_key = stride_per_key_per_rank.sum(
+                dim=1,
+                dtype=torch.int64,
+            ).to(device=lengths.device, non_blocking=True)
+            batch_size_per_split = torch.ops.fbgemm.segment_sum_csr(
+                1,
+                torch.ops.fbgemm.asynchronous_complete_cumsum(key_splits),
+                stride_per_key,
+            )
+        else:
+            stride_per_key = input._stride_per_key
+            if stride_per_key is not None:
+                batch_size_per_split = torch.tensor(
+                    [
+                        sum(
+                            stride_per_key[
+                                feature_offsets[rank] : feature_offsets[rank + 1]
+                            ]
+                        )
+                        for rank in range(len(splits))
+                    ],
+                    dtype=torch.int64,
+                    device=lengths.device,
+                )
+            elif input._stride is not None:
+                batch_size_per_split = key_splits * input._stride
+            else:
+                return None
+    else:
+        stride = input.stride()
+        batch_size_per_split = key_splits * stride
+    batch_size_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+        batch_size_per_split
+    )
+    length_per_split = torch.ops.fbgemm.segment_sum_csr(
+        1,
+        batch_size_offsets,
+        lengths,
+    )
+    tensor_splits = [batch_size_per_split, length_per_split]
+    if input.variable_stride_per_key():
+        tensor_splits.append(key_splits)
+    if input.weights_or_none() is not None:
+        tensor_splits.append(length_per_split)
+    return tensor_splits
 
 
 class KJEAllToAll(nn.Module):
@@ -1360,16 +1601,25 @@ class KJEAllToAll(nn.Module):
                 self._splits_cumsum[rank] : self._splits_cumsum[rank + 1]
             ]
 
+            input_split_tensors = _get_kjt_input_split_tensors(
+                input,
+                self._splits,
+            )
             return KJTAllToAllSplitsAwaitable(
                 pg=self._pg,
                 input=input,
                 splits=self._splits,
                 labels=input.dist_labels(),
-                tensor_splits=input.dist_splits(self._splits),
+                tensor_splits=(
+                    input.dist_splits(self._splits)
+                    if input_split_tensors is None
+                    else []
+                ),
                 input_tensors=input.dist_tensors(),
                 keys=local_keys,
                 device=input.device(),
                 stagger=self._stagger,
+                input_split_tensors=input_split_tensors,
             )
 
 
@@ -2228,6 +2478,64 @@ class PooledEmbeddingsAllGather(nn.Module):
         return PooledEmbeddingsAwaitable(tensor_awaitable=tensor_awaitable)
 
 
+def _unbucketize_gather_bwd() -> bool:
+    """TORCHREC_UNBUCKETIZE_GATHER_BWD=1: _UnbucketizePermute.backward gathers
+    through the inverse permutation instead of scattering with index_copy_."""
+    return os.environ.get("TORCHREC_UNBUCKETIZE_GATHER_BWD", "1") == "1"
+
+
+def _seq_a2a_unbucketize_rowmap() -> bool:
+    """TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP=1: SequenceEmbeddingsAwaitable hands a
+    bijective unbucketize permute to the MX4 sequence all-to-all, whose wait
+    applies it to the packed rows (comm_ops._seq_a2a_fwd_decode_unbucketize)."""
+    return os.environ.get("TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP", "1") == "1"
+
+
+def _unbucketize_perm_is_bijection(perm: torch.Tensor) -> bool:
+    """Whether ``perm`` is a permutation of [0, numel); one device-to-host sync."""
+    return torch.equal(
+        torch.sort(perm).values,
+        torch.arange(perm.numel(), device=perm.device, dtype=perm.dtype),
+    )
+
+
+class _UnbucketizePermute(torch.autograd.Function):
+    """index_select by a bijective permutation. Every output row comes from a
+    distinct source row and every source row is used, so the backward scatters
+    with index_copy_ into an uninitialized buffer instead of zero-fill plus
+    atomic index_add_. With TORCHREC_UNBUCKETIZE_GATHER_BWD=1 it instead
+    gathers grad through the inverse permutation, a plain row copy either way.
+    """
+
+    @staticmethod
+    # pyrefly: ignore[bad-override]
+    def forward(ctx, src: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(perm)
+        return torch.index_select(src, 0, perm)
+
+    @staticmethod
+    # pyrefly: ignore[bad-override]
+    def backward(ctx, grad: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        (perm,) = ctx.saved_tensors
+        if _unbucketize_gather_bwd():
+            # out[i] = src[perm[i]], so grad_src[r] = grad[inv[r]], inv[perm[i]] = i.
+            # invert_permute leaves rows absent from perm uninitialized; clamp_
+            # keeps every gathered index in range even if perm is not a bijection.
+            inv = torch.ops.fbgemm.invert_permute(perm).clamp_(0, perm.numel() - 1)
+            return grad.index_select(0, inv), None
+        # index_copy_ takes only int64 indices; .long() is a no-op for int64.
+        return grad.new_empty(grad.shape).index_copy_(0, perm.long(), grad), None
+
+
+def unbucketize_rows(src: torch.Tensor, permute: torch.Tensor) -> torch.Tensor:
+    """src.index_select(0, permute) for a bijective ``permute``, as the
+    SequenceEmbeddingsAwaitable callback computes it in eager mode: through
+    _UnbucketizePermute when src needs a gradient."""
+    if torch.is_grad_enabled() and src.requires_grad:
+        return _UnbucketizePermute.apply(src, permute)
+    return torch.index_select(src, 0, permute)
+
+
 class SequenceEmbeddingsAwaitable(Awaitable[torch.Tensor]):
     """
     Awaitable for sequence embeddings after collective operation.
@@ -2238,6 +2546,20 @@ class SequenceEmbeddingsAwaitable(Awaitable[torch.Tensor]):
         unbucketize_permute_tensor (Optional[torch.Tensor]): stores the permute order of
             KJT bucketize (for row-wise sharding only).
         embedding_dim (int): embedding dimension.
+        unbucketize_perm_is_bijection (Optional[Callable[[torch.Tensor], bool]]): the
+            producer's verdict on whether its permutes are bijections; when True, the
+            unbucketize backward copies rows instead of zero-fill plus atomic add.
+
+    With TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP=1, an MX4 all-to-all Request and a
+    bijective permute, the wait hands the permute to the Request, whose wait may
+    return the rows already in unbucketize order (see comm_ops); the callback
+    then passes them through.
+
+    With TORCHREC_SEQ_UNBUCKETIZE_COMPOSE (torchrec.distributed.embedding), a
+    caller that applies the permute in its own row gather takes it from
+    unbucketize_permute_for_compose and calls skip_unbucketize before the wait,
+    which then returns the rows in all-to-all order: neither the callback nor
+    the row-map hand-off applies the permute.
     """
 
     def __init__(
@@ -2245,22 +2567,51 @@ class SequenceEmbeddingsAwaitable(Awaitable[torch.Tensor]):
         tensor_awaitable: Awaitable[torch.Tensor],
         unbucketize_permute_tensor: Optional[torch.Tensor],
         embedding_dim: int,
+        unbucketize_perm_is_bijection: Optional[Callable[[torch.Tensor], bool]] = None,
     ) -> None:
         super().__init__()
         self._tensor_awaitable = tensor_awaitable
-
-        if unbucketize_permute_tensor is not None and not (
-            fold_row_permute_into_seq_decode(
+        self._unbucketize_permute = unbucketize_permute_tensor
+        self._unbucketize_perm_is_bijection = unbucketize_perm_is_bijection
+        # Whether the all-to-all wait returned the rows already unbucketized.
+        self._row_map_applied: List[bool] = [False]
+        # Whether the caller applies the unbucketize permute (skip_unbucketize).
+        self._skip_unbucketize: List[bool] = [False]
+        # The trunk permute-before-decode fold and the row-map hand-off must not
+        # both apply the permute.
+        self._row_permute_folded: bool = (
+            unbucketize_permute_tensor is not None
+            and fold_row_permute_into_seq_decode(
                 tensor_awaitable, unbucketize_permute_tensor
             )
-        ):
-            self.callbacks.append(
-                lambda ret: torch.index_select(
-                    ret.view(-1, embedding_dim),
-                    0,
-                    unbucketize_permute_tensor,
-                )
-            )
+        )
+
+        if unbucketize_permute_tensor is not None and not self._row_permute_folded:
+            permute: torch.Tensor = unbucketize_permute_tensor
+            is_bijection = unbucketize_perm_is_bijection
+            row_map_applied = self._row_map_applied
+            skip_unbucketize = self._skip_unbucketize
+
+            def _unbucketize(ret: torch.Tensor) -> torch.Tensor:
+                if row_map_applied[0]:
+                    return ret
+                src = ret.view(-1, embedding_dim)
+                if skip_unbucketize[0]:
+                    return src
+                if (
+                    is_bijection is not None
+                    and not torch.jit.is_scripting()
+                    and not is_torchdynamo_compiling()
+                    and not torch.fx._symbolic_trace.is_fx_tracing()
+                    and torch.is_grad_enabled()
+                    and src.requires_grad
+                    and permute.numel() == src.size(0)
+                    and is_bijection(permute)
+                ):
+                    return _UnbucketizePermute.apply(src, permute)
+                return torch.index_select(src, 0, permute)
+
+            self.callbacks.append(_unbucketize)
 
     def _wait_impl(self) -> torch.Tensor:
         """
@@ -2270,8 +2621,66 @@ class SequenceEmbeddingsAwaitable(Awaitable[torch.Tensor]):
             torch.Tensor: synced sequence embeddings.
         """
 
+        request = self._row_map_request()
         ret = self._tensor_awaitable.wait()
+        if request is not None:
+            self._row_map_applied[0] = request.row_map_applied
         return ret
+
+    def unbucketize_permute_for_compose(self) -> Optional[torch.Tensor]:
+        """The unbucketize permute, for a caller that applies it in its own
+        row gather (TORCHREC_SEQ_UNBUCKETIZE_COMPOSE), if the producer's verdict
+        is that it is a bijection and the unbucketize callback is the only
+        callback; else None."""
+        permute = self._unbucketize_permute
+        is_bijection = self._unbucketize_perm_is_bijection
+        if (
+            permute is None
+            or is_bijection is None
+            or len(self.callbacks) != 1
+            or not is_bijection(permute)
+        ):
+            return None
+        return permute
+
+    def skip_unbucketize(self) -> None:
+        """Makes the wait return the [rows, dim] rows in all-to-all order:
+        neither the unbucketize callback nor the row-map hand-off
+        (TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP) applies the permute. For the
+        caller of unbucketize_permute_for_compose."""
+        self._skip_unbucketize[0] = True
+
+    def _row_map_request(self) -> Optional[Request[torch.Tensor]]:
+        """With TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP=1, hands the unbucketize
+        permute to the all-to-all Request and returns the Request, or returns
+        None. The permute must be a bijection: the all-to-all backward then
+        gathers the gradient through its inverse, like _UnbucketizePermute.
+        None after skip_unbucketize."""
+        permute = self._unbucketize_permute
+        is_bijection = self._unbucketize_perm_is_bijection
+        request = self._tensor_awaitable
+        if (
+            permute is None
+            or self._row_permute_folded
+            or self._skip_unbucketize[0]
+            or is_bijection is None
+            or not _seq_a2a_unbucketize_rowmap()
+            or not isinstance(request, Request)
+            or torch.jit.is_scripting()
+            or is_torchdynamo_compiling()
+            or torch.fx._symbolic_trace.is_fx_tracing()
+            or not torch.is_grad_enabled()
+        ):
+            return None
+        codecs = getattr(request.a2ai, "codecs", None)
+        if (
+            codecs is None
+            or not _is_fbgemm_mx4_codec(codecs.forward)
+            or not is_bijection(permute)
+        ):
+            return None
+        request.output_row_map = permute
+        return request
 
 
 _side_stream_output_encode_skips: Dict[str, int] = {}
@@ -2346,6 +2755,7 @@ class SequenceEmbeddingsAllToAll(nn.Module):
         )
         self._codecs = codecs
         self._precomputed_send: Optional[SeqA2APrecomputedSend] = None
+        self._unbucketize_perm_verdict: Optional[bool] = None
 
     def precompute_send(
         self,
@@ -2453,6 +2863,29 @@ class SequenceEmbeddingsAllToAll(nn.Module):
             )
         return send
 
+    def _unbucketize_perm_is_bijection(self, perm: torch.Tensor) -> bool:
+        """Whether this instance's unbucketize permutes are bijections of [0, numel).
+
+        They come from block_bucketize_sparse_features, which writes every value to
+        exactly one bucketized slot, so every permute this instance receives shares
+        the property: the first one is verified (one device-to-host sync) and the
+        verdict is reused. TORCHREC_UNBUCKETIZE_INDEX_COPY_BWD=0 forces False.
+        """
+        verdict = self._unbucketize_perm_verdict
+        if verdict is None:
+            verdict = os.environ.get(
+                "TORCHREC_UNBUCKETIZE_INDEX_COPY_BWD", "1"
+            ) != "0" and _unbucketize_perm_is_bijection(perm)
+            self._unbucketize_perm_verdict = verdict
+            logger.info(
+                "SequenceEmbeddingsAllToAll unbucketize permute is_bijection=%s "
+                "(%s backward %s)",
+                verdict,
+                "gather" if _unbucketize_gather_bwd() else "index_copy_",
+                "enabled" if verdict else "disabled",
+            )
+        return verdict
+
     def forward(
         self,
         local_embs: torch.Tensor,
@@ -2530,6 +2963,7 @@ class SequenceEmbeddingsAllToAll(nn.Module):
             tensor_awaitable=tensor_awaitable,
             unbucketize_permute_tensor=unbucketize_permute_tensor,
             embedding_dim=local_embs.shape[1],
+            unbucketize_perm_is_bijection=self._unbucketize_perm_is_bijection,
         )
 
 
