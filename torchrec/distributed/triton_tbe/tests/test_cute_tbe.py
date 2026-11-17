@@ -83,6 +83,7 @@ def _train_step(
     weighted=False,
     vbe=False,
     optimizer=None,
+    stochastic_rounding=False,
 ):
     """Weights and momentum after one Triton TBE forward + backward, with or
     without the CuTe kernels (rowwise Adagrad unless optimizer is given)."""
@@ -106,7 +107,7 @@ def _train_step(
         feature_table_map=ftm,
         weights_precision=torch.float16,
         output_dtype=torch.float32,
-        stochastic_rounding=False,
+        stochastic_rounding=stochastic_rounding,
         learning_rate=0.01,
         eps=0.1,
         optimizer=optimizer,
@@ -158,6 +159,18 @@ class CuteTbeBackwardTest(unittest.TestCase):
                 torch.testing.assert_close(got_w, ref_w, rtol=0, atol=1e-3)
                 torch.testing.assert_close(got_m, ref_m, rtol=1e-4, atol=1e-9)
 
+    def test_stochastic_rounding_matches_triton(self):
+        # Same seed (drawn from torch's RNG), different random bits: each
+        # updated weight rounds to the same or the adjacent fp16 value as
+        # Triton's, and at least some differ (the CuTe kernels ran rather than
+        # falling back to Triton). Packed short runs, long runs, narrow copy.
+        args = ([2000, 50, 40], [256, 128, 8], [0, 1, 2], [8, 3, 5], 8192)
+        ref_w, ref_m = _train_step(*args, False, stochastic_rounding=True)
+        got_w, got_m = _train_step(*args, True, stochastic_rounding=True)
+        torch.testing.assert_close(got_w, ref_w, rtol=0, atol=1e-3)
+        torch.testing.assert_close(got_m, ref_m, rtol=1e-4, atol=1e-9)
+        self.assertGreater((got_w != ref_w).sum().item(), 0)
+
     def test_unsupported_optimizer_falls_back_to_triton(self):
         # SGD: the CuTe backward launchers hand every launch back to Triton.
         args = ([2000, 50], [256, 8], [0, 1], [8, 5], 8192)
@@ -165,6 +178,62 @@ class CuteTbeBackwardTest(unittest.TestCase):
         ref_w, _ = _train_step(*args, False, optimizer=sgd)
         got_w, _ = _train_step(*args, True, optimizer=sgd)
         torch.testing.assert_close(got_w, ref_w, rtol=0, atol=1e-3)
+
+
+def _round_stochastically(x: float, n: int) -> torch.Tensor:
+    """n draws of cute_tbe._f16_sr(x) (as fp32), with independent random bits."""
+    import cutlass
+    import cutlass.cute as cute
+    from torchrec.distributed.triton_tbe import cute_tbe
+
+    @cute.kernel
+    def kernel(x: cutlass.Float32, out_ptr: cute.Pointer, n: cutlass.Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        i = bidx * 256 + tidx
+        if i < n:
+            noise = cute_tbe._fmix32(cutlass.Uint32(i) * cutlass.Uint32(0x9E3779B9))
+            out = cute.make_tensor(out_ptr, cute.make_layout(1 << 30))
+            out[i] = cutlass.Float32(cute_tbe._f16_sr(x, noise))
+
+    @cute.jit
+    def launch(x: cutlass.Float32, out_ptr: cute.Pointer, n: cutlass.Int32, stream):
+        kernel(x, out_ptr, n).launch(
+            grid=[(n + 255) // 256, 1, 1], block=[256, 1, 1], stream=stream
+        )
+
+    out = torch.empty(n, device="cuda")
+    args = (cutlass.Float32(x), cute_tbe._ptr(out), cutlass.Int32(n))
+    cute.compile(launch, *args, cute_tbe._stream())(*args, cute_tbe._stream())
+    torch.cuda.synchronize()
+    return out
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    "needs a Blackwell GPU",
+)
+class CuteTbeStochasticRoundingTest(unittest.TestCase):
+    def test_unbiased(self):
+        n = 1 << 22
+        for x in (
+            1.0 + 0.3 * 2**-10,
+            -(0.5 + 0.7 * 2**-11),
+            3e-3 + 0.25 * 2**-18,
+            0.75,
+        ):
+            with self.subTest(x=x):
+                got = _round_stochastically(x, n)
+                lo = torch.tensor(x).half()
+                inf = float("inf") if x > lo.item() else float("-inf")
+                hi = torch.nextafter(lo, torch.tensor(inf).half())
+                # Every draw is one of the two fp16 neighbours of x.
+                self.assertTrue(((got == lo.float()) | (got == hi.float())).all())
+                # Mean within 6 standard errors of x (exact fp16 values: no noise).
+                ulp = abs(hi.float() - lo.float()).item()
+                p = abs(x - lo.item()) / ulp if ulp else 0.0
+                tol = 6 * ulp * (p * (1 - p) / n) ** 0.5 + 1e-12
+                self.assertLess(abs(got.double().mean().item() - x), tol)
 
 
 @unittest.skipIf(not _BLACKWELL, "needs a Blackwell GPU")
