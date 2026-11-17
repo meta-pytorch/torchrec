@@ -128,6 +128,7 @@ class PECGradientApply:
         grad: torch.Tensor,
         input_splits: List[int],
         output_splits: List[int],
+        # pyrefly: ignore [missing-attribute]
         pg: dist.ProcessGroup,
         codecs: QuantizedCommCodecs | None = None,
     ) -> None:
