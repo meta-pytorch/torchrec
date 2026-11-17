@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 from .apply_optimizers import (  # noqa: F401
     apply_dense_optimizers,
     apply_sparse_optimizers,

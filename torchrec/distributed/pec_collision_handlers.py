@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 # NOTE: Do NOT add `from __future__ import annotations` here.
 # This module is loaded inside a torch.package at model-publish time. Combining

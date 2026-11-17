@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 """A ``torch.compile`` backend whose backward still splits into ``I`` and ``W``.
 

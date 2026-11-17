@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 from torchrec.distributed.planner.dry_run.api import DryRunOrchestrator  # noqa: F401
 from torchrec.distributed.planner.dry_run.protocols import (  # noqa: F401
