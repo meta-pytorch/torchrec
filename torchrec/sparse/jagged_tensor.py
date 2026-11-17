@@ -1752,6 +1752,35 @@ class ComputeJTDictToKJT(torch.nn.Module):
         return KeyedJaggedTensor.from_jt_dict(jt_dict)
 
 
+@torch.jit.unused
+def _vbe_split_offsets(
+    split_lengths: Tuple[torch.Tensor, ...],
+    stride_per_key: List[int],
+    length_per_key: List[int],
+) -> List[torch.Tensor]:
+    """
+    Per-key complete cumsums of variable-stride lengths with one cumsum launch
+    instead of one per key.
+
+    Each key's lengths segment is followed by `-length_per_key[i]`, so the running
+    sum returns to 0 at every key boundary: the exclusive cumsum of the
+    interleaved tensor is the concatenation of the per-key complete cumsums.
+    Integer arithmetic, so the result is identical to the per-key computation.
+    Requires `sum(split_lengths[i]) == length_per_key[i]` (a KJT invariant).
+    """
+    lengths = split_lengths[0]
+    resets = _pin_and_move(
+        torch.tensor([-n for n in length_per_key], dtype=lengths.dtype),
+        lengths.device,
+    ).split(1)
+    interleaved: List[torch.Tensor] = []
+    for segment, reset in zip(split_lengths, resets):
+        interleaved.append(segment)
+        interleaved.append(reset)
+    offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(torch.cat(interleaved))
+    return list(offsets[:-1].split([stride + 1 for stride in stride_per_key]))
+
+
 @torch.fx.wrap
 def _maybe_compute_kjt_to_jt_dict(
     stride: int,
@@ -1786,10 +1815,21 @@ def _maybe_compute_kjt_to_jt_dict(
     if variable_stride_per_key:
         split_lengths = torch.split(lengths, stride_per_key)
         if compute_offsets:
-            split_offsets = [
-                torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
-                for lengths in split_lengths
-            ]
+            if (
+                not torch.jit.is_scripting()
+                and not is_pt2_compiling()
+                and not is_non_strict_exporting()
+                and len(keys) > 1
+                and lengths.device.type in ("cuda", "cpu")
+            ):
+                split_offsets = _vbe_split_offsets(
+                    split_lengths, stride_per_key, length_per_key
+                )
+            else:
+                split_offsets = [
+                    torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+                    for lengths in split_lengths
+                ]
     elif pt2_guard_or_true(lengths.numel() > 0):
         strided_lengths = lengths.view(len(keys), stride)
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
