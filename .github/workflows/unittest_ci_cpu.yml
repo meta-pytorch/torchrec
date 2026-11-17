@@ -169,7 +169,12 @@ jobs:
         echo "numpy succeeded"
         conda run -n build_binary \
           pip install pytest
+        # Inductor-compiled test modules need libstdc++ >= GLIBCXX_3.4.32, newer than the
+        # runner's /lib64 one: preload conda-forge's libstdc++ (backward compatible) for pytest.
+        conda install -n build_binary -y -c conda-forge "libstdcxx>=14"
+        env_prefix=$(conda run -n build_binary python -c "import sys; print(sys.prefix)")
         conda run -n build_binary \
+          env LD_PRELOAD="$env_prefix/lib/libstdc++.so.6" \
           python -m pytest torchrec -v -s -W ignore::pytest.PytestCollectionWarning --continue-on-collection-errors \
         --ignore-glob=**/test_utils/ \
         -k "not _disabled_in_oss_compatibility"
