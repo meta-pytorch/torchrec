@@ -1211,6 +1211,9 @@ class ShardedManagedCollisionCollection(
             embedding_names_per_sharding=self._embedding_names_per_sharding,
             need_indices=False,
             features_to_permute_indices=None,
+            # input_dist deduplicated the ids; expand the per-unique-id remapped
+            # ids back to the layout of features_before_input_dist.
+            reverse_indices=ctx.reverse_indices if self._use_index_dedup else None,
         )
 
     def lookup_remapped_lengths_mask(self, features: KeyedJaggedTensor) -> torch.Tensor:
