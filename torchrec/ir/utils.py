@@ -147,6 +147,7 @@ def encapsulate_ir_modules(
     children: List[str] = []  # fqns of the children that need further serialization
     # handle current module, and find the children which need further serialization
     typename = qualname(module)
+    # pyrefly: ignore [not-iterable]
     if typename in serializer.module_to_serializer_cls:
         children = serializer.encapsulate_module(module)
         preserve_fqns.append(fqn)
