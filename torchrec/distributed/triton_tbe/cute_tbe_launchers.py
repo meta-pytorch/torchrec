@@ -11,8 +11,8 @@ TBE kernel launches, for ``TritonTableBatchedEmbeddingBags(cute_kernels=True)``.
 Each launcher takes its Triton kernel's launch arguments unchanged, so
 ``triton_table_batched_embeddings`` only swaps the kernel object at its launch
 sites (``_cute_or``), and falls back to that Triton kernel for what the CuTe
-kernels don't cover: split weight tensors, stochastic rounding, optimizers other
-than exact row-wise Adagrad, non-fp32 outputs, and unsupported embedding dims.
+kernels don't cover: split weight tensors, stochastic rounding with non-fp16
+weights, optimizers other than exact row-wise Adagrad, non-fp32 outputs, and unsupported embedding dims.
 """
 
 from functools import partial
@@ -47,6 +47,15 @@ def _meta(table_offsets, dims, out_offsets, ftm, hash_cumsum, rows_cumsum):
             table_offsets.device,
         )
     return _meta_cache[key]
+
+
+def _sr_ok(weight: torch.Tensor, kw: Dict[str, Any]) -> bool:
+    """Stochastic rounding: the CuTe backward does it for fp16 weights only."""
+    return not kw.get("STOCHASTIC_ROUNDING") or weight.dtype == torch.float16
+
+
+def _sr_seed(kw: Dict[str, Any]) -> Optional[int]:
+    return kw["stochastic_rounding_seed"] if kw.get("STOCHASTIC_ROUNDING") else None
 
 
 def _cached(key: Tuple, check) -> bool:
@@ -227,7 +236,7 @@ class _ShortRun(_Launcher):
         block = kw.get("BLOCK_SIZE", 0)
         if (
             optimizer != _ROWWISE_ADAGRAD
-            or kw.get("STOCHASTIC_ROUNDING")
+            or not _sr_ok(weight, kw)
             or dout.dtype != torch.float32
             or not _short_ok(dims, num_short, block)
         ):
@@ -253,6 +262,7 @@ class _ShortRun(_Launcher):
             per_sample_weights=psw,
             vbe_B_offsets=vbe_B if vbe else None,
             vbe_row_output_offsets=vbe_rows if vbe else None,
+            stochastic_rounding_seed=_sr_seed(kw),
         )
 
 
@@ -277,7 +287,7 @@ class _LongRun(_Launcher):
             ]
             lin_run, cum, orig_ids, tbl_off, ftm, hsc, mom, rcs = args[12:20]
             max_long_runs, num, vr, vb, total_D, lr, eps, optim = args[20:28]
-            if optim != _ROWWISE_ADAGRAD or kw.get("STOCHASTIC_ROUNDING"):
+            if optim != _ROWWISE_ADAGRAD or not _sr_ok(w, kw):
                 return self._fallback(grid, *args, **kw)
         else:
             (dout, infos, ss, se, gid, temp, dims, embo, num, vr, vb, total_D) = args
@@ -346,6 +356,7 @@ class _LongRun(_Launcher):
                 bits,
                 lr,
                 eps,
+                stochastic_rounding_seed=_sr_seed(kw),
             )
 
 
@@ -355,10 +366,16 @@ class _LongRunApply(_Launcher):
     def _launch(self, grid, *args, **kw):
         # Triton's (w, chunk_starts, split_starts, temp, lin_run, cum, infos,
         # orig_ids, num, tbl_off, dims, ftm, hsc, mom, rcs, lr, eps, optim).
-        if args[17] != _ROWWISE_ADAGRAD or kw.get("STOCHASTIC_ROUNDING"):
+        if args[17] != _ROWWISE_ADAGRAD or not _sr_ok(args[0], kw):
             return self._fallback(grid, *args, **kw)
         bits = kw["info_B_num_bits"]
-        cute_tbe.tbe_long_run_apply(args[0], *args[3:15], bits, *args[15:17])
+        cute_tbe.tbe_long_run_apply(
+            args[0],
+            *args[3:15],
+            bits,
+            *args[15:17],
+            stochastic_rounding_seed=_sr_seed(kw),
+        )
 
 
 _launchers: Dict[Any, _Launcher] = {}
