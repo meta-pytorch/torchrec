@@ -6194,14 +6194,12 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
         assert len(specs) == len(self._weight_init_mins) == len(self._weight_init_maxs)
         with torch.no_grad():
             initialized = [
-                torch.empty(
-                    (rows, dim), dtype=weights.dtype, device=weights.device
-                ).uniform_(lo, hi)
+                torch.empty((rows, dim), dtype=weights.dtype).uniform_(lo, hi)
                 for (rows, dim), lo, hi in zip(
                     specs, self._weight_init_mins, self._weight_init_maxs
                 )
             ]
-            weights.copy_(torch.cat(initialized, dim=0).flatten())
+            weights.copy_(torch.cat(initialized, dim=0).flatten().to(weights.device))
 
     @property
     # pyrefly: ignore [bad-override]
