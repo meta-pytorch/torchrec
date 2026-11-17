@@ -83,6 +83,12 @@ jobs:
       binary-matrix: ${{ toJSON(matrix) }}
       script: |
         set -ex
+        # linux_job_v3 doesn't load the MATRIX_* file that v2 exported, so
+        # read it back. Values can hold spaces, so split on the first =.
+        while IFS= read -r line; do
+          [[ -z "${line}" || "${line}" == "GITHUB_WORKFLOW="* ]] && continue
+          export "${line%%=*}=${line#*=}"
+        done < "${RUNNER_TEMP}/github_env_${GITHUB_RUN_ID}"
         export ENV_NAME="conda-env-${{ github.run_id }}"
         export SMOKE_TEST="source ./.github/scripts/validate_binaries.sh"
         eval $SMOKE_TEST
