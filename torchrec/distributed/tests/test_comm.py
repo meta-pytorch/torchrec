@@ -15,6 +15,7 @@ import multiprocessing
 import os
 import unittest
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Callable, Dict, List, Optional, Tuple, Union
 from unittest import mock
 from unittest.mock import MagicMock, patch
@@ -28,6 +29,7 @@ from fbgemm_gpu.split_embedding_configs import SparseType
 from hypothesis import given, settings
 from torch import Tensor
 from torch.distributed.distributed_c10d import GroupMember
+from torch.testing._internal.distributed.fake_pg import _create_fake_pg, FakeStore
 from torchrec.distributed import comm
 from torchrec.distributed.comm import get_2d_pod_size, get_resolved_pod_size
 from torchrec.distributed.fbgemm_qcomm_codec import (
@@ -2849,6 +2851,42 @@ class TestAllToAll(unittest.TestCase):
             callable=self._test_alltoall_sequence_unbucketize_compose_cpu,
         )
 
+    @classmethod
+    def _test_custom_backend_is_not_fake(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        pg = none_throws(GroupMember.WORLD)
+        assert pg._get_backend_name() == "custom"
+        assert not comm_ops.is_fake_pg(pg)
+
+        comm_ops.set_use_sync_collectives(True)
+        # One feature per rank, batch size 1, dim 1: rank r sends
+        # [10 * r, 10 * r + 1] and receives [r, 10 + r].
+        out = comm_ops.variable_batch_alltoall_pooled(
+            torch.tensor([10.0 * rank, 10.0 * rank + 1]),
+            batch_size_per_rank_per_feature=[[1], [1]],
+            batch_size_per_feature_pre_a2a=[1, 1],
+            emb_dim_per_rank_per_feature=[[1], [1]],
+            group=pg,
+        ).wait()
+        torch.testing.assert_close(out, torch.tensor([float(rank), 10.0 + rank]))
+        dist.destroy_process_group()
+
+    def test_custom_backend_is_not_fake(self) -> None:
+        # A real backend registered via register_backend (as nccl2 is) reports
+        # backend name "custom", like FakeProcessGroup, and must still run the
+        # real all_to_all.
+        self._run_multi_process_test(
+            world_size=self.WORLD_SIZE,
+            backend="wrapped_gloo",
+            # pyrefly: ignore[bad-argument-type]
+            callable=self._test_custom_backend_is_not_fake,
+        )
+
 
 class TestSeqA2AFlagDefaults(unittest.TestCase):
     def test_paths_default_on(self) -> None:
@@ -2869,6 +2907,70 @@ class TestSeqA2AFlagDefaults(unittest.TestCase):
             self.assertFalse(comm_ops._mx4v2_requested("fwd_enc"))
             self.assertFalse(dist_data._unbucketize_gather_bwd())
             self.assertFalse(dist_data._seq_a2a_unbucketize_rowmap())
+
+
+def _create_wrapped_gloo(
+    store: dist.Store, rank: int, size: int, timeout: timedelta
+) -> dist.ProcessGroupGloo:
+    return dist.ProcessGroupGloo(store, rank, size, timeout)
+
+
+# A real backend registered via register_backend, like nccl2.
+dist.Backend.register_backend("wrapped_gloo", _create_wrapped_gloo, devices=["cpu"])
+# A non-"fake" name for a fake implementation, to build mixed device maps.
+dist.Backend.register_backend(
+    "fake_alias", _create_fake_pg, extended_api=True, devices=["cpu", "cuda"]
+)
+
+
+class TestIsFakePg(unittest.TestCase):
+    def tearDown(self) -> None:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        # Drop compiled entries guarded on (and keeping alive) destroyed PGs.
+        torch._dynamo.reset()
+
+    def _check_fake(
+        self,
+        backend: str,
+        expected: bool,
+        store: Optional[dist.Store] = None,
+        world_size: int = 2,
+    ) -> None:
+        dist.init_process_group(
+            backend=backend,
+            store=store if store is not None else FakeStore(),
+            rank=0,
+            world_size=world_size,
+        )
+        pg = none_throws(GroupMember.WORLD)
+        self.assertEqual(comm_ops.is_fake_pg(pg), expected)
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def f(x: Tensor) -> Tensor:
+            return x + 1 if comm_ops.is_fake_pg(pg) else x - 1
+
+        # Dynamo skips torchrec frames (including this test) by default.
+        with torch._dynamo.config.patch(skip_torchrec=False):
+            out = f(torch.zeros(1))
+        self.assertEqual(out.item(), 1.0 if expected else -1.0)
+
+    def test_fake_pg(self) -> None:
+        self._check_fake("fake", True)
+
+    def test_multi_device_fake_pg(self) -> None:
+        self._check_fake("cpu:fake,cuda:fake", True)
+
+    def test_mixed_device_backends_is_not_fake(self) -> None:
+        self._check_fake("cpu:fake,cuda:fake_alias", False)
+
+    def test_real_pg_is_not_fake(self) -> None:
+        self._check_fake("gloo", False, store=dist.HashStore(), world_size=1)
+
+    def test_unregistered_pg_raises(self) -> None:
+        pg = dist.ProcessGroupGloo(dist.HashStore(), 0, 1, timedelta(seconds=30))
+        with self.assertRaisesRegex(ValueError, "not initialized"):
+            comm_ops.is_fake_pg(pg)
 
 
 class TestResolvedPodSize(unittest.TestCase):

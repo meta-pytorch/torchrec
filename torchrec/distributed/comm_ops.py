@@ -717,14 +717,14 @@ def pg_name(pg: dist.ProcessGroup) -> str:
 
 @torch.compiler.assume_constant_result
 def is_fake_pg(pg: dist.ProcessGroup) -> bool:
-    # FakeProcessGroup reports backend name "custom", but so do real custom
-    # backends (e.g. nccl2), so check the registered backend instead.
-    if pg._get_backend_name() != "custom":
-        return False
-    try:
-        return dist.get_backend(pg) == "fake"
-    except ValueError:
-        return False
+    """
+    Whether ``pg`` uses the ``fake`` backend on every device. Mixed backends
+    such as ``"cpu:fake,cuda:nccl2"`` are not fake.
+
+    Raises ``ValueError`` if ``pg`` is not registered with torch.distributed.
+    """
+    backend = dist.get_backend(pg)
+    return all(entry.rsplit(":", 1)[-1] == "fake" for entry in backend.split(","))
 
 
 def all2all_pooled_sync(
