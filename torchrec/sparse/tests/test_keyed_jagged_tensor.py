@@ -291,6 +291,38 @@ class TestKeyedJaggedTensor(unittest.TestCase):
             atol=0,
         )
 
+    def test_to_dict_vb_offsets_match_per_key_cumsum(self) -> None:
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        stride_per_key = [3, 0, 1, 5, 2]
+        keys = [f"f{i}" for i in range(len(stride_per_key))]
+        generator = torch.Generator().manual_seed(0)
+        for device in devices:
+            for dtype in (torch.int32, torch.int64):
+                lengths = torch.randint(
+                    0, 4, (sum(stride_per_key),), dtype=dtype, generator=generator
+                )
+                lengths[3:4] = 0
+                kjt = KeyedJaggedTensor(
+                    keys=keys,
+                    values=torch.arange(int(lengths.sum().item()), device=device),
+                    lengths=lengths.to(device),
+                    stride_per_key_per_rank=[[s] for s in stride_per_key],
+                )
+                jt_dict = kjt.to_dict()
+                for key, segment in zip(
+                    keys, torch.split(lengths.to(device), stride_per_key)
+                ):
+                    expected = torch.ops.fbgemm.asynchronous_complete_cumsum(segment)
+                    offsets = jt_dict[key].offsets()
+                    self.assertEqual(offsets.dtype, dtype)
+                    self.assertEqual(offsets.device.type, device.type)
+                    torch.testing.assert_close(offsets, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        jt_dict[key].lengths(), segment, rtol=0, atol=0
+                    )
+
     def test_empty(self) -> None:
         keys = ["index_0"]
         values = torch.tensor([])
