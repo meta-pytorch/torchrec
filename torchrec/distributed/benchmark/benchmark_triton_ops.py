@@ -42,7 +42,7 @@ from fbgemm_gpu.quantize_utils import (
 from torch.autograd.profiler import record_function
 
 try:
-    from fbgemm_gpu.tbe.config.embedding_config import BoundsCheckMode
+    from fbgemm_gpu.tbe.config.embedding_config import BoundsCheckMode  # @manual
 except ImportError:
     # Base layers predating the tbe.config leaf module still re-export it here.
     from fbgemm_gpu.split_table_batched_embeddings_ops_common import BoundsCheckMode
