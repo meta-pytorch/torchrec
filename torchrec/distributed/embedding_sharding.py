@@ -9,6 +9,7 @@
 
 import abc
 import copy
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import filterfalse
@@ -46,11 +47,15 @@ except ImportError:
 # predate this helper.  The check is a safety net for training, not needed
 # during model serialization.
 try:
-    from torchrec.distributed.dist_data import _check_int_overflow
+    from torchrec.distributed.dist_data import (
+        _check_int_overflow,
+        _TORCHREC_OVERFLOW_DEBUG,
+    )
 except ImportError:
     torch._C._log_api_usage_once(
         "torchrec.distributed.embedding_sharding.import_failure._check_int_overflow"
     )
+    _TORCHREC_OVERFLOW_DEBUG: bool = False  # type: ignore[no-redef]
 
     def _check_int_overflow(*args: object, **kwargs: object) -> bool:  # type: ignore[misc]
         return False
@@ -894,6 +899,40 @@ def bucketize_embeddings_before_all2all_write(
     )
 
 
+def reuse_kjt_bucketization_for_all2all_write(
+    kjt: KeyedJaggedTensor,
+    bucketized_features: KeyedJaggedTensor,
+    source_to_bucketized_permute: torch.Tensor,
+    num_buckets: int,
+) -> KeyedJaggedTensor:
+    """Reuse lookup routing while attaching the write-side 2D payload."""
+    weights = none_throws(kjt.weights_or_none())
+    if weights.dim() != 2:
+        raise ValueError("Routing reuse requires 2D write weights")
+    if (
+        bucketized_features.values().numel() != kjt.values().numel()
+        or source_to_bucketized_permute.numel() != kjt.values().numel()
+    ):
+        raise ValueError("Routing reuse requires a one-to-one source permutation")
+
+    bucketized_weights = torch.empty_like(weights)
+    bucketized_weights.index_copy_(
+        0, source_to_bucketized_permute.to(torch.int64), weights
+    )
+    return KeyedJaggedTensor(
+        keys=bucketized_features.keys(),
+        values=bucketized_features.values(),
+        weights=bucketized_weights,
+        lengths=bucketized_features.lengths(),
+        offsets=None,
+        stride=_fx_wrap_stride(kjt),
+        stride_per_key_per_rank=_fx_wrap_stride_per_key_per_rank(kjt, num_buckets),
+        length_per_key=None,
+        offset_per_key=None,
+        index_per_key=None,
+    )
+
+
 class KJTListSplitsAwaitable(Awaitable[Awaitable[KJTList]], Generic[C]):
     """
     Awaitable of Awaitable of KJTList.
@@ -955,6 +994,7 @@ class KJTSplitsAllToAllMeta:
     keys: List[str]
     device: torch.device
     stagger: int
+    input_splits_are_tensors: bool = False
 
 
 class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
@@ -1002,9 +1042,12 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
 
         # Log the stride tensors being sent into the fused AllToAll.
         # These are the input values — if they are already corrupted,
-        # the bug is upstream of the collective.
-        if splits_tensors and pg is not None:
+        # the bug is upstream of the collective. Reading them back syncs the
+        # device, so only do it when checking.
+        if _TORCHREC_OVERFLOW_DEBUG and splits_tensors and pg is not None:
             for idx, t in enumerate(splits_tensors):
+                if t.device.type != "cpu":
+                    continue
                 t_list = _safe_tolist(t)
                 _check_int_overflow(
                     "FusedKJTListSplitsAwaitable",
@@ -1074,18 +1117,34 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
     def _wait_impl(self) -> List[KJTListAwaitable]:
         if self._splits_awaitable:
             splits_list = self._splits_awaitable.wait()
+            input_splits_list = self._splits_awaitable.input_list()
             splits_per_awaitable = _split(splits_list, self._lengths)
+            input_splits_per_awaitable = _split(
+                input_splits_list,
+                self._lengths,
+            )
         else:
             splits_per_awaitable = [[] for _ in range(len(self._lengths))]
+            input_splits_per_awaitable = [[] for _ in range(len(self._lengths))]
         tensors_awaitables = []
-        for idx, (splits, awaitable) in enumerate(
-            zip(splits_per_awaitable, self._awaitables)
+        for idx, (splits, input_splits, awaitable) in enumerate(
+            zip(
+                splits_per_awaitable,
+                input_splits_per_awaitable,
+                self._awaitables,
+            )
         ):
             if not splits:  # NoWait
                 assert isinstance(awaitable, Awaitable)
                 tensors_awaitables.append(awaitable.wait())
                 continue
             assert isinstance(awaitable, KJTSplitsAllToAllMeta)
+            if awaitable.input_splits_are_tensors:
+                awaitable.input_splits = (
+                    input_splits
+                    if awaitable._input.variable_stride_per_key()
+                    else input_splits[:-1]
+                )
             if awaitable._input.variable_stride_per_key():
                 output_splits = splits
                 stride_per_rank = None
@@ -1125,6 +1184,11 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                         stride_per_rank=stride_per_rank,
                     )
                 )
+        if os.environ.get("ONEFLOW_SDD_ASYNC_LENGTH_PER_KEY", "1") == "1":
+            for tensors_awaitable in tensors_awaitables:
+                prefetch = getattr(tensors_awaitable, "prefetch_length_per_key", None)
+                if callable(prefetch):
+                    prefetch()
         output = []
         awaitables_per_output = _split(tensors_awaitables, self._output_lengths)
         for awaitables, ctx in zip(awaitables_per_output, self._contexts):

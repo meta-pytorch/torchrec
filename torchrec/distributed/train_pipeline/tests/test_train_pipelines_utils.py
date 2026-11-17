@@ -215,6 +215,41 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(missing_keys, [])
         self.assertEqual(unexpected_keys, [])
 
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_rewrite_model_explicitly_excludes_one_sharded_module(self) -> None:
+        model = self._setup_model()
+        sharded_model, _ = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            {},
+        )
+
+        pipelined, _, original_forwards, _, non_pipelined = _rewrite_model(
+            model=sharded_model,
+            batch=None,
+            context=TrainPipelineContext(),
+            dist_stream=None,
+            excluded_pipeline_module_fqns={"sparse.ebc"},
+        )
+
+        # pyrefly: ignore[missing-attribute]
+        self.assertNotIsInstance(
+            sharded_model.module.sparse.ebc.forward,  # pyrefly: ignore[missing-attribute]
+            PipelinedForward,
+        )
+        self.assertIsInstance(
+            # pyrefly: ignore[missing-attribute]
+            sharded_model.module.sparse.weighted_ebc.forward,
+            PipelinedForward,
+        )
+        self.assertEqual(len(pipelined), 1)
+        self.assertEqual(len(original_forwards), 1)
+        self.assertEqual(non_pipelined, ["sparse.ebc"])
+
     @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
     @unittest.skipIf(
         not torch.cuda.is_available(),

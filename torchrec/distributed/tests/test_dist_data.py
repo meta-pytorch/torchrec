@@ -2038,6 +2038,31 @@ class GetRecatOverflowTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.dtype, torch.int32)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "requires a GPU")
+    def test_get_recat_cuda_matches_cpu(self) -> None:
+        for batch_size_per_rank in ([32, 32, 32, 32], [32, 64, 32, 64]):
+            expected = none_throws(
+                _get_recat(
+                    local_split=2,
+                    num_splits=4,
+                    stagger=2,
+                    device=torch.device("cpu"),
+                    batch_size_per_rank=batch_size_per_rank,
+                )
+            )
+            result = none_throws(
+                _get_recat(
+                    local_split=2,
+                    num_splits=4,
+                    stagger=2,
+                    device=torch.device("cuda"),
+                    batch_size_per_rank=batch_size_per_rank,
+                )
+            )
+            self.assertEqual(result.device.type, "cuda")
+            self.assertEqual(result.dtype, torch.int32)
+            self.assertTrue(torch.equal(result.cpu(), expected))
+
     def test_get_recat_returns_fresh_tensor_by_default(self) -> None:
         first = _get_recat(
             local_split=2,
@@ -2536,6 +2561,45 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
     def test_no_tag_passthrough(self) -> None:
         self._run_multi_process_test(
             callable=self._run_test_no_tag,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_input_list_without_overflow_debug(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        import torchrec.distributed.dist_data as dd
+
+        previous_overflow_debug = dd._TORCHREC_OVERFLOW_DEBUG
+        dd._TORCHREC_OVERFLOW_DEBUG = False
+        try:
+            input_tensors = [
+                torch.tensor([rank] * world_size, dtype=torch.int64),
+                torch.tensor([rank + 1] * world_size, dtype=torch.int64),
+            ]
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=input_tensors,
+                pg=none_throws(dist.group.WORLD),
+            )
+
+            awaitable.wait()
+
+            assert awaitable.input_list() == [
+                [rank] * world_size,
+                [rank + 1] * world_size,
+            ]
+        finally:
+            dd._TORCHREC_OVERFLOW_DEBUG = previous_overflow_debug
+            dist.destroy_process_group()
+
+    def test_input_list_available_without_overflow_debug(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_input_list_without_overflow_debug,
             world_size=2,
             backend="gloo",
         )
@@ -3419,3 +3483,95 @@ class FusedKJTListSplitsAwaitableAnnotationTest(unittest.TestCase):
                 ("exit",),
             ],
         )
+
+
+class SequenceEmbeddingsUnbucketizeBackwardTest(unittest.TestCase):
+    """The unbucketize index_select takes the index_copy_ backward only when the
+    producing SequenceEmbeddingsAllToAll has verified its permutes are bijections."""
+
+    def _a2a(self) -> SequenceEmbeddingsAllToAll:
+        pg = MagicMock()
+        pg.rank.return_value = 0
+        pg.size.return_value = 1
+        return SequenceEmbeddingsAllToAll(pg, features_per_rank=[1])
+
+    def _unbucketize(
+        self, perm: torch.Tensor, a2a: Optional[SequenceEmbeddingsAllToAll]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (src, output, src.grad, reference src.grad) for a weighted sum."""
+        src = torch.randn(perm.numel(), 3, requires_grad=True)
+        out = SequenceEmbeddingsAwaitable(
+            tensor_awaitable=NoWait(src),
+            unbucketize_permute_tensor=perm,
+            embedding_dim=3,
+            unbucketize_perm_is_bijection=(
+                None if a2a is None else a2a._unbucketize_perm_is_bijection
+            ),
+        ).wait()
+        weights = torch.arange(out.numel(), dtype=out.dtype).view_as(out)
+        (out * weights).sum().backward()
+        expected = torch.zeros_like(src).index_add_(0, perm, weights)
+        return src, out, none_throws(src.grad), expected
+
+    def test_bijection_takes_index_copy_backward(self) -> None:
+        perm = torch.tensor([2, 0, 3, 1])
+        src, out, grad, expected = self._unbucketize(perm, self._a2a())
+        self.assertEqual(type(out.grad_fn).__name__, "_UnbucketizePermuteBackward")
+        torch.testing.assert_close(out, src[perm])
+        torch.testing.assert_close(grad, expected)
+
+    def test_non_bijection_falls_back_to_index_select(self) -> None:
+        # Same length as src, but row 1 is never selected and row 0 twice.
+        perm = torch.tensor([0, 0, 2, 3])
+        a2a = self._a2a()
+        _, out, grad, expected = self._unbucketize(perm, a2a)
+        self.assertEqual(type(out.grad_fn).__name__, "IndexSelectBackward0")
+        self.assertFalse(a2a._unbucketize_perm_verdict)
+        torch.testing.assert_close(grad, expected)
+
+    def test_without_producer_verdict_uses_index_select(self) -> None:
+        _, out, _, _ = self._unbucketize(torch.tensor([1, 0]), None)
+        self.assertEqual(type(out.grad_fn).__name__, "IndexSelectBackward0")
+
+    def test_verdict_is_per_instance_and_checked_once(self) -> None:
+        bijective, other = self._a2a(), self._a2a()
+        with patch.object(
+            dist_data,
+            "_unbucketize_perm_is_bijection",
+            wraps=dist_data._unbucketize_perm_is_bijection,
+        ) as check:
+            self._unbucketize(torch.tensor([1, 0, 2]), bijective)
+            self._unbucketize(torch.tensor([2, 1, 0]), bijective)
+            self._unbucketize(torch.tensor([1, 1, 2]), other)
+        self.assertEqual(check.call_count, 2)
+        self.assertTrue(bijective._unbucketize_perm_verdict)
+        self.assertFalse(other._unbucketize_perm_verdict)
+
+    def test_env_kill_switch_skips_the_check(self) -> None:
+        a2a = self._a2a()
+        with patch.dict("os.environ", {"TORCHREC_UNBUCKETIZE_INDEX_COPY_BWD": "0"}):
+            _, out, _, _ = self._unbucketize(torch.tensor([1, 0]), a2a)
+        self.assertEqual(type(out.grad_fn).__name__, "IndexSelectBackward0")
+        self.assertFalse(a2a._unbucketize_perm_verdict)
+
+    def test_gather_backward_keeps_indices_in_range_for_non_surjective_perm(
+        self,
+    ) -> None:
+        # Row 1 is never selected, so invert_permute leaves its slot unwritten;
+        # poison unwritten slots with an out-of-range index to emulate that.
+        perm = torch.tensor([0, 0, 2, 3])
+        src = torch.randn(4, 3, requires_grad=True)
+        upstream = torch.arange(12, dtype=src.dtype).view(4, 3)
+
+        def poisoned_invert_permute(p: torch.Tensor) -> torch.Tensor:
+            inv = torch.full_like(p, 1 << 40)
+            return inv.scatter_(0, p, torch.arange(p.numel(), dtype=p.dtype))
+
+        with patch.object(
+            dist_data, "_unbucketize_gather_bwd", return_value=True
+        ), patch.object(torch.ops.fbgemm, "invert_permute", poisoned_invert_permute):
+            dist_data._UnbucketizePermute.apply(src, perm).backward(upstream)
+        grad = none_throws(src.grad)
+        torch.testing.assert_close(grad[2:], upstream[2:])
+        # CPU index_select bounds-checks, and every row is some upstream row.
+        self.assertTrue((grad.unsqueeze(1) == upstream).all(-1).any(-1).all())

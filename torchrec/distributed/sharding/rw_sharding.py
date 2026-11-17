@@ -38,6 +38,7 @@ from torchrec.distributed.embedding_sharding import (
     EmbeddingShardingContext,
     EmbeddingShardingInfo,
     group_tables,
+    reuse_kjt_bucketization_for_all2all_write,
 )
 from torchrec.distributed.embedding_types import (
     BaseGroupedFeatureProcessor,
@@ -484,6 +485,7 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         self._has_feature_processor = has_feature_processor
         self._need_pos = need_pos
         self.unbucketize_permute_tensor: Optional[torch.Tensor] = None
+        self.bucketized_features: Optional[KeyedJaggedTensor] = None
         self._keep_original_indices = keep_original_indices
 
     @EventLoggingHandler.event_logger(
@@ -528,6 +530,7 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
             keep_original_indices=self._keep_original_indices,
             block_bucketize_row_pos=self.zch_bucketize_row_pos,
         )
+        self.bucketized_features = bucketized_features
 
         return self._dist(bucketized_features)
 
@@ -827,6 +830,7 @@ class RwSparseFeaturesWriteDist(BaseSparseFeaturesWriteDist[KeyedJaggedTensor]):
         self._is_sequence = is_sequence
         self.unbucketize_permute_tensor: Optional[torch.Tensor] = None
         self._keep_original_indices = keep_original_indices
+        self._routing_reuse_count: int = 0
 
     def forward(
         self,
@@ -864,6 +868,23 @@ class RwSparseFeaturesWriteDist(BaseSparseFeaturesWriteDist[KeyedJaggedTensor]):
         )
 
         return self._dist(bucketized_features)
+
+    def forward_with_reused_routing(
+        self,
+        embeddings: KeyedJaggedTensor,
+        bucketized_features: KeyedJaggedTensor,
+        source_to_bucketized_permute: torch.Tensor,
+    ) -> Awaitable[Awaitable[KeyedJaggedTensor]]:
+        """Redistribute 2D payloads with routing produced by the lookup path."""
+        bucketized_embeddings = reuse_kjt_bucketization_for_all2all_write(
+            embeddings,
+            bucketized_features,
+            source_to_bucketized_permute,
+            self._world_size,
+        )
+        self.unbucketize_permute_tensor = source_to_bucketized_permute
+        self._routing_reuse_count += 1
+        return self._dist(bucketized_embeddings)
 
 
 @overload

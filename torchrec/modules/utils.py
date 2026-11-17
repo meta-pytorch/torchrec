@@ -15,6 +15,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 from torch.profiler import record_function
+from torchrec.modules.embedding_select import select_embeddings
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
 from torchrec.types import CacheMixin
@@ -292,28 +293,47 @@ def construct_jagged_tensors(
     seq_vbe_ctx: Optional[SequenceVBEContext] = None,
     use_gather_select: bool = False,
     use_sorted_select: bool = False,
+    seg_plan: Optional[object] = None,
 ) -> Dict[str, JaggedTensor]:
+    """Construct feature tensors, optionally expanding deduplicated embeddings.
+
+    When both selection flags are enabled, gather handles index counts up to
+    twice the input row count; larger expansions use sorted selection.
+    """
     with record_function("## construct_jagged_tensors ##"):
         if original_features is not None:
             features = original_features
 
+        sorted_split: Optional[Tuple[torch.Tensor, ...]] = None
         if reverse_indices is not None:
-            if use_sorted_select:
-                # sorted segment-reduce backward (fp32, atomic-light): faster and
-                # more accurate than index_add on AMD. Forward is the same gather.
-                # Opt-in via the explicit use_sorted_select flag (threaded from the
-                # EmbeddingCollection config); torchrec reads no env/global state.
-                from torchrec.modules.sorted_index_select import sorted_index_select
-
-                embeddings = sorted_index_select(embeddings, reverse_indices)
-            elif use_gather_select:
-                # gather has better backward performance than index_select in many cases
-                expanded_indices = reverse_indices.unsqueeze(1).expand(
-                    -1, embeddings.size(-1)
+            if use_sorted_select and (
+                not use_gather_select
+                or reverse_indices.numel() > 2 * embeddings.size(0)
+            ):
+                from torchrec.modules.sorted_index_select import (
+                    maybe_sorted_index_select_split,
+                    sorted_index_select,
                 )
-                embeddings = torch.gather(embeddings, 0, expanded_indices)
+
+                if seq_vbe_ctx is None:
+                    sorted_split = maybe_sorted_index_select_split(
+                        embeddings,
+                        reverse_indices,
+                        features,
+                        seg_plan=seg_plan,
+                        names=embedding_names,
+                    )
+                if sorted_split is None:
+                    embeddings = sorted_index_select(
+                        embeddings, reverse_indices, seg_plan=seg_plan
+                    )
             else:
-                embeddings = torch.index_select(embeddings, 0, reverse_indices)
+                embeddings = select_embeddings(
+                    embeddings,
+                    reverse_indices,
+                    use_gather_select=use_gather_select,
+                    use_sorted_select=use_sorted_select,
+                )
 
         if seq_vbe_ctx is not None:
             embeddings, lengths, length_per_key, values = _vbe_reindex(
@@ -325,7 +345,11 @@ def construct_jagged_tensors(
             values = features.values()
 
         lengths_tuple = torch.unbind(lengths, dim=0)
-        embeddings_list = torch.split(embeddings, length_per_key, dim=0)
+        embeddings_list = (
+            torch.split(embeddings, length_per_key, dim=0)
+            if sorted_split is None
+            else sorted_split
+        )
         values_list = (
             list(torch.split(values, length_per_key))
             if need_indices and values is not None
