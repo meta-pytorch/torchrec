@@ -40,6 +40,8 @@ jobs:
       test-infra-ref: main
       with-cuda: enable
       with-rocm: false
+      # OSDC (ARC) runners: validation_runner becomes an mt-l-* label.
+      runner-fleet: osdc
   filter-matrix:
     needs: generate-matrix
     runs-on: linux.24_04.4x
@@ -68,7 +70,7 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.filter-matrix.outputs.matrix) }}
       fail-fast: false
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
     name: "linux-${{ matrix.package_type }}-${{ matrix.python_version }}-${{ matrix.desired_cuda }}"
     permissions:
       id-token: write
