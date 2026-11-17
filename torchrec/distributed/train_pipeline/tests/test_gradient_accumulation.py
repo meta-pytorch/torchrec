@@ -11,6 +11,7 @@
 # test; enabling foreach would change that behavior without improving test performance.
 # @lint-ignore-every CITRINE
 # @lint-ignore-every CITRINEAGENT missing_for_each_optimizer
+# @lint-ignore-every CITRINECI missing_for_each_optimizer
 
 import contextlib
 import unittest
@@ -494,11 +495,11 @@ class FsdpSyncSuppressionSeamTest(unittest.TestCase):
             ):
                 for _ in range(4):
                     wrapper.progress(iter([torch.randn(2, 10)]))
-        # The first window synchronizes the warmup and final microbatches.
+        # Native FSDP2 synchronizes only the step microbatch, in the first window too.
         self.assertEqual(
             calls,
             [
-                "restore",
+                "suppress",
                 "progress",
                 "suppress",
                 "progress",
@@ -523,7 +524,7 @@ class FsdpSyncSuppressionSeamTest(unittest.TestCase):
         self.assertIn("ensure_sharded", calls)
         self.assertLess(calls.index("ensure_sharded"), calls.index("optimizer.step"))
 
-    def test_suppression_follows_the_no_sync_boundaries(self) -> None:
+    def test_suppression_follows_the_optimizer_step_boundaries(self) -> None:
         wrapper = self._make()
         calls: List[str] = []
         with self._record(wrapper, calls):
@@ -531,12 +532,11 @@ class FsdpSyncSuppressionSeamTest(unittest.TestCase):
                 wrapper.progress(iter([torch.randn(2, 10)]))
         # Compare synchronization flags independently of optimizer validation.
         flags = [c for c in calls if c in ("suppress", "restore")]
-        # Warmup synchronizes the first microbatch.
-        # Subsequent windows synchronize only their final microbatch.
+        # Every window, the first included, synchronizes only its final microbatch.
         self.assertEqual(
             flags,
             [
-                "restore",
+                "suppress",
                 "suppress",
                 "suppress",
                 "restore",
@@ -546,6 +546,111 @@ class FsdpSyncSuppressionSeamTest(unittest.TestCase):
                 "restore",
             ],
         )
+
+    def test_a_restarted_schedule_synchronizes_only_its_step_micro_batch(self) -> None:
+        # A compile warmup's reset() must not make FSDP2 all-reduce microbatch 0 again.
+        for api in ("reset", "set_step"):
+            with self.subTest(api=api):
+                wrapper = self._make()
+                for _ in range(4):
+                    wrapper.progress(iter([torch.randn(2, 10)]))
+                if api == "reset":
+                    wrapper.reset()
+                else:
+                    wrapper.set_step(0)
+                calls: List[str] = []
+                with self._record(wrapper, calls):
+                    for _ in range(4):
+                        wrapper.progress(iter([torch.randn(2, 10)]))
+                self.assertEqual(
+                    [c for c in calls if c in ("suppress", "restore")],
+                    ["suppress", "suppress", "suppress", "restore"],
+                )
+
+    def test_no_sync_warmup_does_not_synchronize_fsdp2(self) -> None:
+        cases = {
+            4: ["suppress", "suppress", "suppress", "restore"],
+            # Warmup spans two windows.
+            2: ["suppress", "restore", "suppress", "restore"],
+        }
+        for num_steps, expected in cases.items():
+            with self.subTest(num_steps=num_steps):
+                model = _MockModel()
+                wrapper = GradientAccumulationWrapper(
+                    _MockPipeline(num_batches=4),
+                    optim.SGD(model.parameters(), lr=0.01),
+                    model,
+                    GradientAccumulationConfig(
+                        is_enabled=True, num_steps=num_steps, num_warmup_steps=3
+                    ),
+                )
+                calls: List[str] = []
+                with self._record(wrapper, calls):
+                    for _ in range(4):
+                        wrapper.progress(iter([]))
+                self.assertEqual(model.no_sync_entered, 0)
+                self.assertEqual(
+                    [c for c in calls if c in ("suppress", "restore")], expected
+                )
+
+    def test_k1_synchronizes_every_micro_batch(self) -> None:
+        # A compile warmup may run at K=1 on a wrapper built for a larger K.
+        wrapper = self._make()
+        wrapper.set_num_micro_batches_per_step(1)
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            for _ in range(2):
+                wrapper.progress(iter([torch.randn(2, 10)]))
+            wrapper.reset()
+            for _ in range(2):
+                wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertEqual(
+            [c for c in calls if c in ("suppress", "restore")], ["restore"] * 4
+        )
+
+    def test_disabled_accumulation_leaves_fsdp_state_alone(self) -> None:
+        model = nn.Linear(10, 5)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        wrapper = GradientAccumulationWrapper(
+            _RealForwardPipeline(model, optimizer),
+            optimizer,
+            model,
+            GradientAccumulationConfig(),
+        )
+        calls: List[str] = []
+        with self._record(wrapper, calls):
+            for _ in range(2):
+                wrapper.progress(iter([torch.randn(2, 10)]))
+            wrapper.reset()
+            wrapper.progress(iter([torch.randn(2, 10)]))
+        self.assertEqual(calls, [])
+
+    def test_exhaustion_after_the_first_micro_batch_drops_its_fsdp_partial(
+        self,
+    ) -> None:
+        wrapper = self._make(PartialWindowPolicy.STEP)
+        calls: List[str] = []
+        with self._record(wrapper, calls), patch.object(
+            wrapper._fsdp_sync_suppression, "has_partial", return_value=True
+        ), self.assertLogs(
+            "torchrec.distributed.train_pipeline.gradient_accumulation", "WARNING"
+        ) as logs:
+            wrapper.progress(iter([torch.randn(2, 10)]))
+            with self.assertRaises(StopIteration):
+                wrapper.progress(iter([]))
+        self.assertEqual(
+            calls,
+            [
+                "suppress",
+                "suppress",
+                "restore",
+                "ensure_sharded",
+                "clear_partial",
+                "restore",
+                "ensure_sharded",
+            ],
+        )
+        self.assertIn("Dropping the native-FSDP2 gradients", "\n".join(logs.output))
 
     def test_the_targets_are_collected_once(self) -> None:
         wrapper = self._make()

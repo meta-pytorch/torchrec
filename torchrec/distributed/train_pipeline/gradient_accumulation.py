@@ -108,9 +108,11 @@ class GradientAccumulationConfig:
     Attributes:
         is_enabled: Whether gradient accumulation is enabled.
         num_steps: Number of micro-batches to accumulate before optimizer step.
-        num_warmup_steps: Number of initial micro-batches that synchronize gradients.
-            The default synchronizes only the first micro-batch, as required by DDP
-            ``static_graph`` initialization.
+        num_warmup_steps: Number of initial micro-batches that synchronize modules
+            managed through ``no_sync()``, such as DDP. The default synchronizes only
+            the first micro-batch, as required by DDP ``static_graph`` initialization.
+            Warmup does not apply to native FSDP2, whose deferred all-reduce and
+            resharding run only on optimizer-step micro-batches.
     """
 
     is_enabled: bool = False
@@ -319,7 +321,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             pipeline._optimizer = self._optimizer_wrapper
 
     def _should_sync_grad(self, is_last_batch: bool = False) -> bool:
-        """Return whether this batch should synchronize distributed gradients."""
+        """Return whether ``no_sync()`` modules synchronize gradients on this batch."""
         if is_last_batch:
             return True
 
@@ -567,9 +569,10 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         ctx: ContextManager[None] = (
             contextlib.nullcontext() if should_sync else self._get_no_sync_context()
         )
-        # Native FSDP2 ignores no_sync(), so set its flags before backward.
+        # Native FSDP2 ignores no_sync() and needs no synchronized first backward, so
+        # restore its all-reduce and resharding only on optimizer steps and in eval.
         fsdp_targets = self._get_fsdp_targets()
-        if should_sync:
+        if should_step or not self._model.training:
             self._fsdp_sync_suppression.restore(fsdp_targets)
         else:
             self._fsdp_sync_suppression.suppress(fsdp_targets)
