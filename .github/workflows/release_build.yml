@@ -16,30 +16,34 @@ jobs:
   # build on cpu hosts and upload to GHA
   build_on_cpu:
     runs-on: ${{ matrix.os }}
+    # OSDC runners have no host toolchain: the job runs in this image, which
+    # already has conda, gcc and git.
+    container:
+      image: pytorch/almalinux-builder:cpu
     strategy:
       matrix:
         include:
-          - os: linux.2xlarge
+          - os: mt-l-x86iavx512-8-64
             python-version: '3.10'
             python-tag: "py310"
             cuda-tag: "cu126"
-          - os: linux.2xlarge
+          - os: mt-l-x86iavx512-8-64
             python-version: '3.11'
             python-tag: "py311"
             cuda-tag: "cu126"
-          - os: linux.2xlarge
+          - os: mt-l-x86iavx512-8-64
             python-version: '3.12'
             python-tag: "py312"
             cuda-tag: "cu126"
-          - os: linux.2xlarge
+          - os: mt-l-x86iavx512-8-64
             python-version: '3.13'
             python-tag: "py313"
             cuda-tag: "cu126"
-          - os: linux.2xlarge
+          - os: mt-l-x86iavx512-8-64
             python-version: '3.14'
             python-tag: "py314"
             cuda-tag: "cu126"
-          - os: linux.2xlarge
+          - os: mt-l-x86iavx512-8-64
             python-version: '3.15'
             python-tag: "py315"
             cuda-tag: "cu126"
@@ -49,18 +53,6 @@ jobs:
         run: ldd --version
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Update pip
-        run: |
-          sudo yum update -y
-          sudo yum -y install git python3-pip
-      - name: Setup conda
-        run: |
-          wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
-          bash ~/miniconda.sh -b -p $HOME/miniconda -u
-      - name: setup Path
-        run: |
-          echo "/home/ec2-user/miniconda/bin" >> $GITHUB_PATH
-          echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
       - name: create conda env
         run: |
           if [[ "${{ matrix.python-version }}" == "3.15" ]]; then
@@ -75,9 +67,6 @@ jobs:
       - name: check python version
         run: |
           conda run -n build_binary python --version
-      - name: Install C/C++ compilers
-        run: |
-          sudo yum install -y gcc gcc-c++
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
@@ -118,10 +107,14 @@ jobs:
   # download from GHA, sanity check on gpu and push to pypi
   sanity_check_on_gpu_and_push:
     runs-on: ${{ matrix.os }}
+    # Same image as the build; the OSDC GPU label exposes the GPU to it.
+    container:
+      image: pytorch/almalinux-builder:cpu
+      options: --gpus all
     strategy:
       matrix:
         os:
-          - linux.g5.12xlarge.nvidia.gpu
+          - mt-l-x86aavx2-11-41-a10g
         python-version:
           - "3.10"
           - "3.11"
@@ -133,7 +126,6 @@ jobs:
           - "cu126"
     needs: build_on_cpu
     # the glibc version should match the version of the one we used to build the binary
-    # for this case, it's 2.26
     steps:
       - name: Check ldd --version
         run: ldd --version
@@ -145,39 +137,13 @@ jobs:
         shell: bash
         run: |
           cat /proc/version
-      - name: Display EC2 information
-        shell: bash
-        run: |
-          set -euo pipefail
-          function get_ec2_metadata() {
-            # Pulled from instance metadata endpoint for EC2
-            # see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html
-            category=$1
-              curl -H "X-aws-ec2-metadata-token: $(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 30")" -fsSL "http://169.254.169.254/latest/meta-data/${category}"
-          }
-          echo "ami-id: $(get_ec2_metadata ami-id)"
-          echo "instance-id: $(get_ec2_metadata instance-id)"
-          echo "instance-type: $(get_ec2_metadata instance-type)"
       - name: check gpu info
         shell: bash
         run: |
-          sudo yum install lshw -y
-          sudo lshw -C display
+          nvidia-smi
       # Checkout the repository to the GitHub Actions runner
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Update pip
-        run: |
-          sudo yum update -y
-          sudo yum -y install git python3-pip
-      - name: Setup conda
-        run: |
-          wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
-          bash ~/miniconda.sh -b -p $HOME/miniconda
-      - name: setup Path
-        run: |
-          echo "/home/ec2-user/miniconda/bin" >> $GITHUB_PATH
-          echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
       - name: create conda env
         run: |
           if [[ "${{ matrix.python-version }}" == "3.15" ]]; then
@@ -192,9 +158,6 @@ jobs:
       - name: check python version
         run: |
           conda run -n build_binary python --version
-      - name: Install C/C++ compilers
-        run: |
-          sudo yum install -y gcc gcc-c++
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
