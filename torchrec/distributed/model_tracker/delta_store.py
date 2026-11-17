@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 
-# pyre-strict
 from abc import ABC, abstractmethod
 from bisect import bisect_left
 from typing import Dict, List, Optional
