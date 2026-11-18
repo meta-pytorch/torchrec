@@ -257,6 +257,10 @@ class BaseTwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 embedding_tables.extend(grouped_config.embedding_tables)
         return embedding_tables
 
+    def grouped_embedding_configs_per_rank(self) -> List[List[GroupedEmbeddingConfig]]:
+        """Every rank's TBE groups, as this sharding's lookups are built from them."""
+        return self._grouped_embedding_configs_per_rank
+
     def feature_names_per_rank(self) -> List[List[str]]:
         feature_names = []
         for grouped_embedding_configs in self._grouped_embedding_configs_per_rank:

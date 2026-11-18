@@ -54,6 +54,7 @@ from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
     DPLookupAwaitable,
     EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
     KJTList,
     ShardedEmbeddingModule,
 )
@@ -84,7 +85,10 @@ from torchrec.distributed.sharding.dynamic_sharding import (
 )
 from torchrec.distributed.sharding.grid_sharding import GridPooledEmbeddingSharding
 from torchrec.distributed.sharding.rw_sharding import RwPooledEmbeddingSharding
-from torchrec.distributed.sharding.tw_sharding import TwPooledEmbeddingSharding
+from torchrec.distributed.sharding.tw_sharding import (
+    BaseTwEmbeddingSharding,
+    TwPooledEmbeddingSharding,
+)
 from torchrec.distributed.sharding.twcw_sharding import TwCwPooledEmbeddingSharding
 from torchrec.distributed.sharding.twrw_sharding import TwRwPooledEmbeddingSharding
 from torchrec.distributed.shards_wrapper import (
@@ -2497,6 +2501,53 @@ class EmbeddingBagCollectionSharder(BaseEmbeddingSharder[EmbeddingBagCollection]
             name.split(".")[0]: param
             for name, param in module.embedding_bags.named_parameters()
         }
+
+    def key_value_l1_grouping_sharding_types(
+        self, module: EmbeddingBagCollection
+    ) -> Set[str]:
+        return {ShardingType.TABLE_WISE.value, ShardingType.COLUMN_WISE.value}
+
+    def key_value_grouped_configs_per_rank(
+        self,
+        module: EmbeddingBagCollection,
+        params: Dict[str, ParameterSharding],
+        env: ShardingEnv,
+    ) -> List[List[GroupedEmbeddingConfig]]:
+        """
+        Builds the groups with `ShardedEmbeddingBagCollection`'s own
+        `create_grouped_sharding_infos` and `create_embedding_bag_sharding`, as its
+        constructor does, without building lookups or touching any weight. Like
+        the constructor, it fills empty `feature_names` and the `optimizer` key of
+        the parameters' `_optimizer_kwargs` in place, to the same values.
+        """
+        declared = self.key_value_l1_grouping_sharding_types(module)
+        configs_per_rank: List[List[GroupedEmbeddingConfig]] = [
+            [] for _ in range(env.world_size)
+        ]
+        for (
+            sharding_type,
+            sharding_infos,
+        ) in ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
+            module, params, "embedding_bags.", self.fused_params
+        ).items():
+            if sharding_type not in declared:
+                continue
+            sharding = ShardedEmbeddingBagCollection.create_embedding_bag_sharding(
+                sharding_infos, env, permute_embeddings=True
+            )
+            if not isinstance(sharding, BaseTwEmbeddingSharding):
+                raise TypeError(
+                    f"{sharding_type} sharding {type(sharding).__name__} does not expose its TBE groups"
+                )
+            for rank, configs in enumerate(
+                sharding.grouped_embedding_configs_per_rank()
+            ):
+                configs_per_rank[rank].extend(
+                    config
+                    for config in configs
+                    if config.compute_kernel == EmbeddingComputeKernel.KEY_VALUE
+                )
+        return configs_per_rank
 
     def reshard(
         self,

@@ -259,7 +259,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     sharding_option.name,
                 )
             try:
-                shard_storages, cache_weight_sizes = (
+                shard_storages, cache_weight_sizes, key_value_l1_sizes = (
                     _calculate_shard_storages_and_cache_sizes(
                         sharder_data=sharder_data,
                         sharding_type=sharding_option.sharding_type,
@@ -300,13 +300,15 @@ class EmbeddingStorageEstimator(ShardEstimator):
                     f"sharding_type='{sharding_option.sharding_type}', "
                     f"compute_kernel='{sharding_option.compute_kernel}'"
                 ) from e
-            for shard, storage, cache_weight_size in zip(
+            for shard, storage, cache_weight_size, key_value_l1_size in zip(
                 sharding_option.shards,
                 shard_storages,
                 cache_weight_sizes,
+                key_value_l1_sizes,
             ):
                 shard.storage = storage
                 shard.cache_weight_bytes = cache_weight_size
+                shard.key_value_l1_bytes = key_value_l1_size
 
 
 def calculate_pipeline_io_cost(
@@ -384,7 +386,7 @@ def calculate_shard_storages(
     Like calculate_shard_storages but takes a SharderData snapshot instead of a live
     ModuleSharder, enabling picklability.
     """
-    storages, _ = _calculate_shard_storages_and_cache_sizes(
+    storages, _, _ = _calculate_shard_storages_and_cache_sizes(
         sharder_data=sharder_data,
         sharding_type=sharding_type,
         tensor=tensor,
@@ -471,7 +473,11 @@ def _calculate_shard_storages_and_cache_sizes(
     use_virtual_table: bool = False,
     weight_init_on_cpu: bool = False,
     quantized_weight_dtype: Optional[DataType] = None,
-) -> Tuple[List[Storage], List[int]]:
+) -> Tuple[List[Storage], List[int], List[int]]:
+    """
+    Per shard: its storage, its UVM-caching cache bytes, and the part of its HBM
+    booked for a key-value (or virtual) table's L1 cache (0 for other kernels).
+    """
     input_sizes, output_sizes = _calculate_shard_io_sizes(
         sharding_type=sharding_type,
         batch_sizes=batch_sizes,
@@ -563,6 +569,7 @@ def _calculate_shard_storages_and_cache_sizes(
         )
     ]
 
+    key_value_l1_sizes = [0] * len(shard_sizes)
     if (
         compute_kernel
         in {
@@ -579,6 +586,8 @@ def _calculate_shard_storages_and_cache_sizes(
             key_value_params=key_value_params,
             kv_cache_load_factor=kv_cache_load_factor,
         )
+        if compute_device in {"cuda", "mtia", "tpu"}:  # the devices hbm_sizes books
+            key_value_l1_sizes = list(hbm_specific_sizes)
         ddr_specific_sizes = [0 for _ in ddr_specific_sizes]
 
     hbm_sizes: List[int] = [
@@ -634,7 +643,7 @@ def _calculate_shard_storages_and_cache_sizes(
         )
         for hbm_size, ddr_size, ssd_size in zip(hbm_sizes, ddr_sizes, ssd_sizes)
     ]
-    return storages, cache_weight_sizes
+    return storages, cache_weight_sizes, key_value_l1_sizes
 
 
 def _is_table_cached(
