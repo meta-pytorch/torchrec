@@ -48,6 +48,7 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     ShardingType,
+    StorageUsageType,
 )
 from torchrec.modules.embedding_configs import DataType
 from torchrec.modules.embedding_modules import (
@@ -73,6 +74,9 @@ GUARDED_COMPUTE_KERNELS: Set[EmbeddingComputeKernel] = {
     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
     EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,
 }
+
+# IntNBit dtypes a training sharder's QUANT_UVM table may be built and priced at
+TRAINING_QUANT_UVM_WEIGHT_DTYPES: Set[DataType] = {DataType.INT8, DataType.INT4}
 
 # sharding types that require explicit user specification for feature-processed modules
 # row wise sharding uses a different pipelined configuration for feature processing
@@ -239,6 +243,22 @@ class EmbeddingEnumerator(Enumerator):
                         sharder.compute_kernels(sharding_type, self._compute_device),
                         sharding_type,
                     ):
+                        quantized_weight_dtype: Optional[DataType] = None
+                        if (
+                            compute_kernel == EmbeddingComputeKernel.QUANT_UVM.value
+                            and self._sharder_data_map[sharder_key].storage_usage_type
+                            == StorageUsageType.BASE
+                        ):
+                            quantized_weight_dtype = (
+                                self._training_quant_uvm_weight_dtype(name)
+                            )
+                            if quantized_weight_dtype is None:
+                                logger.debug(
+                                    f"Not enumerating {compute_kernel} for {name} in a "
+                                    "training sharder: its ParameterConstraints do not "
+                                    "name that compute kernel."
+                                )
+                                continue
                         try:
                             (
                                 shard_sizes,
@@ -301,6 +321,7 @@ class EmbeddingEnumerator(Enumerator):
                                     name, child_module
                                 ),
                                 num_twrw_groups=num_twrw_groups,
+                                quantized_weight_dtype=quantized_weight_dtype,
                             )
                         )
                 if not sharding_options_per_table:
@@ -521,6 +542,35 @@ class EmbeddingEnumerator(Enumerator):
                 "sharding types, or if non-strings are passed in."
             )
         return filtered_sharding_types
+
+    def _training_quant_uvm_weight_dtype(self, name: str) -> Optional[DataType]:
+        """
+        The IntNBit dtype a training sharder's QUANT_UVM option for `name` is priced and
+        built at, or None when that option must not be enumerated.
+
+        A training sharder that offers QUANT_UVM (the inference TBE, IntNBit rows in host
+        memory) offers it for every table it shards, so the option is guarded per table:
+        only a table whose constraint names the kernel gets it, never one planned without
+        constraints.
+        Naming it without an INT8/INT4 `quantized_weight_dtype` is a configuration
+        error.
+        """
+        constraints = self._constraints.get(name) if self._constraints else None
+        if (
+            constraints is None
+            or not constraints.compute_kernels
+            or EmbeddingComputeKernel.QUANT_UVM.value not in constraints.compute_kernels
+        ):
+            return None
+        if constraints.quantized_weight_dtype not in TRAINING_QUANT_UVM_WEIGHT_DTYPES:
+            raise ValueError(
+                f"[TorchRec Planner] Table {name} names compute kernel "
+                f"{EmbeddingComputeKernel.QUANT_UVM.value} in a training sharder, which "
+                "needs ParameterConstraints.quantized_weight_dtype set to one of "
+                f"{sorted(d.value for d in TRAINING_QUANT_UVM_WEIGHT_DTYPES)}, got "
+                f"{constraints.quantized_weight_dtype}."
+            )
+        return constraints.quantized_weight_dtype
 
     def _filter_compute_kernels(
         self,
