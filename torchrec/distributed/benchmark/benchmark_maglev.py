@@ -9,7 +9,8 @@
 """
 Benchmark for the Maglev staged pipeline (MVP).
 
-Measures the schedule selected by ``--pipeline``. ``1f1b`` is the default;
+Measures the schedule selected by ``--pipeline``. ``1f1b``, the default, and
+``rail`` are built through :class:`~torchrec.distributed.maglev.maglev_pp.MaglevPP`;
 ``rail`` batches each layer's sparse work over the whole pass before running
 the dense halves in the order ``--dense_schedule`` names, ``1f1b`` (the
 default) or ``zero_bubble``. ``data_parallel`` is the baseline without a
@@ -70,12 +71,16 @@ from torchrec.distributed.benchmark.base import (
     GPUMemoryStats,
 )
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.maglev.maglev_pp import (
+    MaglevPP,
+    MaglevPPConfig,
+    MaglevSchedule,
+)
 from torchrec.distributed.maglev.module import MaglevLayer, StructuredActivationsLayout
 from torchrec.distributed.maglev.pipeline import (
     Maglev1F1B,
     Maglev1F1BRecvAhead,
     MaglevPipelineBase,
-    MaglevRail,
 )
 from torchrec.distributed.maglev.stage import (
     HandoffPGMode,
@@ -109,18 +114,17 @@ from torchrec.optim.optimizers import in_backward_optimizer_filter
 # Inputs are left unseeded -- values don't affect a throughput benchmark.
 _WEIGHT_SEED = 100
 
-# Selectable schedules, by --pipeline. "base" runs one microbatch per pass,
-# forwarding all then backwarding all. The recv-ahead name is kept for callers
-# of the earlier experimental schedule. "rail" runs each sparse half once per
-# pass on the whole batch, its dense order picked by --dense_schedule.
-# --pipeline=data_parallel is the baseline without a pipeline (see _PIPELINES).
+# Selectable schedules, by --pipeline. "1f1b" and "rail" are MaglevPP's; "rail"
+# runs each sparse half once per pass on the whole batch, its dense order picked
+# by --dense_schedule. "base" (one microbatch per pass, forwarding all then
+# backwarding all) and the recv-ahead name are built directly.
+# --pipeline=data_parallel is the baseline without a pipeline.
+_MAGLEV_PP_PIPELINES: tuple[str, ...] = tuple(s.value for s in MaglevSchedule)
 _PIPELINE_CLS: Dict[str, Type[MaglevPipelineBase]] = {
     "base": MaglevPipelineBase,
-    "1f1b": Maglev1F1B,
     "1f1b-recv-ahead": Maglev1F1BRecvAhead,
-    "rail": MaglevRail,
 }
-_PIPELINES: tuple[str, ...] = (*_PIPELINE_CLS, "data_parallel")
+_PIPELINES: tuple[str, ...] = (*_MAGLEV_PP_PIPELINES, *_PIPELINE_CLS, "data_parallel")
 # MaglevRail's dense orders, by --dense_schedule.
 _DENSE_SCHEDULES: tuple[str, ...] = ("1f1b", "zero_bubble")
 
@@ -259,12 +263,12 @@ class RunOptions(BenchFuncConfig):
         pipeline (str): Which schedule to measure. Options:
             - "base": one microbatch per pass, no pipelining -- the reference the
               1F1B variants are worth measuring against
-            - "1f1b": the standard bidirectional 1F1B schedule
+            - "1f1b": the standard bidirectional 1F1B schedule, through MaglevPP
             - "1f1b-recv-ahead": split-mode 1F1B with receives posted one
               microbatch ahead; shared mode uses its batched crossover schedule
-            - "rail": one whole-pass sparse lookup per layer followed by a
-              dense pipeline over ``num_microbatches``, in the order
-              ``dense_schedule`` names
+            - "rail": through MaglevPP, one whole-pass sparse lookup per layer
+              followed by a dense pipeline over ``num_microbatches``, in the
+              order ``dense_schedule`` names
             - "data_parallel": no pipeline; every rank trains the whole model,
               tables sharded over all ranks, on ``1 / world_size`` of the
               pipelines' global batch per step. Requires ``shard_embeddings``.
@@ -397,40 +401,38 @@ class RunOptions(BenchFuncConfig):
             )
         return dense_schedule
 
+    def pp_config(self, loss_only_output: bool) -> MaglevPPConfig:
+        """The :class:`MaglevPPConfig` for a MaglevPP :attr:`pipeline`."""
+        return MaglevPPConfig(
+            schedule=MaglevSchedule(self.pipeline),
+            num_microbatches=self.num_microbatches,
+            layers_per_stage=tuple(self.layers_per_stage),
+            stage_size=self.ranks_per_stage,
+            loss_only_output=loss_only_output,
+            dense_schedule=self.dense_schedule,
+        )
+
     def generate_pipeline(
         self, stage: StageWrapper, optimizer: torch.optim.Optimizer
     ) -> MaglevPipelineBase:
-        """Build the schedule named by :attr:`pipeline`.
+        """Build a :attr:`pipeline` MaglevPP does not route: "base" or the
+        recv-ahead schedule.
 
         Raises:
-            ValueError: if :attr:`pipeline` is not a known schedule.
+            ValueError: if :attr:`pipeline` is not one of them.
         """
-        dense_schedule = self.rail_dense_schedule()
-        if self.is_rail:
-            return MaglevRail(
-                stage,
-                optimizer,
-                num_microbatches=self.num_microbatches,
-                dense_schedule=dense_schedule,
-            )
+        if self.pipeline == "base":
+            # One input-distribution round per pass; no microbatch count.
+            return MaglevPipelineBase(stage=stage, optimizer=optimizer)
         if self.pipeline not in _PIPELINE_CLS:
             raise ValueError(
                 f"unknown pipeline {self.pipeline!r}; expected one of "
                 f"{sorted(_PIPELINE_CLS)}"
             )
-        match self.pipeline:
-            case "base":
-                # One input-distribution round per pass; takes no configured
-                # microbatch count.
-                return MaglevPipelineBase(stage=stage, optimizer=optimizer)
-            case _:
-                # The remaining entries are Maglev1F1B subclasses.
-                Pipeline = cast(Type[Maglev1F1B], _PIPELINE_CLS[self.pipeline])
-                return Pipeline(
-                    stage=stage,
-                    optimizer=optimizer,
-                    num_microbatches=self.num_microbatches,
-                )
+        Pipeline = cast(Type[Maglev1F1B], _PIPELINE_CLS[self.pipeline])
+        return Pipeline(
+            stage=stage, optimizer=optimizer, num_microbatches=self.num_microbatches
+        )
 
 
 def _rows_per_pass(run_option: "RunOptions") -> int:
@@ -539,7 +541,8 @@ def _pipelined(
     device: torch.device,
     run_option: RunOptions,
 ) -> _Step:
-    """Build this rank's stage and the schedule :attr:`RunOptions.pipeline` names."""
+    """Build this rank's stage and the schedule :attr:`RunOptions.pipeline`
+    names, through :class:`MaglevPP` for the schedules it routes."""
     layers_per_stage = list(run_option.layers_per_stage)
     num_stages = len(layers_per_stage)
     process_groups = MaglevProcessGroups.from_scratch(
@@ -552,47 +555,55 @@ def _pipelined(
     )
     # Per stage: an HSD's ranks must start identical, and nothing syncs them.
     torch.manual_seed(_WEIGHT_SEED + my_stage_index)
-    stage = StageWrapper(
-        model=model,
-        layers_per_stage=layers_per_stage,
-        stage_size=run_option.ranks_per_stage,
-        loss_only_output=run_option.shard_embeddings and run_option.ranks_per_stage > 1,
-        process_groups=process_groups,
-        enable_rail=run_option.is_rail,
-    )
+    loss_only_output = run_option.shard_embeddings and run_option.ranks_per_stage > 1
+    pp: Optional[MaglevPP] = None
+    if run_option.pipeline in _MAGLEV_PP_PIPELINES:
+        pp = MaglevPP(model, run_option.pp_config(loss_only_output), process_groups)
+        stage = pp.stage
+    else:
+        stage = StageWrapper(
+            model=model,
+            layers_per_stage=layers_per_stage,
+            stage_size=run_option.ranks_per_stage,
+            loss_only_output=loss_only_output,
+            process_groups=process_groups,
+        )
     # Shard before to(): a meta-authored stage never allocates full tables.
     if run_option.shard_embeddings:
-        stage.module = _shard_and_wrap(
+        module = _shard_and_wrap(
             stage.module,
             stage.stage_pg,
             device,
             run_option.lr,
             run_option.data_parallelism(),
         )
+        if pp is not None:
+            pp.module = module
+        else:
+            stage.module = module
     stage.to(device)
-    pipeline = run_option.generate_pipeline(
-        stage=stage,
-        optimizer=_dense_optimizer(stage.module, run_option),
-    )
-    # A whole-pass schedule reads one batch per pass; the others read one
-    # microbatch per input carrier.
-    batch = _replayed_batch(
-        all_tables,
-        run_option.batch_size
-        * (run_option.num_microbatches if pipeline.takes_whole_pass_input else 1),
-        run_option,
-    )
+    optimizer = _dense_optimizer(stage.module, run_option)
+    progress: Callable[[Iterator[Any]], Optional[torch.Tensor]]
+    if pp is not None:
+        pp.build(optimizer)
+        progress = pp.progress
+        rows = pp.input_batch_size(run_option.batch_size)
+    else:
+        # Both read one microbatch per input carrier.
+        progress = run_option.generate_pipeline(stage, optimizer).progress
+        rows = run_option.batch_size
+    batch = _replayed_batch(all_tables, rows, run_option)
 
     def _round(
         bench_inputs: List[ModelInput],
-        pipeline: MaglevPipelineBase,
+        progress: Callable[[Iterator[Any]], Optional[torch.Tensor]],
         dataloader_iter: Iterator[List[ModelInput]],
     ) -> None:
         # num_stages passes: whole input-dist rounds for every schedule.
         for _ in range(num_stages):
-            pipeline.progress(dataloader_iter)
+            progress(dataloader_iter)
 
-    return _round, {"pipeline": pipeline, "dataloader_iter": itertools.repeat(batch)}
+    return _round, {"progress": progress, "dataloader_iter": itertools.repeat(batch)}
 
 
 def _data_parallel(
