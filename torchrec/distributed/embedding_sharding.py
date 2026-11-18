@@ -1183,7 +1183,7 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                         stride_per_rank=stride_per_rank,
                     )
                 )
-        if os.environ.get("ONEFLOW_SDD_ASYNC_LENGTH_PER_KEY", "1") == "1":
+        if os.environ.get("ONEFLOW_SDD_ASYNC_LENGTH_PER_KEY", "0") == "1":
             for tensors_awaitable in tensors_awaitables:
                 prefetch = getattr(tensors_awaitable, "prefetch_length_per_key", None)
                 if callable(prefetch):

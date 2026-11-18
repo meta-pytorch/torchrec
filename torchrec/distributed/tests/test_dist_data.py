@@ -3408,6 +3408,27 @@ class FusedKJTListSplitsAwaitableAnnotationTest(unittest.TestCase):
             requests=list(requests), contexts=[r.ctx for r in requests], pg=None
         )
 
+    def test_async_length_per_key_prefetch_requires_opt_in(self) -> None:
+        for flag in (None, "0", "1"):
+            with self.subTest(flag=flag), patch.dict(os.environ):
+                os.environ.pop("ONEFLOW_SDD_ASYNC_LENGTH_PER_KEY", None)
+                if flag is not None:
+                    os.environ["ONEFLOW_SDD_ASYNC_LENGTH_PER_KEY"] = flag
+                tensors_awaitable = MagicMock(spec=KJTAllToAllTensorsAwaitable)
+                request = KJTListSplitsAwaitable(
+                    awaitables=[NoWait(tensors_awaitable)],
+                    ctx=NullShardingContext(),
+                )
+
+                output = self._fuse(request).wait()
+
+                self.assertEqual(len(output), 1)
+                self.assertEqual(output[0].awaitables, [tensors_awaitable])
+                if flag == "1":
+                    tensors_awaitable.prefetch_length_per_key.assert_called_once_with()
+                else:
+                    tensors_awaitable.prefetch_length_per_key.assert_not_called()
+
     def test_labels_align_with_flattened_awaitables(self) -> None:
         fused = self._fuse(
             self._request("mod_a", ["row_wise", "table_row_wise"]),
