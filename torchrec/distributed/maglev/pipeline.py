@@ -22,6 +22,7 @@ from torch.autograd.profiler import record_function
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo
 from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.maglev.data_parallel import make_pass_reduction, PassReduction
 from torchrec.distributed.maglev.stage import (
     HandoffPGMode,
     MaglevRailPassState,
@@ -81,8 +82,7 @@ class MaglevPipelineBase:
 
     Subclasses override :meth:`progress` with their own ordering; what they
     inherit is the stage and optimizer, the boundary-contract check, and the
-    data-parallel synchronization controls. FSDP2 is armed before the pass's final
-    backward; DDP is flushed immediately after it.
+    data-parallel wrapper discovery.
 
     Args:
         stage: this rank's :class:`StageWrapper`. Everything about where this
@@ -192,57 +192,6 @@ class MaglevPipelineBase:
             self.optimizer.step()
         return loss if self.stage.is_last else None
 
-    def _forward_context(self, fwd_idx: int, num_forwards: int) -> ContextManager[None]:
-        """Suppress DDP sync for every microbatch forward.
-
-        A 1F1B stage can have several forwards outstanding and backpropagates them
-        in FIFO order. Arming DDP on the final *forward* therefore makes the reducer
-        consume an earlier graph's hooks. Keep every DDP forward unsynchronized and
-        flush its accumulated gradient buckets after the final backward.
-
-        Non-DDP wrappers retain the ordinary last-forward synchronization behavior.
-
-        Args:
-            fwd_idx: index of this forward within the pass.
-            num_forwards: forwards this pass will run.
-        """
-        if fwd_idx == num_forwards - 1:
-            return _no_sync(self._ddp_modules)
-        return self._no_sync()
-
-    def _finalize_ddp_backward(
-        self,
-        backward_idx: int,
-        num_backwards: int,
-    ) -> None:
-        """Reduce DDP gradients once, after every microbatch has accumulated."""
-        if backward_idx != num_backwards - 1:
-            return
-        for module in self._ddp_modules:
-            # All forwards ran under no_sync, so no graph-specific reducer state is
-            # live. Flush the accumulated parameter grads through DDP's configured
-            # buckets and communication hook in one reduction.
-            module.reducer.prepare_for_backward([])
-            module.reducer._delay_all_reduce()
-
-    def _configure_fsdp_backward(
-        self,
-        backward_idx: int,
-        num_backwards: int,
-    ) -> None:
-        """Reduce FSDP2 gradients on the final microbatch backward.
-
-        All three flags, as upstream's ``backward_maybe_with_nosync`` does.
-        Leaving ``reshard_after_backward`` at its default reshards after every
-        microbatch, so the next microbatch's forward has to all-gather again --
-        measured at 8x the all-gathers for ``m=8`` before this was set.
-        """
-        should_sync = backward_idx == num_backwards - 1
-        for module in self._fsdp_modules:
-            module.set_requires_gradient_sync(should_sync, recurse=False)
-            module.set_is_last_backward(should_sync)
-            module.set_reshard_after_backward(should_sync)
-
 
 class Maglev1F1B(MaglevPipelineBase):
     """The 1F1B (one-forward-one-backward) schedule.
@@ -252,6 +201,11 @@ class Maglev1F1B(MaglevPipelineBase):
     backwards in cooldown. ``num_warmup = num_stages - stage_index - 1`` (clamped
     to the microbatch count), so deeper stages warm up less and the send/recv
     pairs line up across ranks.
+
+    Each microbatch runs every local layer's sparse half, then its dense half,
+    so a fused embedding optimizer steps once per microbatch backward. DDP and
+    ZeRO-2 FSDP2 reduce once per pass; ZeRO-3 reduce-scatters per microbatch
+    (:mod:`~torchrec.distributed.maglev.data_parallel`).
 
     Communication follows the stage's global handoff-PG configuration. ``SPLIT``
     keeps activation and gradient traffic on independent communicators and uses
@@ -263,6 +217,8 @@ class Maglev1F1B(MaglevPipelineBase):
         optimizer: the stage's optimizer.
         num_microbatches: microbatches per pass. Fixed for the pipeline's life,
             so the schedule's shape is computed once here rather than per pass.
+        no_sync: an extra context entered around every forward, beside the
+            reduction's own ``no_sync``. Default: ``None``
 
     Raises:
         ValueError: if there are fewer microbatches than stages. That leaves the
@@ -270,7 +226,9 @@ class Maglev1F1B(MaglevPipelineBase):
             that seeds the gradient receives -- so those ranks would fail in
             cooldown while the later ones ran on, hanging the job
             asymmetrically. It is also a pointless schedule: the pipeline never
-            fills, so it is all bubble.
+            fills, so it is all bubble. Also if the stage's data-parallel
+            wrappers cannot be reduced as above (see
+            :func:`~torchrec.distributed.maglev.data_parallel.make_pass_reduction`).
     """
 
     def __init__(
@@ -281,21 +239,15 @@ class Maglev1F1B(MaglevPipelineBase):
         no_sync: Optional[Callable[[], ContextManager[None]]] = None,
     ) -> None:
         super().__init__(stage, optimizer, no_sync)
-        if any(module.static_graph for module in self._ddp_modules):
-            raise ValueError(
-                "1F1B requires DDP static_graph=False because every forward runs under "
-                "no_sync and the reducer is flushed after the final backward"
-            )
-        if any(not module.find_unused_parameters for module in self._ddp_modules):
-            raise ValueError(
-                "1F1B requires DDP find_unused_parameters=True so its deferred reducer "
-                "can distinguish accumulated gradients from unused parameters"
-            )
         if num_microbatches < stage.num_stages:
             raise ValueError(
                 f"1F1B needs at least one microbatch per stage: got "
                 f"{num_microbatches} for {stage.num_stages} stages"
             )
+        self._extra_no_sync: Optional[Callable[[], ContextManager[None]]] = no_sync
+        self._reduction: PassReduction = make_pass_reduction(
+            stage.module, type(self).__name__
+        )
         self.num_microbatches: int = num_microbatches
         self.num_warmup: int = min(
             stage.num_stages - stage.stage_index - 1, num_microbatches
@@ -309,7 +261,7 @@ class Maglev1F1B(MaglevPipelineBase):
     def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
         """Run one 1F1B pass.
 
-        Gradients are accumulated across all microbatches, then DP-averaged and
+        Gradients are accumulated across all microbatches, then reduced once and
         applied with a single optimizer step.
 
         Args:
@@ -326,18 +278,38 @@ class Maglev1F1B(MaglevPipelineBase):
         """
         stage = self.stage
         microbatch_inputs = self._take_inputs(dataloader_iter, self.num_microbatches)
+        reduction = self._reduction
         with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
             self.optimizer.zero_grad()
-
-        if stage.handoff_pg_mode is HandoffPGMode.SHARED:
-            self._progress_shared(microbatch_inputs)
-        else:
-            self._progress_split(microbatch_inputs)
-
-        stage.drain_sends()
+        with reduction.accumulate():
+            self._run_microbatches(microbatch_inputs)
+            stage.drain_sends()
+        # Outside the context: a pass that raised reduces nothing.
+        with record_function("## torchrec_maglev:reduce_gradients ##"):
+            reduction.reduce()
         with record_function("## torchrec_maglev:optimizer_step ##"):
             self.optimizer.step()
         return None
+
+    def close(self) -> None:
+        """Release what the gradient reduction registered on the stage's modules."""
+        self._reduction.close()
+
+    @contextlib.contextmanager
+    def _forward_no_sync(self) -> Iterator[None]:
+        """Suppress every wrapper's gradient sync for one microbatch forward."""
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(self._reduction.no_sync())
+            if self._extra_no_sync is not None:
+                stack.enter_context(self._extra_no_sync())
+            yield
+
+    def _run_microbatches(self, microbatch_inputs: List[List[Any]]) -> None:
+        """Run the pass's forwards and backwards in the handoff mode's order."""
+        if self.stage.handoff_pg_mode is HandoffPGMode.SHARED:
+            self._progress_shared(microbatch_inputs)
+        else:
+            self._progress_split(microbatch_inputs)
 
     def _progress_split(
         self,
@@ -346,22 +318,17 @@ class Maglev1F1B(MaglevPipelineBase):
         """Run 1F1B with independent activation and gradient communicators."""
         stage = self.stage
         fwd_idx = 0
-        bwd_idx = 0
 
         def _forward() -> None:
             nonlocal fwd_idx
             stage.start_recv_act(microbatch_inputs[fwd_idx])
-            with self._forward_context(fwd_idx, self.num_microbatches):
+            with self._forward_no_sync():
                 stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
             fwd_idx += 1
 
         def _backward() -> None:
-            nonlocal bwd_idx
-            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
             stage.start_recv_grad()
             stage.backward_micro()
-            self._finalize_ddp_backward(bwd_idx, self.num_microbatches)
-            bwd_idx += 1
 
         for _ in range(self.num_warmup):
             _forward()
@@ -379,11 +346,10 @@ class Maglev1F1B(MaglevPipelineBase):
         stage = self.stage
 
         fwd_idx = 0
-        bwd_idx = 0
 
         def _compute_forward(in_activations: tuple[torch.Tensor, ...]) -> Any:
             nonlocal fwd_idx
-            with self._forward_context(fwd_idx, self.num_microbatches):
+            with self._forward_no_sync():
                 outputs = stage.compute_forward_micro(
                     microbatch_inputs[fwd_idx],
                     in_activations,
@@ -395,12 +361,7 @@ class Maglev1F1B(MaglevPipelineBase):
         def _compute_backward(
             grads: Sequence[torch.Tensor],
         ) -> tuple[Optional[torch.Tensor], tuple[torch.Tensor, ...]]:
-            nonlocal bwd_idx
-            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
-            result = stage.compute_backward_micro(grads)
-            self._finalize_ddp_backward(bwd_idx, self.num_microbatches)
-            bwd_idx += 1
-            return result
+            return stage.compute_backward_micro(grads)
 
         # Warmup: fill the pipeline with one-way forward hand-offs.
         if self.num_warmup:
@@ -444,26 +405,18 @@ class Maglev1F1B(MaglevPipelineBase):
 class Maglev1F1BRecvAhead(Maglev1F1B):
     """1F1B that posts each split-mode receive ahead of its compute."""
 
-    def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
+    def _run_microbatches(self, microbatch_inputs: List[List[Any]]) -> None:
         """Run receive-ahead 1F1B in split mode.
 
-        Shared mode uses :class:`Maglev1F1B` because its opposing handoffs must
-        be issued together on the shared communicator.
-
-        Returns:
-            Optional[torch.Tensor]: always ``None``, as
-            :meth:`Maglev1F1B.progress`.
+        Shared mode uses :class:`Maglev1F1B`'s order because its opposing
+        handoffs must be issued together on the shared communicator.
         """
         stage = self.stage
         if stage.handoff_pg_mode is HandoffPGMode.SHARED:
-            return super().progress(dataloader_iter)
-
-        microbatch_inputs = self._take_inputs(dataloader_iter, self.num_microbatches)
-        with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
-            self.optimizer.zero_grad()
+            super()._run_microbatches(microbatch_inputs)
+            return
 
         fwd_idx = 0
-        bwd_idx = 0
         recv_idx = 0
 
         def _start_recv_act() -> None:
@@ -473,7 +426,7 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
 
         def _forward() -> None:
             nonlocal fwd_idx
-            with self._forward_context(fwd_idx, self.num_microbatches):
+            with self._forward_no_sync():
                 stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
             fwd_idx += 1
 
@@ -483,13 +436,6 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
             _start_recv_act()
             _forward()
 
-        def _backward() -> None:
-            nonlocal bwd_idx
-            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
-            stage.backward_micro()
-            self._finalize_ddp_backward(bwd_idx, self.num_microbatches)
-            bwd_idx += 1
-
         for i in range(self.num_steady):
             stage.start_recv_grad()
             _forward()
@@ -497,17 +443,12 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
                 _start_recv_act()
             else:
                 stage.start_recv_grad()
-            _backward()
+            stage.backward_micro()
 
         for i in range(self.num_warmup):
             if i < self.num_warmup - 1:
                 stage.start_recv_grad()
-            _backward()
-
-        stage.drain_sends()
-        with record_function("## torchrec_maglev:optimizer_step ##"):
-            self.optimizer.step()
-        return None
+            stage.backward_micro()
 
 
 class MaglevRail(MaglevPipelineBase):

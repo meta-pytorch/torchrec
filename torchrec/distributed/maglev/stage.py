@@ -342,6 +342,12 @@ class _LayerChain(nn.Module):
     inserts the supplied sequence in execution order, and :meth:`forward`
     iterates :meth:`nn.ModuleDict.values` in that same order.
 
+    When every local layer runs on its two halves (a dense half and the default
+    :meth:`~torchrec.distributed.maglev.module.MaglevLayer.forward`), a forward
+    runs each layer's sparse half first, then the dense halves in order; the
+    result is the per-layer composition's. A layer that overrides ``forward``
+    runs whole, so a stage holding one runs every layer whole.
+
     The stage holding the model's *final* layer is also given the model's
     :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.postproc`, and
     applies it to the last activation. By default its complete result is
@@ -390,6 +396,15 @@ class _LayerChain(nn.Module):
             f"{type(layer).__name__.lstrip('_')} ##"
             for index, layer in enumerate(layers)
         ]
+        self._sparse_profile_names: List[str] = [
+            f"## torchrec_maglev:layer[{first_layer_index + index}] "
+            f"{type(layer).__name__.lstrip('_')} sparse ##"
+            for index, layer in enumerate(layers)
+        ]
+        halved = [layer for layer in layers if _runs_halves(layer)]
+        # Author time, before any wrapper obscures which half owns what.
+        _reject_unhalved_parameters(halved)
+        self._runs_halves: bool = bool(layers) and len(halved) == len(layers)
         # Plain attribute, not a submodule: postproc is a bound method of the
         # authored model, whose parameters are already owned by ``layers``.
         self._postproc = postproc
@@ -419,12 +434,33 @@ class _LayerChain(nn.Module):
                 f"expected {len(self.layers)} layer inputs, got {len(layer_inputs)}"
             )
         activations = in_activations
-        for layer, layer_input, profile_name in zip(
-            self.layers.values(), layer_inputs, self._profile_names
-        ):
-            maglev_layer = cast(MaglevLayer, layer)
-            with record_function(profile_name):
-                activations = maglev_layer(layer_input, activations)
+        if self._runs_halves:
+            sparse_outputs: List[Any] = []
+            for layer, layer_input, profile_name in zip(
+                self.layers.values(), layer_inputs, self._sparse_profile_names
+            ):
+                sparse = cast(MaglevLayer, layer).sparse
+                with record_function(profile_name):
+                    sparse_outputs.append(
+                        None if sparse is None else sparse(layer_input)
+                    )
+            for layer, layer_input, sparse_output, profile_name in zip(
+                self.layers.values(),
+                layer_inputs,
+                sparse_outputs,
+                self._profile_names,
+            ):
+                with record_function(profile_name):
+                    activations = cast(MaglevLayer, layer).require_dense()(
+                        sparse_output, layer_input, activations
+                    )
+        else:
+            for layer, layer_input, profile_name in zip(
+                self.layers.values(), layer_inputs, self._profile_names
+            ):
+                maglev_layer = cast(MaglevLayer, layer)
+                with record_function(profile_name):
+                    activations = maglev_layer(layer_input, activations)
         if self._postproc is not None:
             # The last layer's input carries the target postproc scores against.
             with record_function("## torchrec_maglev:postproc ##"):
@@ -488,6 +524,15 @@ class MaglevRailPassState:
 _RailLayerForward = Tuple[Optional[torch.Tensor], List[Any]]
 
 
+def _runs_halves(layer: nn.Module) -> bool:
+    """Whether ``layer`` runs on its halves: a dense half and the default forward."""
+    return (
+        isinstance(layer, MaglevLayer)
+        and layer.dense is not None
+        and type(layer).forward is MaglevLayer.forward
+    )
+
+
 def _reject_unhalved_parameters(layers: Sequence[MaglevLayer]) -> None:
     """Require every trainable layer parameter to live in one of the two halves.
 
@@ -518,9 +563,9 @@ def _reject_unhalved_parameters(layers: Sequence[MaglevLayer]) -> None:
             raise ValueError(
                 f"{type(layer).__name__} at index {index} owns trainable "
                 f"parameters outside its sparse and dense halves: {stray}. "
-                "MaglevRail computes weight gradients from the dense half only, "
-                "so these would silently never train -- move them into the "
-                "sparse or dense submodule"
+                "Maglev schedules run a layer's halves, not its body, so these "
+                "would silently never train -- move them into the sparse or "
+                "dense submodule"
             )
 
 
@@ -768,7 +813,8 @@ class StageWrapper(nn.Module):
     The stage reduces no gradients itself. Functional execution combines the
     microbatch graphs into one autograd traversal, while explicit schedules use
     their DP wrapper's synchronization controls; either way, that wrapper's
-    reducer fires once per pass (see
+    reducer fires once per pass, except that ZeRO-3 FSDP2 reduce-scatters per
+    microbatch (see
     :class:`~torchrec.distributed.maglev.pipeline.MaglevPipelineBase`).
 
     The activation specs are captured in the constructor, before any wrapping,
