@@ -5,9 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
-
 import random
 import unittest
 from typing import Any, Dict, List, Optional
@@ -33,8 +30,11 @@ except ImportError:
         EnrichmentPolicy,
         EnrichmentType,
     )
-from hypothesis import given, settings
-from torchrec.distributed.batched_embedding_kernel import ZeroCollisionKeyValueEmbedding
+from hypothesis import example, given, settings
+from torchrec.distributed.batched_embedding_kernel import (
+    _get_sharded_local_buckets_for_zero_collision,
+    ZeroCollisionKeyValueEmbedding,
+)
 from torchrec.distributed.embedding import (
     EmbeddingCollectionAwaitable,
     EmbeddingCollectionContext,
@@ -654,83 +654,27 @@ class TestGroupTablesPerRank(unittest.TestCase):
 
 
 class TestECBucketMetadata(unittest.TestCase):
-    @unittest.skipIf(
-        not torch.cuda.is_available(),
-        "Not enough GPUs, this test requires at least one GPU",
-    )
     @given(
-        data_type=st.sampled_from([DataType.FP16, DataType.FP32]),
-        embedding_dim=st.sampled_from(list(range(160, 320, 40))),
         total_bucket=st.sampled_from([14, 20, 32, 40]),
         my_rank=st.integers(min_value=0, max_value=WORLD_SIZE - 1),
     )
+    @example(total_bucket=14, my_rank=0)
+    @example(total_bucket=32, my_rank=1)
+    @example(total_bucket=20, my_rank=0)
+    @example(total_bucket=40, my_rank=1)
     @settings(max_examples=10, deadline=10000)
     def test_bucket_metadata_calculation_util_disabled_in_oss_compatibility(
-        self, data_type: DataType, embedding_dim: int, total_bucket: int, my_rank: int
+        self, total_bucket: int, my_rank: int
     ) -> None:
-        compute_kernels = [EmbeddingComputeKernel.SSD_VIRTUAL_TABLE] * WORLD_SIZE
-        fused_params_groups = [
-            {"cache_load_factor": 0.5},
-        ] * WORLD_SIZE
         tables = [
             ShardedEmbeddingTable(
                 name=f"table_{i}",
-                data_type=data_type,
-                pooling=PoolingType.NONE,
-                has_feature_processor=False,
-                fused_params=fused_params_groups[i],
-                feature_names=[f"feature_{i}"],
-                compute_kernel=compute_kernels[i],
-                embedding_dim=embedding_dim,
-                local_rows=10000 * (2 * i + 1) // WORLD_SIZE,
-                local_cols=embedding_dim,
+                embedding_dim=160,
                 num_embeddings=10000 * (2 * i + 1),
                 total_num_buckets=total_bucket,
-                use_virtual_table=True,
-                local_metadata=ShardMetadata(
-                    shard_offsets=[i * (10000 * (2 * i + 1) // WORLD_SIZE), 0],
-                    shard_sizes=[10000 * (2 * i + 1) // WORLD_SIZE, embedding_dim],
-                    placement=f"rank:{i}/cuda:{i}",
-                ),
-                global_metadata=ShardedTensorMetadata(
-                    shards_metadata=[
-                        ShardMetadata(
-                            shard_offsets=[j * (10000 * (2 * i + 1) // WORLD_SIZE), 0],
-                            shard_sizes=[
-                                10000 * (2 * i + 1) // WORLD_SIZE,
-                                embedding_dim,
-                            ],
-                            placement=f"rank:{j}/cuda:{j}",
-                        )
-                        for j in range(WORLD_SIZE)
-                    ],
-                    size=torch.Size([10000 * (2 * i + 1), embedding_dim]),
-                ),
-                virtual_table_eviction_policy=NoEvictionPolicy(),
             )
             for i in range(WORLD_SIZE)
         ]
-
-        # since we don't have access to _group_tables_per_rank
-        tables_per_rank: List[List[ShardedEmbeddingTable]] = [tables]
-
-        # taking only the list for the first rank
-        table_groups: List[GroupedEmbeddingConfig] = group_tables(tables_per_rank)[0]
-
-        # assert that they are grouped together
-        self.assertEqual(len(table_groups), 1)
-
-        table_group = table_groups[0]
-
-        expect_failure = False
-        for table in tables:
-            if (
-                table.num_embeddings % total_bucket != 0
-                or total_bucket % WORLD_SIZE != 0
-            ):
-                expect_failure = True
-                break
-
         with patch(
             "torchrec.distributed.batched_embedding_kernel.dist.get_world_size",
             return_value=WORLD_SIZE,
@@ -738,26 +682,94 @@ class TestECBucketMetadata(unittest.TestCase):
             "torchrec.distributed.batched_embedding_kernel.dist.get_rank",
             return_value=my_rank,
         ):
-            if expect_failure:
+            if any(table.num_embeddings % total_bucket != 0 for table in tables):
                 with self.assertRaisesRegex(
                     AssertionError, "must be divisible by num_buckets"
                 ):
-                    zch_kv_emb = ZeroCollisionKeyValueEmbedding(
-                        table_group, None, torch.device("cuda")
-                    )
+                    _get_sharded_local_buckets_for_zero_collision(tables)
             else:
-                zch_kv_emb = ZeroCollisionKeyValueEmbedding(
-                    table_group, None, torch.device("cuda")
-                )
-                expected_tuple = [
+                self.assertEqual(total_bucket % WORLD_SIZE, 0)
+                expected = [
                     (
-                        total_bucket / WORLD_SIZE * my_rank,
-                        total_bucket / WORLD_SIZE * (my_rank + 1),
-                        table.num_embeddings / total_bucket,
+                        total_bucket // WORLD_SIZE * my_rank,
+                        total_bucket // WORLD_SIZE * (my_rank + 1),
+                        table.num_embeddings // total_bucket,
                     )
                     for table in tables
                 ]
-                self.assertEqual(zch_kv_emb._bucket_spec, expected_tuple)
+                self.assertEqual(
+                    _get_sharded_local_buckets_for_zero_collision(tables), expected
+                )
+
+    def _make_ssd_config(
+        self, data_type: DataType, total_bucket: int
+    ) -> GroupedEmbeddingConfig:
+        tables = []
+        for i in range(WORLD_SIZE):
+            num_embeddings = 10000 * (2 * i + 1)
+            shards = [
+                ShardMetadata(
+                    shard_offsets=[j * (num_embeddings // WORLD_SIZE), 0],
+                    shard_sizes=[num_embeddings // WORLD_SIZE, 160],
+                    placement=f"rank:{j}/cuda:{j}",
+                )
+                for j in range(WORLD_SIZE)
+            ]
+            tables.append(
+                ShardedEmbeddingTable(
+                    name=f"table_{i}",
+                    data_type=data_type,
+                    pooling=PoolingType.NONE,
+                    has_feature_processor=False,
+                    fused_params={"cache_load_factor": 0.5},
+                    feature_names=[f"feature_{i}"],
+                    compute_kernel=EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,
+                    embedding_dim=160,
+                    local_rows=num_embeddings // WORLD_SIZE,
+                    local_cols=160,
+                    num_embeddings=num_embeddings,
+                    total_num_buckets=total_bucket,
+                    use_virtual_table=True,
+                    local_metadata=shards[i],
+                    global_metadata=ShardedTensorMetadata(
+                        shards_metadata=shards,
+                        size=torch.Size([num_embeddings, 160]),
+                    ),
+                    virtual_table_eviction_policy=NoEvictionPolicy(),
+                )
+            )
+        groups = group_tables([tables])[0]
+        self.assertEqual(len(groups), 1)
+        return groups[0]
+
+    @unittest.skipIf(not torch.cuda.is_available(), "This test requires one GPU")
+    def test_ssd_constructor_bucket_metadata_disabled_in_oss_compatibility(
+        self,
+    ) -> None:
+        with patch(
+            "torchrec.distributed.batched_embedding_kernel.dist.get_world_size",
+            return_value=WORLD_SIZE,
+        ), patch(
+            "torchrec.distributed.batched_embedding_kernel.dist.get_rank",
+            return_value=1,
+        ):
+            for data_type in (DataType.FP16, DataType.FP32):
+                with self.subTest(data_type=data_type):
+                    config = self._make_ssd_config(data_type, 40)
+                    embedding = ZeroCollisionKeyValueEmbedding(
+                        config, None, torch.device("cuda")
+                    )
+                    self.assertEqual(
+                        embedding._bucket_spec, [(20, 40, 250), (20, 40, 750)]
+                    )
+                    del embedding
+                    invalid_config = self._make_ssd_config(data_type, 14)
+                    with self.assertRaisesRegex(
+                        AssertionError, "must be divisible by num_buckets"
+                    ):
+                        ZeroCollisionKeyValueEmbedding(
+                            invalid_config, None, torch.device("cuda")
+                        )
 
 
 class TestCreateEmbeddingKernelEnrichment(unittest.TestCase):
