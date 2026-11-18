@@ -11,10 +11,13 @@ import unittest
 from typing import cast, Dict, List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from hypothesis import given, settings, strategies as st, Verbosity
 from torch import nn
+from torch._C._distributed_c10d import FakeStore
 from torch.distributed._tensor import DTensor
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.sharding_plan import (
@@ -150,6 +153,48 @@ def _select_sharding_type(sharding_type: str) -> ParameterShardingGenerator:
         return data_parallel()
     else:
         raise AssertionError(f"Invalid sharding type specified: {sharding_type}")
+
+
+class FakeParameterInitializationTest(unittest.TestCase):
+    def test_fake_ebc_registers_weight_and_optimizer_state(self) -> None:
+        dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=2)
+        self.addCleanup(dist.destroy_process_group)
+        table = EmbeddingBagConfig(
+            name="table", embedding_dim=8, num_embeddings=16, feature_names=["feature"]
+        )
+        ebc = EmbeddingBagCollection(tables=[table], device=torch.device("meta"))
+        sharder = EmbeddingBagCollectionSharder()
+        plan = construct_module_sharding_plan(
+            ebc,
+            per_param_sharding={
+                "table": table_wise(
+                    rank=0, compute_kernel=EmbeddingComputeKernel.FUSED.value
+                )
+            },
+            local_size=2,
+            world_size=2,
+            device_type="cpu",
+            sharder=cast(ModuleSharder[nn.Module], sharder),
+        )
+        model = DistributedModelParallel(
+            module=ebc,
+            env=ShardingEnv.from_process_group(
+                cast(dist.ProcessGroup, dist.group.WORLD)
+            ),
+            device=torch.device("cpu"),
+            plan=ShardingPlan({"": plan}),
+            sharders=[cast(ModuleSharder[nn.Module], sharder)],
+            init_data_parallel=False,
+            init_parameters=False,
+        )
+        key = "embedding_bags.table.weight"
+        self.assertEqual({key}, set(dict(model.named_parameters())))
+        self.assertEqual({key}, set(model.fused_optimizer.params))
+        state = model.state_dict()[key]
+        self.assertIsInstance(state, ShardedTensor)
+        self.assertEqual(
+            cast(ShardedTensor, state).local_shards()[0].tensor.shape, (16, 8)
+        )
 
 
 @skip_if_asan_class
