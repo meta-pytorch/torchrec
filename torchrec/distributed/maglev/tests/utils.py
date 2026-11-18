@@ -5,28 +5,45 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Scaffolding the Maglev data-parallel tests share: mock process groups, a
-small chain model, its inputs and reference checks."""
+"""Scaffolding the Maglev tests share: mock process groups, a small chain
+model, its inputs and reference checks, and the one-stage split order."""
 
 from __future__ import annotations
 
+import contextlib
+import random
 from collections.abc import Iterator, Sequence
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import torch
 from torch.distributed.tensor import DTensor
+from torchrec.distributed.maglev.customized_pipeline import MaglevRailCustom
 from torchrec.distributed.maglev.module import (
     Activations,
     ActivationSpec,
     MaglevLayer,
     MaglevModuleList,
+    StructuredActivationsLayout,
 )
+from torchrec.distributed.maglev.pipeline import MaglevRail
 from torchrec.distributed.maglev.stage import (
     HandoffPGMode,
+    MaglevPassState,
     MaglevProcessGroups,
     StageWrapper,
 )
+from torchrec.distributed.test_utils.model_input import ModelInput
+from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
+from torchrec.distributed.test_utils.test_model import (
+    MaglevTestActivations,
+    MaglevTestLayer,
+    MaglevTestModel,
+)
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
+
+WEIGHT_SEED = 100
+INPUT_SEED = 500
 
 
 def mock_groups(num_stages: int = 1) -> MaglevProcessGroups:
@@ -50,6 +67,7 @@ def stage_mock() -> MagicMock:
     stage.stage_index = 0
     stage.is_first = True
     stage.in_activation_specs.return_value = ()
+    stage.take_pass_losses.return_value = []
     return stage
 
 
@@ -57,6 +75,39 @@ def partial_devices(world_size: int) -> bool:
     """Whether the host has CUDA devices, but fewer than ``world_size``: each
     rank of a Gloo multi-process test still binds the device of its index."""
     return 0 < torch.cuda.device_count() < world_size
+
+
+def split_row(num_microbatches: int) -> list[str]:
+    """A one-stage dense order that splits every backward, each W one slot late,
+    where one-stage zero-bubble MaglevRail runs each W right after its I."""
+    row: list[str] = []
+    for k in range(num_microbatches):
+        row += [f"F{k}", f"I{k}"] + ([f"W{k - 1}"] if k else [])
+    return row + [f"W{num_microbatches - 1}"]
+
+
+def zero_bubble_rail(
+    stage: StageWrapper,
+    optimizer: torch.optim.Optimizer,
+    num_microbatches: int,
+    **kwargs: Any,
+) -> MaglevRail:
+    """``MaglevRail`` with ``dense_schedule="zero_bubble"``."""
+    return MaglevRail(
+        stage, optimizer, num_microbatches, dense_schedule="zero_bubble", **kwargs
+    )
+
+
+def split_rail(
+    stage: StageWrapper,
+    optimizer: torch.optim.Optimizer,
+    num_microbatches: int,
+    **kwargs: Any,
+) -> MaglevRailCustom:
+    """A rail pipeline running the split row given to ``MaglevRailCustom``."""
+    return MaglevRailCustom(
+        stage, optimizer, num_microbatches, split_row(num_microbatches), **kwargs
+    )
 
 
 class SparseFrontend(torch.nn.Module):
@@ -107,6 +158,11 @@ class Layer(MaglevLayer):
 
     def out_activation_specs(self) -> tuple[ActivationSpec, ...]:
         return (ActivationSpec(torch.Size([-1, 4])),)
+
+    def split_dense_input(
+        self, layer_input: torch.Tensor, batch_size: int, num_microbatches: int
+    ) -> list[torch.Tensor]:
+        return list(torch.tensor_split(layer_input, num_microbatches, dim=0))
 
     def sparse_half(self) -> SparseFrontend:
         sparse = self.sparse
@@ -188,16 +244,82 @@ def assert_reduced_layer(layer: torch.nn.Module, reference: torch.nn.Module) -> 
             torch.testing.assert_close(grad, expected_grad, rtol=1e-4, atol=1e-5)
 
 
+def make_tables(layer_index: int) -> list[EmbeddingBagConfig]:
+    """Layer ``layer_index``'s feature partition: two disjoint 1-feature tables."""
+    return EmbeddingTablesConfig(
+        num_unweighted_features=2,
+        num_weighted_features=0,
+        embedding_feature_dim=4,
+        base_row_size=16,
+    ).generate_tables(name_prefix=f"l{layer_index}_")[0]
+
+
+def maglev_test_model(num_layers: int) -> MaglevTestModel:
+    """A ``MaglevTestModel`` with weights seeded by layer index."""
+    layout = StructuredActivationsLayout[MaglevTestActivations]()
+    layers: list[MaglevTestLayer] = []
+    for layer_index in range(num_layers):
+        tables = make_tables(layer_index)
+        torch.manual_seed(WEIGHT_SEED + layer_index)
+        layers.append(
+            MaglevTestLayer(
+                tables=tables,
+                layer_dim=6,
+                is_first=layer_index == 0,
+                activation_layout=layout,
+                num_float_features=4,
+                device=torch.device("cpu"),
+            )
+        )
+    return MaglevTestModel(layers, layout)
+
+
+def maglev_test_inputs(num_layers: int, batch_size: int = 4) -> list[ModelInput]:
+    """One deterministic ``ModelInput`` per layer of :func:`maglev_test_model`.
+
+    ``ModelInput.generate`` draws from both the ``torch`` and ``random`` RNGs
+    and takes no seed, so both are seeded here.
+    """
+    inputs = []
+    for layer_index in range(num_layers):
+        torch.manual_seed(INPUT_SEED + layer_index)
+        random.seed(INPUT_SEED + layer_index)
+        inputs.append(
+            ModelInput.generate(
+                batch_size=batch_size,
+                tables=make_tables(layer_index),
+                weighted_tables=[],
+                num_float_features=4,
+                device=torch.device("cpu"),
+            )
+        )
+    return inputs
+
+
+def run_split_dense(stage: StageWrapper, state: MaglevPassState) -> None:
+    """Run each microbatch's dense forward, input half and weight half in turn."""
+    for microbatch, dense_input in enumerate(state.dense_inputs):
+        stage.compute_dense_forward_micro(
+            dense_input, (), microbatch, state.seams[microbatch]
+        )
+        stage.dense_backward_act_micro()
+        stage.dense_backward_weight_micro()
+
+
 def two_by_two_stage(
-    model: ChainModel, device: torch.device
+    model: ChainModel, device: torch.device, stub_driver: bool = True
 ) -> tuple[StageWrapper, Any]:
     """This rank's stage of ``model`` cut over two stages of two replicas.
 
-    The input driver is a mock, returned for the caller to feed: its NCCL
-    exchange needs CUDA, and the tests hand each pass its microbatches.
+    With ``stub_driver`` the input driver is a mock, returned for the caller to
+    feed: its NCCL exchange needs CUDA.
     """
     groups = MaglevProcessGroups.from_scratch(stage_size=2, num_stages=2)
-    with patch("torchrec.distributed.maglev.stage.InputDistDriver") as driver:
+    with (
+        patch("torchrec.distributed.maglev.stage.InputDistDriver")
+        if stub_driver
+        else contextlib.nullcontext()
+    ) as driver:
         stage = StageWrapper(model, [1, 1], stage_size=2, process_groups=groups)
     del model[:]
     stage.to(device)
@@ -251,5 +373,31 @@ def averaged_passes(
         step_averaged_reference(reference, optimizer, pass_index, device, divergent)
         raw = input_for(stage.position, pass_index, device)
         driver.return_value.take.return_value = microbatches(raw, num_microbatches)
+        yield raw
+        assert_reduced_layer(stage._layers[0], reference[stage.stage_index])
+
+
+def rail_averaged_passes(
+    stage: StageWrapper,
+    reference: ChainModel,
+    optimizer: torch.optim.Optimizer,
+    driver: Any,
+    device: torch.device,
+    divergent: bool,
+    passes: int = 3,
+) -> Iterator[torch.Tensor]:
+    """Yield this replica's raw batch for each pass, after stepping the
+    reference on it; once the caller has run the pass, the stage's one layer
+    must match the reference's.
+
+    A real input round feeds ``num_stages`` passes, so each round's batch is
+    reused for that many.
+    """
+    for pass_index in range(passes):
+        reader_round = pass_index // stage.num_stages
+        step_averaged_reference(reference, optimizer, reader_round, device, divergent)
+        raw = input_for(stage.position, reader_round, torch.device("cpu"))
+        if driver is not None:
+            driver.return_value.take.return_value = [[raw]]
         yield raw
         assert_reduced_layer(stage._layers[0], reference[stage.stage_index])

@@ -14,9 +14,10 @@ authored as a :class:`~torchrec.distributed.maglev.module.MaglevModuleList` of
 layers and runs either standalone in one process or pipeline-parallel: each rank
 hands the whole model to a
 :class:`~torchrec.distributed.maglev.stage.StageWrapper`, which keeps the one
-stage that rank owns, and a
-:class:`~torchrec.distributed.maglev.pipeline.MaglevPipelineBase` schedule drives
-it.
+stage that rank owns, and a schedule from
+:mod:`~torchrec.distributed.maglev.pipeline` drives it: ``Maglev1F1B`` per
+microbatch, or ``MaglevRail`` with each sparse half once per pass on the whole
+batch.
 
 Import from the submodules directly (``maglev.module``, ``maglev.stage``,
 ``maglev.pipeline``); nothing is re-exported here, so there is no second list of
