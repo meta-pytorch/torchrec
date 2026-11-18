@@ -15,12 +15,20 @@ import torch
 from torch._dynamo.backends.common import aot_autograd
 from torch._dynamo.utils import counters
 from torch._functorch.aot_autograd import make_boxed_func
+from torch._functorch.partitioners import min_cut_rematerialization_partition
+from torch._inductor.custom_graph_pass import CustomPartitionerFn
+from torch.distributed.pipelining._backward import (
+    stage_backward_input,
+    stage_backward_weight,
+)
 from torch.utils._python_dispatch import TorchDispatchMode
 from torchrec.distributed.maglev.module import StructuredActivationsLayout
 from torchrec.distributed.maglev.split_backward import (
     Compiler,
     eager_compiler,
     inductor_compiler,
+    MAGLEV_SPLIT_BACKEND_NAME,
+    register_maglev_split_backend,
     SplitBackwardBackend,
 )
 from torchrec.distributed.maglev.stage import (
@@ -77,6 +85,22 @@ class _RecordingCompiler:
     ) -> Callable[..., Any]:
         self.graphs.append(gm)
         return self._compiler(gm, example_inputs)
+
+
+class _CountingPartitioner(CustomPartitionerFn):
+    """A ``custom_partitioner_fn`` that counts its calls and partitions by min-cut."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def uuid(self) -> Any:
+        return "counting-partitioner"
+
+    def __call__(
+        self, gm: torch.fx.GraphModule, joint_inputs: Sequence[object], **kwargs: Any
+    ) -> Tuple[torch.fx.GraphModule, torch.fx.GraphModule]:
+        self.calls += 1
+        return min_cut_rematerialization_partition(gm, joint_inputs, **kwargs)
 
 
 def _model() -> MaglevTestModel:
@@ -183,6 +207,59 @@ def _run_split_backward(
         weight_matmuls += counter.count
     stage.sparse_backward_global(state)
     return input_matmuls, weight_matmuls
+
+
+class _AliasingRegion(torch.nn.Module):
+    """Hands its input on reshaped next to a projection: one output aliases it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        torch.manual_seed(3)
+        self.proj = torch.nn.Linear(4, 4)
+
+    def forward(self, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return value.view(-1, 2, 2), self.proj(value)
+
+
+class _IndexOutputRegion(torch.nn.Module):
+    """A projection next to an integer index map, which takes no gradient."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        torch.manual_seed(5)
+        self.proj = torch.nn.Linear(4, 4)
+
+    def forward(self, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        projected = self.proj(value)
+        return projected, projected.argmax(dim=-1)
+
+
+class _NoGradOutputsRegion(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return value.detach() * 2, value > 0
+
+
+def _run_region_halves(
+    region: torch.nn.Module, weights: List[torch.nn.Parameter], value: torch.Tensor
+) -> Tuple[int, int, Optional[torch.Tensor]]:
+    """I then W on one region, through the helpers ``StageWrapper`` calls.
+
+    Returns:
+        The matmuls I runs, the matmuls W runs, and the input's gradient.
+    """
+    value = value.detach().requires_grad_()
+    outputs = [output for output in region(value) if output.requires_grad]
+    with _MatmulCounter() as counter:
+        _, param_groups = stage_backward_input(
+            stage_outputs_or_loss=[output.clone() for output in outputs],
+            output_grads=[torch.ones_like(output) for output in outputs],
+            input_values=[value],
+            weights=iter(weights),
+        )
+    input_matmuls = counter.count
+    with _MatmulCounter() as counter:
+        stage_backward_weight(iter(weights), param_groups)
+    return input_matmuls, counter.count, value.grad
 
 
 def _assert_grads_close(actual: torch.nn.Module, expected: torch.nn.Module) -> None:
@@ -296,3 +373,151 @@ class SplitBackwardCompileTest(unittest.TestCase):
         self._assert_captured_whole(_NUM_LAYERS)
         self.assertEqual(len(compiler.graphs), 3 * _NUM_LAYERS)
         _assert_grads_close(compiled, eager)
+
+    def test_split_backend_partitions_with_the_custom_partitioner(self) -> None:
+        """A ``custom_partitioner_fn`` partitions each region; each half still runs alone."""
+        eager = _model()
+        eager_input, eager_weight = _run_split_backward(eager)
+
+        partitioner = _CountingPartitioner()
+        compiler = _RecordingCompiler()
+        with torch._inductor.config.patch(
+            custom_partitioner_fn=partitioner, force_disable_caches=True
+        ):
+            compiled = _model()
+            _compile_dense_halves(compiled, SplitBackwardBackend(compiler))
+            compiled_input, compiled_weight = _run_split_backward(compiled)
+
+        self._assert_captured_whole(_NUM_LAYERS)
+        self.assertEqual(partitioner.calls, _NUM_LAYERS)
+        self.assertEqual(len(compiler.graphs), 3 * _NUM_LAYERS)
+        self.assertEqual(compiled_input, eager_input)
+        self.assertEqual(compiled_weight, eager_weight)
+        _assert_grads_close(compiled, eager)
+
+    def test_registered_backend_splits_by_name(self) -> None:
+        """``torch.compile(backend=<registered name>)`` runs the split backward."""
+        name = "maglev_split_backward_eager_test"
+        register_maglev_split_backend(name=name, compiler=eager_compiler)
+        eager = _model()
+        eager_input, eager_weight = _run_split_backward(eager)
+
+        compiled = _model()
+        _compile_dense_halves(compiled, name)
+        compiled_input, compiled_weight = _run_split_backward(compiled)
+
+        self._assert_captured_whole(_NUM_LAYERS)
+        self.assertEqual(compiled_input, eager_input)
+        self.assertEqual(compiled_weight, eager_weight)
+        _assert_grads_close(compiled, eager)
+
+    def test_registered_backend_compiles_under_torch_compile_options(self) -> None:
+        """Every extracted graph compiles under the options ``torch.compile`` passes."""
+        wanted = not torch._inductor.config.max_autotune_gemm
+        seen: List[bool] = []
+
+        def recording(
+            gm: torch.fx.GraphModule, example_inputs: Sequence[torch.Tensor]
+        ) -> Callable[..., Any]:
+            seen.append(torch._inductor.config.max_autotune_gemm)
+            return eager_compiler(gm, example_inputs)
+
+        name = "maglev_split_backward_options_test"
+        register_maglev_split_backend(name=name, compiler=recording)
+        eager = _model()
+        _run_split_backward(eager)
+
+        compiled = _model()
+        for layer in compiled.modules():
+            if isinstance(layer, MaglevTestLayer):
+                layer.dense = cast(
+                    torch.nn.Module,
+                    torch.compile(
+                        layer.require_dense(),
+                        backend=name,
+                        options={"max_autotune_gemm": wanted},
+                    ),
+                )
+        _run_split_backward(compiled)
+
+        self._assert_captured_whole(_NUM_LAYERS)
+        # Each layer's forward, input half and weight half.
+        self.assertEqual(seen, [wanted] * (3 * _NUM_LAYERS))
+        _assert_grads_close(compiled, eager)
+
+    def test_registers_the_inductor_split_backend_under_its_default_name(
+        self,
+    ) -> None:
+        register_maglev_split_backend()
+
+        self.assertIn(MAGLEV_SPLIT_BACKEND_NAME, torch._dynamo.list_backends())
+
+    def test_split_backend_copies_an_output_that_aliases_an_input(self) -> None:
+        """A region that hands an input on as a view still splits: the view is
+        returned as a copy, which ``aot_export_joint_simple`` accepts."""
+        value = torch.randn(6, 4)
+        eager = _AliasingRegion()
+        eager_input, eager_weight, eager_grad = _run_region_halves(
+            eager, list(eager.parameters()), value
+        )
+
+        compiler = _RecordingCompiler()
+        region = _AliasingRegion()
+        compiled_input, compiled_weight, compiled_grad = _run_region_halves(
+            cast(
+                torch.nn.Module,
+                torch.compile(region, backend=SplitBackwardBackend(compiler)),
+            ),
+            list(region.parameters()),
+            value,
+        )
+
+        self._assert_captured_whole(1)
+        # Forward, input half, weight half: split, not refused and run eager.
+        self.assertEqual(len(compiler.graphs), 3)
+        self.assertEqual((compiled_input, compiled_weight), (eager_input, eager_weight))
+        torch.testing.assert_close(compiled_grad, eager_grad)
+        _assert_grads_close(region, eager)
+
+    def test_split_backend_compiles_outputs_without_grad_apart(self) -> None:
+        """An output that takes no gradient comes from a separate inference graph,
+        and the differentiable ones still split."""
+        value = torch.randn(6, 4)
+        eager = _IndexOutputRegion()
+        eager_input, eager_weight, eager_grad = _run_region_halves(
+            eager, list(eager.parameters()), value
+        )
+
+        compiler = _RecordingCompiler()
+        region = _IndexOutputRegion()
+        compiled = cast(
+            torch.nn.Module,
+            torch.compile(region, backend=SplitBackwardBackend(compiler)),
+        )
+        compiled_input, compiled_weight, compiled_grad = _run_region_halves(
+            compiled, list(region.parameters()), value
+        )
+
+        self._assert_captured_whole(1)
+        # The split's forward, input half and weight half, and the inference graph.
+        self.assertEqual(len(compiler.graphs), 4)
+        self.assertEqual((compiled_input, compiled_weight), (eager_input, eager_weight))
+        torch.testing.assert_close(compiled_grad, eager_grad)
+        _assert_grads_close(region, eager)
+        self.assertTrue(torch.equal(compiled(value)[1], eager(value)[1]))
+
+    def test_split_backend_compiles_a_region_with_no_differentiable_output_as_is(
+        self,
+    ) -> None:
+        """Differentiable inputs but no differentiable output: nothing to split."""
+        compiler = _RecordingCompiler()
+        region = torch.compile(
+            _NoGradOutputsRegion(), backend=SplitBackwardBackend(compiler)
+        )
+        value = torch.randn(6, 4, requires_grad=True)
+        doubled, positive = region(value)
+
+        self._assert_captured_whole(1)
+        self.assertEqual(len(compiler.graphs), 1)
+        torch.testing.assert_close(doubled, value.detach() * 2)
+        self.assertTrue(torch.equal(positive, value > 0))
