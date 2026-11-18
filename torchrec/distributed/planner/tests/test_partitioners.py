@@ -9,7 +9,7 @@
 
 import unittest
 from typing import cast, List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from pyre_extensions import none_throws
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -36,6 +36,10 @@ from torchrec.distributed.planner.utils import reset_shard_rank
 from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+
+_GATE = (
+    "torchrec.distributed.planner.partitioners.should_place_zero_perf_shards_by_storage"
+)
 
 
 class RWSharder(EmbeddingBagCollectionSharder):
@@ -240,7 +244,9 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
             )
 
             GreedyPerfPartitioner._device_partition(
-                sharding_option, minheap_devices, threshold
+                sharding_option,
+                minheap_devices,
+                threshold,
             )
 
             want_minheap_devices = GreedyPerfPartitioner._establish_minheap(
@@ -250,6 +256,110 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
 
         validate(0)  # force heapify
         validate(1)  # force incremental rebuild
+
+    @staticmethod
+    def _single_shard_option(storage: Storage, perf: Perf) -> ShardingOption:
+        return ShardingOption(
+            name=MagicMock(),
+            tensor=MagicMock(),
+            module=MagicMock(),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type=MagicMock(),
+            partition_by=MagicMock(),
+            compute_kernel=MagicMock(),
+            shards=[Shard(storage=storage, perf=perf, size=[], offset=[])],
+        )
+
+    @staticmethod
+    def _partition_zero_perf_shards(
+        starting_storage: List[Storage],
+        shard_storage: Storage,
+        num_shards: int,
+        should_place_by_storage: bool,
+    ) -> List[Storage]:
+        zero_perf = Perf(fwd_compute=0, fwd_comms=0, bwd_compute=0, bwd_comms=0)
+        devices = [
+            DeviceHardware(
+                rank=rank,
+                storage=storage,
+                perf=Perf(fwd_compute=rank, fwd_comms=0, bwd_compute=0, bwd_comms=0),
+            )
+            for rank, storage in enumerate(starting_storage)
+        ]
+        minheap_devices = GreedyPerfPartitioner._establish_minheap(devices, 2)
+        with patch(_GATE, return_value=should_place_by_storage):
+            for _ in range(num_shards):
+                GreedyPerfPartitioner._device_partition(
+                    TestGreedyPerfPartitioner._single_shard_option(
+                        shard_storage, zero_perf
+                    ),
+                    minheap_devices,
+                )
+
+        return [device.storage for device in devices]
+
+    def test_zero_perf_shards_are_spread_across_devices(self) -> None:
+        starting_hbm = [1_000_000, 900_000, 800_000, 700_000]
+        remaining = self._partition_zero_perf_shards(
+            [Storage(hbm=hbm, ddr=0) for hbm in starting_hbm],
+            Storage(hbm=100_000, ddr=0),
+            6,
+            should_place_by_storage=True,
+        )
+        self.assertEqual([storage.hbm for storage in remaining], [700_000] * 4)
+
+    def test_zero_perf_shards_with_no_hbm_are_left_on_the_perf_minimum_device(
+        self,
+    ) -> None:
+        starting_ddr = [1_000_000, 900_000, 800_000, 700_000]
+        remaining = self._partition_zero_perf_shards(
+            [Storage(hbm=0, ddr=ddr) for ddr in starting_ddr],
+            Storage(hbm=0, ddr=100_000),
+            6,
+            should_place_by_storage=True,
+        )
+        self.assertEqual(
+            [storage.ddr for storage in remaining],
+            [400_000, 900_000, 800_000, 700_000],
+        )
+
+    def test_zero_perf_shards_stack_on_one_device_when_gated_off(self) -> None:
+        starting_hbm = [1_000_000, 900_000, 800_000, 700_000]
+        remaining = self._partition_zero_perf_shards(
+            [Storage(hbm=hbm, ddr=0) for hbm in starting_hbm],
+            Storage(hbm=100_000, ddr=0),
+            6,
+            should_place_by_storage=False,
+        )
+        self.assertEqual(
+            [storage.hbm for storage in remaining],
+            [400_000, 900_000, 800_000, 700_000],
+        )
+
+    def test_nonzero_perf_shard_still_goes_to_the_perf_minimum_device(self) -> None:
+        devices = [
+            DeviceHardware(
+                rank=rank,
+                storage=Storage(hbm=(4 - rank) * 1_000_000, ddr=0),
+                perf=Perf(
+                    fwd_compute=4 - rank, fwd_comms=0, bwd_compute=0, bwd_comms=0
+                ),
+            )
+            for rank in range(4)
+        ]
+        sharding_option = self._single_shard_option(
+            Storage(hbm=1000, ddr=0),
+            Perf(fwd_compute=1, fwd_comms=0, bwd_compute=0, bwd_comms=0),
+        )
+
+        with patch(_GATE, return_value=True):
+            GreedyPerfPartitioner._device_partition(
+                sharding_option,
+                GreedyPerfPartitioner._establish_minheap(devices, 2),
+            )
+
+        self.assertEqual(sharding_option.shards[0].rank, 3)
 
     def test_tw_unbalanced_perf_device(self) -> None:
         sharding_options = self.enumerator.enumerate(
