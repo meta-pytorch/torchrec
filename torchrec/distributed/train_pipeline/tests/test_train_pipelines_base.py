@@ -10,7 +10,7 @@
 import copy
 import os
 import unittest
-from typing import Any, cast, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -24,9 +24,12 @@ from torchrec.distributed.test_utils.emb_sharder import (
     TestEBCSharderMCH,
 )
 from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNN
+from torchrec.distributed.test_utils.test_sharding import copy_state_dict
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.types import ModuleSharder, ShardingEnv
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
+from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
+from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.test_utils import init_distributed_single_host
 
 
@@ -185,3 +188,100 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
             lr=0.1,
         )
         return sharded_model, optimizer
+
+    def _setup_ddp_model_and_optimizer(
+        self,
+        model: nn.Module,
+        sharding_type: str,
+        kernel_type: str,
+        combined_optimizer: bool = True,
+    ) -> Tuple[DistributedModelParallel, Optimizer]:
+        """
+        Shards ``model`` with DDP enabled and returns it with an Adam optimizer over
+        the remaining (dense) parameters. With ``combined_optimizer``, the Adam
+        optimizer is combined with the model's fused optimizer.
+        """
+        sharded_model, _ = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type
+        )
+        sharded_model = cast(DistributedModelParallel, sharded_model)
+        # The helper above skips DDP, and async_optimizer falls back without it.
+        sharded_model.init_data_parallel()
+        dense_params = dict(
+            in_backward_optimizer_filter(sharded_model.named_parameters())
+        )
+        if not combined_optimizer:
+            # Citrine C2: use the multi-tensor optimizer implementation.
+            return sharded_model, optim.Adam(
+                dense_params.values(), lr=0.01, foreach=True
+            )
+        dense_optimizer = KeyedOptimizerWrapper(
+            dense_params,
+            # Citrine C2: use the multi-tensor optimizer implementation.
+            lambda params: optim.Adam(params, lr=0.01, foreach=True),
+        )
+        return sharded_model, CombinedOptimizer(
+            [sharded_model.fused_optimizer, dense_optimizer]
+        )
+
+    def _run_async_optimizer_parity(
+        self,
+        pipeline_class: Type[TrainPipelineSparseDist],
+        sharding_type: str,
+        kernel_type: str,
+        num_batches: int = 10,
+        combined_optimizer: bool = True,
+        optimizer_factory: Optional[Callable[[CombinedOptimizer], Optimizer]] = None,
+        expect_async: bool = True,
+        **pipeline_kwargs: Any,
+    ) -> Tuple[TrainPipelineSparseDist, TrainPipelineSparseDist]:
+        """
+        Trains the same model with and without ``async_optimizer`` and checks
+        that every step's output and the final parameters match. With
+        ``optimizer_factory``, both pipelines get the optimizer it builds from the
+        combined optimizer. With ``expect_async=False``, checks that the async
+        pipeline fell back to the regular step. Returns the sync and async pipelines.
+        """
+        model = self._setup_model()
+        data = self._generate_data(num_batches=num_batches, batch_size=32)
+        sync_model, sync_optimizer = self._setup_ddp_model_and_optimizer(
+            model, sharding_type, kernel_type, combined_optimizer
+        )
+        async_model, async_optimizer = self._setup_ddp_model_and_optimizer(
+            model, sharding_type, kernel_type, combined_optimizer
+        )
+        if optimizer_factory is not None:
+            sync_optimizer = optimizer_factory(cast(CombinedOptimizer, sync_optimizer))
+            async_optimizer = optimizer_factory(
+                cast(CombinedOptimizer, async_optimizer)
+            )
+        copy_state_dict(async_model.state_dict(), sync_model.state_dict())
+
+        sync_pipeline = pipeline_class(
+            model=sync_model,
+            optimizer=sync_optimizer,
+            device=self.device,
+            **pipeline_kwargs,
+        )
+        async_pipeline = pipeline_class(
+            model=async_model,
+            optimizer=async_optimizer,
+            device=self.device,
+            async_optimizer=True,
+            **pipeline_kwargs,
+        )
+        sync_iter, async_iter = iter(data), iter(data)
+        for _ in range(num_batches):
+            torch.testing.assert_close(
+                async_pipeline.progress(async_iter), sync_pipeline.progress(sync_iter)
+            )
+
+        if expect_async:
+            self.assertGreater(len(async_pipeline._async_optimizer_ddp_modules), 0)
+        else:
+            self.assertEqual(async_pipeline._async_optimizer_ddp_modules, [])
+        self.assertEqual(sync_pipeline._async_optimizer_ddp_modules, [])
+        async_params = dict(async_model.named_parameters())
+        for name, param in sync_model.named_parameters():
+            torch.testing.assert_close(async_params[name], param)
+        return sync_pipeline, async_pipeline
