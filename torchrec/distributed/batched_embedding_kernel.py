@@ -417,6 +417,88 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
     return (enable_raw_embedding_streaming, res_params)
 
 
+def _ssd_tbe_weights_precision(config: GroupedEmbeddingConfig) -> SparseType:
+    fused_params = config.fused_params or {}
+    if "weights_precision" in fused_params:
+        return fused_params["weights_precision"]
+    return data_type_to_sparse_type(config.data_type)
+
+
+def _ssd_tbe_cache_sets(
+    config: GroupedEmbeddingConfig, device: torch.device | None
+) -> Tuple[int, int, float | None]:
+    """
+    The L1 cache sets an SSD TBE built for ``config`` gets: before and after the
+    ``max_l1_cache_size`` cap that ``_populate_ssd_tbe_params`` applies, and the
+    unrounded set count that cap allows (None without a cap).
+    """
+    fused_params = config.fused_params or {}
+    if "cache_sets" in fused_params:
+        cache_sets: int = fused_params["cache_sets"]
+    else:
+        cache_load_factor = fused_params.get("cache_load_factor") or 0.2
+        local_rows_sum: int = sum(table.local_rows for table in config.embedding_tables)
+        cache_sets = max(
+            int(cache_load_factor * local_rows_sum / get_cache_assoc(device)), 1
+        )
+    if "max_l1_cache_size" not in fused_params:
+        return cache_sets, cache_sets, None
+    l1_cache_size = fused_params["max_l1_cache_size"] * 1024 * 1024
+    max_dim: int = max(table.local_cols for table in config.embedding_tables)
+    weight_precision_bytes = _ssd_tbe_weights_precision(config).bit_rate() / 8
+    max_cache_sets: float = (
+        l1_cache_size / get_cache_assoc(device) / weight_precision_bytes / max_dim
+    )
+    return cache_sets, min(cache_sets, int(max_cache_sets)), max_cache_sets
+
+
+def key_value_l1_device_bytes(
+    config: GroupedEmbeddingConfig, device: torch.device | None = None
+) -> int:
+    """
+    Device bytes of the L1 cache an SSD TBE (``EmbeddingComputeKernel.KEY_VALUE``)
+    built for ``config`` allocates: ``cache_sets * associativity`` slots, each one
+    row of ``max(local_cols)`` weights plus its slot state (``lxu_cache_state`` and
+    ``lru_state``, int64 each, and the int32 ``lxu_cache_locking_counter`` under a
+    prefetch pipeline). ``max_l1_cache_size`` caps the weights only, so this can
+    exceed it.
+
+    Not counted: the TBE's two eviction buffers. They are unified (managed)
+    memory of the L1's shape, so how much of them is resident on the device is up
+    to the driver's migration, not the allocation. Virtual tables, whose cache rows
+    also hold optimizer state, are not supported.
+
+    ``max_physical_l1_cache_size_mb``, when set, is passed through to the SSD TBE,
+    which caps ``cache_sets`` at ``MB * 2**20 // (assoc * element size *
+    cache_row_dim)`` and raises when that is below one set; it is applied here the
+    same way.
+
+    ``device`` is the one the TBE will use; ``None`` reads the associativity of the
+    current CUDA device, or fbgemm's default when there is none.
+    """
+    if config.is_using_virtual_table():
+        raise ValueError(
+            f"key_value_l1_device_bytes does not support virtual tables: {config.table_names()}"
+        )
+    fused_params = config.fused_params or {}
+    assoc = get_cache_assoc(device)
+    element_size = _ssd_tbe_weights_precision(config).bit_rate() // 8
+    row_dim = max(table.local_cols for table in config.embedding_tables)
+    _, cache_sets, _ = _ssd_tbe_cache_sets(config, device)
+    physical_mb = fused_params.get("max_physical_l1_cache_size_mb")
+    if physical_mb is not None:
+        max_physical_sets = (physical_mb * 1024 * 1024) // (
+            assoc * element_size * row_dim
+        )
+        if max_physical_sets < 1:
+            raise ValueError(
+                "max_physical_l1_cache_size_mb must fit at least one physical cache set"
+            )
+        cache_sets = min(cache_sets, max_physical_sets)
+    slot_state_bytes = 8 + 8 + (4 if fused_params.get("prefetch_pipeline") else 0)
+    return cache_sets * assoc * (element_size * row_dim + slot_state_bytes)
+
+
 def _populate_ssd_tbe_params(  # noqa: C901
     config: GroupedEmbeddingConfig,
     device: torch.device | None = None,
@@ -452,24 +534,19 @@ def _populate_ssd_tbe_params(  # noqa: C901
             f"Dropping {invalid_keys} since they are not valid SSD TBE params."
         )
 
-    # populate number cache sets, aka number of rows of the cache space
-    if "cache_sets" not in ssd_tbe_params:
-        cache_load_factor = fused_params.get("cache_load_factor")
-        if cache_load_factor:
-            cache_load_factor = fused_params.get("cache_load_factor")
-            logger.info(
-                f"Using cache load factor from fused params dict: {cache_load_factor}"
-            )
-        else:
-            cache_load_factor = 0.2
-
-        local_rows_sum: int = sum(table.local_rows for table in config.embedding_tables)
-        cache_assoc = get_cache_assoc(device)
-        ssd_tbe_params["cache_sets"] = max(
-            # pyrefly: ignore [unsupported-operation]
-            int(cache_load_factor * local_rows_sum / cache_assoc),
-            1,
+    # populate number cache sets, aka number of rows of the cache space, capped by
+    # max_l1_cache_size (key_value_l1_device_bytes sizes the L1 from the same helper)
+    if "cache_sets" not in ssd_tbe_params and fused_params.get("cache_load_factor"):
+        logger.info(
+            f"Using cache load factor from fused params dict: {fused_params.get('cache_load_factor')}"
         )
+    cache_sets, capped_cache_sets, max_cache_sets = _ssd_tbe_cache_sets(config, device)
+    if capped_cache_sets < cache_sets:
+        logger.warning(
+            f"cache_sets {cache_sets} is larger than max_cache_sets {max_cache_sets} calculated "
+            "by max_l1_cache_size, cap at max_cache_sets instead"
+        )
+    ssd_tbe_params["cache_sets"] = capped_cache_sets
 
     # populate init min and max
     if config.is_using_virtual_table():
@@ -504,21 +581,6 @@ def _populate_ssd_tbe_params(  # noqa: C901
     if "weights_precision" not in ssd_tbe_params:
         weights_precision = data_type_to_sparse_type(config.data_type)
         ssd_tbe_params["weights_precision"] = weights_precision
-
-    if "max_l1_cache_size" in fused_params:
-        l1_cache_size = fused_params.get("max_l1_cache_size") * 1024 * 1024
-        max_dim: int = max(table.local_cols for table in config.embedding_tables)
-        weight_precision_bytes = ssd_tbe_params["weights_precision"].bit_rate() / 8
-        max_cache_sets = (
-            l1_cache_size / get_cache_assoc(device) / weight_precision_bytes / max_dim
-        )  # 100MB
-
-        if ssd_tbe_params["cache_sets"] > int(max_cache_sets):
-            logger.warning(
-                f"cache_sets {ssd_tbe_params['cache_sets']} is larger than max_cache_sets {max_cache_sets} calculated "
-                "by max_l1_cache_size, cap at max_cache_sets instead"
-            )
-            ssd_tbe_params["cache_sets"] = int(max_cache_sets)
 
     if "kvzch_tbe_config" in fused_params and config.is_using_virtual_table():
         ssd_tbe_params["kvzch_tbe_config"] = fused_params.get("kvzch_tbe_config")

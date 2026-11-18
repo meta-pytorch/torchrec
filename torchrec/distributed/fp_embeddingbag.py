@@ -14,6 +14,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Set,
     Tuple,
     Type,
     TypeVar,
@@ -24,6 +25,7 @@ import torch
 from torch import nn
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
+    GroupedEmbeddingConfig,
     KJTList,
     ShardedEmbeddingModule,
 )
@@ -263,6 +265,24 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
         self, module: FeatureProcessedEmbeddingBagCollection
     ) -> Dict[str, torch.nn.Parameter]:
         return self._ebc_sharder.shardable_parameters(module._embedding_bag_collection)
+
+    # The sharded module shards its inner EBC with the EBC sharder, so the groups are its.
+    def key_value_l1_grouping_sharding_types(
+        self, module: FeatureProcessedEmbeddingBagCollection
+    ) -> Set[str]:
+        return self._ebc_sharder.key_value_l1_grouping_sharding_types(
+            module._embedding_bag_collection
+        )
+
+    def key_value_grouped_configs_per_rank(
+        self,
+        module: FeatureProcessedEmbeddingBagCollection,
+        params: Dict[str, ParameterSharding],
+        env: ShardingEnv,
+    ) -> List[List[GroupedEmbeddingConfig]]:
+        return self._ebc_sharder.key_value_grouped_configs_per_rank(
+            module._embedding_bag_collection, params, env
+        )
 
     @property
     def module_type(self) -> Type[FeatureProcessedEmbeddingBagCollection]:
