@@ -29,6 +29,7 @@ engine which of its inputs the current graph task needs, so the pipelining
 helpers drive it unchanged.
 """
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -204,6 +205,58 @@ def _engine_visible(primal: torch.Tensor) -> torch.Tensor:
     return primal
 
 
+def _export_joint(
+    forward: Callable[..., Tuple[torch.Tensor, ...]],
+    primals: Tuple[torch.Tensor, ...],
+) -> fx.GraphModule:
+    """The joint graph of ``forward``, with its outputs copied if one aliases an input.
+
+    ``aot_export_joint_simple`` refuses an output that is a view of an input: a
+    region that hands an input on reshaped, or through a ``.to`` that is a no-op.
+    A copy carries the same value and the same gradient.
+    """
+    try:
+        return cast(
+            fx.GraphModule,
+            aot_export_joint_simple(forward, primals, trace_joint=True),
+        )
+    except RuntimeError as error:
+        if "outputs that alias inputs" not in str(error):
+            raise
+
+    def copied(*args: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        return tuple(output.clone() for output in forward(*args))
+
+    return cast(
+        fx.GraphModule, aot_export_joint_simple(copied, primals, trace_joint=True)
+    )
+
+
+def _differentiable_outputs(gm: fx.GraphModule) -> List[bool]:
+    """Per output of a dynamo graph, whether it requires grad; True when unknown."""
+    (output,) = gm.graph.find_nodes(op="output")
+    flags = []
+    for node in output.args[0]:
+        if not isinstance(node, fx.Node):
+            flags.append(False)
+            continue
+        value = node.meta.get("example_value", node.meta.get("val"))
+        flags.append(
+            value.requires_grad if isinstance(value, torch.Tensor) else value is None
+        )
+    return flags
+
+
+def _with_outputs(gm: fx.GraphModule, keep: Sequence[int]) -> fx.GraphModule:
+    """``gm`` returning only its outputs at ``keep``; its attributes are shared."""
+    graph = copy.deepcopy(gm.graph)
+    (output,) = graph.find_nodes(op="output")
+    outputs = output.args[0]
+    output.args = (tuple(outputs[i] for i in keep),)
+    graph.eliminate_dead_code()
+    return fx.GraphModule(gm, graph)
+
+
 class _SplitProgram:
     """One dynamo graph as forward, input-gradient and weight-gradient graphs."""
 
@@ -230,13 +283,8 @@ class _SplitProgram:
                 args[slot] = primal
             return tuple(gm(*args))
 
-        joint = cast(
-            fx.GraphModule,
-            aot_export_joint_simple(
-                forward,
-                tuple(example_inputs[slot] for slot in self.order),
-                trace_joint=True,
-            ),
+        joint = _export_joint(
+            forward, tuple(example_inputs[slot] for slot in self.order)
         )
         tangents = [
             node.name
@@ -287,6 +335,43 @@ class _SplitProgram:
     def __call__(self, *args: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         primals = [_engine_visible(args[slot]) for slot in self.order]
         return _SplitBackwardFunction.apply(self, *primals)
+
+
+class _MixedProgram:
+    """A dynamo graph with both differentiable and non-differentiable outputs.
+
+    The differentiable outputs go through a :class:`_SplitProgram`. The others
+    take no gradient, so they come from a second, inference-only graph over the
+    same inputs; it recomputes whatever they share with the first, which for the
+    outputs seen so far (index maps, ``empty_like`` buffers) is little.
+    """
+
+    def __init__(
+        self,
+        gm: fx.GraphModule,
+        example_inputs: Sequence[torch.Tensor],
+        differentiable: Sequence[bool],
+        compiler: Compiler,
+    ) -> None:
+        self.differentiable: Tuple[bool, ...] = tuple(differentiable)
+        keep = [i for i, flag in enumerate(differentiable) if flag]
+        rest = [i for i, flag in enumerate(differentiable) if not flag]
+        self.split_program = _SplitProgram(
+            _with_outputs(gm, keep), example_inputs, compiler
+        )
+        with torch.no_grad():
+            self.plain: Callable[..., Any] = compiler(
+                _with_outputs(gm, rest), example_inputs
+            )
+
+    def __call__(self, *args: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        split_outputs = iter(self.split_program(*args))
+        with torch.no_grad():
+            plain_outputs = iter(self.plain(*args))
+        return tuple(
+            next(split_outputs) if flag else next(plain_outputs)
+            for flag in self.differentiable
+        )
 
 
 def _scatter(
@@ -366,13 +451,16 @@ class SplitBackwardBackend:
     is what dynamo lifts a module's parameters to; every other differentiable
     input belongs to the input half.
 
+    An output that is a view of an input is returned as a copy, and outputs that
+    take no gradient come from a separate inference graph; a region with no
+    differentiable output is compiled as is.
+
     The joint graph is partitioned with Inductor's ``custom_partitioner_fn``
     when one is set, else with the min-cut partitioner, as Inductor does.
 
-    Limitations: static shapes only, and the region must neither mutate its
-    inputs nor return a view of one -- the constraints of
-    ``aot_export_joint_simple``, which traces it. Inductor's joint-graph passes
-    do not run on the region.
+    Limitations: static shapes only, and the region must not mutate its inputs
+    -- constraints of ``aot_export_joint_simple``, which traces it. Inductor's
+    joint-graph passes do not run on the region.
 
     Args:
         compiler (Callable): compiles each extracted aten graph against example
@@ -399,6 +487,11 @@ class SplitBackwardBackend:
             and any(value.requires_grad for value in example_inputs)
         ):
             return self._compiler(gm, example_inputs)
+        differentiable = _differentiable_outputs(gm)
+        if not any(differentiable):
+            return self._compiler(gm, example_inputs)
+        if not all(differentiable):
+            return _MixedProgram(gm, example_inputs, differentiable, self._compiler)
         return _SplitProgram(gm, example_inputs, self._compiler)
 
 
