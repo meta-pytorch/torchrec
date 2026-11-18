@@ -11,7 +11,7 @@ import copy
 import multiprocessing
 import unittest
 from collections import OrderedDict
-from typing import Any, Dict, Final, List, Optional, Tuple
+from typing import Any, cast, Dict, Final, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -611,8 +611,145 @@ def _run_single_rank_training_step(
         loss.backward()  # Test if backward pass gave no errors
 
 
+def _assert_multi_feature_table_eviction(
+    sharded: ShardedManagedCollisionEmbeddingBagCollection,
+    tables: List[EmbeddingBagConfig],
+    name: str,
+    rows: List[int],
+) -> None:
+    tbe = sharded._table_to_tbe_and_index[tables[0].name][0]
+    weights = tbe.split_embedding_weights()
+    momenta = [state[0] for state in tbe.split_optimizer_states()]
+    assert [weight.shape[0] for weight in weights] == [8, 12, 4]
+    with torch.no_grad():
+        # Citrine C3: initialize test sentinels directly on their device.
+        for i, (weight, momentum) in enumerate(zip(weights, momenta)):
+            weight.copy_(
+                torch.arange(weight.numel(), device=weight.device).view_as(weight)
+                + 100 * (i + 1)
+            )
+            momentum.copy_(
+                torch.arange(momentum.numel(), device=momentum.device) + 100 * (i + 1)
+            )
+        expected = [
+            (weight.clone(), momentum.clone())
+            for weight, momentum in zip(weights, momenta)
+        ]
+        indices = torch.tensor(rows, device=sharded._device, dtype=torch.long)
+        for table, (expected_weight, expected_momentum) in zip(tables, expected):
+            if table.name == name:
+                expected_weight[indices] = -7
+                expected_momentum[indices] = 0
+        sharded._evict({name: indices})
+        for table, (weight, momentum), (expected_weight, expected_momentum) in zip(
+            tables, zip(weights, momenta), expected
+        ):
+            torch.testing.assert_close(
+                weight,
+                expected_weight,
+                rtol=0,
+                atol=0,
+                msg=f"{name}: {table.name} weights",
+            )
+            torch.testing.assert_close(
+                momentum,
+                expected_momentum,
+                rtol=0,
+                atol=0,
+                msg=f"{name}: {table.name} momentum",
+            )
+
+
+def _test_multi_feature_table_eviction(
+    tables: List[EmbeddingBagConfig], rank: int, world_size: int, backend: str
+) -> None:
+    with MultiProcessContext(rank, world_size, backend) as ctx:
+        module = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection(tables=tables, device=torch.device("meta")),
+            ManagedCollisionCollection(
+                managed_collision_modules={
+                    table.name: HashZchManagedCollisionModule(
+                        zch_size=table.num_embeddings,
+                        input_hash_size=0,
+                        device=torch.device("meta"),
+                        total_num_buckets=world_size,
+                        eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
+                        eviction_config=HashZchEvictionConfig(
+                            features=table.feature_names, single_ttl=-1
+                        ),
+                    )
+                    for table in tables
+                },
+                embedding_configs=tables,
+            ),
+        )
+        apply_optimizer_in_backward(
+            RowWiseAdagrad, module._embedding_bag_collection.parameters(), {"lr": 0.01}
+        )
+        sharder = ManagedCollisionEmbeddingBagCollectionSharder()
+        plan = construct_module_sharding_plan(
+            module,
+            per_param_sharding={
+                table.name: row_wise(compute_kernel=EmbeddingComputeKernel.FUSED.value)
+                for table in tables
+            },
+            world_size=world_size,
+            device_type="cuda",
+            sharder=cast(ModuleSharder[nn.Module], sharder),
+        )
+        assert ctx.pg is not None
+        sharded = sharder.shard(
+            module, plan, ShardingEnv.from_process_group(ctx.pg), ctx.device
+        )
+        tbe = sharded._table_to_tbe_and_index[tables[0].name][0]
+        assert all(
+            sharded._table_to_tbe_and_index[table.name][0] is tbe for table in tables
+        )
+        assert [
+            sharded._table_to_tbe_and_index[table.name][1].item() for table in tables
+        ] == [0, 1, 2]
+        assert [
+            sharded._table_to_logical_table_ids[table.name].item() for table in tables
+        ] == [0, 4, 7]
+        for name, rows in (
+            (tables[0].name, [1]),
+            (tables[1].name, [1, 10]),
+            (tables[2].name, [2]),
+        ):
+            _assert_multi_feature_table_eviction(sharded, tables, name, rows)
+
+
 @skip_if_asan_class
 class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_multi_feature_table_eviction(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                name=name,
+                feature_names=[f"{name}_feature_{i}" for i in range(num_features)],
+                embedding_dim=8,
+                num_embeddings=num_embeddings,
+                data_type=DataType.FP16,
+                pooling=PoolingType.SUM,
+                weight_init_min=-7,
+                weight_init_max=-7,
+            )
+            for name, num_embeddings, num_features in (
+                ("query_expression_zch", 16, 4),
+                ("query_text_span_zch", 24, 3),
+                ("query_entity_zch", 8, 1),
+            )
+        ]
+        self._run_multi_process_test(
+            callable=_test_multi_feature_table_eviction,
+            world_size=2,
+            tables=tables,
+            backend="nccl",
+        )
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
