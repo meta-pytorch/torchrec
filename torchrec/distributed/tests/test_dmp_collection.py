@@ -71,6 +71,17 @@ class MockLookupContainer(nn.Module):
         self._lookups = [kernel]
 
 
+class MockTwoEmbeddingModel(nn.Module):
+    def __init__(
+        self,
+        ebc1_kernel: MockSyncableEmbeddingKernel,
+        ebc2_kernel: MockSyncableEmbeddingKernel,
+    ) -> None:
+        super().__init__()
+        self.ebc1 = MockLookupContainer(ebc1_kernel)
+        self.ebc2 = MockLookupContainer(ebc2_kernel)
+
+
 class MockChunkAwareLookupContainer(MockLookupContainer):
     def __init__(self, kernel: MockSyncableEmbeddingKernel) -> None:
         super().__init__(kernel)
@@ -404,6 +415,15 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         dmp._dmp_wrapped_module = module
         return dmp
 
+    def test_module_sync_ownership_traverses_hidden_lookups(self) -> None:
+        kernel = MockSyncableEmbeddingKernel()
+        container = MockLookupContainer(kernel)
+
+        reachable = DMPCollection._reachable_module_ids(container)
+
+        self.assertIn(id(container), reachable)
+        self.assertIn(id(kernel), reachable)
+
     def test_marked_triton_kernel_discovery_caches_sync_tensors_once(self) -> None:
         kernel = MockSyncableEmbeddingKernel()
         dmp = self._dmp_shell(MockLookupContainer(kernel))
@@ -524,6 +544,47 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         dmp._sync(context)
 
         dmp._allreduce_tensors.assert_not_called()
+
+    def test_module_sync_preserves_fqn_ownership(self) -> None:
+        ebc1_kernel = MockSyncableEmbeddingKernel()
+        ebc2_kernel = MockSyncableEmbeddingKernel()
+        model = MockTwoEmbeddingModel(ebc1_kernel, ebc2_kernel)
+        dmp = self._dmp_shell(model)
+        context = self._context()
+        process_group = MagicMock(spec=dist.ProcessGroup)
+        process_group.size.return_value = 2
+        context.replica_pg = process_group
+        dmp._ctxs = [context]
+        dmp._plan = ShardingPlan(
+            {
+                "ebc1": MagicMock(spec=EmbeddingModuleShardingPlan),
+                "ebc2": MagicMock(spec=EmbeddingModuleShardingPlan),
+            }
+        )
+        dmp._custom_all_reduce = None
+        dmp._pending_module_syncs = {}
+        dmp._restore_stashed_sync_tensors = MagicMock()
+        weight_work = MagicMock(spec=dist.Work)
+        optimizer_work = MagicMock(spec=dist.Work)
+        process_group.allreduce_coalesced.side_effect = [
+            weight_work,
+            optimizer_work,
+        ]
+
+        dmp._group_sharded_modules([context])
+        dmp._cache_sync_tensors([context])
+        dmp._build_module_sync_units()
+
+        self.assertEqual(dmp.module_sync_fqns, ("ebc1", "ebc2"))
+        dmp.start_module_sync("ebc1")
+        calls = process_group.allreduce_coalesced.call_args_list
+        self.assertEqual(calls[0].args[0], [ebc1_kernel.weight])
+        self.assertEqual(calls[1].args[0], [ebc1_kernel.optimizer_state])
+
+        dmp.wait_all_module_syncs()
+        weight_work.wait.assert_called_once_with()
+        optimizer_work.wait.assert_called_once_with()
+        self.assertNotIn("ebc1", dmp._pending_module_syncs)
 
     def test_sync_skips_default_allreduce_for_empty_modules(self) -> None:
         dmp = self._dmp_shell(MockModule())
