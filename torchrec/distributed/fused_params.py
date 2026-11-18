@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
@@ -45,6 +45,10 @@ FUSED_PARAM_EMBEDDING_TABLE_INDEX_TYPE: str = "embedding_table_index_type"
 
 # Embedding table offset type for int32 support. Defaults to torch.int64 if not specified.
 FUSED_PARAM_EMBEDDING_TABLE_OFFSET_TYPE: str = "embedding_table_offset_type"
+
+# EmbeddingCollection only: backward of the sequence variable-batch reindex uses
+# the atomic-free segment gather instead of fbgemm's zero-fill + atomic add.
+FUSED_PARAM_SEGMENT_GATHER_BACKWARD: str = "__register_segment_gather_backward"
 
 
 class TBEToRegisterMixIn:
@@ -112,6 +116,20 @@ def fused_param_lengths_to_offsets_lookup(
         return fused_params[FUSED_PARAM_LENGTHS_TO_OFFSETS_LOOKUP]
 
 
+def split_fused_param_segment_gather_backward(
+    fused_params: Optional[Dict[str, Any]],
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Returns the segment gather backward flag and fused_params without it.
+
+    The key is read by ShardedEmbeddingCollection, not by the TBE, whose
+    constructor rejects unknown keyword arguments.
+    """
+    if not fused_params or FUSED_PARAM_SEGMENT_GATHER_BACKWARD not in fused_params:
+        return False, fused_params
+    rest = dict(fused_params)
+    return bool(rest.pop(FUSED_PARAM_SEGMENT_GATHER_BACKWARD)), rest
+
+
 def is_fused_param_device_ro(fused_params: Optional[Dict[str, Any]]) -> bool:
     return (
         # pyrefly: ignore[bad-return]
@@ -155,6 +173,8 @@ def tbe_fused_params(
         fused_params_for_tbe.pop(FUSED_PARAM_IS_DEVICE_RO)
     if FUSED_PARAM_SSD_TABLE_LIST in fused_params_for_tbe:
         fused_params_for_tbe.pop(FUSED_PARAM_SSD_TABLE_LIST)
+    if FUSED_PARAM_SEGMENT_GATHER_BACKWARD in fused_params_for_tbe:
+        fused_params_for_tbe.pop(FUSED_PARAM_SEGMENT_GATHER_BACKWARD)
 
     return fused_params_for_tbe
 

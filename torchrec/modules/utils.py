@@ -255,6 +255,7 @@ def _permute_tensor_by_segments(
 def _vbe_reindex(
     embeddings: torch.Tensor,
     seq_vbe_ctx: SequenceVBEContext,
+    use_segment_gather_backward: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[int], Optional[torch.Tensor]]:
     """
     Reindexes embeddings for variable batch size per feature scenarios.
@@ -265,13 +266,23 @@ def _vbe_reindex(
     """
     dim = embeddings.shape[1]
     output_size = sum(seq_vbe_ctx.reindexed_length_per_key) * dim
-    reindexed_embeddings, _ = _permute_tensor_by_segments(
-        tensor=embeddings.flatten(),
-        segment_sizes=seq_vbe_ctx.unpadded_lengths * dim,
-        recat=seq_vbe_ctx.recat,
-        weights=None,
-        output_size=output_size,
-    )
+    segment_sizes = seq_vbe_ctx.unpadded_lengths * dim
+    if use_segment_gather_backward and embeddings.device.type == "cuda":
+        # Same forward as below; the backward gathers each segment's sources
+        # instead of fbgemm's zero-fill + atomic add.
+        from torchrec.modules.segment_permute import permute_segments_gather_backward
+
+        reindexed_embeddings = permute_segments_gather_backward(
+            embeddings.flatten(), segment_sizes, seq_vbe_ctx.recat, output_size
+        )
+    else:
+        reindexed_embeddings, _ = _permute_tensor_by_segments(
+            tensor=embeddings.flatten(),
+            segment_sizes=segment_sizes,
+            recat=seq_vbe_ctx.recat,
+            weights=None,
+            output_size=output_size,
+        )
     reindexed_embeddings = reindexed_embeddings.view(-1, dim)
     assert len(seq_vbe_ctx.reindexed_lengths.shape) == 2
     return (
@@ -294,6 +305,7 @@ def construct_jagged_tensors(
     use_gather_select: bool = False,
     use_sorted_select: bool = False,
     seg_plan: Optional[object] = None,
+    use_segment_gather_backward: bool = False,
 ) -> Dict[str, JaggedTensor]:
     """Construct feature tensors, optionally expanding deduplicated embeddings.
 
@@ -337,7 +349,9 @@ def construct_jagged_tensors(
 
         if seq_vbe_ctx is not None:
             embeddings, lengths, length_per_key, values = _vbe_reindex(
-                embeddings=embeddings, seq_vbe_ctx=seq_vbe_ctx
+                embeddings=embeddings,
+                seq_vbe_ctx=seq_vbe_ctx,
+                use_segment_gather_backward=use_segment_gather_backward,
             )
         else:
             lengths = features.lengths().view(-1, features.stride())
