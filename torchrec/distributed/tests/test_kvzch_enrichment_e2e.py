@@ -285,6 +285,7 @@ def _build_sharded_model(
     serving_qdq_group_size: int = 0,
     embedding_dim: int = EMBEDDING_DIM,
     data_type: DataType = DataType.FP32,
+    int8_storage: bool = False,
 ) -> DistributedModelParallel:
     """Build row-wise virtual tables backed by the test enrichment provider."""
     tables = [
@@ -336,6 +337,8 @@ def _build_sharded_model(
         enrichment_policy = enrichment_policy._replace(
             owner_cache_int8=True, owner_cache_exclusive=True
         )
+    if int8_storage:
+        enrichment_policy = enrichment_policy._replace(int8_storage=True)
     fused_params = {
         "embedding_cache_mode": True,
         "l2_cache_size": 1,
@@ -919,6 +922,17 @@ def _run_owner_local_cache_bounded_read_populate_round_trip(
     )
 
 
+def _run_owner_local_cache_int8_exclusive_row_write(
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    _run_owner_local_cache_row_write(
+        rank, world_size, backend, local_size, int8_exclusive=True
+    )
+
+
 def _dram_rows(tbe: SSDTableBatchedEmbeddingBags) -> int:
     """Rows the DRAM backend holds a block for (rows only in HBM excluded)."""
     return int(tbe.ssd_db.get_dram_kv_perf(1, 1)[22])
@@ -1126,12 +1140,19 @@ def _run_owner_local_cache_row_write(
     world_size: int,
     backend: str,
     local_size: Optional[int] = None,
+    int8_exclusive: bool = False,
 ) -> None:
     """Row writes fill only absent or all-zero rows; Laser writes still work."""
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         assert ctx.pg is not None
         sharded_model = _build_sharded_model(
-            ctx, world_size, local_size, owner_local_cache=True
+            ctx,
+            world_size,
+            local_size,
+            owner_local_cache=True,
+            owner_local_cache_exclusive=int8_exclusive,
+            data_type=DataType.FP16 if int8_exclusive else DataType.FP32,
+            int8_storage=int8_exclusive,
         )
         laser_hashed_ids = [101, 202]
         laser_unhashed_ids = [1010, 2020]
@@ -1145,6 +1166,18 @@ def _run_owner_local_cache_row_write(
         )
         torch.cuda.synchronize()
         _wait_for_cache_fill(sharded_model, laser_kjt, len(laser_hashed_ids))
+        if int8_exclusive:
+            torch.cuda.synchronize()
+            tbe = _enrichment_cache(sharded_model).emb_module
+            tbe.ssd_db.exclusive_hbm_wait()
+            # The Laser-filled ids live only in HBM, so the row write below
+            # reaches the HBM-row skip rather than the DRAM non-zero check.
+            tiers = torch.tensor(
+                [int(tbe.ssd_db.exclusive_hbm_stats()[0]), _dram_rows(tbe)],
+                device=ctx.device,
+            )
+            torch.distributed.all_reduce(tiers, group=ctx.pg)
+            assert tiers.tolist() == [len(laser_hashed_ids), 0], tiers.tolist()
 
         new_ids = [303, 404]
         zero_id = 505
@@ -1414,6 +1447,18 @@ class TestKvzchEnrichmentE2E(MultiProcessTestBase):
         )
         self._run_multi_process_test(
             callable=_run_owner_local_cache_exclusive_round_trip,
+            world_size=world_size,
+            backend="nccl",
+        )
+
+    def test_int8_exclusive_row_writes_fill_only_empty_rows(self) -> None:
+        world_size = 2
+        self._require_test_runtime(world_size)
+        self._require_enrichment_policy_fields(
+            (*_OWNER_LOCAL_CACHE_EXCLUSIVE_POLICY_FIELDS, "int8_storage")
+        )
+        self._run_multi_process_test(
+            callable=_run_owner_local_cache_int8_exclusive_row_write,
             world_size=world_size,
             backend="nccl",
         )
