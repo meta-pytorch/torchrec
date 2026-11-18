@@ -778,7 +778,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
             self.assertIsInstance(val_grad, torch.Tensor)
-            # pyrefly: ignore[bad-argument-type]
             torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
     @given(
@@ -813,7 +812,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         for i in range(permutes.size(0)):
             in_idx, out_idx, in_start, _, length, _ = permutes[i].tolist()
             refs[out_idx].append(ref_values[in_idx][in_start : (in_start + length), :])
-        # pyrefly: ignore[no-matching-overload]
         # pyrefly: ignore
         refs = [torch.cat(ref).t() for ref in refs]
         outputs = torch.ops.fbgemm.permute_multi_embedding(
@@ -831,7 +829,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
             self.assertIsInstance(val_grad, torch.Tensor)
-            # pyrefly: ignore[bad-argument-type]
             torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
     @given(
@@ -978,7 +975,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
             self.assertIsInstance(val_grad, torch.Tensor)
-            # pyrefly: ignore[bad-argument-type]
             torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
 

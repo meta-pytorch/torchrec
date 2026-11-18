@@ -29,7 +29,6 @@ class _GradCheck(torch.autograd.Function):
     """
 
     @staticmethod
-    # pyrefly: ignore[bad-override]
     def forward(ctx, x: torch.Tensor, tag: str):
         ctx.tag = tag
         return x

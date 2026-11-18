@@ -216,7 +216,6 @@ class InteractionArch(nn.Module):
         interactions = torch.bmm(
             combined_values, torch.transpose(combined_values, 1, 2)
         )
-        # pyrefly: ignore[bad-index]
         interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
 
         return torch.cat((dense_features, interactions_flat), dim=1)
@@ -954,7 +953,7 @@ class DLRMTrain(nn.Module):
 
 
 class DLRMWrapper(DLRM):
-    # pyrefly: ignore [bad-override, bad-param-name-override]
+    # pyrefly: ignore [bad-override]
     def forward(
         self, model_input: ModelInput
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:

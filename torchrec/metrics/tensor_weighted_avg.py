@@ -106,7 +106,6 @@ class TensorWeightedAvgMetricComputation(RecMetricComputation):
                 else:
                     target_tensor = cast(
                         torch.Tensor,
-                        # pyrefly: ignore[bad-index]
                         kwargs["required_inputs"][tensor_name],
                     )
 
@@ -121,9 +120,7 @@ class TensorWeightedAvgMetricComputation(RecMetricComputation):
         # Vectorized computation using masks
         weighted_values = torch.where(
             self.weighted_mask,
-            # pyrefly: ignore[unbound-name]
             target_tensor * weights,
-            # pyrefly: ignore[unbound-name]
             target_tensor,
         )
 

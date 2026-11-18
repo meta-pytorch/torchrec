@@ -1252,18 +1252,13 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
     @torch.no_grad()
     def _sort_mch_buffers(self) -> None:
         #  Tensor]`.
-        # pyrefly: ignore[no-matching-overload]
         argsorted_sorted_raw_ids = torch.argsort(self._mch_sorted_raw_ids, stable=True)
         #  = ...) -> Tensor, Module, Tensor]` is not a function.
-        # pyrefly: ignore[not-callable]
         self._mch_sorted_raw_ids.copy_(
-            # pyrefly: ignore[bad-index]
             self._mch_sorted_raw_ids[argsorted_sorted_raw_ids]
         )
         #  = ...) -> Tensor, Module, Tensor]` is not a function.
-        # pyrefly: ignore[not-callable]
         self._mch_remapped_ids_mapping.copy_(
-            # pyrefly: ignore[bad-index]
             self._mch_remapped_ids_mapping[argsorted_sorted_raw_ids]
         )
         for mch_metadata_buffer in self._mch_metadata.values():
@@ -1284,7 +1279,6 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
 
         matching_eles, matched_indices = self._match_indices(
             #  `Union[Module, Tensor]`.
-            # pyrefly: ignore[bad-argument-type]
             self._mch_sorted_raw_ids,
             frequency_sorted_uniq_ids,
         )
@@ -1307,7 +1301,6 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
             self._mch_metadata,
             uniq_ids_metadata,
         )
-        # pyrefly: ignore[unsupported-operation]
         self._mch_sorted_raw_ids[evicted_indices] = new_frequency_sorted_uniq_ids[
             selected_new_indices
         ]
@@ -1320,13 +1313,11 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
                 torch.cat(
                     [
                         self._evicted_emb_indices,
-                        # pyrefly: ignore[bad-index]
                         self._mch_remapped_ids_mapping[evicted_indices],
                     ]
                 )
             )
         else:
-            # pyrefly: ignore[bad-index]
             self._evicted_emb_indices = self._mch_remapped_ids_mapping[evicted_indices]
         self._evicted = True
 
@@ -1381,11 +1372,9 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
             return features
 
         if self._current_iter == -1:
-            # pyrefly: ignore[not-callable]
             self._current_iter = int(self._current_iter_tensor.item())
             self._last_eviction_iter = self._current_iter
         self._current_iter += 1
-        # pyrefly: ignore [bad-argument-type, bad-assignment, missing-attribute, unsupported-operation]
         self._current_iter_tensor.data += 1
 
         # init history buffers if needed

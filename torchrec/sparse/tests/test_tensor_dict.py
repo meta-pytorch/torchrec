@@ -55,7 +55,6 @@ class TestTensorDict(unittest.TestCase):
                 lengths=torch.tensor([1, 2], device=device),
             ),
         }
-        # pyrefly: ignore[bad-specialization]
         td = TensorDict(
             data,  # type: ignore[arg-type]
             device=device,

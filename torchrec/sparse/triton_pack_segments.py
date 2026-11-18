@@ -124,9 +124,7 @@ def _forward_impl(
         max_length,
         cell_size,
         output.numel(),
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=_BLOCK_SIZE,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=4,
     )
     return output
@@ -153,9 +151,7 @@ def _backward_impl(
         max_length,
         cell_size,
         grad_output.numel(),
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=_BLOCK_SIZE,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=4,
     )
     return grad_input

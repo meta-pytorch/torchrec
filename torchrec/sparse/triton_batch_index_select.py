@@ -443,9 +443,7 @@ def _sorted_backward_impl(
         linear_indices,
         num_indices,
         batch_size,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=256,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=4,
     )
     sorted_rows, sorted_positions = torch.sort(linear_indices)
@@ -455,9 +453,7 @@ def _sorted_backward_impl(
         sorted_rows,
         run_flags,
         num_indices,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=256,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=4,
     )
     run_ids = torch.cumsum(run_flags, dim=0, dtype=torch.int32)
@@ -471,9 +467,7 @@ def _sorted_backward_impl(
         unique_rows,
         run_offsets,
         num_indices,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=256,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=4,
     )
     _finish_sorted_runs_kernel[(1,)](
@@ -497,11 +491,8 @@ def _sorted_backward_impl(
         grad_inputs,
         batch_size,
         metadata.total_columns,
-        # pyrefly: ignore[bad-argument-type]
         COLUMNS=input_columns[0],
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_ROWS=4,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=2,
     )
     return grad_inputs
@@ -572,13 +563,9 @@ def _forward_impl(
             output,
             batch_size,
             metadata.total_columns,
-            # pyrefly: ignore[bad-argument-type]
             NUM_FEATURES=num_features,
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_BATCH=block_batch,
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_COLUMNS=block_columns,
-            # pyrefly: ignore[unexpected-keyword]
             num_warps=num_warps,
         )
     return output
@@ -633,9 +620,7 @@ def _backward_impl(
             num_indices,
             batch_size,
             RELAXED_ATOMICS=relaxed_atomics,
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_SIZE=256,
-            # pyrefly: ignore[unexpected-keyword]
             num_warps=4,
         )
     for bucket in _launch_buckets(metadata, batch_size):
@@ -668,15 +653,11 @@ def _backward_impl(
             grad_inputs,
             batch_size,
             metadata.total_columns,
-            # pyrefly: ignore[bad-argument-type]
             NUM_FEATURES=num_features,
             USE_COUNTS=counted_scatter,
             RELAXED_ATOMICS=relaxed_atomics,
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_BATCH=block_batch,
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_COLUMNS=block_columns,
-            # pyrefly: ignore[unexpected-keyword]
             num_warps=num_warps,
         )
     return (

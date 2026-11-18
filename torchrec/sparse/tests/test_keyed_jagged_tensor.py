@@ -1423,7 +1423,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertIsNotNone(empty_kjt._stride_per_key_per_rank)
         torch.testing.assert_close(
             empty_kjt._stride_per_key_per_rank,
-            # pyrefly: ignore[bad-argument-type]
             kjt._stride_per_key_per_rank,
             rtol=0,
             atol=0,

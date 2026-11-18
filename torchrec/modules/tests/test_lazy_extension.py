@@ -97,14 +97,12 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
             """
 
             def __init__(self, *args, **kwargs):
-                # pyrefly: ignore[bad-argument-type]
                 super().__init__(*args, **kwargs)
                 self.register_forward_pre_hook(self.valid_input_only_hook)
 
             def valid_input_only_hook(self, module, input):
                 self.output = torch.zeros(2, 2)
 
-            # pyrefly: ignore[bad-override]
             def initialize_parameters(self) -> None:
                 return None
 
@@ -138,10 +136,8 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
             """
 
             def __init__(self, *args, **kwargs):
-                # pyrefly: ignore[bad-argument-type]
                 super().__init__(*args, **kwargs)
 
-            # pyrefly: ignore[bad-override]
             def initialize_parameters(self, input) -> None:
                 return None
 
@@ -165,11 +161,9 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
 
         class TestModule(LazyModuleExtensionMixin, torch.nn.Module):
             def __init__(self):
-                # pyrefly: ignore[bad-argument-type]
                 super().__init__()
                 self.count = torch.tensor(count_original)
 
-            # pyrefly: ignore[bad-override]
             def initialize_parameters(self, input) -> None:
                 pass
 
@@ -277,11 +271,9 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
     def test_apply(self) -> None:
         class TestModule(LazyModuleExtensionMixin, torch.nn.Module):
             def __init__(self):
-                # pyrefly: ignore[bad-argument-type]
                 super().__init__()
                 self.param = torch.tensor(1.0)
 
-            # pyrefly: ignore[bad-override]
             def initialize_parameters(self, input) -> None:
                 return None
 
@@ -303,7 +295,6 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
         net(torch.tensor(2.0))
         net.apply(init_weights)
         #  Module]`.
-        # pyrefly: ignore[bad-argument-type]
         torch.testing.assert_close(
             net[0].param, torch.tensor(7.0), rtol=1e-05, atol=1e-08
         )

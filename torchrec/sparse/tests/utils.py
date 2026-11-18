@@ -76,7 +76,6 @@ def repeat_test(
         @functools.wraps(f)
         def decorator(self: unittest.TestCase) -> None:
             queue = [(arg, {}) for arg in args] if args else [((), {})]
-            # pyrefly: ignore[bad-assignment]
             for k, values in kwargs.items():
                 new_queue = []
                 for a, d in queue:

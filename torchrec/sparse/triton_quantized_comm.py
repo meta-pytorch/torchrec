@@ -199,11 +199,8 @@ def triton_float_to_fused8bitrowwise_quantized(
         num_columns,
         output_columns,
         output_columns // 4,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_ROWS=block_rows,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_COLUMNS=block_columns,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=min(8, max(1, block_columns // 32)),
     )
     return output
@@ -243,9 +240,7 @@ def triton_fused8bitrowwise_quantized_to_float(
         input_columns,
         output_columns,
         input_columns // 4,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=512,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=8,
     )
     return output
@@ -274,9 +269,7 @@ def triton_float_to_bfloat16_quantized(input: torch.Tensor) -> torch.Tensor:
             input,
             output,
             input.numel(),
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_SIZE=512,
-            # pyrefly: ignore[unexpected-keyword]
             num_warps=8,
         )
     return output
@@ -301,9 +294,7 @@ def triton_bfloat16_quantized_to_float(input: torch.Tensor) -> torch.Tensor:
             input,
             output,
             input.numel(),
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_SIZE=8192,
-            # pyrefly: ignore[unexpected-keyword]
             num_warps=8,
         )
     return output

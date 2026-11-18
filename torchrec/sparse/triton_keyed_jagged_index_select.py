@@ -216,9 +216,7 @@ def _selected_metadata(
             input_batch_size,
             indices.numel(),
             num_output_segments,
-            # pyrefly: ignore[bad-argument-type]
             BLOCK_SIZE=triton.next_power_of_2(num_output_segments),
-            # pyrefly: ignore[bad-argument-type]
             VALUE_BLOCK_SIZE=_BLOCK_SIZE,
         )
         return selected_lengths, selected_offsets, selected_block_offsets
@@ -288,11 +286,8 @@ def _forward_impl(
         input_batch_size,
         output_batch_size,
         selected_lengths.numel(),
-        # pyrefly: ignore[bad-argument-type]
         HAS_WEIGHTS=weights is not None,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=_BLOCK_SIZE,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=8,
     )
     return output_values, selected_lengths, output_weights
@@ -390,11 +385,8 @@ def _backward_impl(
         grad_weights if grad_weights is not None else grad_values,
         input_batch_size,
         indices.numel(),
-        # pyrefly: ignore[bad-argument-type]
         HAS_WEIGHTS=has_weights and grad_output_weights is not None,
-        # pyrefly: ignore[bad-argument-type]
         BLOCK_SIZE=_BLOCK_SIZE,
-        # pyrefly: ignore[unexpected-keyword]
         num_warps=8,
     )
     return grad_values, grad_weights
