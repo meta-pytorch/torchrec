@@ -355,6 +355,55 @@ class RecMetricTest(unittest.TestCase):
 
         self.assertIn("ne-DefaultTask|lifetime_ne", ne.compute())
 
+    def _make_ne(self, fused_update_limit: int) -> NEMetric:
+        return NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=128,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=1000,
+            fused_update_limit=fused_update_limit,
+        )
+
+    def test_state_dict_flushes_buffered_updates(self) -> None:
+        """A checkpoint taken mid-buffer must carry the buffered updates.
+
+        With fused_update_limit set, update() parks its inputs instead of
+        applying them. state_dict() force-flushes first, so a checkpoint
+        written before the limit is reached is not silently short.
+
+        Comparing against an eager metric fed the same batch is what makes
+        this exact: a partial or doubled flush also leaves the state nonzero.
+        """
+        # Above the single update below, so nothing auto-flushes.
+        buffered = self._make_ne(fused_update_limit=4)
+        eager = self._make_ne(fused_update_limit=0)
+
+        for metric in (buffered, eager):
+            metric.update(
+                predictions=self.predictions,
+                labels=self.labels,
+                weights=self.weights,
+            )
+
+        # Module.__getattr__ is typed Tensor | Module, so the state needs a cast
+        # before .item() type-checks.
+        cross_entropy_sum = cast(
+            torch.Tensor, buffered._metrics_computations[0].cross_entropy_sum
+        )
+        self.assertEqual(
+            cross_entropy_sum.item(),
+            0.0,
+            "the update should still be buffered, or this test proves nothing",
+        )
+
+        actual = buffered.state_dict()
+        expected = eager.state_dict()
+        self.assertEqual(set(actual), set(expected))
+        for key in expected:
+            torch.testing.assert_close(actual[key], expected[key], msg=key)
+
 
 class RecMetricTensorSizeLoggingTest(unittest.TestCase):
     def test_get_tensor_size_metadata_tensor(self) -> None:
