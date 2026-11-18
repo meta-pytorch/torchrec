@@ -14,6 +14,11 @@ from unittest.mock import MagicMock, Mock, patch
 
 import torch
 import torchrec.optim as trec_optim
+from fbgemm_gpu.split_embedding_configs import SparseType
+from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
+    EmbeddingLocation,
+    IntNBitTableBatchedEmbeddingBagsCodegen,
+)
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
@@ -30,7 +35,9 @@ from torchrec.distributed.planner.constants import (
 )
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+from torchrec.distributed.planner.planners import to_sharding_plan
 from torchrec.distributed.planner.shard_estimators import (
+    _calculate_intnbit_weight_sizes,
     _calculate_quantized_weight_bytes,
     _calculate_shard_io_sizes,
     _calculate_storage_specific_sizes,
@@ -2298,6 +2305,230 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
             "Negative HBM size detected in hbm_specific_sizes[0]=-700",
             str(ctx.exception),
         )
+
+
+def _intnbit_tbe_bytes(
+    rows: int, cols: int, dtype: DataType, row_alignment: int
+) -> int:
+    """Weight bytes of a real CPU-built inference TBE holding one rows x cols table."""
+    sparse_type = SparseType.INT8 if dtype == DataType.INT8 else SparseType.INT4
+    tbe = IntNBitTableBatchedEmbeddingBagsCodegen(
+        embedding_specs=[("t", rows, cols, sparse_type, EmbeddingLocation.HOST)],
+        device="cpu",
+        row_alignment=row_alignment,
+    )
+    tbe.initialize_weights()
+    return tbe.host_size
+
+
+class TestTrainingQuantUvmPlanning(unittest.TestCase):
+    """A training sharder's QUANT_UVM table: the inference TBE, IntNBit rows in host
+    memory, planned only when its constraint names the kernel and an INT8/INT4 dtype."""
+
+    def _enumerate(
+        self,
+        constraint: Optional[ParameterConstraints],
+        embedding_dim: int = 160,
+        sharding_type: str = ShardingType.TABLE_WISE.value,
+        estimator: Optional[EmbeddingStorageEstimator] = None,
+    ) -> List[ShardingOption]:
+        enumerator = EmbeddingEnumerator(
+            topology=Topology(world_size=2, compute_device="cuda"),
+            batch_size=BATCH_SIZE,
+            constraints={"table_0": constraint} if constraint is not None else None,
+            estimator=estimator,
+        )
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=embedding_dim,
+                name="table_0",
+                feature_names=["feature_0"],
+                data_type=DataType.FP16,
+            )
+        ]
+        return enumerator.enumerate(
+            module=TestSparseNN(tables=tables, weighted_tables=[]),
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    TestEBCSharder(
+                        sharding_type=sharding_type,
+                        kernel_type=EmbeddingComputeKernel.QUANT_UVM.value,
+                    ),
+                )
+            ],
+        )
+
+    def test_intnbit_weight_sizes_match_inference_tbe(self) -> None:
+        for dtype in (DataType.INT8, DataType.INT4):
+            for cols in (64, 96, 160, 256):
+                for compute_device, row_alignment in (("cuda", 16), ("cpu", 1)):
+                    with self.subTest(
+                        dtype=dtype, cols=cols, compute_device=compute_device
+                    ):
+                        self.assertEqual(
+                            _calculate_intnbit_weight_sizes(
+                                shard_sizes=[[100, cols]],
+                                quantized_weight_dtype=dtype,
+                                compute_device=compute_device,
+                            ),
+                            [_intnbit_tbe_bytes(100, cols, dtype, row_alignment)],
+                        )
+
+    def test_intnbit_weight_sizes_refuse_a_float_dtype(self) -> None:
+        with self.assertRaisesRegex(ValueError, "INT8 or INT4"):
+            _calculate_intnbit_weight_sizes([[100, 64]], DataType.FP16, "cuda")
+
+    def test_table_wise_option_charges_intnbit_rows_to_ddr(self) -> None:
+        for dtype in (DataType.INT8, DataType.INT4):
+            with self.subTest(dtype=dtype):
+                (option,) = self._enumerate(
+                    ParameterConstraints(
+                        compute_kernels=[EmbeddingComputeKernel.QUANT_UVM.value],
+                        quantized_weight_dtype=dtype,
+                    )
+                )
+                self.assertEqual(option.quantized_weight_dtype, dtype)
+                (shard,) = option.shards
+                assert shard.storage is not None and shard.perf is not None
+                # Exactly the TBE's rows: no optimizer or cache-auxiliary bytes.
+                self.assertEqual(
+                    shard.storage.ddr, _intnbit_tbe_bytes(100, 160, dtype, 16)
+                )
+                # The inference TBE has no backward pass.
+                self.assertEqual(shard.perf.bwd_compute, 0.0)
+                self.assertEqual(shard.perf.bwd_comms, 0.0)
+                self.assertGreater(shard.perf.fwd_compute, 0.0)
+
+    def test_priced_from_the_option_when_the_estimator_has_no_constraints(self) -> None:
+        # The option carries the dtype the enumerator validated; an estimator built
+        # without the enumerator's constraints prices the same IntNBit rows.
+        (option,) = self._enumerate(
+            ParameterConstraints(
+                compute_kernels=[EmbeddingComputeKernel.QUANT_UVM.value],
+                quantized_weight_dtype=DataType.INT4,
+            ),
+            estimator=EmbeddingStorageEstimator(
+                topology=Topology(world_size=2, compute_device="cuda")
+            ),
+        )
+        self.assertEqual(
+            cast(Storage, option.shards[0].storage).ddr,
+            _intnbit_tbe_bytes(100, 160, DataType.INT4, 16),
+        )
+
+    def test_virtual_table_flag_does_not_reprice_intnbit_rows(self) -> None:
+        (option,) = self._enumerate(
+            ParameterConstraints(
+                compute_kernels=[EmbeddingComputeKernel.QUANT_UVM.value],
+                quantized_weight_dtype=DataType.INT8,
+                use_virtual_table=True,
+            )
+        )
+        (shard,) = option.shards
+        assert shard.storage is not None
+        self.assertEqual(
+            shard.storage.ddr, _intnbit_tbe_bytes(100, 160, DataType.INT8, 16)
+        )
+
+    def test_column_wise_option_prices_each_shard(self) -> None:
+        options = self._enumerate(
+            ParameterConstraints(
+                compute_kernels=[EmbeddingComputeKernel.QUANT_UVM.value],
+                quantized_weight_dtype=DataType.INT8,
+                min_partition=128,
+            ),
+            embedding_dim=256,
+            sharding_type=ShardingType.COLUMN_WISE.value,
+        )
+        (option,) = options
+        self.assertEqual([shard.size for shard in option.shards], [[100, 128]] * 2)
+        expected = _intnbit_tbe_bytes(100, 128, DataType.INT8, 16)
+        self.assertEqual(
+            [cast(Storage, shard.storage).ddr for shard in option.shards],
+            [expected, expected],
+        )
+
+    def test_not_offered_without_a_constraint_naming_it(self) -> None:
+        # The test sharder offers only QUANT_UVM, so a table planned without a
+        # constraint naming it has no option at all.
+        for constraint in (None, ParameterConstraints()):
+            with self.subTest(constraint=constraint):
+                with self.assertRaisesRegex(
+                    RuntimeError, "No available sharding type and compute kernel"
+                ):
+                    self._enumerate(constraint)
+
+    def test_refuses_a_missing_or_float_dtype(self) -> None:
+        for dtype in (None, DataType.FP16, DataType.NFP8):
+            with self.subTest(dtype=dtype):
+                with self.assertRaisesRegex(ValueError, "quantized_weight_dtype"):
+                    self._enumerate(
+                        ParameterConstraints(
+                            compute_kernels=[EmbeddingComputeKernel.QUANT_UVM.value],
+                            quantized_weight_dtype=dtype,
+                        )
+                    )
+
+    def test_sharding_plan_carries_the_dtype(self) -> None:
+        (option,) = self._enumerate(
+            ParameterConstraints(
+                compute_kernels=[EmbeddingComputeKernel.QUANT_UVM.value],
+                quantized_weight_dtype=DataType.INT4,
+            )
+        )
+        option.shards[0].rank = 1
+        plan = to_sharding_plan([option], Topology(world_size=2, compute_device="cuda"))
+        (module_plan,) = plan.plan.values()
+        parameter_sharding = module_plan["table_0"]
+        self.assertEqual(parameter_sharding.quantized_weight_dtype, DataType.INT4)
+
+    def test_inference_sharder_quant_uvm_is_unchanged(self) -> None:
+        # The quant sharder keeps its own pricing (BASE_QUANT) and needs no
+        # constraint; the training-only guard and dtype never apply to it.
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+        quant_model = quantize(
+            TestSparseNN(tables=tables, weighted_tables=[]), inplace=True
+        )
+        enumerator = EmbeddingEnumerator(
+            topology=Topology(world_size=2, compute_device="cuda"),
+            batch_size=BATCH_SIZE,
+            estimator=EmbeddingStorageEstimator(
+                topology=Topology(world_size=2, compute_device="cuda"),
+                is_inference=True,
+            ),
+        )
+        options = [
+            option
+            for option in enumerator.enumerate(
+                module=quant_model,
+                sharders=[
+                    cast(
+                        ModuleSharder[torch.nn.Module],
+                        QuantEmbeddingBagCollectionSharder(),
+                    )
+                ],
+            )
+            if option.compute_kernel == EmbeddingComputeKernel.QUANT_UVM.value
+            and option.sharding_type == ShardingType.TABLE_WISE.value
+        ]
+        (option,) = options
+        self.assertIsNone(option.quantized_weight_dtype)
+        expected_ddr = compute_storage_usage(
+            option.tensor,
+            "cuda",
+            EmbeddingComputeKernel.QUANT_UVM.value,
+            StorageUsageType.BASE_QUANT,
+        )["ddr"]
+        self.assertEqual(cast(Storage, option.shards[0].storage).ddr, expected_ddr)
 
 
 class TestEmbeddingOffloadStats(unittest.TestCase):
