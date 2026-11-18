@@ -9,7 +9,9 @@
 
 import io
 import unittest
-from typing import Any, Dict, List
+from copy import deepcopy
+from typing import Any, Dict, List, Mapping
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -39,6 +41,72 @@ class DummyOptimizerModule:
 
 
 class TestKeyedOptimizer(unittest.TestCase):
+    def test_legacy_checkpoint_resume(self) -> None:
+        for optimizer_type in (torch.optim.SGD, torch.optim.AdamW):
+            for save_groups in (False, True):
+                with self.subTest(optimizer=optimizer_type, save_groups=save_groups):
+                    kwargs = {"lr": 0.03, "weight_decay": 0.2}
+                    if optimizer_type is torch.optim.SGD:
+                        kwargs["momentum"] = 0.9
+                    p = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+                    reference = optimizer_type([p], **kwargs)
+                    for step in range(4):
+                        p.grad = torch.tensor([0.2 * (step + 1), -0.3])
+                        reference.step()
+                    saved: dict[str, Any] = {
+                        "state": {"weight": deepcopy(reference.state[p])}
+                    }
+                    if save_groups:
+                        saved["param_groups"] = [
+                            {**reference.param_groups[0], "params": ["weight"]}
+                        ]
+                    q = torch.nn.Parameter(p.detach().clone())
+                    restored = optimizer_type([q], **kwargs)
+                    child = KeyedOptimizerWrapper(
+                        {"weight": q}, lambda _, optimizer=restored: optimizer
+                    )
+                    wrapped = OptimizerWrapper(
+                        CombinedOptimizer([OptimizerWrapper(child)])
+                    )
+                    wrapped.save_param_groups(save_groups)
+                    wrapped.init_state()
+                    with torch.no_grad():
+                        q.copy_(p)
+                    with patch.object(
+                        restored, "post_load_state_dict", create=True
+                    ) as legacy_hook:
+                        wrapped.load_state_dict(deepcopy(saved))
+                        legacy_hook.assert_not_called()
+                    actual = wrapped.state_dict()
+                    self.assertEqual(set(actual), set(saved))
+                    self.assertEqual(
+                        actual.get("param_groups"), saved.get("param_groups")
+                    )
+                    torch.testing.assert_close(
+                        actual["state"], saved["state"], rtol=0, atol=0
+                    )
+                    invalid = deepcopy(saved)
+                    invalid["checkpoint_metadata"] = {"unexpected": torch.tensor(1)}
+                    with self.assertRaisesRegex(ValueError, "checkpoint metadata"):
+                        wrapped.load_state_dict(invalid)
+                    actual = wrapped.state_dict()
+                    self.assertEqual(
+                        actual.get("param_groups"), saved.get("param_groups")
+                    )
+                    torch.testing.assert_close(
+                        actual["state"], saved["state"], rtol=0, atol=0
+                    )
+                    for step in range(4, 9):
+                        p.grad = torch.tensor([0.2 * (step + 1), -0.3])
+                        q.grad = p.grad.clone()
+                        reference.step()
+                        wrapped.step()
+                        torch.testing.assert_close(q, p, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            restored.state[q], reference.state[p], rtol=0, atol=0
+                        )
+                        self.assertNotIn("checkpoint_metadata", wrapped.state_dict())
+
     def _assert_state_dict_equals(
         self, dict1: Dict[str, Any], dict2: Dict[str, Any]
     ) -> None:
@@ -336,3 +404,144 @@ class TestOptimizerWrapper(unittest.TestCase):
         self.assertEqual(keyed_optimizer.param_groups[0]["param_group_val_0"], 998)
         # pyrefly: ignore[bad-index]
         self.assertEqual(optimizer_wrapper.param_groups[0]["param_group_val_0"], 998)
+
+
+class MetadataSGD(torch.optim.SGD):
+    def __init__(self, params: list[torch.Tensor], layout: int) -> None:
+        super().__init__(params, lr=0.1, momentum=0.9)
+        self.layout = layout
+        self.loaded_momentum: torch.Tensor | None = None
+
+    def get_checkpoint_metadata(self) -> dict[str, torch.Tensor]:
+        return {"layout": torch.tensor(self.layout)}
+
+    def validate_checkpoint_metadata(self, metadata: Mapping[str, Any]) -> None:
+        layout = metadata.get("layout")
+        if (
+            set(metadata) != {"layout"}
+            or not isinstance(layout, torch.Tensor)
+            or not torch.equal(layout, torch.tensor(self.layout))
+        ):
+            raise ValueError("Incompatible test layout")
+
+    def post_load_state_dict(self) -> None:
+        p = self.param_groups[0]["params"][0]
+        self.loaded_momentum = self.state[p]["momentum_buffer"].clone()
+
+
+class TestCheckpointMetadata(unittest.TestCase):
+    def test_metadata_parameter_group_order(self) -> None:
+        def make(order: list[list[str]]) -> KeyedOptimizerWrapper:
+            params = {key: torch.nn.Parameter(torch.ones(2)) for key in ("a", "b", "c")}
+            inner = MetadataSGD([params[key] for key in order[0]], layout=0)
+            for group in order[1:]:
+                inner.add_param_group({"params": [params[key] for key in group]})
+            wrapped = KeyedOptimizerWrapper(params, lambda _: inner)
+            wrapped.init_state()
+            return wrapped
+
+        source = make([["a", "b"], ["c"]])
+        saved = deepcopy(source.state_dict())
+        for order in (
+            [["a", "b"], ["c"]],
+            [["b", "a"], ["c"]],
+            [["c"], ["a", "b"]],
+            [["a"], ["b", "c"]],
+        ):
+            with self.subTest(order=order):
+                target = make(order)
+                for state in target.state.values():
+                    state["momentum_buffer"].fill_(7)
+                before = deepcopy(target.state_dict())
+                if order == [["a", "b"], ["c"]]:
+                    target.load_state_dict(saved)
+                    torch.testing.assert_close(
+                        target.state_dict(), saved, rtol=0, atol=0
+                    )
+                else:
+                    with self.assertRaisesRegex(ValueError, "parameter names or order"):
+                        target.load_state_dict(saved)
+                    torch.testing.assert_close(
+                        target.state_dict(), before, rtol=0, atol=0
+                    )
+
+    def _make_pair(self, value: float) -> tuple[OptimizerWrapper, list[MetadataSGD]]:
+        children: list[KeyedOptimizer | tuple[str, KeyedOptimizer]] = []
+        raw = []
+        for index, key in enumerate(("a", "b")):
+            p = torch.nn.Parameter(torch.tensor([value]))
+            inner = MetadataSGD([p], layout=index)
+            child = KeyedOptimizerWrapper(
+                {key: p}, lambda _, optimizer=inner: optimizer
+            )
+            p.grad = torch.full_like(p, value + index)
+            child.step()
+            children.append(OptimizerWrapper(child))
+            raw.append(inner)
+        wrapped = OptimizerWrapper(CombinedOptimizer(children))
+        wrapped.save_param_groups(True)
+        return wrapped, raw
+
+    def test_anonymous_metadata_roundtrip(self) -> None:
+        source, _ = self._make_pair(7.0)
+        saved = deepcopy(source.state_dict())
+        self.assertEqual(set(saved["checkpoint_metadata"]), {"0:", "1:"})
+        target, raw = self._make_pair(-3.0)
+        target.load_state_dict(saved)
+        actual = target.state_dict()
+        self.assertEqual(actual["param_groups"], saved["param_groups"])
+        for key in ("state", "checkpoint_metadata"):
+            torch.testing.assert_close(actual[key], saved[key], rtol=0, atol=0)
+        for key, inner in zip(("a", "b"), raw):
+            torch.testing.assert_close(
+                inner.loaded_momentum,
+                saved["state"][key]["momentum_buffer"],
+                rtol=0,
+                atol=0,
+            )
+
+    def test_metadata_rejection_before_any_state_copy(self) -> None:
+        source, _ = self._make_pair(7.0)
+        saved = deepcopy(source.state_dict())
+        for fault in (
+            "missing",
+            "extra",
+            "second_layout",
+            "swapped",
+            "keys_dtype",
+            "keys_shape",
+            "keys_type",
+            "keys_value",
+        ):
+            with self.subTest(fault=fault):
+                target, raw = self._make_pair(-3.0)
+                for inner in raw:
+                    inner.param_groups[0]["lr"] = 0.7
+                before = deepcopy(target.state_dict())
+                invalid = deepcopy(saved)
+                metadata = invalid["checkpoint_metadata"]
+                if fault == "missing":
+                    del metadata["1:"]
+                elif fault == "extra":
+                    metadata["2:"] = deepcopy(metadata["1:"])
+                elif fault == "second_layout":
+                    metadata["1:"]["optimizer"]["layout"] = torch.tensor(99)
+                elif fault == "swapped":
+                    metadata["0:"], metadata["1:"] = metadata["1:"], metadata["0:"]
+                else:
+                    keys = metadata["1:"]["parameter_keys"]
+                    replacements = {
+                        "keys_dtype": keys.to(torch.int64),
+                        "keys_shape": keys.unsqueeze(0),
+                        "keys_type": keys.tolist(),
+                        "keys_value": keys ^ 1,
+                    }
+                    metadata["1:"]["parameter_keys"] = replacements[fault]
+                with self.assertRaises(ValueError):
+                    target.load_state_dict(invalid)
+                actual = target.state_dict()
+                self.assertEqual(actual["param_groups"], before["param_groups"])
+                for key in ("state", "checkpoint_metadata"):
+                    torch.testing.assert_close(actual[key], before[key], rtol=0, atol=0)
+                for inner in raw:
+                    self.assertIsNone(inner.loaded_momentum)

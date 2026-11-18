@@ -159,6 +159,8 @@ class WarmupOptimizer(OptimizerWrapper):
         iter_, stage_id = self._get_warmup_state()
         logger.info(f"Warmup Optimizer set to iteration {iter_}")
         self._set_lr(iter_, stage_id)
+        if self.get_checkpoint_metadata():
+            super().post_load_state_dict()
 
     def step(self, closure: Any = None) -> None:
         super().step(closure)
