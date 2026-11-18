@@ -291,7 +291,8 @@ class _LongRun(_Launcher):
                 return self._fallback(grid, *args, **kw)
         else:
             (dout, infos, ss, se, gid, temp, dims, embo, num, vr, vb, total_D) = args
-        if dout.dtype != torch.float32:
+        # tbe_long_run shuffles dout element offsets as int32.
+        if dout.dtype != torch.float32 or dout.numel() >= 1 << 31:
             return self._fallback(grid, *args, **kw)
         perm, n_rest = cute_tbe.tbe_long_run(
             dout,
