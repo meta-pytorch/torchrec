@@ -524,9 +524,12 @@ def check_activations(
             f"{what}: expected {len(specs)} activation tensors, got {len(activations)}"
         )
     for i, (spec, tensor) in enumerate(zip(specs, activations)):
-        expected_shape = spec.materialize_shape(
-            tensor.shape[0] if spec.batch_size_dependent and tensor.ndim > 0 else None
-        )
+        expected_shape = spec.shape
+        if spec.batch_size_dependent and tensor.ndim == len(spec.shape):
+            # The spec's -1 marks the batch dimension, wherever it sits.
+            expected_shape = spec.materialize_shape(
+                tensor.shape[tuple(spec.shape).index(-1)]
+            )
         if tuple(tensor.shape) != tuple(expected_shape):
             raise ValueError(
                 f"{what}[{i}]: expected shape {tuple(expected_shape)}, got "
