@@ -44,7 +44,7 @@ try:
     torch.ops.load_library(
         "//deeplearning/fbgemm/fbgemm_gpu:permute_multi_embedding_ops_gpu"
     )
-except OSError:
+except (OSError, RuntimeError):
     pass
 
 
