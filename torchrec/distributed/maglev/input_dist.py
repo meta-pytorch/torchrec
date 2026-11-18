@@ -45,9 +45,10 @@ def _kjt_tensor_fields(kjt: KeyedJaggedTensor) -> List[Tuple[str, torch.Tensor]]
     """The KJT's required tensor members in a fixed order.
 
     A KJT always has values and exactly one length representation (lengths *or*
-    offsets). Weights, variable-stride metadata, and inverse indices are present
-    only when the source KJT carries them. Flatten and rebuild use this same order
-    so they line up.
+    offsets). Weights and inverse indices are present only when the source KJT
+    carries them. Variable-stride metadata is not a member here: it travels with
+    the host-resident KJT metadata (:func:`_flatten_kjt_metadata`). Flatten and
+    rebuild use this same order so they line up.
     """
     out: List[Tuple[str, torch.Tensor]] = [("values", kjt.values())]
     weights = kjt.weights_or_none()
@@ -58,8 +59,6 @@ def _kjt_tensor_fields(kjt: KeyedJaggedTensor) -> List[Tuple[str, torch.Tensor]]
         out.append(("lengths", lengths))
     else:
         out.append(("offsets", kjt.offsets()))
-    if kjt._stride_per_key_per_rank is not None:
-        out.append(("stride_per_key_per_rank", kjt._stride_per_key_per_rank))
     inverse_indices = kjt.inverse_indices_or_none()
     if inverse_indices is not None:
         out.append(("inverse_indices", inverse_indices[1]))
@@ -90,6 +89,9 @@ def _flatten_kjt_metadata(obj: Any, out: List[int]) -> None:
     if isinstance(obj, KeyedJaggedTensor):
         out.extend(obj.stride_per_key())
         out.extend(obj.length_per_key())
+        stride_per_key_per_rank = obj.stride_per_key_per_rank_tensor_or_none()
+        if stride_per_key_per_rank is not None:
+            out.extend(stride_per_key_per_rank.flatten().tolist())
     elif is_dataclass(obj) and not isinstance(obj, type):
         for f in fields(obj):
             _flatten_kjt_metadata(getattr(obj, f.name), out)
@@ -204,19 +206,33 @@ def _rebuild_kjt(
         name: _next(it) for name, _tensor in _kjt_tensor_fields(example)
     }
     example_inverse_indices = example.inverse_indices_or_none()
+    example_strides = example.stride_per_key_per_rank_tensor_or_none()
     stride_per_key: Optional[List[int]] = None
     length_per_key: Optional[List[int]] = None
+    stride_per_key_per_rank: Optional[torch.Tensor] = None
     if metadata_it is not None:
         num_keys = len(example.keys())
         stride_per_key = [_next_metadata(metadata_it) for _ in range(num_keys)]
         length_per_key = [_next_metadata(metadata_it) for _ in range(num_keys)]
+        if example_strides is not None:
+            # Host resident, as the source holds it: stride_per_key_per_rank()
+            # on a CUDA copy would sync the device.
+            stride_per_key_per_rank = torch.tensor(
+                [_next_metadata(metadata_it) for _ in range(example_strides.numel())],
+                dtype=example_strides.dtype,
+            ).view(example_strides.shape)
+    elif example_strides is not None:
+        raise ValueError(
+            "rebuilding a variable-batch KeyedJaggedTensor needs its source's KJT "
+            "metadata: its strides travel there, not as a tensor"
+        )
     return KeyedJaggedTensor(
         keys=example.keys(),
         values=parts["values"],
         weights=parts.get("weights"),
         lengths=parts.get("lengths"),
         offsets=parts.get("offsets"),
-        stride_per_key_per_rank=parts.get("stride_per_key_per_rank"),
+        stride_per_key_per_rank=stride_per_key_per_rank,
         # Citrine C6: preserve the source's CPU-side metadata so consumers do
         # not derive it from received CUDA tensors with Tensor.tolist().
         stride_per_key=stride_per_key,
@@ -960,6 +976,8 @@ class InputDistDriver(Generic[T]):
             List[T]: ``n`` carriers for this rank; the remainder of the last
             round stays queued for the next call.
         """
+        if n <= 0:
+            raise ValueError(f"carrier count must be positive, got {n}")
         while len(self._queue) < n:
             self._queue.extend(self.exchange(next_send()).wait())
         # Oldest first: the remainder of the last round stays queued for the
