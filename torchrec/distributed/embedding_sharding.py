@@ -85,7 +85,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.distributed.utils import maybe_annotate_embedding_event, none_throws
 from torchrec.fx.utils import assert_fx_safe
-from torchrec.modules.embedding_configs import EmbeddingTableConfig
+from torchrec.modules.embedding_configs import DataType, EmbeddingTableConfig
 from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
@@ -1397,3 +1397,18 @@ class EmbeddingShardingInfo:
     param_sharding: ParameterSharding
     param: torch.Tensor
     fused_params: Optional[Dict[str, Any]] = None
+
+    def sharded_data_type(self) -> DataType:
+        """
+        The data type the sharded table is built at: a training plan's quant_uvm table
+        takes its planned IntNBit dtype (`ParameterSharding.quantized_weight_dtype`),
+        every other table its own.
+        """
+        quantized_weight_dtype = self.param_sharding.quantized_weight_dtype
+        if (
+            quantized_weight_dtype is not None
+            and self.param_sharding.compute_kernel
+            == EmbeddingComputeKernel.QUANT_UVM.value
+        ):
+            return quantized_weight_dtype
+        return self.embedding_config.data_type

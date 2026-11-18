@@ -164,7 +164,7 @@ class BaseTwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                     embedding_dim=info.embedding_config.embedding_dim,
                     name=info.embedding_config.name,
                     embedding_names=info.embedding_config.embedding_names,
-                    data_type=info.embedding_config.data_type,
+                    data_type=info.sharded_data_type(),
                     feature_names=info.embedding_config.feature_names,
                     pooling=info.embedding_config.pooling,
                     is_weighted=info.embedding_config.is_weighted,

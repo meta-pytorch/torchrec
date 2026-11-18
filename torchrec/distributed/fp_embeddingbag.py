@@ -218,6 +218,8 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
     BaseEmbeddingSharder[FeatureProcessedEmbeddingBagCollection]
 ):
     supports_fused_triton: bool = True
+    # Its sharded module runs an inner ShardedEmbeddingBagCollection, whose gate applies.
+    supports_quant_uvm: bool = True
 
     def __init__(
         self,
