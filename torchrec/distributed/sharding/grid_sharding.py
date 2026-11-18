@@ -7,6 +7,8 @@
 
 # pyre-strict
 
+import itertools
+import math
 from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, TypeVar
 
 import torch
@@ -15,6 +17,7 @@ from fbgemm_gpu.permute_pooled_embedding_modules_split import (
     PermutePooledEmbeddingsSplit,
 )
 from torch.distributed._tensor import Replicate, Shard
+from torchrec.distributed import utils as distributed_utils
 from torchrec.distributed.comm import (
     get_local_size,
     intra_and_cross_node_pg,
@@ -44,7 +47,10 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
-from torchrec.distributed.sharding.twrw_sharding import TwRwSparseFeaturesDist
+from torchrec.distributed.sharding.twrw_sharding import (
+    TwRwFeatureDistLayout,
+    TwRwSparseFeaturesDist,
+)
 from torchrec.distributed.types import (
     Awaitable,
     CommOp,
@@ -55,6 +61,7 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
+from torchrec.distributed.utils import none_throws
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
 
@@ -62,6 +69,49 @@ C = TypeVar("C", bound=Multistreamable)
 F = TypeVar("F", bound=Multistreamable)
 T = TypeVar("T")
 W = TypeVar("W")
+
+
+def _column_block_buckets(
+    table: ShardedEmbeddingTable, local_size: int
+) -> Dict[Tuple[int, int], int]:
+    """TWRW bucket of each row shard in `table`'s column block, keyed by (row offset, rank).
+
+    Bucket `b` receives ids from `min(b * ceil(rows / local_size), rows)`. Zero-row
+    tail shards share that offset, so ties go by rank.
+    """
+    local = none_throws(table.local_metadata)
+    column_block = [
+        s
+        for s in none_throws(table.global_metadata).shards_metadata
+        if s.shard_offsets[1] == local.shard_offsets[1]
+    ]
+    where = f"GRID_SHARD table {table.name}, column offset {local.shard_offsets[1]}"
+    if any(s.placement is None or s.placement.rank() is None for s in column_block):
+        raise ValueError(f"{where}: every row shard needs a rank placement")
+    shards = sorted(
+        (s.shard_offsets[0], none_throws(none_throws(s.placement).rank()))
+        for s in column_block
+    )
+    block = math.ceil(table.num_embeddings / local_size)
+    expected = [min(b * block, table.num_embeddings) for b in range(local_size)]
+    offsets = [offset for offset, _ in shards]
+    if offsets != expected:
+        raise ValueError(
+            f"{where}: row shard offsets {offsets} do not match the {local_size} "
+            f"TWRW buckets {expected}"
+        )
+    return {shard: bucket for bucket, shard in enumerate(shards)}
+
+
+def _table_features(
+    grouped_configs: List[GroupedEmbeddingConfig],
+) -> List[Tuple[str, int, str]]:
+    return [
+        (table.name, none_throws(table.local_metadata).shard_offsets[1], feature)
+        for config in grouped_configs
+        for table in config.embedding_tables
+        for feature in table.feature_names
+    ]
 
 
 class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
@@ -134,6 +184,14 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 self._has_feature_processor = True
 
         self._init_combined_embeddings()
+        # Meta-device construction has no intra-node group, and its fallback local
+        # size may not match the plan.
+        self._feature_dist_layout: Optional[TwRwFeatureDistLayout] = (
+            self._build_feature_dist_layout()
+            if intra_pg is not None
+            and distributed_utils.is_grid_shard_plan_row_routing_enabled()
+            else None
+        )
 
     def _init_combined_embeddings(self) -> None:
         """
@@ -348,6 +406,63 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 num_features += grouped_config.num_features()
             features_per_rank.append(num_features)
         return features_per_rank
+
+    def _build_feature_dist_layout(self) -> TwRwFeatureDistLayout:
+        """Send each row block of a feature to the rank whose shard holds it; a column
+        block's row shards may sit on its node's ranks in any order."""
+        hash_sizes = self._get_feature_hash_sizes()
+        num_features = len(hash_sizes)
+        node_feature_offsets = [
+            0,
+            *itertools.accumulate(
+                self._features_per_rank(self._grouped_embedding_configs_per_node)
+            ),
+        ]
+        node_features = [
+            _table_features(configs)
+            for configs in self._grouped_embedding_configs_per_node
+        ]
+        buckets_by_column_block: Dict[Tuple[str, int], Dict[Tuple[int, int], int]] = {}
+        feature_shards: List[Tuple[int, int]] = []
+        for rank, grouped_configs in enumerate(
+            self._grouped_embedding_configs_per_rank
+        ):
+            # Feature indices are per node, so every rank must list its node's
+            # (table, column block, feature) entries in the same order.
+            if (
+                _table_features(grouped_configs)
+                != node_features[rank // self._local_size]
+            ):
+                raise ValueError(
+                    f"GRID_SHARD rank {rank} lists its tables, column blocks or features "
+                    "in a different order from its node's first rank"
+                )
+            feature = node_feature_offsets[rank // self._local_size]
+            for grouped_config in grouped_configs:
+                for table in grouped_config.embedding_tables:
+                    local = none_throws(table.local_metadata)
+                    key = (table.name, local.shard_offsets[1])
+                    if key not in buckets_by_column_block:
+                        buckets_by_column_block[key] = _column_block_buckets(
+                            table, self._local_size
+                        )
+                    bucket = buckets_by_column_block[key][
+                        (
+                            local.shard_offsets[0],
+                            none_throws(none_throws(local.placement).rank()),
+                        )
+                    ]
+                    for _ in range(table.num_features()):
+                        feature_shards.append((feature, bucket))
+                        feature += 1
+        return TwRwFeatureDistLayout.from_feature_shards(
+            hash_sizes=tuple(hash_sizes),
+            shard_counts=(self._local_size,) * num_features,
+            feature_shards=feature_shards,
+            features_per_rank=tuple(
+                self._features_per_rank(self._grouped_embedding_configs_per_rank)
+            ),
+        )
 
 
 class GridPooledEmbeddingDist(
@@ -567,20 +682,19 @@ class GridPooledEmbeddingSharding(
     def create_input_dist(
         self, device: Optional[torch.device] = None
     ) -> BaseSparseFeaturesDist[KeyedJaggedTensor]:
-        features_per_rank = self._features_per_rank(
-            self._grouped_embedding_configs_per_rank
-        )
-        feature_hash_sizes = self._get_feature_hash_sizes()
         assert self._pg is not None
         assert self._intra_pg is not None
         return TwRwSparseFeaturesDist(
             pg=self._pg,
             local_size=self._intra_pg.size(),
-            features_per_rank=features_per_rank,
-            feature_hash_sizes=feature_hash_sizes,
+            features_per_rank=self._features_per_rank(
+                self._grouped_embedding_configs_per_rank
+            ),
+            feature_hash_sizes=self._get_feature_hash_sizes(),
             device=device if device is not None else self._device,
             has_feature_processor=self._has_feature_processor,
             need_pos=self._need_pos,
+            layout=self._feature_dist_layout,
         )
 
     def create_lookup(

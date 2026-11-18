@@ -292,9 +292,32 @@ class TwRwSparseFeaturesDistTest(unittest.TestCase):
         self.assertEqual(bucket_values, ungrouped)
 
 
+class TwRwFeatureDistLayoutTest(unittest.TestCase):
+    def test_from_feature_shards_requires_each_shard_once(self) -> None:
+        layout = TwRwFeatureDistLayout.from_feature_shards(
+            hash_sizes=(8, 8),
+            shard_counts=(2, 2),
+            feature_shards=[(0, 1), (1, 0), (0, 0), (1, 1)],
+            features_per_rank=(2, 2),
+        )
+        self.assertEqual(layout.rank_order_indices, (2, 1, 0, 3))
+        for feature_shards in (
+            [(0, 0), (0, 0), (1, 0), (1, 1)],
+            [(0, 0), (1, 0), (1, 1)],
+        ):
+            with self.subTest(feature_shards=feature_shards):
+                with self.assertRaisesRegex(ValueError, "exactly once"):
+                    TwRwFeatureDistLayout.from_feature_shards(
+                        hash_sizes=(8, 8),
+                        shard_counts=(2, 2),
+                        feature_shards=feature_shards,
+                        features_per_rank=(2, 2),
+                    )
+
+
 class TwRwDistLayoutsTest(unittest.TestCase):
     # (local_size, features of each table on each group). No table spans groups,
-    # so every case must match the legacy uniform routing used by GRID_SHARD.
+    # so every case must match the uniform routing.
     SINGLE_GROUP_TOPOLOGIES: list[tuple[int, list[list[int]]]] = [
         (1, [[1]]),  # one rank holding one table
         (2, [[1, 1]]),  # one group of two ranks
