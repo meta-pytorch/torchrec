@@ -40,11 +40,11 @@ jobs:
         bash ~/miniconda.sh -b -p $HOME/miniconda
     - name: setup Path
       run: |
-        echo "/home/ec2-user/miniconda/bin" >> $GITHUB_PATH
-        echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
+        echo "$HOME/miniconda/bin" >> $GITHUB_PATH
+        echo "CONDA=$HOME/miniconda" >> $GITHUB_ENV
     - name: create conda env
       run: |
-        conda create --name build_binary python=${{ matrix.python-version }}
+        conda create -y --name build_binary --override-channels -c conda-forge python=${{ matrix.python-version }}
         conda info
     - name: check python version no Conda
       run: |
