@@ -38,7 +38,7 @@ class TestRecallMetric(TestMetric):
     ) -> Dict[str, torch.Tensor]:
         predictions = predictions.double()
         true_pos_sum = torch.sum(weights * ((predictions >= 0.5) * labels))
-        false_neg_sum = torch.sum(weights * ((predictions <= 0.5) * (labels)))
+        false_neg_sum = torch.sum(weights * ((predictions < 0.5) * (labels)))
         return {
             "true_pos_sum": true_pos_sum,
             "false_neg_sum": false_neg_sum,
@@ -133,7 +133,7 @@ class RecallMetricValueTest(unittest.TestCase):
         expected_recall = torch.tensor([1], dtype=torch.double)
         self.recall.update(**self.batches)
         actual_recall = self.recall.compute()["recall-DefaultTask|window_recall"]
-        torch.allclose(expected_recall, actual_recall)
+        self.assertTrue(torch.allclose(expected_recall, actual_recall))
 
     def test_calc_acc_zero(self) -> None:
         self.predictions["DefaultTask"] = torch.Tensor(
@@ -147,7 +147,7 @@ class RecallMetricValueTest(unittest.TestCase):
         expected_recall = torch.tensor([0], dtype=torch.double)
         self.recall.update(**self.batches)
         actual_recall = self.recall.compute()["recall-DefaultTask|window_recall"]
-        torch.allclose(expected_recall, actual_recall)
+        self.assertTrue(torch.allclose(expected_recall, actual_recall))
 
     def test_calc_recall_balanced(self) -> None:
         self.predictions["DefaultTask"] = torch.Tensor(
@@ -159,7 +159,19 @@ class RecallMetricValueTest(unittest.TestCase):
         expected_recall = torch.tensor([0.5], dtype=torch.double)
         self.recall.update(**self.batches)
         actual_recall = self.recall.compute()["recall-DefaultTask|window_recall"]
-        torch.allclose(expected_recall, actual_recall)
+        self.assertTrue(torch.allclose(expected_recall, actual_recall))
+
+    def test_positive_at_threshold_is_not_a_false_negative(self) -> None:
+        self.predictions["DefaultTask"] = torch.tensor([[0.9, 0.5, 0.1]])
+        self.labels["DefaultTask"] = torch.tensor([[1.0, 1.0, 1.0]])
+        self.weights["DefaultTask"] = torch.tensor([[1.0, 1.0, 1.0]])
+
+        self.recall.update(**self.batches)
+        actual_recall = self.recall.compute()["recall-DefaultTask|window_recall"]
+        # 0.9 and 0.5 are predicted positive. Only 0.1 is a false negative.
+        self.assertTrue(
+            torch.allclose(actual_recall, torch.tensor([2.0 / 3.0], dtype=torch.double))
+        )
 
 
 def generate_model_outputs_cases() -> Iterable[Dict[str, Union[float, torch.Tensor]]]:
