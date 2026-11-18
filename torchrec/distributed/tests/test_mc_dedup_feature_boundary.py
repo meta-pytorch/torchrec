@@ -10,11 +10,13 @@
 import copy
 import unittest
 from typing import cast, Dict, List, Optional, Tuple
+from unittest import mock
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.mc_embedding import (
     ManagedCollisionEmbeddingCollectionSharder,
     ShardedManagedCollisionEmbeddingCollection,
@@ -36,10 +38,14 @@ from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingCollection
-from torchrec.modules.mc_modules import ManagedCollisionCollection
+from torchrec.modules.mc_modules import (
+    DistanceLFU_EvictionPolicy,
+    ManagedCollisionCollection,
+    MCHManagedCollisionModule,
+)
 from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
 from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 
 _HASH_SIZE = 100_000
@@ -407,4 +413,129 @@ class McDedupReadOnlyFeatureTest(MultiProcessTestBase):
                 ),
             ),
             backend="nccl",
+        )
+
+
+def _cpu_jagged_unique_indices(
+    hash_size_cumsum: torch.Tensor,
+    hash_size_offsets: torch.Tensor,
+    offsets: torch.Tensor,
+    indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    CPU stand-in for ``fbgemm.jagged_unique_indices``, which has no CPU kernel. Covers
+    only one table whose features share one hash range, so the raw ids are the dedup
+    keys. Like the op, it spreads the unique count evenly over the (feature, batch)
+    slots.
+    """
+    assert bool((hash_size_cumsum[:-1] == 0).all()), "only one shared hash range"
+    unique, reverse = torch.unique(indices, return_inverse=True)
+    slots = offsets.numel() - 1
+    lengths = (
+        unique.numel() // slots + (torch.arange(slots) < unique.numel() % slots).long()
+    )
+    out_offsets = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
+    return lengths, out_offsets, unique, reverse
+
+
+class McIndexDedupRemappedFeaturesTest(unittest.TestCase):
+    """
+    With index dedup each id goes through the MC module once, but the remapped KJT
+    that a ``ManagedCollisionEmbeddingCollection`` with ``return_remapped_features``
+    returns must still hold one row per input value, in input order.
+    """
+
+    def setUp(self) -> None:
+        dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+        self.addCleanup(dist.destroy_process_group)
+        self.env: ShardingEnv = ShardingEnv.from_process_group(
+            # pyrefly: ignore[bad-argument-type]
+            dist.group.WORLD
+        )
+
+    def _module(self) -> ManagedCollisionEmbeddingCollection:
+        table = EmbeddingConfig(
+            name=_TABLE,
+            embedding_dim=8,
+            num_embeddings=16,
+            feature_names=["f1", "f2"],
+        )
+        ec = EmbeddingCollection(tables=[table], device=torch.device("cpu"))
+        mch = MCHManagedCollisionModule(
+            zch_size=table.num_embeddings,
+            device=torch.device("cpu"),
+            eviction_policy=DistanceLFU_EvictionPolicy(),
+            eviction_interval=1,
+            input_hash_size=2**40,
+        )
+        return ManagedCollisionEmbeddingCollection(
+            ec,
+            ManagedCollisionCollection({_TABLE: mch}, ec.embedding_configs()),
+            return_remapped_features=True,
+        )
+
+    def _remapped(
+        self,
+        module: ManagedCollisionEmbeddingCollection,
+        use_index_dedup: bool,
+        kjt: KeyedJaggedTensor,
+    ) -> Tuple[KeyedJaggedTensor, torch.Tensor]:
+        """The sharded MC-EC's remapped KJT, and the row its table holds for each
+        input value."""
+        sharder = ManagedCollisionEmbeddingCollectionSharder(
+            ec_sharder=EmbeddingCollectionSharder(use_index_dedup=use_index_dedup)
+        )
+        plan = construct_module_sharding_plan(
+            module,
+            per_param_sharding={
+                _TABLE: row_wise(compute_kernel=EmbeddingComputeKernel.FUSED.value)
+            },
+            local_size=1,
+            world_size=1,
+            device_type="cpu",
+            sharder=cast(ModuleSharder[nn.Module], sharder),
+        )
+        sharded = sharder.shard(module, plan, self.env, torch.device("cpu"))
+        mcc = sharded._managed_collision_collection
+        self.assertEqual(mcc._use_index_dedup, use_index_dedup)
+        _, remapped = sharded(kjt)
+        mch = cast(MCHManagedCollisionModule, mcc._managed_collision_modules[_TABLE])
+        rows = mch.remap(
+            {"x": JaggedTensor(values=kjt.values(), lengths=kjt.lengths())}
+        )["x"].values()
+        self.assertIsNotNone(remapped)
+        return cast(KeyedJaggedTensor, remapped.wait()), rows
+
+    def test_remapped_features_match_dedup_off(self) -> None:
+        module = self._module()
+        module.train()
+        # 9 values, 4 unique ids, repeated within a feature and across both.
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1", "f2"],
+            values=torch.tensor([5, 9, 5, 5, 7, 9, 9, 11, 5]),
+            lengths=torch.tensor([3, 2, 3, 1]),
+        )
+
+        off, off_rows = self._remapped(copy.deepcopy(module), False, kjt)
+        with mock.patch.object(
+            torch.ops.fbgemm,
+            "jagged_unique_indices",
+            wraps=_cpu_jagged_unique_indices,
+        ) as dedup_op:
+            on, on_rows = self._remapped(copy.deepcopy(module), True, kjt)
+        self.assertEqual(dedup_op.call_count, 1)
+
+        for remapped, rows in [(off, off_rows), (on, on_rows)]:
+            self.assertEqual(remapped.keys(), kjt.keys())
+            torch.testing.assert_close(
+                remapped.lengths(), kjt.lengths(), rtol=0, atol=0
+            )
+            torch.testing.assert_close(remapped.values(), rows, rtol=0, atol=0)
+            # Eviction ran before the remap, so every id has its own row.
+            self.assertEqual(len(set(rows.tolist())), 4)
+        # Dedup changes the LFU counts, and with them which free slot each id lands
+        # in, so the two tables differ by a relabelling of rows only.
+        relabel = dict(zip(off.values().tolist(), on.values().tolist()))
+        self.assertEqual(
+            [relabel[r] for r in off.values().tolist()], on.values().tolist()
         )
