@@ -156,15 +156,23 @@ class BaseShardedManagedCollisionEmbeddingCollection(
         )
 
         self._table_to_tbe_and_index = {}
+        # FBGEMM reset metadata is indexed by feature, so a table's logical id is
+        # the position of its first feature within the TBE.
+        self._table_to_logical_table_ids: Dict[str, torch.Tensor] = {}
         for lookup in self._embedding_module._lookups:
             #  a function.
             # pyrefly: ignore[not-iterable]
             for emb_module in lookup._emb_modules:
+                logical_table_idx = 0
                 for table_idx, table in enumerate(emb_module._config.embedding_tables):
                     self._table_to_tbe_and_index[table.name] = (
                         emb_module._emb_module,
                         torch.tensor([table_idx], dtype=torch.int, device=self._device),
                     )
+                    self._table_to_logical_table_ids[table.name] = torch.tensor(
+                        [logical_table_idx], dtype=torch.int, device=self._device
+                    )
+                    logical_table_idx += table.num_features()
         self._buffer_ids: torch.Tensor = torch.tensor(
             [0], device=self._device, dtype=torch.int
         )
@@ -185,7 +193,8 @@ class BaseShardedManagedCollisionEmbeddingCollection(
         open_slots = None
         for table, evictions_indices_for_table in evictions_per_table.items():
             if evictions_indices_for_table is not None:
-                (tbe, logical_table_ids) = self._table_to_tbe_and_index[table]
+                tbe = self._table_to_tbe_and_index[table][0]
+                logical_table_ids = self._table_to_logical_table_ids[table]
                 pruned_indices_offsets = torch.tensor(
                     [0, evictions_indices_for_table.shape[0]],
                     dtype=torch.long,
