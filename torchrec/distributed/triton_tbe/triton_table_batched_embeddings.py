@@ -3817,6 +3817,7 @@ class TritonTBE(torch.autograd.Function):
                 and enable_triton_tbe_optimizations
                 and len(weight_ptrs) == 1
                 and vbe_forward_groups
+                and not cute_kernels
             ):
                 assert batch_size_per_feature_per_rank is not None
                 _launch_unweighted_vbe_forward(
