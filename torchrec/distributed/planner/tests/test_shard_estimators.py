@@ -1896,6 +1896,194 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
         )
         self.assertGreater(large, small)
 
+    # Key-value storage goldens: one 1M x 128 FP32 table (its whole-table L1 at the
+    # default 0.2 load factor is ceil(1e6 * 0.2 * 4 * 128) = 102,400,000 B), sharded
+    # three ways, under every route into the key-value booking: the four key-value
+    # and virtual-table kernels, and a FUSED table with use_virtual_table set.
+    _KV_ROWS, _KV_DIM = 1_000_000, 128
+    _KV_TABLE_L1_BYTES = 102_400_000
+    _KV_SHARDINGS: Dict[str, List[Shard]] = {
+        ShardingType.TABLE_WISE.value: [Shard(size=[1_000_000, 128], offset=[0, 0])],
+        ShardingType.COLUMN_WISE.value: [
+            Shard(size=[1_000_000, 64], offset=[0, 0]),
+            Shard(size=[1_000_000, 64], offset=[0, 64]),
+        ],
+        ShardingType.ROW_WISE.value: [
+            Shard(size=[500_000, 128], offset=[0, 0]),
+            Shard(size=[500_000, 128], offset=[500_000, 0]),
+        ],
+    }
+    # route label -> (compute kernel, ParameterConstraints.use_virtual_table)
+    _KV_ROUTES: Dict[str, Tuple[str, bool]] = {
+        "key_value": (EmbeddingComputeKernel.KEY_VALUE.value, False),
+        "ssd_virtual_table": (EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value, False),
+        "dram_virtual_table": (EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value, False),
+        "dram_ssd_virtual_table": (
+            EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
+            False,
+        ),
+        "fused_use_virtual_table": (EmbeddingComputeKernel.FUSED.value, True),
+    }
+
+    def _estimate_key_value_storages(
+        self,
+        sharding_type: str,
+        route: str,
+        key_value_params: Optional[KeyValueParams],
+    ) -> List[Storage]:
+        """Per-shard storage estimates for the golden key-value table."""
+        compute_kernel, use_virtual_table = self._KV_ROUTES[route]
+        topology = Topology(world_size=2, compute_device="cuda")
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=self._KV_ROWS,
+                embedding_dim=self._KV_DIM,
+                name="table_kv",
+                feature_names=["feature_0"],
+            )
+        ]
+        # The estimate reads only the option's meta tensor; a meta module keeps the
+        # 1M x 128 table from being allocated on every call.
+        ebc_module = TestSparseNN(
+            tables=tables, weighted_tables=[], sparse_device=torch.device("meta")
+        ).sparse.ebc
+        assert isinstance(ebc_module, torch.nn.Module)
+        sharding_option = ShardingOption(
+            name="table_kv",
+            tensor=torch.zeros(self._KV_ROWS, self._KV_DIM, device="meta"),
+            module=("sparse.ebc", ebc_module),
+            input_lengths=[1.0],
+            batch_size=BATCH_SIZE,
+            sharding_type=sharding_type,
+            partition_by="host",
+            compute_kernel=compute_kernel,
+            shards=[
+                Shard(size=list(s.size), offset=list(s.offset))
+                for s in self._KV_SHARDINGS[sharding_type]
+            ],
+            key_value_params=key_value_params,
+        )
+        EmbeddingStorageEstimator(
+            topology=topology,
+            constraints={
+                "table_kv": ParameterConstraints(use_virtual_table=use_virtual_table)
+            },
+        ).estimate(
+            [sharding_option],
+            sharder_data_map={
+                sharding_option.module_type_key: SharderData(
+                    fused_params={},
+                    qcomm_dtype_sizes={},
+                    storage_usage_type=StorageUsageType.DEFAULT,
+                ),
+            },
+        )
+        storages = [shard.storage for shard in sharding_option.shards]
+        assert all(storage is not None for storage in storages)
+        return cast(List[Storage], storages)
+
+    def test_key_value_l1_booked_per_shard_from_whole_table(self) -> None:
+        # Today's booking: every shard is charged min(cap, the WHOLE table's L1),
+        # whatever its own size, and no params, an unset cap or a 0 cap books 0. The
+        # no-params estimate is the L1-free baseline (pipeline I/O only), so the
+        # difference isolates L1.
+        cases = [
+            (KeyValueParams(), 0),
+            (KeyValueParams(max_l1_cache_size=0), 0),
+            (KeyValueParams(max_l1_cache_size=8), 8 * 1024 * 1024),
+            (KeyValueParams(max_l1_cache_size=1024), self._KV_TABLE_L1_BYTES),
+        ]
+        for sharding_type in self._KV_SHARDINGS:
+            for route in self._KV_ROUTES:
+                baseline = self._estimate_key_value_storages(sharding_type, route, None)
+                for key_value_params, l1_bytes in cases:
+                    with self.subTest(
+                        sharding_type=sharding_type,
+                        route=route,
+                        key_value_params=key_value_params,
+                    ):
+                        storages = self._estimate_key_value_storages(
+                            sharding_type, route, key_value_params
+                        )
+                        self.assertEqual(
+                            [s.hbm - b.hbm for s, b in zip(storages, baseline)],
+                            [l1_bytes] * len(storages),
+                        )
+                        self.assertEqual([s.ddr for s in storages], [0] * len(storages))
+                        self.assertEqual(
+                            [s.ssd for s in storages], [b.ssd for b in baseline]
+                        )
+
+    def test_key_value_storage_goldens(self) -> None:
+        # Pins today's full per-shard Storage (hbm, ddr, ssd) for key-value tables,
+        # so a change to key-value booking cannot silently move a default plan.
+        # Keyed (sharding type, route, max_l1_cache_size in MiB). Each hbm is the
+        # shard's pipeline I/O (the no-cap row) plus min(cap, the whole table's L1).
+        tw, cw, rw = "table_wise", "column_wise", "row_wise"
+        kv, ssd, dram = "key_value", "ssd_virtual_table", "dram_virtual_table"
+        dram_ssd, fused_vt = "dram_ssd_virtual_table", "fused_use_virtual_table"
+        goldens: Dict[Tuple[str, str, Optional[int]], List[Tuple[int, int, int]]] = {
+            (tw, kv, None): [(532480, 0, 519200000)],
+            (tw, kv, 8): [(8921088, 0, 519200000)],
+            (tw, kv, 1024): [(102932480, 0, 519200000)],
+            (tw, ssd, None): [(532480, 0, 0)],
+            (tw, ssd, 8): [(8921088, 0, 0)],
+            (tw, ssd, 1024): [(102932480, 0, 0)],
+            (tw, dram, None): [(532480, 0, 0)],
+            (tw, dram, 8): [(8921088, 0, 0)],
+            (tw, dram, 1024): [(102932480, 0, 0)],
+            (tw, dram_ssd, None): [(532480, 0, 0)],
+            (tw, dram_ssd, 8): [(8921088, 0, 0)],
+            (tw, dram_ssd, 1024): [(102932480, 0, 0)],
+            (tw, fused_vt, None): [(532480, 0, 0)],
+            (tw, fused_vt, 8): [(8921088, 0, 0)],
+            (tw, fused_vt, 1024): [(102932480, 0, 0)],
+            (cw, kv, None): [(270336, 0, 263200000)] * 2,
+            (cw, kv, 8): [(8658944, 0, 263200000)] * 2,
+            (cw, kv, 1024): [(102670336, 0, 263200000)] * 2,
+            (cw, ssd, None): [(270336, 0, 0)] * 2,
+            (cw, ssd, 8): [(8658944, 0, 0)] * 2,
+            (cw, ssd, 1024): [(102670336, 0, 0)] * 2,
+            (cw, dram, None): [(270336, 0, 0)] * 2,
+            (cw, dram, 8): [(8658944, 0, 0)] * 2,
+            (cw, dram, 1024): [(102670336, 0, 0)] * 2,
+            (cw, dram_ssd, None): [(270336, 0, 0)] * 2,
+            (cw, dram_ssd, 8): [(8658944, 0, 0)] * 2,
+            (cw, dram_ssd, 1024): [(102670336, 0, 0)] * 2,
+            (cw, fused_vt, None): [(270336, 0, 0)] * 2,
+            (cw, fused_vt, 8): [(8658944, 0, 0)] * 2,
+            (cw, fused_vt, 1024): [(102670336, 0, 0)] * 2,
+            (rw, kv, None): [(528384, 0, 259600000)] * 2,
+            (rw, kv, 8): [(8916992, 0, 259600000)] * 2,
+            (rw, kv, 1024): [(102928384, 0, 259600000)] * 2,
+            (rw, ssd, None): [(528384, 0, 0)] * 2,
+            (rw, ssd, 8): [(8916992, 0, 0)] * 2,
+            (rw, ssd, 1024): [(102928384, 0, 0)] * 2,
+            (rw, dram, None): [(528384, 0, 0)] * 2,
+            (rw, dram, 8): [(8916992, 0, 0)] * 2,
+            (rw, dram, 1024): [(102928384, 0, 0)] * 2,
+            (rw, dram_ssd, None): [(528384, 0, 0)] * 2,
+            (rw, dram_ssd, 8): [(8916992, 0, 0)] * 2,
+            (rw, dram_ssd, 1024): [(102928384, 0, 0)] * 2,
+            (rw, fused_vt, None): [(528384, 0, 0)] * 2,
+            (rw, fused_vt, 8): [(8916992, 0, 0)] * 2,
+            (rw, fused_vt, 1024): [(102928384, 0, 0)] * 2,
+        }
+        actual = {
+            (sharding_type, route, cap): [
+                (s.hbm, s.ddr, s.ssd)
+                for s in self._estimate_key_value_storages(
+                    sharding_type,
+                    route,
+                    None if cap is None else KeyValueParams(max_l1_cache_size=cap),
+                )
+            ]
+            for sharding_type in self._KV_SHARDINGS
+            for route in self._KV_ROUTES
+            for cap in (None, 8, 1024)
+        }
+        self.assertEqual(actual, goldens, msg=repr(actual))
+
     def _weight_init_on_cpu_storage(
         self,
         weight_init_on_cpu: bool,

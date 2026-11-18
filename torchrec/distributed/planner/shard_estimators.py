@@ -413,6 +413,39 @@ def calculate_shard_storages(
     return storages
 
 
+def _calculate_key_value_l1_cache_sizes(
+    tensor: torch.Tensor,
+    num_shards: int,
+    key_value_params: Optional[KeyValueParams],
+    kv_cache_load_factor: float,
+) -> List[int]:
+    """
+    HBM bytes booked for each shard of a key-value (or virtual) table's L1 cache.
+
+    Every shard is booked the same amount,
+    ``min(max_l1_cache_size * 2**20, ceil(rows * kv_cache_load_factor * element_size * dim))``,
+    where rows and dim are the WHOLE table's (``tensor.shape``), not the shard's.
+    An unset ``key_value_params`` or ``max_l1_cache_size`` books 0.
+    """
+    max_l1_cache_bytes = (
+        ((key_value_params.max_l1_cache_size or 0) if key_value_params else 0)
+        * 1024
+        * 1024
+    )
+    return [
+        min(
+            max_l1_cache_bytes,
+            math.ceil(
+                tensor.shape[0]
+                * kv_cache_load_factor
+                * tensor.element_size()
+                * tensor.shape[1]
+            ),
+        )
+        for _ in range(num_shards)
+    ]
+
+
 def _calculate_shard_storages_and_cache_sizes(
     sharder_data: SharderData,
     sharding_type: str,
@@ -540,22 +573,12 @@ def _calculate_shard_storages_and_cache_sizes(
         }
         or use_virtual_table
     ):
-        key_value_params = key_value_params or KeyValueParams(
-            max_l1_cache_size=0, l2_cache_size=0
+        hbm_specific_sizes = _calculate_key_value_l1_cache_sizes(
+            tensor=tensor,
+            num_shards=len(hbm_specific_sizes),
+            key_value_params=key_value_params,
+            kv_cache_load_factor=kv_cache_load_factor,
         )
-
-        hbm_specific_sizes = [
-            min(
-                (key_value_params.max_l1_cache_size or 0) * 1024 * 1024,
-                math.ceil(
-                    tensor.shape[0]
-                    * kv_cache_load_factor
-                    * tensor.element_size()
-                    * tensor.shape[1],
-                ),
-            )
-            for _ in hbm_specific_sizes
-        ]
         ddr_specific_sizes = [0 for _ in ddr_specific_sizes]
 
     hbm_sizes: List[int] = [
