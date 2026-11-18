@@ -288,7 +288,7 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
         )
         self.assertEqual(self.evaluator.get_prefetch_divisor(ctx), 8)
 
-    def test_multi_group_changes_compute_and_communication_costs(self) -> None:
+    def test_multi_group_keeps_per_shard_comms_and_cuts_compute(self) -> None:
         single_group = self.evaluator.compute_perf(
             create_test_context(
                 sharding_type=ShardingType.TABLE_ROW_WISE.value,
@@ -305,8 +305,21 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
         )
 
         self.assertLess(two_groups.fwd_compute, single_group.fwd_compute)
-        self.assertGreater(two_groups.fwd_comms, single_group.fwd_comms)
-        self.assertGreater(two_groups.bwd_comms, single_group.bwd_comms)
+        # Per shard: reduce-scatter of the global batch (64 * 8 samples) plus
+        # its slice of the all-to-all across the 2 groups (64 * 2), D=128 at
+        # 4 bytes over the mock's 1000 bytes/s.
+        self.assertAlmostEqual(
+            single_group.fwd_comms, (64 * 8 + 64 * 2) * 128 * 4 / 1000
+        )
+        # Each shard sends only its own group's partial; the extra partials come
+        # from the doubled shard count, not from a larger per-shard volume.
+        self.assertAlmostEqual(two_groups.fwd_comms, single_group.fwd_comms)
+        self.assertAlmostEqual(two_groups.bwd_comms, single_group.bwd_comms)
+        # Its ids halve; every shard still receives all lengths.
+        self.assertLess(two_groups.input_dist_comms, single_group.input_dist_comms)
+        self.assertGreater(
+            two_groups.input_dist_comms, single_group.input_dist_comms / 2
+        )
 
     def test_compute_perf_returns_perf_object(self) -> None:
         """Test that compute_perf returns a Perf object."""
@@ -327,6 +340,49 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
             # The topology has 16 groups of 4, not 32 groups of 2.
             self.assertEqual(ctx.num_twrw_groups, 16)
             self.assertEqual(ctx.num_hosts, 32)
+
+
+class InputDistCommsTest(unittest.TestCase):
+    """Each shard is charged for the ids in its rows and every length."""
+
+    @staticmethod
+    def _input_dist_comms(sharding_type: str, table_num_twrw_groups: int = 1) -> float:
+        # 8 ranks in TWRW groups of 4, 64 samples per rank with 10 ids each.
+        return get_embedding_perf_sharding_evaluator(
+            sharding_type
+        ).compute_input_dist_comms(
+            create_test_context(
+                sharding_type=sharding_type,
+                world_size=8,
+                local_world_size=4,
+                table_num_twrw_groups=table_num_twrw_groups,
+            ),
+            HardwarePerfConfig(),
+        )
+
+    def test_divides_ids_but_not_lengths_by_the_ranks_the_rows_are_cut_over(
+        self,
+    ) -> None:
+        # Global batch: 512 samples, 5120 ids and 512 lengths of 8 bytes each,
+        # over the mock's 1000 bytes/s.
+        ids, lengths = 5120 * 8 / 1000, 512 * 8 / 1000
+        for name, sharding_type, table_num_twrw_groups, divisor in (
+            ("table_wise", ShardingType.TABLE_WISE.value, 1, 1),
+            ("column_wise", ShardingType.COLUMN_WISE.value, 1, 1),
+            ("row_wise", ShardingType.ROW_WISE.value, 1, 8),
+            ("table_row_wise", ShardingType.TABLE_ROW_WISE.value, 1, 4),
+            ("two_groups", ShardingType.TABLE_ROW_WISE.value, 2, 8),
+            # Each column block receives every id of its rows.
+            ("grid_shard_block", ShardingType.GRID_SHARD.value, 1, 4),
+        ):
+            with self.subTest(name):
+                self.assertAlmostEqual(
+                    self._input_dist_comms(sharding_type, table_num_twrw_groups),
+                    ids / divisor + lengths,
+                )
+
+    def test_data_parallel_has_no_input_dist(self) -> None:
+        self.assertEqual(self._input_dist_comms(ShardingType.DATA_PARALLEL.value), 0.0)
 
 
 class ColumnWiseEvaluatorTest(unittest.TestCase):

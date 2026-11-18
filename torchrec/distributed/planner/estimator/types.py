@@ -830,6 +830,15 @@ class ShardPerfContext:
         )
 
     @property
+    def batch_lengths(self) -> float:
+        """
+        Number of length entries in the batch: one per sample per feature
+        (times `num_poolings`), the sum of num_poolings * batch_sizes
+        (batch_inputs counts the ids).
+        """
+        return sum(x * y for x, y in zip(self.num_poolings, self.batch_sizes))
+
+    @property
     def batch_outputs(self) -> float:
         """
         Raw batch outputs.
