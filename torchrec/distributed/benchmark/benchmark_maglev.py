@@ -10,8 +10,9 @@
 Benchmark for the Maglev staged pipeline (MVP).
 
 Measures the schedule selected by ``--pipeline``. ``1f1b`` is the default;
-``rail`` batches each layer's sparse work over the whole pass before running a
-dense zero-bubble schedule. ``data_parallel`` is the baseline without a
+``rail`` batches each layer's sparse work over the whole pass before running
+the dense halves in the order ``--dense_schedule`` names, ``1f1b`` (the
+default) or ``zero_bubble``. ``data_parallel`` is the baseline without a
 pipeline: every rank runs the whole model on its share of the same global batch,
 with the tables sharded over all ranks. ``--dp_mode`` picks the dense halves'
 data parallelism under each: DDP, or FSDP2 ``fully_shard`` without or with
@@ -110,8 +111,9 @@ _WEIGHT_SEED = 100
 
 # Selectable schedules, by --pipeline. "base" runs one microbatch per pass,
 # forwarding all then backwarding all. The recv-ahead name is kept for callers
-# of the earlier experimental schedule. --pipeline=data_parallel is the
-# baseline without a pipeline (see _PIPELINES).
+# of the earlier experimental schedule. "rail" runs each sparse half once per
+# pass on the whole batch, its dense order picked by --dense_schedule.
+# --pipeline=data_parallel is the baseline without a pipeline (see _PIPELINES).
 _PIPELINE_CLS: Dict[str, Type[MaglevPipelineBase]] = {
     "base": MaglevPipelineBase,
     "1f1b": Maglev1F1B,
@@ -119,21 +121,24 @@ _PIPELINE_CLS: Dict[str, Type[MaglevPipelineBase]] = {
     "rail": MaglevRail,
 }
 _PIPELINES: tuple[str, ...] = (*_PIPELINE_CLS, "data_parallel")
+# MaglevRail's dense orders, by --dense_schedule.
+_DENSE_SCHEDULES: tuple[str, ...] = ("1f1b", "zero_bubble")
 
 
 # The dense halves' data parallelism, and what each costs per pass:
 #
 #   ddp    DMP's DDP: 1 AllReduce per bucket, after the pass under a pipeline
+#          MaglevRail flushes DDP once per pass the same way.
 #   zero2  fully_shard(reshard_after_forward=False): 1 AllGather + 1
 #          ReduceScatter per pass
 #   zero3  fully_shard(reshard_after_forward=True): AllGathers per forward and
 #          backward, and 1 ReduceScatter per microbatch (ZeRO-3 gradient memory)
 #
-# MaglevRail reduces FSDP2 only: it refuses ddp, defaults to zero2, and keeps
-# its parameters gathered and reduces once per pass under zero3 too.
+# --dense_schedule=zero_bubble's split backward needs zero2, so MaglevRail
+# refuses zero3 with it.
 _DP_MODES: tuple[str, ...] = ("ddp", "zero2", "zero3")
 # The schedules that reduce DDP only, as on master; Maglev1F1B and
-# data_parallel take every mode, and MaglevRail the FSDP2 modes.
+# data_parallel and MaglevRail take every mode.
 _DDP_ONLY_PIPELINES: tuple[str, ...] = ("base", "1f1b-recv-ahead")
 
 
@@ -258,7 +263,8 @@ class RunOptions(BenchFuncConfig):
             - "1f1b-recv-ahead": split-mode 1F1B with receives posted one
               microbatch ahead; shared mode uses its batched crossover schedule
             - "rail": one whole-pass sparse lookup per layer followed by a
-              zero-bubble dense pipeline over ``num_microbatches``
+              dense pipeline over ``num_microbatches``, in the order
+              ``dense_schedule`` names
             - "data_parallel": no pipeline; every rank trains the whole model,
               tables sharded over all ranks, on ``1 / world_size`` of the
               pipelines' global batch per step. Requires ``shard_embeddings``.
@@ -267,10 +273,13 @@ class RunOptions(BenchFuncConfig):
             ``shard_embeddings``: "ddp" (DMP's DDP), or FSDP2 "zero2"/"zero3"
             (``fully_shard`` without/with resharding after each forward).
             ddp/zero2 reduce once per pass; zero3 reduce-scatters per
-            microbatch for ZeRO-3 gradient memory. See
-            ``_DP_MODES``. "base" and "1f1b-recv-ahead" take "ddp" only,
-            "rail" "zero2"/"zero3" only. Default is None: "ddp", except
-            "zero2" under "rail", which has no DDP path.
+            microbatch for ZeRO-3 gradient memory. See ``_DP_MODES``. "base"
+            and "1f1b-recv-ahead" take "ddp" only, and "rail" with
+            ``dense_schedule="zero_bubble"`` refuses "zero3". Default is None:
+            "ddp".
+        dense_schedule (Optional[str]): ``MaglevRail``'s dense order under
+            "rail": "1f1b" or "zero_bubble". Other pipelines refuse it.
+            Default is None: "1f1b".
         handoff_pg_mode (str): Whether activation and gradient traffic uses
             separate process groups ("split", the default) or one shared process
             group with batched steady-state exchanges ("shared").
@@ -322,6 +331,8 @@ class RunOptions(BenchFuncConfig):
     # How the dense halves are data-parallelized, when --shard_embeddings.
     # See _DP_MODES.
     dp_mode: Optional[str] = None
+    # MaglevRail's dense order under --pipeline=rail; see _DENSE_SCHEDULES.
+    dense_schedule: Optional[str] = None
     # Heavier embedding tables: 1M rows * 256 dim * 8 tables per layer.
     num_tables: int = 8
     num_embeddings: int = 1_000_000
@@ -351,17 +362,40 @@ class RunOptions(BenchFuncConfig):
             ValueError: if the mode is unknown or :attr:`pipeline` cannot
                 reduce it.
         """
-        # Rail has no DDP path, so it defaults to an FSDP2 mode.
-        dp_mode = self.dp_mode or ("zero2" if self.pipeline == "rail" else "ddp")
+        dp_mode = self.dp_mode or "ddp"
         if dp_mode not in _DP_MODES:
             raise ValueError(
                 f"unknown dp_mode {dp_mode!r}; expected one of {list(_DP_MODES)}"
             )
         if self.pipeline in _DDP_ONLY_PIPELINES and dp_mode != "ddp":
             raise ValueError(f"--pipeline={self.pipeline} reduces DDP only")
-        if self.pipeline == "rail" and dp_mode == "ddp":
-            raise ValueError("--pipeline=rail reduces FSDP2 only")
         return dp_mode
+
+    @property
+    def is_rail(self) -> bool:
+        """Whether :attr:`pipeline` names MaglevRail."""
+        return self.pipeline == "rail"
+
+    def rail_dense_schedule(self) -> str:
+        """:attr:`dense_schedule`, or ``"1f1b"`` when unset.
+
+        Raises:
+            ValueError: if the order is unknown, or set for another pipeline.
+        """
+        if not self.is_rail:
+            if self.dense_schedule is not None:
+                raise ValueError(
+                    f"--dense_schedule applies to --pipeline=rail only, not "
+                    f"--pipeline={self.pipeline}"
+                )
+            return "1f1b"
+        dense_schedule = self.dense_schedule or "1f1b"
+        if dense_schedule not in _DENSE_SCHEDULES:
+            raise ValueError(
+                f"unknown dense_schedule {dense_schedule!r}; expected one of "
+                f"{list(_DENSE_SCHEDULES)}"
+            )
+        return dense_schedule
 
     def generate_pipeline(
         self, stage: StageWrapper, optimizer: torch.optim.Optimizer
@@ -371,6 +405,14 @@ class RunOptions(BenchFuncConfig):
         Raises:
             ValueError: if :attr:`pipeline` is not a known schedule.
         """
+        dense_schedule = self.rail_dense_schedule()
+        if self.is_rail:
+            return MaglevRail(
+                stage,
+                optimizer,
+                num_microbatches=self.num_microbatches,
+                dense_schedule=dense_schedule,
+            )
         if self.pipeline not in _PIPELINE_CLS:
             raise ValueError(
                 f"unknown pipeline {self.pipeline!r}; expected one of "
@@ -381,12 +423,6 @@ class RunOptions(BenchFuncConfig):
                 # One input-distribution round per pass; takes no configured
                 # microbatch count.
                 return MaglevPipelineBase(stage=stage, optimizer=optimizer)
-            case "rail":
-                return MaglevRail(
-                    stage=stage,
-                    optimizer=optimizer,
-                    num_microbatches=self.num_microbatches,
-                )
             case _:
                 # The remaining entries are Maglev1F1B subclasses.
                 Pipeline = cast(Type[Maglev1F1B], _PIPELINE_CLS[self.pipeline])
@@ -522,7 +558,7 @@ def _pipelined(
         stage_size=run_option.ranks_per_stage,
         loss_only_output=run_option.shard_embeddings and run_option.ranks_per_stage > 1,
         process_groups=process_groups,
-        enable_rail=run_option.pipeline == "rail",
+        enable_rail=run_option.is_rail,
     )
     # Shard before to(): a meta-authored stage never allocates full tables.
     if run_option.shard_embeddings:
@@ -639,6 +675,7 @@ def runner(
             f"{list(_PIPELINES)}"
         )
     run_option.data_parallelism()
+    run_option.rail_dense_schedule()
     # The cut is the source of truth: it fixes the stage count, the depth and,
     # with ranks_per_stage, the global batch every arm trains.
     layers_per_stage = list(run_option.layers_per_stage)
