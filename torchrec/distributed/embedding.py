@@ -87,6 +87,8 @@ from torchrec.distributed.sharding.tw_sequence_sharding import (
 from torchrec.distributed.shards_wrapper import (
     get_combined_local_size,
     LocalShardsWrapper,
+    merging_cw_local_shards_by_view,
+    view_cw_local_shards,
 )
 from torchrec.distributed.types import (
     Awaitable,
@@ -1281,6 +1283,13 @@ class ShardedEmbeddingCollection(
                     state_dict[key] = torch.empty(0)
                 else:
                     dim = state_dict[key].metadata().shards_metadata[0].shard_sizes[1]
+                    if merging_cw_local_shards_by_view() and len(local_shards) > 1:
+                        merged = view_cw_local_shards(
+                            [s.tensor for s in local_shards], dim
+                        )
+                        if merged is not None:
+                            state_dict[key] = merged
+                            continue
                     # CW multiple shards are merged
                     if len(local_shards) > 1:
                         state_dict[key] = torch.cat(
@@ -1292,6 +1301,11 @@ class ShardedEmbeddingCollection(
                 shards_wrapper = state_dict[key].to_local()
                 local_shards = shards_wrapper.local_shards()
                 dim = shards_wrapper.local_sizes()[0][1]
+                if merging_cw_local_shards_by_view() and len(local_shards) > 1:
+                    merged = view_cw_local_shards(local_shards, dim)
+                    if merged is not None:
+                        state_dict[key] = merged
+                        continue
                 if len(local_shards) == 0:
                     state_dict[key] = torch.empty(0)
                 elif len(local_shards) > 1:
