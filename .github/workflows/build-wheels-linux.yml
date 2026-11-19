@@ -55,6 +55,7 @@ jobs:
       os: linux
       test-infra-repository: pytorch/test-infra
       test-infra-ref: main
+      runner-fleet: osdc
       with-rocm: false
   filter-matrix:
     needs: generate-matrix
