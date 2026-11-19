@@ -33,22 +33,25 @@ lib.define(
 lib.define(
     "embedding_pooled_batched_lookup_offset("
     "Tensor indices, Tensor offsets, Tensor weights, Tensor row_offsets, "
-    "int emb_dim) -> Tensor"
+    "int emb_dim, Tensor? row_output_offsets=None) -> Tensor"
 )
 lib.define(
     "embedding_pooled_batched_lookup_offset_backward("
     "Tensor grad_out, Tensor indices, Tensor offsets, Tensor row_offsets, "
-    "int num_rows, int emb_dim, bool flat_weights=False) -> Tensor"
+    "int num_rows, int emb_dim, bool flat_weights=False, "
+    "Tensor? row_output_offsets=None) -> Tensor"
 )
 lib.define(
     "embedding_pooled_batched_lookup_offset_fused_adagrad("
     "Tensor indices, Tensor offsets, Tensor weights, Tensor row_offsets, "
-    "Tensor momentum, float lr, float eps, int emb_dim) -> Tensor"
+    "Tensor momentum, float lr, float eps, int emb_dim, "
+    "Tensor? row_output_offsets=None) -> Tensor"
 )
 lib.define(
     "embedding_pooled_batched_lookup_offset_adagrad_update("
     "Tensor grad_out, Tensor indices, Tensor offsets, Tensor row_offsets, "
-    "Tensor(a!) weights, Tensor(b!) momentum, float lr, float eps) -> ()"
+    "Tensor(a!) weights, Tensor(b!) momentum, float lr, float eps, "
+    "Tensor? row_output_offsets=None) -> ()"
 )
 lib.define(
     "permute_pooled_embs("
@@ -105,7 +108,12 @@ def _embedding_pooled_lookup_offset_meta(
 
 @torch.library.register_fake("torchrec::embedding_pooled_batched_lookup_offset")
 def _embedding_pooled_batched_lookup_offset_meta(
-    indices, offsets, weights, row_offsets, emb_dim
+    indices,
+    offsets,
+    weights,
+    row_offsets,
+    emb_dim,
+    row_output_offsets=None,
 ):
     return weights.new_empty((offsets.numel() - 1, emb_dim))
 
@@ -128,6 +136,7 @@ def _embedding_pooled_batched_lookup_offset_backward_meta(
     num_rows: int,
     emb_dim: int,
     flat_weights: bool = False,
+    row_output_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     shape = (num_rows * emb_dim,) if flat_weights else (num_rows, emb_dim)
     return grad_out.new_empty(shape)
@@ -137,7 +146,15 @@ def _embedding_pooled_batched_lookup_offset_backward_meta(
     "torchrec::embedding_pooled_batched_lookup_offset_fused_adagrad"
 )
 def _embedding_pooled_batched_lookup_offset_fused_adagrad_meta(
-    indices, offsets, weights, row_offsets, momentum, lr, eps, emb_dim
+    indices,
+    offsets,
+    weights,
+    row_offsets,
+    momentum,
+    lr,
+    eps,
+    emb_dim,
+    row_output_offsets=None,
 ):
     return weights.new_empty((offsets.numel() - 1, emb_dim))
 
@@ -146,7 +163,15 @@ def _embedding_pooled_batched_lookup_offset_fused_adagrad_meta(
     "torchrec::embedding_pooled_batched_lookup_offset_adagrad_update"
 )
 def _embedding_pooled_batched_lookup_offset_adagrad_update_meta(
-    grad_out, indices, offsets, row_offsets, weights, momentum, lr, eps
+    grad_out,
+    indices,
+    offsets,
+    row_offsets,
+    weights,
+    momentum,
+    lr,
+    eps,
+    row_output_offsets=None,
 ):
     return None  # In-place update
 
@@ -241,7 +266,10 @@ def embedding_pooled_batched_lookup_offset_cpu(
     weights: torch.Tensor,
     row_offsets: torch.Tensor,
     emb_dim: int,
+    row_output_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if row_output_offsets is not None:
+        raise NotImplementedError("VBE output layout requires the Pallas backend")
     bag_indices = _bag_indices(offsets)
     active_indices = indices[: bag_indices.numel()]
     weight_indices = active_indices.long() + row_offsets[bag_indices].long()
@@ -265,20 +293,24 @@ def embedding_pooled_batched_lookup_offset_backward_cpu(
     num_rows: int,
     emb_dim: int,
     flat_weights: bool = False,
+    row_output_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     bag_indices = _bag_indices(offsets)
+    gradient_rows = bag_indices
+    if row_output_offsets is not None:
+        gradient_rows = (row_output_offsets[bag_indices] // emb_dim).long()
     active_indices = indices[: bag_indices.numel()]
     weight_indices = active_indices.long() + row_offsets[bag_indices].long()
     if flat_weights:
         columns = torch.arange(emb_dim, device=grad_out.device)
         linear_indices = weight_indices[:, None] * emb_dim + columns
         return grad_out.new_zeros((num_rows * emb_dim,)).index_put_(
-            (linear_indices,), grad_out[bag_indices], accumulate=True
+            (linear_indices,), grad_out[gradient_rows], accumulate=True
         )
     return grad_out.new_zeros((num_rows, emb_dim)).index_add_(
         0,
         weight_indices,
-        grad_out[bag_indices],
+        grad_out[gradient_rows],
     )
 
 
@@ -291,9 +323,15 @@ def embedding_pooled_batched_lookup_offset_fused_adagrad_cpu(
     lr: float,
     eps: float,
     emb_dim: int,
+    row_output_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return embedding_pooled_batched_lookup_offset_cpu(
-        indices, offsets, weights, row_offsets, emb_dim
+        indices,
+        offsets,
+        weights,
+        row_offsets,
+        emb_dim,
+        row_output_offsets=row_output_offsets,
     )
 
 
@@ -306,12 +344,16 @@ def embedding_pooled_batched_lookup_offset_adagrad_update_cpu(
     momentum: torch.Tensor,
     lr: float,
     eps: float,
+    row_output_offsets: torch.Tensor | None = None,
 ) -> None:
     bag_indices = _bag_indices(offsets)
+    gradient_rows = bag_indices
+    if row_output_offsets is not None:
+        gradient_rows = (row_output_offsets[bag_indices] // grad_out.shape[1]).long()
     rows = indices[: bag_indices.numel()].long() + row_offsets[bag_indices].long()
     unique_rows, inverse = torch.unique(rows, return_inverse=True)
     grad_per_row = grad_out.new_zeros((unique_rows.numel(), grad_out.shape[1]))
-    grad_per_row.index_add_(0, inverse, grad_out[bag_indices])
+    grad_per_row.index_add_(0, inverse, grad_out[gradient_rows])
     updated_momentum = momentum[unique_rows] + grad_per_row.square().mean(dim=1)
     if weights.ndim == 1:
         columns = torch.arange(grad_out.shape[1], device=weights.device)
@@ -464,17 +506,99 @@ def _pooled_offset_backward(ctx, grad_out: torch.Tensor):
     return None, None, grad_weights, None
 
 
+def _validate_vbe_metadata(
+    B_offsets: torch.Tensor | None,
+    B_offsets_rank_per_feature: torch.Tensor | None,
+    output_offsets_feature_rank: torch.Tensor | None,
+) -> None:
+    if B_offsets is None:
+        assert (
+            B_offsets_rank_per_feature is None
+        ), "VBE metadata must be all None or all provided"
+        assert (
+            output_offsets_feature_rank is None
+        ), "VBE metadata must be all None or all provided"
+    else:
+        assert (
+            B_offsets_rank_per_feature is not None
+        ), "B_offsets_rank_per_feature is required for VBE"
+        assert (
+            output_offsets_feature_rank is not None
+        ), "output_offsets_feature_rank is required for VBE"
+        assert B_offsets.ndim == 1, "B_offsets must be 1D"
+        assert (
+            B_offsets_rank_per_feature.ndim == 2
+        ), "B_offsets_rank_per_feature must be 2D"
+        assert (
+            output_offsets_feature_rank.ndim == 1
+        ), "output_offsets_feature_rank must be 1D"
+        num_features = B_offsets.shape[0] - 1
+        num_ranks = B_offsets_rank_per_feature.shape[1] - 1
+        assert num_features > 0, "VBE requires at least one feature"
+        assert num_ranks > 0, "VBE requires at least one rank"
+        assert (
+            B_offsets_rank_per_feature.shape[0] == num_features
+        ), "VBE feature counts must match"
+        assert (
+            output_offsets_feature_rank.shape[0] == num_ranks * num_features + 1
+        ), "VBE output offsets must have num_ranks * num_features + 1 entries"
+
+
+def _generate_vbe_row_output_offsets(
+    B_offsets: torch.Tensor | None,
+    B_offsets_rank_per_feature: torch.Tensor | None,
+    output_offsets_feature_rank: torch.Tensor | None,
+    num_bags: int,
+    emb_dim: int,
+) -> torch.Tensor | None:
+    """Map input bags to element offsets in the rank-major output."""
+    # Follows fbgemm_gpu generate_vbe_metadata.cu
+    _validate_vbe_metadata(
+        B_offsets, B_offsets_rank_per_feature, output_offsets_feature_rank
+    )
+    if B_offsets is None:
+        return None
+    assert B_offsets_rank_per_feature is not None
+    assert output_offsets_feature_rank is not None
+    num_features = B_offsets.shape[0] - 1
+    num_ranks = B_offsets_rank_per_feature.shape[1] - 1
+    chunk_counts = torch.diff(B_offsets_rank_per_feature, dim=1).flatten()
+    chunk_ids = torch.repeat_interleave(
+        torch.arange(
+            num_features * num_ranks,
+            dtype=B_offsets.dtype,
+            device=B_offsets.device,
+        ),
+        chunk_counts,
+        output_size=num_bags,
+    )
+    features = chunk_ids // num_ranks
+    ranks = chunk_ids % num_ranks
+    bag_ids = torch.arange(num_bags, dtype=B_offsets.dtype, device=B_offsets.device)
+    # Global bag boundaries are indexed by feature and rank, with shape [F, W + 1].
+    # e.g. F=2, W=2, [[0, 2, 5], [5, 6, 8]]: f0/rank0 uses [0, 2).
+    chunk_starts = B_offsets[features] + B_offsets_rank_per_feature[features, ranks]
+    # Bag index within its feature/rank chunk.
+    bags_in_chunk = (bag_ids - chunk_starts).to(output_offsets_feature_rank.dtype)
+    # Output metadata is indexed in rank-major order.
+    return (
+        output_offsets_feature_rank[ranks * num_features + features]
+        + bags_in_chunk * emb_dim
+    )
+
+
 def _setup_pooled_batched_offset_context(ctx, inputs, output) -> None:
     _ = output
-    indices, offsets, weights, row_offsets, emb_dim = inputs
-    ctx.save_for_backward(indices, offsets, row_offsets)
+    indices, offsets, weights, row_offsets, emb_dim, row_output_offsets = inputs
+    ctx.num_inputs = len(inputs)
+    ctx.save_for_backward(indices, offsets, row_offsets, row_output_offsets)
     ctx.num_rows = weights.numel() // emb_dim
     ctx.emb_dim = emb_dim
     ctx.flat_weights = weights.ndim == 1
 
 
 def _pooled_batched_offset_backward(ctx, grad_out: torch.Tensor):
-    indices, offsets, row_offsets = ctx.saved_tensors
+    indices, offsets, row_offsets, row_output_offsets = ctx.saved_tensors
     grad_weights = torch.ops.torchrec.embedding_pooled_batched_lookup_offset_backward(
         grad_out.contiguous(),
         indices,
@@ -483,20 +607,36 @@ def _pooled_batched_offset_backward(ctx, grad_out: torch.Tensor):
         ctx.num_rows,
         ctx.emb_dim,
         ctx.flat_weights,
+        row_output_offsets=row_output_offsets,
     )
-    return None, None, grad_weights, None, None
+    return (None, None, grad_weights) + (None,) * (ctx.num_inputs - 3)
 
 
 def _setup_fused_adagrad_context(ctx, inputs, output) -> None:
     _ = output
-    indices, offsets, weights, row_offsets, momentum, lr, eps, emb_dim = inputs
-    ctx.save_for_backward(indices, offsets, row_offsets, weights, momentum)
+    (
+        indices,
+        offsets,
+        weights,
+        row_offsets,
+        momentum,
+        lr,
+        eps,
+        emb_dim,
+        row_output_offsets,
+    ) = inputs
+    ctx.num_inputs = len(inputs)
+    ctx.save_for_backward(
+        indices, offsets, row_offsets, weights, momentum, row_output_offsets
+    )
     ctx.lr = lr
     ctx.eps = eps
 
 
 def _fused_adagrad_backward(ctx, grad_out: torch.Tensor):
-    indices, offsets, row_offsets, weights, momentum = ctx.saved_tensors
+    indices, offsets, row_offsets, weights, momentum, row_output_offsets = (
+        ctx.saved_tensors
+    )
     with torch.no_grad():
         torch.ops.torchrec.embedding_pooled_batched_lookup_offset_adagrad_update(
             grad_out.contiguous(),
@@ -507,8 +647,9 @@ def _fused_adagrad_backward(ctx, grad_out: torch.Tensor):
             momentum,
             ctx.lr,
             ctx.eps,
+            row_output_offsets=row_output_offsets,
         )
-    return None, None, None, None, None, None, None, None
+    return (None,) * ctx.num_inputs
 
 
 def _permute_setup_context(ctx, inputs, output) -> None:
