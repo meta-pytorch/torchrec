@@ -24,12 +24,22 @@ jobs:
       id-token: write
     steps:
       # The artifact comes from PR code, so we only upload it and never run it.
-      - name: Find the PR
+      - name: Find the docs artifact and the PR
         id: pr
         uses: actions/github-script@v8
         with:
           script: |
             const run = context.payload.workflow_run;
+            // A failed or cancelled run may not have built the docs.
+            const { data: { total_count } } = await github.rest.actions.listWorkflowRunArtifacts({
+              ...context.repo,
+              run_id: run.id,
+              name: 'Built-Docs',
+            });
+            if (total_count === 0) {
+              core.notice(`Run ${run.id} has no Built-Docs artifact`);
+              return;
+            }
             // workflow_run.pull_requests is empty for fork PRs, so look the PR up from its head.
             const { data: pulls } = await github.rest.pulls.list({
               ...context.repo,
@@ -41,6 +51,7 @@ jobs:
 
       # Uploaded by build_docs_job in docs.yml.
       - uses: actions/download-artifact@v4
+        if: steps.pr.outputs.number
         with:
           name: Built-Docs
           path: docs
@@ -49,16 +60,19 @@ jobs:
 
       # Update HTML to add the no-index tag so that search engines do not index these ephemeral docs
       - name: Add no-index tag
+        if: steps.pr.outputs.number
         run: |
           find docs -name "*.html" -print0 | xargs -0 sed -i '/<head>/a \ \ <meta name="robots" content="noindex">';
 
       - name: Configure AWS credentials
+        if: steps.pr.outputs.number
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: arn:aws:iam::308535385114:role/arc
           aws-region: us-east-1
 
       - name: Upload docs preview
+        if: steps.pr.outputs.number
         uses: seemethere/upload-artifact-s3@v5
         with:
           retention-days: 14
