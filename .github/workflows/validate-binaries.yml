@@ -40,7 +40,6 @@ jobs:
       test-infra-ref: main
       with-cuda: enable
       with-rocm: false
-      # OSDC (ARC) runners: validation_runner becomes an mt-l-* label.
       runner-fleet: osdc
   filter-matrix:
     needs: generate-matrix
