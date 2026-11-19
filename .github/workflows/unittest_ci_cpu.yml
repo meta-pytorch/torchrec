@@ -101,7 +101,10 @@ jobs:
       contents: read
     with:
       runner: ${{ matrix.os }}
-      timeout: 30
+      # The serial CPU suite takes 27-31 min per job as of Nov 2026, so the
+      # free-threaded 3.14t job keeps hitting a 30 min limit. Raise the limit
+      # while the slowest tests (see --durations below) are investigated.
+      timeout: 45
       script: |
         ldd --version
         if [[ "${{ matrix.python.version }}" == "3.15" ]]; then
@@ -173,10 +176,13 @@ jobs:
         # runner's /lib64 one: preload conda-forge's libstdc++ (backward compatible) for pytest.
         conda install -n build_binary -y -c conda-forge "libstdcxx>=14"
         env_prefix=$(conda run -n build_binary python -c "import sys; print(sys.prefix)")
-        conda run -n build_binary \
+        # --no-capture-output streams pytest output live. Without it, conda run
+        # buffers everything until exit, so a timed-out job logs no test output.
+        conda run --no-capture-output -n build_binary \
           env LD_PRELOAD="$env_prefix/lib/libstdc++.so.6" \
           python -m pytest torchrec -v -s -W ignore::pytest.PytestCollectionWarning --continue-on-collection-errors \
         --ignore-glob=**/test_utils/ \
+        --durations=50 \
         -k "not _disabled_in_oss_compatibility"
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.repository }}-${{ github.event_name == 'workflow_dispatch' }}
