@@ -1,0 +1,68 @@
+name: Docs preview
+
+# Uploads the docs that the Generate documentation workflow built for a PR to
+# docs-preview.pytorch.org. The upload needs AWS credentials from GitHub OIDC,
+# which a pull_request run from a fork can't get. A workflow_run job runs from
+# main in this repo, so it can, for fork and same-repo PRs alike.
+on:
+  workflow_run:
+    workflows: [Generate documentation]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  doc-preview:
+    # workflow_run.event is the event that triggered the Generate documentation run.
+    if: github.repository == 'meta-pytorch/torchrec' && github.event.workflow_run.event == 'pull_request'
+    runs-on: mt-l-x86iavx512-8-64
+    container:
+      image: docker.io/python:3.11-slim
+    permissions:
+      actions: read
+      pull-requests: read
+      id-token: write
+    steps:
+      # The artifact comes from PR code, so we only upload it and never run it.
+      - name: Find the PR
+        id: pr
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            // workflow_run.pull_requests is empty for fork PRs, so look the PR up from its head.
+            const { data: pulls } = await github.rest.pulls.list({
+              ...context.repo,
+              head: `${run.head_repository.owner.login}:${run.head_branch}`,
+            });
+            const pr = pulls.find((p) => p.head.sha === run.head_sha);
+            if (!pr) throw new Error(`No PR has head ${run.head_sha}`);
+            core.setOutput('number', pr.number);
+
+      # Uploaded by build_docs_job in docs.yml.
+      - uses: actions/download-artifact@v4
+        with:
+          name: Built-Docs
+          path: docs
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # Update HTML to add the no-index tag so that search engines do not index these ephemeral docs
+      - name: Add no-index tag
+        run: |
+          find docs -name "*.html" -print0 | xargs -0 sed -i '/<head>/a \ \ <meta name="robots" content="noindex">';
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: arn:aws:iam::308535385114:role/arc
+          aws-region: us-east-1
+
+      - name: Upload docs preview
+        uses: seemethere/upload-artifact-s3@v5
+        with:
+          retention-days: 14
+          s3-bucket: doc-previews
+          if-no-files-found: error
+          path: docs
+          s3-prefix: meta-pytorch/torchrec/${{ steps.pr.outputs.number }}
