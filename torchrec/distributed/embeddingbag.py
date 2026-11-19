@@ -90,6 +90,8 @@ from torchrec.distributed.sharding.twrw_sharding import TwRwPooledEmbeddingShard
 from torchrec.distributed.shards_wrapper import (
     get_combined_local_size,
     LocalShardsWrapper,
+    merging_cw_local_shards_by_view,
+    view_cw_local_shards,
 )
 from torchrec.distributed.types import (
     Awaitable,
@@ -1207,6 +1209,13 @@ class ShardedEmbeddingBagCollection(
                     state_dict[key] = torch.empty(0)
                 else:
                     dim = state_dict[key].metadata().shards_metadata[0].shard_sizes[1]
+                    if merging_cw_local_shards_by_view() and len(local_shards) > 1:
+                        merged = view_cw_local_shards(
+                            [shard.tensor for shard in local_shards], dim
+                        )
+                        if merged is not None:
+                            state_dict[key] = merged
+                            continue
                     # CW multiple shards are merged
                     if len(local_shards) > 1:
                         flattened_shards = [
@@ -1226,6 +1235,11 @@ class ShardedEmbeddingBagCollection(
                     state_dict[key] = torch.empty(0)
                 else:
                     dim = shards_wrapper.local_sizes()[0][1]
+                    if merging_cw_local_shards_by_view() and len(local_shards) > 1:
+                        merged = view_cw_local_shards(local_shards, dim)
+                        if merged is not None:
+                            state_dict[key] = merged
+                            continue
                     # CW multiple shards are merged
                     if len(local_shards) > 1:
                         flattened_shards = [shard.view(-1) for shard in local_shards]

@@ -9,7 +9,9 @@
 
 # COPY of the code from torch.distributed._tensor._shards_wrapper - for package compat
 
-from typing import Any, List, Optional, Tuple
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator, List, Optional, Tuple
 
 import torch
 from torch.distributed.checkpoint.metadata import (
@@ -35,6 +37,106 @@ def get_combined_local_size(local_sizes: List[torch.Size]) -> torch.Size:
     elif len(local_sizes) > 1 and len(combined_size) == 1:
         combined_size[0] = sum(size[0] for size in local_sizes)
     return torch.Size(combined_size)
+
+
+_MERGE_CW_LOCAL_SHARDS_BY_VIEW: ContextVar[bool] = ContextVar(
+    "torchrec_merge_cw_local_shards_by_view", default=False
+)
+
+
+@contextmanager
+def merge_cw_local_shards_by_view() -> Iterator[None]:
+    """
+    Opts the ``load_state_dict`` calls made inside this block into merging a rank's
+    column-wise local shards by view instead of by copy.
+
+    A fused TBE lays a table's same-rank shards out back to back in one storage, so
+    the merged tensor already exists in memory, and the copy (the full size of the
+    table's local shards, on the shards' device) can be skipped. Enter this only
+    around a load that runs on plain dense shards with no autograd, autocast, or
+    torch-function or dispatch mode, e.g. an online checkpoint-eval reload, where
+    DCP has already loaded the checkpoint in place and the hooks merge the module's
+    own shards. Outside this block, the hooks run their own code unchanged.
+    """
+    token = _MERGE_CW_LOCAL_SHARDS_BY_VIEW.set(True)
+    try:
+        yield
+    finally:
+        _MERGE_CW_LOCAL_SHARDS_BY_VIEW.reset(token)
+
+
+def merging_cw_local_shards_by_view() -> bool:
+    """Whether the caller is inside ``merge_cw_local_shards_by_view()``."""
+    return _MERGE_CW_LOCAL_SHARDS_BY_VIEW.get()
+
+
+def view_cw_local_shards(
+    shards: List[torch.Tensor], dim: int
+) -> Optional[torch.Tensor]:
+    """
+    Returns the value of ``torch.cat([s.view(-1) for s in shards], dim=0).view(-1, dim)``
+    as a view of the shards' own bytes, with no copy, or ``None`` when it cannot.
+
+    It returns a view only inside ``merge_cw_local_shards_by_view()``, and only when
+    every shard is a plain dense CPU/CUDA tensor and the shards sit back to back in
+    one storage in shard order. The view shares the shards' storage. On ``None`` the
+    caller runs its own concatenation.
+
+    Args:
+        shards (List[torch.Tensor]): a rank's column-wise local shards of one table,
+            in shard order.
+        dim (int): the column count of the result.
+
+    Returns:
+        Optional[torch.Tensor]: a ``(total_rows, dim)`` view, or ``None``.
+    """
+    if not _MERGE_CW_LOCAL_SHARDS_BY_VIEW.get():
+        return None
+    # The concatenation's own flattening views come first (they allocate no data), so
+    # any error it would raise there is raised here the same way.
+    for s in shards:
+        s.view(-1)
+    if dim <= 0 or not shards or not all(_is_plain_dense(s) for s in shards):
+        return None
+    try:
+        return _adjacent_view(shards, dim)
+    except RuntimeError:  # NotImplementedError included: it subclasses RuntimeError
+        # A wrapper TensorImpl (vmap's batched tensor, functionalization, a fake
+        # tensor) has no readable storage; the caller's concatenation handles it.
+        return None
+
+
+def _adjacent_view(shards: List[torch.Tensor], dim: int) -> Optional[torch.Tensor]:
+    first = shards[0]
+    storage_ptr = first.untyped_storage().data_ptr()
+    offset = first.storage_offset()
+    for shard in shards:
+        # A storage at the same address is the same memory; if `first`'s storage is
+        # too small to hold the view, as_strided raises and the caller falls back.
+        if (
+            shard.dtype != first.dtype
+            or shard.device != first.device
+            or shard.untyped_storage().data_ptr() != storage_ptr
+            or shard.storage_offset() != offset
+        ):
+            return None
+        offset += shard.numel()
+    numel = offset - first.storage_offset()
+    if numel % dim != 0:
+        return None
+    return first.as_strided((numel // dim, dim), (dim, 1))
+
+
+def _is_plain_dense(t: torch.Tensor) -> bool:
+    return (
+        type(t) is torch.Tensor
+        and t.layout == torch.strided
+        and t.device.type in ("cpu", "cuda")
+        and not t.is_quantized
+        and not t.is_conj()
+        and not t.is_neg()
+        and t.is_contiguous()
+    )
 
 
 class LocalShardsWrapper(torch.Tensor):
