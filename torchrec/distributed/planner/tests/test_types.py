@@ -2536,6 +2536,21 @@ class ShardingPlanRequestTest(unittest.TestCase):
             base, self._create_request(training_framework="apf").request_hash
         )
 
+    def test_request_hash_distinguishes_hbm_overcommit(self) -> None:
+        default = self._create_request().request_hash
+        self.assertEqual(
+            default,
+            self._create_request(
+                planner_config=PlannerConfig(allow_single_device_hbm_overcommit=False)
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            default,
+            self._create_request(
+                planner_config=PlannerConfig(allow_single_device_hbm_overcommit=True)
+            ).request_hash,
+        )
+
     def test_default_planner_config(self) -> None:
         cfg = self._create_request().planner_config
         self.assertIs(cfg.planner_variant, PlannerVariant.UNSET)

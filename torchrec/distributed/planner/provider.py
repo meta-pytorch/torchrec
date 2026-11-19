@@ -369,6 +369,7 @@ class DefaultPlannerProvider(PlannerProvider):
             )
         cfg = ctx.request.planner_config
         return EmbeddingShardingPlanner(
+            allow_single_device_hbm_overcommit=cfg.allow_single_device_hbm_overcommit,
             topology=topology,
             batch_size=ctx.request.batch_size,
             enumerator=self._build_enumerator(sku, topology, ctx),

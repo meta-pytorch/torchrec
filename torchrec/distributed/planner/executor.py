@@ -350,6 +350,7 @@ class DefaultPlannerExecutor(PlannerExecutor):
             )
         solve_time_ms = (time.perf_counter() - start) * 1000.0
         ctx.timing[f"plan_call:{sku}"] = solve_time_ms
+        ctx.storage_reservations_used[sku] = planner.get_storage_reservation()
 
         # get_selected_options() is the chosen List[ShardingOption] with per-shard
         # storage/perf populated; it is the only source of the full cost breakdown
