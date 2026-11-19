@@ -63,6 +63,7 @@ from torchrec.distributed.feature_score_utils import (
 from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
+    split_fused_param_segment_gather_backward,
 )
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.logging_utils import EventType
@@ -647,6 +648,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         use_sorted_select: bool = False,
         resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
         use_packed_jagged_tensor: bool = False,
+        use_segment_gather_backward: bool = False,
     ) -> None:
         super().__init__()
         self._awaitables_per_sharding = awaitables_per_sharding
@@ -662,6 +664,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self._use_sorted_select = use_sorted_select
         self._resize_awaitables = resize_awaitables
         self._use_packed_jagged_tensor = use_packed_jagged_tensor
+        self._use_segment_gather_backward = use_segment_gather_backward
 
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
         jt_dict: Dict[str, JaggedTensor] = {}
@@ -736,6 +739,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     use_gather_select=use_gather_select,
                     use_sorted_select=self._use_sorted_select,
                     seg_plan=seg_plan,
+                    use_segment_gather_backward=self._use_segment_gather_backward,
                 )
                 if composed is not None and _seq_unbucketize_compose_check_due():
                     jts = self._check_composed(
@@ -922,6 +926,10 @@ class ShardedEmbeddingCollection(
                 "Packed JaggedTensor outputs require EmbeddingCollection index dedup"
             )
         self._use_packed_jagged_tensor: bool = use_packed_jagged_tensor
+        use_segment_gather_backward, fused_params = (
+            split_fused_param_segment_gather_backward(fused_params)
+        )
+        self._use_segment_gather_backward: bool = use_segment_gather_backward
         sharding_type_to_sharding_infos = self.create_grouped_sharding_infos(
             module,
             table_name_to_parameter_sharding,
@@ -2155,6 +2163,7 @@ class ShardedEmbeddingCollection(
             use_gather_select_per_sharding=self._use_gather_select_per_sharding,
             use_sorted_select=self._use_sorted_select,
             use_packed_jagged_tensor=self._use_packed_jagged_tensor,
+            use_segment_gather_backward=self._use_segment_gather_backward,
         )
 
     def _compute_and_output_dist_per_sharding(
@@ -2352,6 +2361,7 @@ class ShardedEmbeddingCollection(
             use_sorted_select=self._use_sorted_select,
             use_packed_jagged_tensor=self._use_packed_jagged_tensor,
             resize_awaitables=resize_awaitables,
+            use_segment_gather_backward=self._use_segment_gather_backward,
         )
 
     def _seg_pre_plan_wanted(self) -> bool:
