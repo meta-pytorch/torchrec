@@ -88,12 +88,22 @@ def _ga_abort_all_process_groups(reason: str) -> None:
 
 
 class PartialWindowPolicy(Enum):
-    """Action when input ends before an accumulation window is complete.
+    """Handle gradients left over when input ends before an accumulation window is full.
 
-    ``STEP`` applies the partial gradients. With multiple ranks, those gradients were not
-    synchronized. ``RAISE`` rejects the partial window and first aborts distributed
-    process groups. ``DISCARD`` clears the gradients and is safe only when every rank
-    exhausts together.
+    ``STEP`` updates weights using those gradients, even if they were not
+    synchronized across ranks.
+
+    If any native FSDP2 group still needs an all-reduce, ``STEP`` clears all
+    native FSDP2 gradients. This also clears gradients already synchronized.
+
+    With ``STEP``, call ``progress(..., is_last_batch=True)`` on the final batch
+    to synchronize gradients and apply the partial window.
+
+    ``RAISE`` raises an error. In multi-rank training, it first aborts process
+    groups so other ranks do not wait for the rank that ran out of input.
+
+    ``DISCARD`` clears gradients without an optimizer step. It is safe only
+    when all ranks run out of input together.
     """
 
     STEP = "step"
