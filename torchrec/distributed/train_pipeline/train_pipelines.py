@@ -219,6 +219,10 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
         logger.info(f"TrainPipeline class: {type(self)}")
         one_time_rank0_logger.info(f"TrainPipeline class: {type(self)}")
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return False
+
     def get_optimizer_context(
         self,
     ) -> TrainPipelineContextLite | TrainPipelineContext | None:
@@ -299,6 +303,10 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
     iteration, `self._memcpy_stream` moves the input from host (CPU) memory to GPU
     memory, and the default stream runs forward, backward, and optimization.
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineBase.progress
 
     @_torchrec_method_logger()
     def __init__(
@@ -536,6 +544,10 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
             This is useful when we want to transform KJT parameters for PT2 tracing
     """
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelinePT2.progress
+
     @_torchrec_method_logger()
     def __init__(
         self,
@@ -701,6 +713,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         excluded_pipeline_module_fqns (Optional[Set[str]]): exact ShardedModule
             FQNs whose forward and input_dist must remain in model forward.
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineSparseDist.progress
 
     # The PipelinedForward class that is used in _rewrite_model
     _pipelined_forward_type = PipelinedForward
@@ -1576,6 +1592,10 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         ...     output = pipeline.progress(dataloader_iter)
     """
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineSparseDistLite.progress
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -1793,6 +1813,10 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
     # The PipelinedForward class that is used in _rewrite_model
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = InSyncEmbeddingPipelinedForward
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineFusedSparseDist.progress
 
     def __init__(
         self,
@@ -2250,6 +2274,9 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             return
         self._optimizer.step()
 
+    def get_optimizer_context(self) -> TrainPipelineContext | None:
+        return None
+
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
     )
@@ -2550,6 +2577,10 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = PrefetchPipelinedForward
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is PrefetchTrainPipelineSparseDist.progress
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -2791,6 +2822,10 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     # The PipelinedForward class that is used in _rewrite_model
     _pipelined_forward_type = PipelinedForward
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is EvalPipelineSparseDist.progress
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -2923,6 +2958,10 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
     raises peak memory. This pipeline is experimental -- always run NE/output
     parity tests before relying on it.
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is EvalPipelineFusedSparseDist.progress
 
     def __init__(
         self,
@@ -3139,6 +3178,10 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             loss.backward()
             optimizer.step()
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is StagedTrainPipeline.progress
 
     @_torchrec_method_logger()
     def __init__(
@@ -3481,6 +3524,10 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
     This pipeline clone the TrainPipelineSparseDist, but execute the progress
     method within compiled autograd context.
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineSparseDistCompAutograd.progress
 
     def __init__(
         self,

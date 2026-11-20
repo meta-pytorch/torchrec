@@ -56,6 +56,18 @@ class _Model(nn.Module):
         return self.weight * 2, self.output
 
 
+class _UnsupportedPipeline(TrainPipelineSparseDist[Pipelineable, torch.Tensor]):
+    context_lookups: int = 0
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return False
+
+    def get_optimizer_context(self) -> TrainPipelineContext | None:
+        self.context_lookups += 1
+        return super().get_optimizer_context()
+
+
 def _raise_error(error: Exception, *_args: object) -> None:
     raise error
 
@@ -251,6 +263,31 @@ class GradientAccumulationAttributionTest(unittest.TestCase):
 
         self.assertIs(error, raised.exception)
         self.assertIsNone(get_exception_attribution(raised.exception))
+
+    def test_unsupported_pipeline_skips_optimizer_contributors(self) -> None:
+        model = _Model()
+        # Citrine C2: foreach=True for multi-tensor optimizer execution.
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        pipeline = _UnsupportedPipeline(
+            model,
+            optimizer,
+            torch.device("cpu"),
+            dmp_collection_sync_interval_batches=None,
+        )
+        _preload(pipeline, [object(), object()])
+        wrapper = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            GradientAccumulationConfig(num_steps=2),
+        )
+
+        self.assertIs(model.output, wrapper.progress(iter(())))
+
+        # SparseDist's optimizer decorator performs the only context lookup.
+        self.assertEqual(1, pipeline.context_lookups)
+        self.assertIsNone(wrapper.optimizer_wrapper.batch_metadata)
+        self.assertIsNone(wrapper.optimizer_wrapper.index)
 
     def test_context_lookup_failure_does_not_change_optimizer_execution(self) -> None:
         wrapper, pipeline, _, model = self._make_wrapper(
