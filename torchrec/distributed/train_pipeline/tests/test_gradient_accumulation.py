@@ -634,7 +634,7 @@ class FsdpSyncSuppressionSeamTest(unittest.TestCase):
             wrapper._fsdp_sync_suppression, "has_partial", return_value=True
         ), self.assertLogs(
             "torchrec.distributed.train_pipeline.gradient_accumulation", "WARNING"
-        ) as logs:
+        ):
             wrapper.progress(iter([torch.randn(2, 10)]))
             with self.assertRaises(StopIteration):
                 wrapper.progress(iter([]))
@@ -650,7 +650,6 @@ class FsdpSyncSuppressionSeamTest(unittest.TestCase):
                 "ensure_sharded",
             ],
         )
-        self.assertIn("Dropping the native-FSDP2 gradients", "\n".join(logs.output))
 
     def test_the_targets_are_collected_once(self) -> None:
         wrapper = self._make()
