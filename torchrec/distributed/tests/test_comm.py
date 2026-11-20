@@ -16,7 +16,7 @@ import os
 import unittest
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -192,6 +192,43 @@ def _test_async_sync_compile(
 
                 assert sync_bwd_out is not None
                 _assert_close(compile_bwd_out, sync_bwd_out)
+
+
+_MX4_GROUP_SIZE = 8
+
+# Per-rank batch sizes and shard widths for the MX4 padding tests. Widths are
+# multiples of 4; the cases mix aligned and misaligned splits relative to groups of 8.
+_MX4_PADDING_CASES: List[Tuple[List[int], List[int]]] = [
+    # Every slice with rank 0's 9 rows is misaligned, although its send buffer
+    # (108 + 180 = 288) is a multiple of the group size.
+    ([9, 8], [12, 20]),
+    # Rank 0 sends aligned slices (160, 128) but receives a misaligned one (180).
+    ([8, 9], [20, 16]),
+    # Aligned slices: the comm is unchanged with padding on.
+    ([8, 8], [12, 20]),
+]
+
+
+def _mx4_codecs() -> QuantizedCommCodecs:
+    return get_qcomm_codecs(
+        QCommsConfig(
+            forward_precision=CommType.MX4,
+            backward_precision=CommType.MX4,
+            mx4_quantize_dim=_MX4_GROUP_SIZE,
+            mx4_quantize_dim_bwd=_MX4_GROUP_SIZE,
+        )
+    )
+
+
+def _mx4_round_trip(codec: Any, flat: Tensor, splits: List[int]) -> Tensor:
+    """Each split zero-padded to the group size, MX4 encoded and decoded, cut back."""
+    ctx = codec.create_context()
+    chunks = []
+    for chunk in flat.split(splits):
+        padded = torch.nn.functional.pad(chunk, (0, -chunk.numel() % _MX4_GROUP_SIZE))
+        decoded = codec.decode(codec.encode(padded, ctx), ctx)
+        chunks.append(decoded[: chunk.numel()].to(flat.dtype))
+    return torch.cat(chunks)
 
 
 class TestAllToAll(unittest.TestCase):
@@ -605,6 +642,178 @@ class TestAllToAll(unittest.TestCase):
                 batch_size_per_rank=batch_size_per_rank,
                 dim_sum_per_rank=dim_sum_per_rank,
                 use_sync=use_sync,
+            )
+
+    @classmethod
+    def _test_alltoall_pooled_mx4_bwd_padding(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+        batch_size_per_rank: List[int],
+        dim_sum_per_rank: List[int],
+        variable_batch: bool,
+        gradient_division: bool,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        pg = dist.distributed_c10d._get_default_group()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        comm_ops.set_gradient_division(gradient_division)
+        os.environ["TORCHREC_ENABLE_MX4_PADDING"] = "1"
+
+        torch.manual_seed(rank)
+        B_local = batch_size_per_rank[rank]
+        pooled_embs = (
+            torch.rand(sum(batch_size_per_rank), dim_sum_per_rank[rank], device=device)
+            * 2
+            - 1
+        )
+        grad_out = torch.rand(B_local, sum(dim_sum_per_rank), device=device) * 2 - 1
+
+        def bwd_grad(codecs: Optional[QuantizedCommCodecs], grad: Tensor) -> Tensor:
+            embs = pooled_embs.clone().requires_grad_()
+            if variable_batch:
+                # One feature per rank, each with every rank's batch size.
+                out = comm_ops.variable_batch_alltoall_pooled(
+                    embs.view(-1),
+                    batch_size_per_rank_per_feature=[[b] for b in batch_size_per_rank],
+                    batch_size_per_feature_pre_a2a=[B_local] * world_size,
+                    emb_dim_per_rank_per_feature=[[d] for d in dim_sum_per_rank],
+                    group=pg,
+                    codecs=codecs,
+                ).wait()
+                out.backward(grad.view(-1))
+            else:
+                comm_ops.alltoall_pooled(
+                    embs, batch_size_per_rank, dim_sum_per_rank, group=pg, codecs=codecs
+                ).wait().backward(grad)
+            return none_throws(embs.grad)
+
+        mx4 = _mx4_codecs()
+        splits = [B_local * d for d in dim_sum_per_rank]
+        if variable_batch:
+            # The flat gradient goes back split by the forward's output splits.
+            quantized_grad_out = _mx4_round_trip(
+                mx4.backward, grad_out.reshape(-1), splits
+            ).view_as(grad_out)
+        else:
+            # The send buffer is one [B_local, D_r] block per rank, row-major.
+            blocks = [b.reshape(-1) for b in grad_out.split(dim_sum_per_rank, dim=1)]
+            quantized_blocks = _mx4_round_trip(
+                mx4.backward, torch.cat(blocks), splits
+            ).split(splits)
+            quantized_grad_out = torch.cat(
+                [
+                    b.view(B_local, d)
+                    for b, d in zip(quantized_blocks, dim_sum_per_rank)
+                ],
+                dim=1,
+            )
+
+        padded = bwd_grad(mx4, grad_out)
+        # Quantizing each padded slice locally and sending it unquantized must give
+        # exactly what the padded MX4 comm delivers.
+        torch.testing.assert_close(
+            padded, bwd_grad(None, quantized_grad_out), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            padded, bwd_grad(None, grad_out), rtol=0.1, atol=0.15
+        )
+        if all(
+            b * d % _MX4_GROUP_SIZE == 0
+            for b in batch_size_per_rank
+            for d in dim_sum_per_rank
+        ):
+            os.environ["TORCHREC_ENABLE_MX4_PADDING"] = "0"
+            torch.testing.assert_close(padded, bwd_grad(mx4, grad_out), rtol=0, atol=0)
+        dist.destroy_process_group()
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
+    )
+    @given(
+        variable_batch=st.sampled_from([False, True]),
+        gradient_division=st.sampled_from([False, True]),
+    )
+    @settings(deadline=None)
+    def test_alltoall_pooled_mx4_bwd_padding(
+        self, variable_batch: bool, gradient_division: bool
+    ) -> None:
+        for batch_size_per_rank, dim_sum_per_rank in _MX4_PADDING_CASES:
+            self._run_multi_process_test(
+                world_size=self.WORLD_SIZE,
+                backend="nccl",
+                # pyrefly: ignore[bad-argument-type]
+                callable=self._test_alltoall_pooled_mx4_bwd_padding,
+                batch_size_per_rank=batch_size_per_rank,
+                dim_sum_per_rank=dim_sum_per_rank,
+                variable_batch=variable_batch,
+                gradient_division=gradient_division,
+            )
+
+    @classmethod
+    def _test_variable_batch_alltoall_pooled_mx4_fwd_padding(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+        batch_size_per_rank: List[int],
+        dim_sum_per_rank: List[int],
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        pg = dist.distributed_c10d._get_default_group()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        os.environ["TORCHREC_ENABLE_MX4_PADDING"] = "1"
+
+        torch.manual_seed(rank)
+        pooled_embs = (
+            torch.rand(sum(batch_size_per_rank), dim_sum_per_rank[rank], device=device)
+            * 2
+            - 1
+        )
+
+        def fwd(codecs: Optional[QuantizedCommCodecs], embs: Tensor) -> Tensor:
+            # One feature per rank, each with every rank's batch size.
+            return comm_ops.variable_batch_alltoall_pooled(
+                embs.view(-1),
+                batch_size_per_rank_per_feature=[[b] for b in batch_size_per_rank],
+                batch_size_per_feature_pre_a2a=[batch_size_per_rank[rank]] * world_size,
+                emb_dim_per_rank_per_feature=[[d] for d in dim_sum_per_rank],
+                group=pg,
+                codecs=codecs,
+            ).wait()
+
+        mx4 = _mx4_codecs()
+        # Rows for each destination rank are contiguous in the flat input.
+        splits = [b * dim_sum_per_rank[rank] for b in batch_size_per_rank]
+        quantized_embs = _mx4_round_trip(mx4.forward, pooled_embs.reshape(-1), splits)
+
+        padded = fwd(mx4, pooled_embs)
+        torch.testing.assert_close(padded, fwd(None, quantized_embs), rtol=0, atol=0)
+        torch.testing.assert_close(padded, fwd(None, pooled_embs), rtol=0.1, atol=0.15)
+        if all(
+            b * d % _MX4_GROUP_SIZE == 0
+            for b in batch_size_per_rank
+            for d in dim_sum_per_rank
+        ):
+            os.environ["TORCHREC_ENABLE_MX4_PADDING"] = "0"
+            torch.testing.assert_close(padded, fwd(mx4, pooled_embs), rtol=0, atol=0)
+        dist.destroy_process_group()
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
+    )
+    def test_variable_batch_alltoall_pooled_mx4_fwd_padding(self) -> None:
+        for batch_size_per_rank, dim_sum_per_rank in _MX4_PADDING_CASES:
+            self._run_multi_process_test(
+                world_size=self.WORLD_SIZE,
+                backend="nccl",
+                # pyrefly: ignore[bad-argument-type]
+                callable=self._test_variable_batch_alltoall_pooled_mx4_fwd_padding,
+                batch_size_per_rank=batch_size_per_rank,
+                dim_sum_per_rank=dim_sum_per_rank,
             )
 
     @classmethod
