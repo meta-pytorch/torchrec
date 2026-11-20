@@ -36,6 +36,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten
+from torchrec.distributed.attributed_logging import attributed_logger
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding import EmbeddingCollectionContext
 from torchrec.distributed.embedding_sharding import (
@@ -93,6 +94,7 @@ from torchrec.distributed.train_pipeline.pipeline_context import (
     PrefetchEmbeddingTrainPipelineContext,
     PrefetchTrainPipelineContext,
     TrainPipelineContext,
+    TrainPipelineContextLite,
 )
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
 from torchrec.distributed.train_pipeline.runtime_forwards import (
@@ -172,11 +174,14 @@ def _batch_tensor_size(batch: Any) -> int:
     return sum(_batch_tensor_size(leaf) for leaf in leaves)
 
 
+@attributed_logger("copy_to_device", owner_kwarg="context")
 def _to_device(
     batch: In,
     device: torch.device,
     non_blocking: bool,
     data_copy_stream: Optional[torch.Stream] = None,
+    *,
+    context: TrainPipelineContextLite | TrainPipelineContext | None = None,
 ) -> In:
     assert isinstance(
         batch, (torch.Tensor, Pipelineable)
@@ -858,6 +863,7 @@ class DataLoadingThread(Thread, Generic[In]):
         self._to_device_non_blocking = to_device_non_blocking
         self._buffered: Optional[In] = None
         self._buffered_batch_metadata: object | None = None
+        self._next_batch_index: int = 0
         self._exception: Optional[Exception] = None
         self._buffer_empty_event.set()
         one_time_rank0_logger.info(
@@ -907,23 +913,28 @@ class DataLoadingThread(Thread, Generic[In]):
                     self._buffer_filled_event.set()
                     return
             with record_function("## copy_batch_to_gpu ##"):
+                context = TrainPipelineContextLite(
+                    index=self._next_batch_index,
+                    version=1,
+                    batch_metadata=batch_metadata,
+                )
                 try:
                     with torch.get_device_module(self._device).stream(
                         self._memcpy_stream
                     ):
-                        self._buffered = cast(
-                            In,
-                            batch.to(
-                                self._device,
-                                non_blocking=self._to_device_non_blocking,
-                            ),
+                        self._buffered = _to_device(
+                            batch,
+                            self._device,
+                            self._to_device_non_blocking,
+                            context=context,
                         )
-                        self._buffered_batch_metadata = batch_metadata
+                    self._buffered_batch_metadata = batch_metadata
                 except Exception as e:
                     self._exception = e
                     self._stop = True
                     self._buffer_filled_event.set()
                     return
+                self._next_batch_index += 1
                 self._buffer_empty_event.clear()
                 self._buffer_filled_event.set()
 
@@ -1243,6 +1254,8 @@ class AsyncInplaceCopyMixin(Generic[In]):
         batch: In,
         device: torch.device,
         memcpy_stream: Optional[torch.Stream],
+        *,
+        context: TrainPipelineContextLite | TrainPipelineContext | None = None,
     ) -> "Future[In]":
         # Capture the consumer's current stream on the MAIN thread; the worker
         # re-enters it so the destination is allocated on the consumer stream.
@@ -1252,7 +1265,11 @@ class AsyncInplaceCopyMixin(Generic[In]):
             device_module = torch.get_device_module(device)
             with device_module.stream(alloc_stream):
                 return _to_device(
-                    batch, device, non_blocking=True, data_copy_stream=memcpy_stream
+                    batch,
+                    device,
+                    non_blocking=True,
+                    data_copy_stream=memcpy_stream,
+                    context=context,
                 )
 
         assert self._inplace_copy_executor is not None
