@@ -308,7 +308,7 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
 
             # Optimizer step (weight update)
             with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         # Remove processed batch from the pipeline
         self.dequeue_batch()
@@ -915,7 +915,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
 
         def work(pipeline: Any) -> None:
             with record_function(f"## optimizer {pipeline.contexts[0].index} ##"):
-                pipeline._optimizer.step()
+                pipeline._optimizer_step()
 
         self.register_backward_hook(self._output_dist_site, work)
 
@@ -1152,7 +1152,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
                     self._restore_future.result()
                     self._restore_future = None
                 self._await_restore()
-                self._optimizer.step()
+                self._optimizer_step()
 
             with record_function("## stash_optimizer_state ##"):
                 self._stash_future = (
@@ -1453,7 +1453,7 @@ class TrainPipelinePrefetchEMS(TrainPipelineSparseDistEmbStash[In, Out]):
             )
 
             with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         self.dequeue_batch()
         return output
@@ -2360,7 +2360,7 @@ class PrefetchTrainPipelineFusedSparseDist(PrefetchTrainPipelineSparseDist[In, O
             self._backward(losses)
 
             with record_function("## optimizer ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         # Start sparse data dist for batch i+2 at the end, so it overlaps
         # with the next iteration's early phases.
