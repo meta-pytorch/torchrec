@@ -576,7 +576,7 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
 
             # #13 optimizer N (dense), overlaps the OL grad AllToAll.
             with record_function("## optimizer ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
             # #14 apply OL grad N, then defer N's NOL grad to N+1 (or, on the
             #     final batch, attach to N itself and drain now).
