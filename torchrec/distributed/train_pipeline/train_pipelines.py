@@ -128,6 +128,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _start_data_dist,
     _start_embedding_lookup,
     _to_device,
+    _wait_data_dist,
     _wait_for_batch,
     _wait_for_events,
     AsyncInplaceCopyMixin,
@@ -1345,7 +1346,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
 
                 # Temporarily set context for next iter to populate cache
                 with use_context_for_postprocs(self._pipelined_postprocs, context):
-                    _start_data_dist(self._pipelined_modules, batch, context)
+                    _start_data_dist(
+                        self._pipelined_modules,
+                        batch,
+                        context=context,
+                    )
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -1358,9 +1363,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         with record_function(f"## wait_sparse_data_dist {context.index} ##"):
             # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._data_dist_stream):
-                for names, awaitable in context.fused_splits_awaitables:
-                    for name, request in zip(names, awaitable.wait()):
-                        context.input_dist_tensors_requests[name] = request
+                _wait_data_dist(context=context)
         context.input_dist_splits_requests.clear()
         context.fused_splits_awaitables.clear()
 
@@ -1416,9 +1419,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                     self._context.module_contexts_next_batch.copy()
                 )
                 self._context.input_dist_tensors_requests.clear()
-                for names, awaitable in self._context.fused_splits_awaitables:
-                    for name, request in zip(names, awaitable.wait()):
-                        self._context.input_dist_tensors_requests[name] = request
+                _wait_data_dist(context=self._context)
 
     def _fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
         """
@@ -2353,7 +2354,11 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
                 with self._stream_context(self._data_dist_stream):
                     _wait_for_events(batch, context, self._data_dist_stream)
                     model_input = self.extract_model_input_from_batch(batch)
-                    _start_data_dist(self._pipelined_modules, model_input, context)
+                    _start_data_dist(
+                        self._pipelined_modules,
+                        model_input,
+                        context=context,
+                    )
                     event = torch.get_device_module(self._device).Event()
                     event.record()
                     context.events.append(event)
