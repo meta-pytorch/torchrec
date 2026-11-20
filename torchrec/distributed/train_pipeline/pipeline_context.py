@@ -25,11 +25,17 @@ Out = TypeVar("Out")
 
 @dataclass(slots=True, kw_only=True)
 class TrainPipelineContextLite:
-    """Lightweight per-batch context for base and PT2 pipelines."""
+    """Lightweight per-batch context for base and PT2 pipelines.
+
+    Attributes:
+        batch_metadata: Opaque attribution metadata paired with this batch, or
+            ``None`` when the batch is unattributed.
+    """
 
     index: int | None = None
     # Version 0 is deprecated but supported for backward compatibility.
     version: int = 0
+    batch_metadata: object | None = None
 
 
 @dataclass
@@ -54,6 +60,8 @@ class TrainPipelineContext:
         event: Optional[torch.cuda.Event]: Event to record the completion of this stage
         index: Optional[int]: Index of the current batch.
         version: Context schema version. Version 0 remains supported for compatibility.
+        batch_metadata: Opaque attribution metadata paired with this batch, or
+            ``None`` when the batch is unattributed.
         delayed_backward_tensors: Output-dist tensors whose upstream backward is
             delayed until a later pipeline stage.
         delay_backward: Whether output-dist backward is delayed for this batch.
@@ -78,6 +86,7 @@ class TrainPipelineContext:
     version: int = (
         0  # 1 is current version, 0 is deprecated but supported for backward compatibility
     )
+    batch_metadata: object | None = field(default=None, kw_only=True)
     delayed_backward_tensors: List[DelayedBackwardTensor] = field(default_factory=list)
     delay_backward: bool = True
 
