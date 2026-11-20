@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 from torchrec.distributed.test_utils.test_model_parallel import _ModelParallelBase
 from torchrec.distributed.test_utils.test_model_parallel_base import (
