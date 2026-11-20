@@ -57,6 +57,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _rewrite_model,
     _start_data_dist,
     _start_embedding_lookup,
+    _wait_data_dist,
     use_context_for_postprocs,
 )
 from torchrec.distributed.types import Awaitable
@@ -126,16 +127,18 @@ class SparseDataDistUtil(Generic[In]):
         pipeline = [
             PipelineStage(
                 name="data_copy",
-                runnable=lambda batch, context: batch.to(
+                runnable=lambda batch, *, context: batch.to(
                     self._device, non_blocking=True
                 ),
                 stream=torch.cuda.Stream(),
+                pass_batch_context=True,
             ),
             PipelineStage(
                 name="start_sparse_data_dist",
                 runnable=sdd.start_sparse_data_dist,
                 stream=sdd.data_dist_stream,
                 fill_callback=sdd.wait_sdd_fill_callback,
+                pass_batch_context=True,
             ),
             PipelineStage(
                 name="prefetch",
@@ -154,16 +157,18 @@ class SparseDataDistUtil(Generic[In]):
         pipeline = [
             PipelineStage(
                 name="data_copy",
-                runnable=lambda batch, context: batch.to(
+                runnable=lambda batch, *, context: batch.to(
                     self._device, non_blocking=True
                 ),
                 stream=torch.cuda.Stream(),
+                pass_batch_context=True,
             ),
             PipelineStage(
                 name="start_sparse_data_dist",
                 runnable=sdd.start_sparse_data_dist,
                 stream=sdd.data_dist_stream,
                 fill_callback=sdd.wait_sdd_fill_callback,
+                pass_batch_context=True,
             ),
             PipelineStage(
                 name="start_embedding_lookup",
@@ -420,6 +425,17 @@ class SparseDataDistUtil(Generic[In]):
 
         return ctx
 
+    def _set_start_dist_batch_attribution(
+        self,
+        batch_context: TrainPipelineContext | None,
+    ) -> None:
+        start_dist_context = self._start_dist_context()
+        start_dist_context.batch_metadata = (
+            batch_context.batch_metadata if batch_context is not None else None
+        )
+        if batch_context is not None:
+            start_dist_context.index = batch_context.index
+
     def _wait_dist_context(self) -> TrainPipelineContext:
         # Note: see comment on the forward_hook in _initialize method
         ctx = self._start_dist_context()
@@ -484,7 +500,12 @@ class SparseDataDistUtil(Generic[In]):
         self.initialized = False
         return self.model
 
-    def _initialize_or_reattach(self, batch: In) -> None:
+    def _initialize_or_reattach(
+        self,
+        batch: In,
+        *,
+        batch_context: TrainPipelineContext | None,
+    ) -> None:
         # Step 0: Handle differences between initialization and reattaching
         if self._is_reattaching():
             # if reattaching, contexts are already there, so we want to use
@@ -499,6 +520,7 @@ class SparseDataDistUtil(Generic[In]):
             context_for_rewrite = self._contexts[-1]
 
         self._assert_contexts_count()
+        self._set_start_dist_batch_attribution(batch_context)
 
         # Step 1: Pipeline input dist in trec sharded modules
         (
@@ -519,7 +541,11 @@ class SparseDataDistUtil(Generic[In]):
         )
         # Setting the stage for the first batch
         # initialize input dist
-        _start_data_dist(self._pipelined_modules, batch, self._start_dist_context())
+        _start_data_dist(
+            self._pipelined_modules,
+            batch,
+            context=self._start_dist_context(),
+        )
         # so we can override input dist forwards
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
             self._pipelined_modules
@@ -567,14 +593,25 @@ class SparseDataDistUtil(Generic[In]):
         """
         self._exhausting_mode = True
 
-    def start_sparse_data_dist(self, batch: In) -> In:
+    def start_sparse_data_dist(
+        self,
+        batch: In,
+        *,
+        context: TrainPipelineContext | None = None,
+    ) -> In:
         if not self.initialized:
-            self._initialize_or_reattach(batch)
+            self._initialize_or_reattach(batch, batch_context=context)
+        else:
+            self._set_start_dist_batch_attribution(context)
 
         ctx = self._start_dist_context()
         with record_function(f"## start_sparse_data_dist {ctx.index} ##"):
             with use_context_for_postprocs(self._pipelined_postprocs, ctx):
-                _start_data_dist(self._pipelined_modules, batch, ctx)
+                _start_data_dist(
+                    self._pipelined_modules,
+                    batch,
+                    context=ctx,
+                )
 
         return batch
 
@@ -586,9 +623,7 @@ class SparseDataDistUtil(Generic[In]):
         ctx = self._wait_dist_context()
         with record_function(f"## wait_sparse_data_dist {ctx.index} ##"):
             with self._stream_context(self.data_dist_stream):
-                for names, awaitable in ctx.fused_splits_awaitables:
-                    for name, request in zip(names, awaitable.wait()):
-                        ctx.input_dist_tensors_requests[name] = request
+                _wait_data_dist(context=ctx)
         # these won't be used by the rest of the pipeline, so just deleting them to free
         # the memory they occupy
         ctx.input_dist_splits_requests.clear()
