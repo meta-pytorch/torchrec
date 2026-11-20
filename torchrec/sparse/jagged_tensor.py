@@ -54,6 +54,20 @@ _JT_LEGACY_FIELDS: List[str] = ["_values", "_weights", "_lengths", "_offsets"]
 _JT_REVERSE_INDICES_FIELD: str = "_reverse_indices"
 _JT_PACKED_FIELDS: List[str] = [*_JT_LEGACY_FIELDS, _JT_REVERSE_INDICES_FIELD]
 
+# TORCHREC_KJT_SPLIT_WHOLE_FAST_PATH=1: KeyedJaggedTensor.split returns [self] for a
+# single segment covering every key, without computing length_per_key() (a device
+# sync when it is not cached). Default off.
+_KJT_SPLIT_WHOLE_FAST_PATH: bool = (
+    os.environ.get("TORCHREC_KJT_SPLIT_WHOLE_FAST_PATH", "0") == "1"
+)
+
+
+@torch.jit.unused
+def _kjt_split_whole_fast_path() -> bool:
+    # TorchScript cannot read a module global (see torchrec/pt2/checks.py), so
+    # split() reads the flag through this, after `not torch.jit.is_scripting()`.
+    return _KJT_SPLIT_WHOLE_FAST_PATH
+
 
 def _pin_and_move(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     """
@@ -2906,6 +2920,15 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         Returns:
             List[KeyedJaggedTensor]: list of KeyedJaggedTensor.
         """
+        if (
+            len(segments) == 1
+            and segments[0] == len(self._keys)
+            and not torch.jit.is_scripting()
+            and _kjt_split_whole_fast_path()
+        ):
+            # Nothing to slice. Skip length_per_key(), which syncs with the device
+            # when it is not cached.
+            return [self]
         split_list: List[KeyedJaggedTensor] = []
         start = 0
         start_offset = 0
