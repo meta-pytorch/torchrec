@@ -109,7 +109,11 @@ from torchrec.distributed.train_pipeline.train_pipelines import (
     TrainPipelineSparseDistLite,
 )
 from torchrec.distributed.train_pipeline.types import PipelineState
-from torchrec.distributed.train_pipeline.utils import DataLoadingThread, get_h2d_func
+from torchrec.distributed.train_pipeline.utils import (
+    _wait_for_batch,
+    DataLoadingThread,
+    get_h2d_func,
+)
 from torchrec.distributed.types import (
     ModuleSharder,
     ShardingEnv,
@@ -161,6 +165,47 @@ class _FailingBatch(Pipelineable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         pass
+
+
+class _FailingRecordStreamBatch(Pipelineable):
+    def __init__(self, error: RuntimeError) -> None:
+        self.error = error
+
+    def to(
+        self,
+        device: torch.device,
+        non_blocking: bool,
+        data_copy_stream: Optional[torch.Stream] = None,
+    ) -> "_FailingRecordStreamBatch":
+        return self
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        raise self.error
+
+
+class _FakeStream:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.waited_on: List["_FakeStream"] = []
+
+    def wait_stream(self, stream: "_FakeStream") -> None:
+        self.waited_on.append(stream)
+
+
+class _FakeDeviceModule:
+    def __init__(self, current_stream: _FakeStream) -> None:
+        self._current_stream = current_stream
+
+    def current_stream(self) -> _FakeStream:
+        return self._current_stream
+
+
+class _FakeEvent:
+    def __init__(self) -> None:
+        self.waited_on: List[_FakeStream] = []
+
+    def wait(self, stream: _FakeStream) -> None:
+        self.waited_on.append(stream)
 
 
 def _assert_exception_attribution(
@@ -401,6 +446,46 @@ class TrainPipelineBaseTest(unittest.TestCase):
                     self,
                     error,
                     "copy_to_device",
+                    metadata,
+                    batch_index,
+                )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_record_stream_failure_uses_batch_context(self) -> None:
+        metadata = object()
+        valid_batch = ModelInputSimple(
+            float_features=torch.zeros(10, device=self.device),
+            label=torch.zeros(1, device=self.device),
+        )
+
+        for wait_path, preceding_batches, progress_calls, batch_index in (
+            ("connected", [], 1, 0),
+            ("prefetched", [valid_batch], 2, 1),
+        ):
+            with self.subTest(wait_path=wait_path):
+                model = TestModule().to(self.device)
+                model.eval()
+                optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+                pipeline = TrainPipelineBase(model, optimizer, self.device)
+                error = RuntimeError("record_stream failed")
+                failing_batch = cast(
+                    ModelInputSimple,
+                    AttributedBatch(_FailingRecordStreamBatch(error), metadata),
+                )
+                dataloader = iter([*preceding_batches, failing_batch])
+
+                with self.assertRaises(RuntimeError) as raised:
+                    for _ in range(progress_calls):
+                        pipeline.progress(dataloader)
+
+                self.assertIs(error, raised.exception)
+                _assert_exception_attribution(
+                    self,
+                    error,
+                    "wait_for_batch",
                     metadata,
                     batch_index,
                 )
@@ -1120,6 +1205,83 @@ class TrainPipelineSparseDistBatchContextTest(unittest.TestCase):
                 _assert_exception_attribution(
                     self, error, "copy_to_device", metadata, 0
                 )
+
+    def test_record_stream_failure_uses_batch_context(self) -> None:
+        error = RuntimeError("record_stream failed")
+        metadata = object()
+        context = TrainPipelineContextLite(
+            index=7,
+            version=1,
+            batch_metadata=metadata,
+        )
+        source_stream = _FakeStream(torch.device("cuda"))
+        current_stream = _FakeStream(torch.device("cuda"))
+
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch.get_device_module",
+            return_value=_FakeDeviceModule(current_stream),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                _wait_for_batch(
+                    _FailingRecordStreamBatch(error),
+                    cast(torch.Stream, source_stream),
+                    context=context,
+                )
+
+        self.assertIs(error, raised.exception)
+        self.assertEqual(current_stream.waited_on, [source_stream])
+        _assert_exception_attribution(self, error, "wait_for_batch", metadata, 7)
+
+    def test_record_stream_failure_without_context_is_unchanged(self) -> None:
+        error = RuntimeError("record_stream failed")
+        source_stream = _FakeStream(torch.device("cuda"))
+        current_stream = _FakeStream(torch.device("cuda"))
+
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch.get_device_module",
+            return_value=_FakeDeviceModule(current_stream),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                _wait_for_batch(
+                    _FailingRecordStreamBatch(error),
+                    cast(torch.Stream, source_stream),
+                )
+
+        self.assertIs(error, raised.exception)
+        self.assertEqual(current_stream.waited_on, [source_stream])
+        self.assertIsNone(get_exception_attribution(error))
+
+    def test_sparse_dist_wait_failure_uses_queued_batch_context(self) -> None:
+        model = TestModule()
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelineSparseDist(
+            model,
+            optimizer,
+            device=torch.device("cpu"),
+        )
+        error = RuntimeError("record_stream failed")
+        metadata = object()
+        context = TrainPipelineContext(
+            index=11,
+            version=1,
+            batch_metadata=metadata,
+        )
+        source_stream = _FakeStream(torch.device("cuda"))
+        current_stream = _FakeStream(torch.device("cuda"))
+        pipeline.batches.append(_FailingRecordStreamBatch(error))
+        pipeline.contexts.append(context)
+        pipeline._data_dist_stream = cast(torch.Stream, source_stream)
+
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch.get_device_module",
+            return_value=_FakeDeviceModule(current_stream),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                pipeline._wait_for_batch()
+
+        self.assertIs(error, raised.exception)
+        self.assertEqual(current_stream.waited_on, [source_stream])
+        _assert_exception_attribution(self, error, "wait_for_batch", metadata, 11)
 
 
 class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
@@ -3383,6 +3545,36 @@ class PrefetchTrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    def test_wait_failure_uses_current_batch_context(self) -> None:
+        pipeline, dataloader, _, _ = self._setup_pipeline(num_batches=4)
+        pipeline.fill_pipeline(dataloader)
+        context = pipeline.contexts[0]
+        metadata = object()
+        context.batch_metadata = metadata
+        batch = pipeline.batches[0]
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        error = RuntimeError("record_stream failed")
+
+        with (
+            patch.object(type(batch), "record_stream", side_effect=error),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            pipeline.progress(dataloader)
+
+        self.assertIs(error, raised.exception)
+        _assert_exception_attribution(
+            self,
+            error,
+            "wait_for_batch",
+            metadata,
+            cast(int, context.index),
+        )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     def test_pipeline_drain(self) -> None:
         """
         A dataloader with N batches yields exactly N outputs, then StopIteration. The
@@ -3967,6 +4159,35 @@ class TrainPipelineResetTest(unittest.TestCase):
 
 
 class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
+    def test_flush_with_none_output_skips_record_stream(self) -> None:
+        stage_stream = _FakeStream(torch.device("cpu"))
+        compute_stream = _FakeStream(torch.device("cpu"))
+        event = _FakeEvent()
+        pipeline = StagedTrainPipeline(
+            pipeline_stages=[
+                PipelineStage(
+                    name="identity",
+                    runnable=lambda value: value,
+                    stream=cast(torch.Stream, stage_stream),
+                )
+            ],
+            compute_stream=cast(torch.Stream, compute_stream),
+        )
+        pipeline._initialized = True
+        pipeline._flushing = True
+        pipeline._stage_outputs[0] = (None, cast(torch.Event, event))
+
+        with (
+            patch.object(pipeline, "_run_stage"),
+            patch.object(pipeline, "_record_stream") as record_stream,
+        ):
+            output = pipeline.progress(iter(()))
+
+        self.assertIsNone(output)
+        self.assertEqual(event.waited_on, [compute_stream])
+        record_stream.assert_not_called()
+        self.assertFalse(pipeline._flushing)
+
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -3999,7 +4220,9 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
             compute_stream=torch.cuda.current_stream(),
         )
         batch = torch.tensor([1], device=self.device)
-        pipeline._stage_outputs[0] = (batch, None)
+        event = torch.cuda.Event()
+        event.record()
+        pipeline._stage_outputs[0] = (batch, event)
 
         pipeline._run_stage(
             batch_offset=0,
@@ -4073,6 +4296,48 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
 
         pipeline.reset()
         self.assertIsNone(pipeline._last_output_context)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_record_stream_failure_uses_batch_context(self) -> None:
+        metadata = object()
+        error = RuntimeError("record_stream failed")
+        pipeline = StagedTrainPipeline(
+            pipeline_stages=[
+                PipelineStage(
+                    name="identity_0",
+                    runnable=lambda value: value,
+                    stream=torch.cuda.Stream(),
+                ),
+                PipelineStage(
+                    name="identity_1",
+                    runnable=lambda value: value,
+                    stream=torch.cuda.Stream(),
+                ),
+            ],
+            compute_stream=torch.cuda.current_stream(),
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            pipeline.progress(
+                iter(
+                    [
+                        torch.tensor([0], device=self.device),
+                        cast(
+                            torch.Tensor,
+                            AttributedBatch(
+                                _FailingRecordStreamBatch(error),
+                                metadata,
+                            ),
+                        ),
+                    ]
+                )
+            )
+
+        self.assertIs(error, raised.exception)
+        _assert_exception_attribution(self, error, "record_stream", metadata, 1)
 
     @unittest.skipIf(
         not torch.cuda.is_available(),
