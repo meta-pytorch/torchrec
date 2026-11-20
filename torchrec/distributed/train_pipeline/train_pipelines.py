@@ -99,6 +99,7 @@ from torchrec.distributed.train_pipeline.pipeline_context import (
     Out,
     PrefetchTrainPipelineContext,
     TrainPipelineContext,
+    TrainPipelineContextLite,
 )
 from torchrec.distributed.train_pipeline.pipeline_stage import (
     PipelineStage,
@@ -309,6 +310,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             else torch.cuda.stream
         )
         self._cur_batch: Optional[In] = None
+        self._cur_context: TrainPipelineContextLite | None = None
         self._dataloader_iter: Optional[Iterator[In]] = None
         self._connected = False
         self._data_iter_stopped = False
@@ -318,6 +320,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._connected = False
         self._data_iter_stopped = False
         self._cur_batch = None
+        self._cur_context = None
 
     def _reset_data_iter_if_needed(self, dataloader_iter: Iterator[In]) -> None:
         if dataloader_iter is not self._dataloader_iter:
@@ -333,6 +336,11 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         """
         cur_batch = self._next_batch(dataloader_iter)
         self._cur_batch = cur_batch
+        self._cur_context = (
+            TrainPipelineContextLite(index=self._batch_count, version=1)
+            if not self._data_iter_stopped
+            else None
+        )
         if cur_batch is not None:
             self._copy_batch_to_gpu(cur_batch)
         self._connected = True
@@ -402,6 +410,11 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
 
         # Fetch next batch from dataloader (host), aise at start of next progress if depleted
         next_batch = self._next_batch(dataloader_iter)
+        next_context = (
+            TrainPipelineContextLite(index=self._batch_count, version=1)
+            if not self._data_iter_stopped
+            else None
+        )
 
         # for exhaustive data iter, some ranks will first depletes data,
         # but we still need progress the train pipeline for other ranks;
@@ -421,6 +434,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
 
             # clear the current batch after forward pass (so current batch can be freed)
             self._cur_batch = cur_batch = next_batch
+            self._cur_context = next_context
 
         if self._model.training:
             self._backward(losses)
@@ -479,6 +493,7 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         )
         self._iter = 0
         self._cur_batch: Optional[In] = None
+        self._cur_context: TrainPipelineContextLite | None = None
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -493,8 +508,11 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
 
         cc = self._compile_configs
 
+        self._cur_batch, self._cur_context = None, None
         with record_function("## load_batch ##"):
             cur_batch = next(dataloader_iter)
+        context = TrainPipelineContextLite(index=self._iter, version=1)
+        self._cur_batch, self._cur_context = cur_batch, context
 
         with record_function("## copy_batch_to_gpu ##"):
             self._cur_batch = _to_device(cur_batch, self._device, non_blocking=False)
