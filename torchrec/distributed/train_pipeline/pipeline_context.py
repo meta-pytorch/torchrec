@@ -23,10 +23,19 @@ In = TypeVar("In", bound=Pipelineable)
 Out = TypeVar("Out")
 
 
+@dataclass(slots=True, kw_only=True)
+class TrainPipelineContextLite:
+    """Lightweight per-batch context for base and PT2 pipelines."""
+
+    index: int | None = None
+    # Version 0 is deprecated but supported for backward compatibility.
+    version: int = 0
+
+
 @dataclass
 class TrainPipelineContext:
     """
-    Context information for a `TrainPipelineSparseDist` instance.
+    Per-batch context for pipelines that carry sparse-distribution state.
 
     Attributes:
         input_dist_splits_requests (Dict[str, Awaitable[Any]]): Stores input dist
@@ -44,7 +53,7 @@ class TrainPipelineContext:
             of each awaitable.
         event: Optional[torch.cuda.Event]: Event to record the completion of this stage
         index: Optional[int]: Index of the current batch.
-        version: int = 0; support for backward compatiblity
+        version: Context schema version. Version 0 remains supported for compatibility.
         delayed_backward_tensors: Output-dist tensors whose upstream backward is
             delayed until a later pipeline stage.
         delay_backward: Whether output-dist backward is delayed for this batch.
