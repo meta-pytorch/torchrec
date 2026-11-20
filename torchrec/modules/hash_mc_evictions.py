@@ -30,12 +30,15 @@ class HashZchEvictionPolicyName(Enum):
     LRU_EVICTION = "LRU_EVICTION"
 
 
-@torch.jit.script
 @dataclass
 class HashZchEvictionConfig:
     features: List[str]
     single_ttl: Optional[int] = None
     per_feature_ttl: Optional[List[int]] = None
+
+
+if hasattr(torch.jit, "script"):
+    torch.jit.script(HashZchEvictionConfig)
 
 
 @torch.fx.wrap

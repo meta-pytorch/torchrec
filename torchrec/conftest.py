@@ -8,7 +8,7 @@
 """pytest configuration for the OSS test run (``python -m pytest torchrec``); the
 Buck test targets do not load it.
 
-PyTorch builds for Python 3.14+ ship without TorchScript, so ``torch.jit.script`` and
+Some PyTorch builds ship without TorchScript, so ``torch.jit.script`` and
 ``torch.jit.trace`` do not exist there. Tests that script or trace a module cannot run
 on those builds: report them as skipped, not failed. Only that AttributeError is
 converted, and only when TorchScript is missing; every other failure still fails.
