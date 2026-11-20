@@ -73,8 +73,12 @@ from torchrec.distributed.train_pipeline.batch_attribution import (
 )
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
     EvalPipelineCPUSparse,
+    EvalPipelinePrefetchSparseDist,
     PrefetchTrainPipelineFusedSparseDist,
     TrainEvalHybridPipelineBase,
+    TrainPipelinePrefetchEMS,
+    TrainPipelineSparseDistBwdOpt,
+    TrainPipelineSparseDistOptStash,
     TrainPipelineSparseDistT,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
@@ -97,11 +101,13 @@ from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import 
     TrainPipelineSparseDistTestBase,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import (
+    EvalPipelineFusedSparseDist,
     EvalPipelineSparseDist,
     PrefetchTrainPipelineSparseDist,
     StagedTrainPipeline,
     TorchCompileConfig,
     TrainPipelineBase,
+    TrainPipelineFusedSparseDist,
     TrainPipelinePT2,
     TrainPipelineSemiSync,
     TrainPipelineSparseDist,
@@ -249,6 +255,61 @@ class Tracer(torch.fx.Tracer):
         if module_qualified_name in self._leaf_module_names:
             return True
         return super().is_leaf_module(m, module_qualified_name)
+
+
+class TrainPipelineCapabilityTest(unittest.TestCase):
+    def test_progress_override_requires_explicit_support(self) -> None:
+        def overridden_progress(
+            _pipeline: object,
+            _dataloader_iter: Iterator[Any],
+        ) -> Any:
+            raise NotImplementedError
+
+        for pipeline_type in (
+            TrainPipelineBase,
+            TrainPipelinePT2,
+            TrainPipelineSparseDist,
+            TrainPipelineSparseDistLite,
+            TrainPipelineFusedSparseDist,
+            PrefetchTrainPipelineSparseDist,
+            EvalPipelineSparseDist,
+            EvalPipelineFusedSparseDist,
+            TrainPipelineSparseDistCompAutograd,
+            StagedTrainPipeline,
+            TrainEvalHybridPipelineBase,
+            EvalPipelineCPUSparse,
+            TrainPipelineSparseDistBwdOpt,
+            TrainPipelineSparseDistOptStash,
+            TrainPipelinePrefetchEMS,
+            EvalPipelinePrefetchSparseDist,
+            PrefetchTrainPipelineFusedSparseDist,
+        ):
+            with self.subTest(pipeline_type=pipeline_type.__name__):
+                inherited_type = type(
+                    f"Inherited{pipeline_type.__name__}",
+                    (pipeline_type,),
+                    {},
+                )
+                overridden_type = type(
+                    f"Overridden{pipeline_type.__name__}",
+                    (pipeline_type,),
+                    {"progress": overridden_progress},
+                )
+
+                inherited_pipeline = object.__new__(inherited_type)
+                overridden_pipeline = object.__new__(overridden_type)
+
+                self.assertTrue(inherited_pipeline.supports_batch_attribution)
+                self.assertFalse(overridden_pipeline.supports_batch_attribution)
+
+    def test_semi_sync_is_not_supported(self) -> None:
+        for stash_gradients in (False, True):
+            with self.subTest(stash_gradients=stash_gradients):
+                pipeline = object.__new__(TrainPipelineSemiSync)
+                pipeline._stash_gradients = stash_gradients
+
+                self.assertFalse(pipeline.supports_batch_attribution)
+                self.assertIsNone(pipeline.get_optimizer_context())
 
 
 class TrainPipelineBaseTest(unittest.TestCase):

@@ -172,7 +172,7 @@ class _GAOptimizerWrapper:
 
     def _record_optimizer_contributor(self) -> None:
         ga = self._ga_wrapper
-        if ga is None:
+        if ga is None or not ga._pipeline.supports_batch_attribution:
             return
         try:
             context = ga._pipeline.get_optimizer_context()

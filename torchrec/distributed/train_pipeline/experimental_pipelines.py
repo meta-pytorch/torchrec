@@ -132,6 +132,10 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
     _draining_eval: bool = False
     _next_batch_on_cpu_metadata: Optional[object] = None
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainEvalHybridPipelineBase.progress
+
     def copy_batch_to_gpu(
         self,
         dataloader_iter: Iterator[In],
@@ -349,6 +353,10 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
 
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = CPUEmbeddingPipelinedForward
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is EvalPipelineCPUSparse.progress
 
     def __init__(
         self,
@@ -864,6 +872,10 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
     fires during backward when the output distribution tensor's gradient is computed.
     """
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineSparseDistBwdOpt.progress
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -1008,6 +1020,10 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
         forward -> backward [ restore_optimizer_state at output dist site ] ->
         optimizer.step() -> stash_optimizer_state
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineSparseDistOptStash.progress
 
     def __init__(
         self,
@@ -1332,6 +1348,10 @@ class TrainPipelinePrefetchEMS(TrainPipelineSparseDistEmbStash[In, Out]):
         d2h stream:            stash (flush+free) ──┘
     """
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelinePrefetchEMS.progress
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -1629,6 +1649,10 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
     # The PipelinedForward class that is used in _rewrite_model
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = PrefetchPipelinedForward
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is EvalPipelinePrefetchSparseDist.progress
 
     def __init__(
         self,
@@ -2231,6 +2255,10 @@ class PrefetchTrainPipelineFusedSparseDist(PrefetchTrainPipelineSparseDist[In, O
     # The PipelinedForward class that is used in _rewrite_model
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = InSyncPrefetchEmbeddingPipelinedForward
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is PrefetchTrainPipelineFusedSparseDist.progress
 
     def __init__(
         self,
