@@ -9,12 +9,14 @@
 
 
 import unittest
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+from unittest import mock
 
 import torch
 import torch.utils._pytree as pytree
 from torch.testing import FileCheck
 from torchrec.fx import symbolic_trace
+from torchrec.sparse import jagged_tensor
 from torchrec.sparse.jagged_tensor import (
     ComputeKJTToJTDict,
     JaggedTensor,
@@ -1609,6 +1611,45 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertEqual(kjt._values.untyped_storage().nbytes(), 0)
         self.assertEqual(kjt._lengths.untyped_storage().nbytes(), 0)
         self.assertEqual(kjt._weights.untyped_storage().nbytes(), 0)
+
+    def _dist_init_variable_stride(
+        self, recat: List[int], device: str
+    ) -> Tuple[KeyedJaggedTensor, List[Optional[int]]]:
+        # Received segments are rank-major: (r0, f0), (r0, f1), (r1, f0), (r1, f1).
+        tensors = [
+            torch.tensor([1, 2, 2, 3, 1, 2, 2, 1]),
+            torch.arange(14),
+            torch.tensor([2, 1, 3, 2]),
+            torch.arange(14, dtype=torch.float),
+        ]
+        with mock.patch.object(
+            jagged_tensor,
+            "_permute_tensor_by_segments",
+            wraps=jagged_tensor._permute_tensor_by_segments,
+        ) as permute:
+            kjt = KeyedJaggedTensor.dist_init(
+                keys=["f0", "f1"],
+                tensors=[t.to(device) for t in tensors],
+                variable_stride_per_key=True,
+                num_workers=2,
+                recat=torch.tensor(recat, dtype=torch.int32, device=device),
+                stride_per_rank=None,
+            )
+        return kjt, [c.args[4] for c in permute.call_args_list]
+
+    def test_dist_init_variable_stride_recat_output_size(self) -> None:
+        expected_values = [0, 1, 2, 5, 6, 7, 8, 9, 10, 3, 4, 11, 12, 13]
+        for device in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
+            with self.subTest(device=device):
+                # `_get_recat(2, 2)` covers every segment.
+                kjt, sizes = self._dist_init_variable_stride([0, 2, 1, 3], device)
+                self.assertEqual(sizes, [8, 14])
+                self.assertEqual(kjt.lengths().tolist(), [1, 2, 3, 1, 2, 2, 2, 1])
+                self.assertEqual(kjt.values().tolist(), expected_values)
+                self.assertEqual(kjt.weights().tolist(), expected_values)
+
+                _, sizes = self._dist_init_variable_stride([0, 2], device)
+                self.assertEqual(sizes, [None, None])
 
 
 class TestKeyedJaggedTensorScripting(unittest.TestCase):
