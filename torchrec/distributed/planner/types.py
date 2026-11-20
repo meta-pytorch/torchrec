@@ -1356,6 +1356,10 @@ class ShardingOption:
             table config before planning; the planner reflects the HBM that stashing
             frees in its storage estimates.
         num_twrw_groups (Optional[int]): TWRW groups spanned by this table.
+        quantized_weight_dtype (Optional[DataType]): IntNBit dtype (INT8 or INT4) of a
+            training sharder's QUANT_UVM option, set by the enumerator from the
+            table's constraint. The storage estimate prices it and the plan carries it
+            to the kernel.
     """
 
     def __init__(
@@ -1381,6 +1385,7 @@ class ShardingOption:
         num_poolings: Optional[List[float]] = None,
         stash_weights: bool = False,
         num_twrw_groups: Optional[int] = None,
+        quantized_weight_dtype: Optional[DataType] = None,
     ) -> None:
         self.name = name
         self._tensor = tensor
@@ -1410,6 +1415,7 @@ class ShardingOption:
         self.num_poolings: Optional[List[float]] = num_poolings
         self.stash_weights: bool = stash_weights
         self.num_twrw_groups: Optional[int] = num_twrw_groups
+        self.quantized_weight_dtype: Optional[DataType] = quantized_weight_dtype
 
         child_module = module[1]
         self._module_type_key: str = (
@@ -1682,11 +1688,17 @@ class ParameterConstraints:
             SSD or PS.
         use_virtual_table (bool): is virtual table enabled for this table.
         quantized_weight_dtype (Optional[DataType]): dtype the embedding weights are
-            quantized to before they are moved onto the compute device. Only used
-            together with the sharder's ``weight_init_on_cpu`` fused param: the
-            full-precision weights are charged to DDR and the weights at this dtype
-            are charged to HBM. When unset, the full-precision weights stay charged
-            to HBM as well. Must be a float dtype no wider than the table's dtype.
+            quantized to. Two uses:
+            (1) With the sharder's ``weight_init_on_cpu`` fused param and the FUSED
+            kernel: the weights are quantized before they are moved onto the compute
+            device, so the full-precision weights are charged to DDR and the weights at
+            this dtype are charged to HBM. When unset, the full-precision weights stay
+            charged to HBM as well. Must be a float dtype no wider than the table's
+            dtype.
+            (2) With ``compute_kernels=["quant_uvm"]`` in a training (non-quant)
+            sharder: the table is served by the inference TBE with IntNBit rows in
+            host memory. Must be INT8 or INT4; the planner prices the IntNBit rows and
+            the sharding plan carries the dtype to the kernel.
         num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span. `None` and
             1 preserve the single-group placement.
     """
