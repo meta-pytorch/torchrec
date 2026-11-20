@@ -407,7 +407,7 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                 ):
                     logging.error(
                         f"Invalid setting on {type(emb_op.emb_module)} modules. prefetch_pipeline must be set to True.\n"
-                        "If you don't turn on prefetch_pipeline, cache locations might be wrong in backward and can cause wrong results.\n"
+                        "If you don’t turn on prefetch_pipeline, cache locations might be wrong in backward and can cause wrong results.\n"
                     )
                 if hasattr(emb_op.emb_module, "prefetch"):
                     #  attribute `prefetch`.
@@ -426,12 +426,8 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
         sparse_features: KeyedJaggedTensor,
     ) -> torch.Tensor:
         embeddings: List[torch.Tensor] = []
-        # An identity split otherwise materializes length_per_key on the CPU,
-        # synchronizing deduplicated features whose metadata is not cached.
-        features_by_group = (
-            [sparse_features]
-            if len(self._feature_splits) == 1
-            else sparse_features.split(self._feature_splits)
+        features_by_group = sparse_features.split(
+            self._feature_splits,
         )
         for emb_op, features in zip(self._emb_modules, features_by_group):
             lookup = emb_op(features).view(-1)
@@ -988,7 +984,6 @@ class GroupedPooledEmbeddingsLookup(
                 ],
             ]
         """
-        # Citrine C3: allocate directly on the target device, without a copy.
         # Pre-allocates 1D output tensor to avoid expensive merging.
         # Citrine C3: allocate directly on the target device to avoid a copy.
         vbe_output = torch.empty(
