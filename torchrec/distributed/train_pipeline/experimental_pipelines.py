@@ -28,6 +28,7 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
+from torchrec.distributed.attributed_logging import attributed_logger
 from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.logging_utils import OptimizationTechnique
 from torchrec.distributed.memory_stashing import (
@@ -74,6 +75,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _rewrite_model,
     _start_data_dist,
     _to_device,
+    _wait_data_dist,
     _wait_for_batch,
     FutureDeque,
     prefetch_embeddings,
@@ -128,6 +130,11 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
     """
 
     _draining_eval: bool = False
+    _next_batch_on_cpu_metadata: Optional[object] = None
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainEvalHybridPipelineBase.progress
 
     def copy_batch_to_gpu(
         self,
@@ -143,10 +150,17 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
         with record_function(f"## copy_batch_to_gpu {context.index} ##"):
             # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._memcpy_stream):
-                batch = self._next_batch(dataloader_iter)
+                batch, context.batch_metadata = self._next_batch_with_metadata(
+                    dataloader_iter
+                )
 
                 if batch is not None:
-                    batch = _to_device(batch, self._device, non_blocking=True)
+                    batch = _to_device(
+                        batch,
+                        self._device,
+                        non_blocking=True,
+                        context=context,
+                    )
                 elif not self._execute_all_batches:
                     raise StopIteration
                 return batch, context
@@ -154,6 +168,7 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
         if self._state == PipelineState.UNKNOWN:
             return super()._next_batch(dataloader_iter)
+        self._next_batch_metadata = self._next_batch_on_cpu_metadata
         return self._next_batch_on_cpu
 
     def _prepare_pipeline_step(self, dataloader_iter: Iterator[In]) -> None:
@@ -180,6 +195,8 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
             self._next_batch_on_cpu = TrainPipelineSparseDist._next_batch(
                 self, dataloader_iter
             )
+            self._next_batch_on_cpu_metadata = self._next_batch_metadata
+            self._next_batch_metadata = None
             if self._next_batch_on_cpu is None and not self._model.training:
                 # Eval data exhausted. Enter draining mode to process
                 # remaining eval batches already in the pipeline queue.
@@ -295,7 +312,7 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
 
             # Optimizer step (weight update)
             with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         # Remove processed batch from the pipeline
         self.dequeue_batch()
@@ -336,6 +353,10 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
 
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = CPUEmbeddingPipelinedForward
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is EvalPipelineCPUSparse.progress
 
     def __init__(
         self,
@@ -415,11 +436,13 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=self._pipeline_postproc,
         )
         # Bootstrap: run input_dist once to initialize KJT dist state
-        _start_data_dist(self._pipelined_modules, batch, context)
+        _start_data_dist(
+            self._pipelined_modules,
+            batch,
+            context=context,
+        )
         # Wait for splits → tensor awaitables
-        for names, awaitable in context.fused_splits_awaitables:
-            for name, request in zip(names, awaitable.wait()):
-                context.input_dist_tensors_requests[name] = request
+        _wait_data_dist(context=context)
         context.fused_splits_awaitables.clear()
         # Override KJT dist forwards with fused versions (requires initialized dists)
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
@@ -473,11 +496,13 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         with record_function(f"## sparse_forward {context.index} on CPU ##"):
             # input_dist
             with use_context_for_postprocs(self._pipelined_postprocs, context):
-                _start_data_dist(self._pipelined_modules, batch, context)
+                _start_data_dist(
+                    self._pipelined_modules,
+                    batch,
+                    context=context,
+                )
             # wait splits → tensor awaitables
-            for names, awaitable in context.fused_splits_awaitables:
-                for name, request in zip(names, awaitable.wait()):
-                    context.input_dist_tensors_requests[name] = request
+            _wait_data_dist(context=context)
             context.fused_splits_awaitables.clear()
             # compute + output_dist + pin
             self._embedding_lookup_and_pin(context)
@@ -576,6 +601,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
                     context.gpu_embedding_outputs[name] = gpu_embeddings
         return batch
 
+    @attributed_logger("copy_to_device", owner_kwarg="context")
     def copy_data_to_gpu(
         self, batch: In, context: CPUEmbeddingTrainPipelineContext
     ) -> In:
@@ -591,11 +617,12 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         Load a batch from the dataloader, create context, and append to
         pipeline deques. The batch stays on CPU at this point.
         """
-        batch = self._next_batch(dataloader_iter)
+        batch, batch_metadata = self._next_batch_with_metadata(dataloader_iter)
         if batch is None:
             return False
         context = self._create_context()
         assert isinstance(context, CPUEmbeddingTrainPipelineContext)
+        context.batch_metadata = batch_metadata
         context.dense_gpu_device = self._device.type
 
         self.batches.append(batch)
@@ -769,13 +796,20 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
     ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
         context = self._create_context()
         with record_function(f"## copy_batch_to_gpu {context.index} ##"):
-            batch = self._next_batch(dataloader_iter)
+            batch, context.batch_metadata = self._next_batch_with_metadata(
+                dataloader_iter
+            )
             if batch is not None:
 
                 def _copy_work() -> In:
                     # pyrefly: ignore [bad-argument-type]
                     with self._stream_context(self._memcpy_stream):
-                        return _to_device(batch, self._device, True)
+                        return _to_device(
+                            batch,
+                            self._device,
+                            True,
+                            context=context,
+                        )
 
                 future_batch = self._copy_executor.submit(_copy_work)
                 return cast(In, future_batch), context
@@ -796,7 +830,9 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
     ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
         context = self._create_context()
         with record_function(f"## inplace_copy_batch_to_gpu {context.index} ##"):
-            batch = self._next_batch(dataloader_iter)
+            batch, context.batch_metadata = self._next_batch_with_metadata(
+                dataloader_iter
+            )
             if batch is not None:
                 if not self._inplace_copy_batch_size_logged:
                     self._inplace_copy_batch_size_logged = True
@@ -809,6 +845,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
                     self._device,
                     True,
                     self._memcpy_stream,
+                    context=context,
                 )
                 # Return the CPU batch as placeholder; _resolve_copy_future
                 # will replace it in self.batches before consumption.
@@ -834,6 +871,10 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
     The explicit optimizer.step() in progress() is removed; instead, the optimizer
     fires during backward when the output distribution tensor's gradient is computed.
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineSparseDistBwdOpt.progress
 
     def __init__(
         self,
@@ -886,7 +927,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
 
         def work(pipeline: Any) -> None:
             with record_function(f"## optimizer {pipeline.contexts[0].index} ##"):
-                pipeline._optimizer.step()
+                pipeline._optimizer_step()
 
         self.register_backward_hook(self._output_dist_site, work)
 
@@ -979,6 +1020,10 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
         forward -> backward [ restore_optimizer_state at output dist site ] ->
         optimizer.step() -> stash_optimizer_state
     """
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelineSparseDistOptStash.progress
 
     def __init__(
         self,
@@ -1123,7 +1168,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
                     self._restore_future.result()
                     self._restore_future = None
                 self._await_restore()
-                self._optimizer.step()
+                self._optimizer_step()
 
             with record_function("## stash_optimizer_state ##"):
                 self._stash_future = (
@@ -1303,6 +1348,10 @@ class TrainPipelinePrefetchEMS(TrainPipelineSparseDistEmbStash[In, Out]):
         d2h stream:            stash (flush+free) ──┘
     """
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is TrainPipelinePrefetchEMS.progress
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -1424,7 +1473,7 @@ class TrainPipelinePrefetchEMS(TrainPipelineSparseDistEmbStash[In, Out]):
             )
 
             with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         self.dequeue_batch()
         return output
@@ -1600,6 +1649,10 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
     # The PipelinedForward class that is used in _rewrite_model
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = PrefetchPipelinedForward
+
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is EvalPipelinePrefetchSparseDist.progress
 
     def __init__(
         self,
@@ -2021,7 +2074,11 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
             # batch i's prefetch was issued on the prefetch stream; the forward
             # below reads its output on the current stream.
             with record_function(f"## wait_for_batch {self.contexts[0].index} ##"):
-                _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+                _wait_for_batch(
+                    cast(In, self.batches[0]),
+                    self._prefetch_stream,
+                    context=self.contexts[0],
+                )
 
             if not self._enqueue_batch_after_forward:
                 # batch i+3: load data and copy to gpu, the dataloader iter will
@@ -2199,6 +2256,10 @@ class PrefetchTrainPipelineFusedSparseDist(PrefetchTrainPipelineSparseDist[In, O
     # pyrefly: ignore [bad-override]
     _pipelined_forward_type = InSyncPrefetchEmbeddingPipelinedForward
 
+    @property
+    def supports_batch_attribution(self) -> bool:
+        return type(self).progress is PrefetchTrainPipelineFusedSparseDist.progress
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -2296,7 +2357,11 @@ class PrefetchTrainPipelineFusedSparseDist(PrefetchTrainPipelineSparseDist[In, O
                 self._optimizer.zero_grad()
 
         with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+            _wait_for_batch(
+                cast(In, self.batches[0]),
+                self._prefetch_stream,
+                context=context,
+            )
 
         # batch i+2: load data and copy to gpu
         self.enqueue_batch(dataloader_iter)
@@ -2323,7 +2388,7 @@ class PrefetchTrainPipelineFusedSparseDist(PrefetchTrainPipelineSparseDist[In, O
             self._backward(losses)
 
             with record_function("## optimizer ##"):
-                self._optimizer.step()
+                self._optimizer_step()
 
         # Start sparse data dist for batch i+2 at the end, so it overlaps
         # with the next iteration's early phases.

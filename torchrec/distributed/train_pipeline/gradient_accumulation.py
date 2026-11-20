@@ -33,6 +33,7 @@ from typing import (
 import torch
 from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.attributed_logging import attributed_logger
 from torchrec.distributed.train_pipeline.bucket_view_zeroing import BucketViewZeroing
 from torchrec.distributed.train_pipeline.fsdp_sync_suppression import (
     FsdpSyncSuppression,
@@ -54,7 +55,9 @@ class GAWindowObserver(Protocol):
 
 
 class _GAPipelineHooks(Protocol):
-    """Methods used by the wrapper but not declared by ``TrainPipeline``."""
+    """Optional operation hooks not declared by ``TrainPipeline``."""
+
+    _optimizer: "torch.optim.Optimizer | _GAOptimizerWrapper"
 
     def attach(
         self, model: Optional[torch.nn.Module] = None, *args: Any, **kwargs: Any
@@ -135,6 +138,12 @@ class GradientAccumulationConfig:
             self.is_enabled = True
 
 
+@dataclass(frozen=True)
+class _GAContributor:
+    batch_metadata: object | None
+    index: int | None
+
+
 class _GAOptimizerWrapper:
     """Control optimizer clearing and stepping across accumulation windows."""
 
@@ -159,6 +168,50 @@ class _GAOptimizerWrapper:
         self._micro_batches_counted: int = 0
         # A window that starts on a boundary must contain exactly _k micro-batches.
         self._window_started_aligned: bool = True
+        self._window_contributors: list[_GAContributor] = []
+
+    def _record_optimizer_contributor(self) -> None:
+        ga = self._ga_wrapper
+        if ga is None or not ga._pipeline.supports_batch_attribution:
+            return
+        try:
+            context = ga._pipeline.get_optimizer_context()
+        except Exception:
+            logger.warning(
+                "Unable to resolve gradient-accumulation optimizer attribution context",
+                exc_info=True,
+            )
+            context = None
+        self._window_contributors.append(
+            _GAContributor(
+                batch_metadata=context.batch_metadata if context is not None else None,
+                index=context.index if context is not None else None,
+            )
+        )
+
+    def _clear_optimizer_contributors(self) -> None:
+        self._window_contributors.clear()
+
+    @property
+    def batch_metadata(self) -> object | None:
+        """Return metadata for every micro-batch contributing to this update."""
+        metadata = [item.batch_metadata for item in self._window_contributors]
+        if not any(item is not None for item in metadata):
+            return None
+        return metadata
+
+    @property
+    def index(self) -> int | None:
+        """Return the latest contributing micro-batch's pipeline index.
+
+        ``batch_metadata`` represents the full accumulation window, while this
+        index identifies the batch that completed it, or the last processed
+        batch when a partial window is flushed after exhaustion.
+        """
+        contributor = (
+            self._window_contributors[-1] if self._window_contributors else None
+        )
+        return contributor.index if contributor is not None else None
 
     @property
     def micro_batches_into_window(self) -> int:
@@ -173,7 +226,8 @@ class _GAOptimizerWrapper:
         """Clear gradients once at the start of each accumulation window.
 
         Bucket-view gradients are zeroed in place when ``accumulate_into_buckets`` is
-        enabled.
+        enabled. Metadata is cleared only after actual zeroing succeeds;
+        skipped calls leave both gradients and metadata unchanged.
         """
         if not self._needs_zero_grad:
             return
@@ -182,17 +236,24 @@ class _GAOptimizerWrapper:
         else:
             self._optimizer.zero_grad(set_to_none=set_to_none)
         self._needs_zero_grad = False
+        self._clear_optimizer_contributors()
 
     def step(self, *args: Any, **kwargs: Any) -> None:
         """Run the optimizer at a scheduled or explicitly forced boundary."""
+        self._record_optimizer_contributor()
         if self._should_step() or self._force_step:
-            ga = self._ga_wrapper
-            if ga is not None:
-                # Deferred resharding may leave parameters unsharded between microbatches.
-                # Optimizers must read sharded parameters.
-                ga._fsdp_sync_suppression.ensure_sharded(ga._get_fsdp_targets())
-            self._optimizer.step(*args, **kwargs)
-            self._needs_zero_grad = True
+            self._apply_gradients(*args, **kwargs)
+
+    @attributed_logger("optimizer", owner=lambda wrapper: wrapper)
+    def _apply_gradients(self, *args: Any, **kwargs: Any) -> None:
+        ga = self._ga_wrapper
+        if ga is not None:
+            # Deferred resharding may leave parameters unsharded between microbatches.
+            # Optimizers must read sharded parameters.
+            ga._fsdp_sync_suppression.ensure_sharded(ga._get_fsdp_targets())
+        self._optimizer.step(*args, **kwargs)
+        self._needs_zero_grad = True
+        self._clear_optimizer_contributors()
 
     def advance_step(
         self, window_completed: bool = False, expect_full_window: bool = True
@@ -244,6 +305,7 @@ class _GAOptimizerWrapper:
         self._window_base = 0
         self._needs_zero_grad = True
         self._force_step = False
+        self._clear_optimizer_contributors()
         self._start_counted_window()
 
     def realign_window(self) -> None:
@@ -273,6 +335,9 @@ class GradientAccumulationWrapper(Generic[In, Out]):
 
     The wrapper controls optimizer boundaries and suppresses distributed gradient
     synchronization between those boundaries.
+
+    Batch attribution snapshots metadata and indexes observed by the wrapped optimizer.
+    Split optimizers that bypass it need integration at their update boundaries.
     """
 
     def __init__(
@@ -317,8 +382,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                     f"{type(pipeline).__name__} already uses a gradient-accumulation "
                     "optimizer; wrap each pipeline only once"
                 )
-            # pyrefly: ignore[missing-attribute]: pipeline may not have _optimizer
-            pipeline._optimizer = self._optimizer_wrapper
+            self._ga_hooks._optimizer = self._optimizer_wrapper
 
     def _should_sync_grad(self, is_last_batch: bool = False) -> bool:
         """Return whether ``no_sync()`` modules synchronize gradients on this batch."""
@@ -502,9 +566,9 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                 )
                 self._fsdp_sync_suppression.clear_partial(targets)
             self._fsdp_sync_suppression.restore(targets)
-            self._fsdp_sync_suppression.ensure_sharded(targets)
-            self._optimizer_wrapper._optimizer.step()
-            self._optimizer_wrapper._needs_zero_grad = True
+            # Each processed micro-batch recorded its context in step(); exhaustion
+            # does not contribute another batch to this partial window.
+            self._optimizer_wrapper._apply_gradients()
             self._optimizer_wrapper.zero_grad(set_to_none=True)
             return True
         return False
