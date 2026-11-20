@@ -3103,6 +3103,11 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
                 managed.append(
                     compute_kernel_to_embedding_location(table.compute_kernel)
                 )
+            elif device is not None and device.type == "xpu":
+                compute_devices.append(ComputeDevice.XPU)
+                managed.append(
+                    compute_kernel_to_embedding_location(table.compute_kernel)
+                )
             elif device is not None and device.type == "mtia":
                 compute_devices.append(ComputeDevice.MTIA)
                 # Set EmbeddingLocation.HOST to make embedding op in FBGEMM choose CPU path.
@@ -4315,6 +4320,11 @@ class BatchedFusedEmbeddingBag(
         for table in config.embedding_tables:
             if device is not None and device.type == "cuda":
                 compute_devices.append(ComputeDevice.CUDA)
+                managed.append(
+                    compute_kernel_to_embedding_location(table.compute_kernel)
+                )
+            elif device is not None and device.type == "xpu":
+                compute_devices.append(ComputeDevice.XPU)
                 managed.append(
                     compute_kernel_to_embedding_location(table.compute_kernel)
                 )

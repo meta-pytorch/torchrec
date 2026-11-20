@@ -77,7 +77,7 @@ def placement(
     local_size: int,
 ) -> str:
     param_device = compute_device
-    if compute_device in {"cuda", "mtia", "tpu"}:
+    if compute_device in {"cuda", "mtia", "tpu", "xpu"}:
         param_device = torch.device(compute_device, rank % local_size)
     return f"rank:{rank}/{param_device}"
 
@@ -653,7 +653,7 @@ def row_wise(
                     device_type = str(sizes_placement[1])
                     placements.append(placement_helper(device_type, index, i))
 
-                if device_type == "cuda":
+                if device_type in {"cuda", "xpu"}:
                     index += 1
 
         return _get_parameter_sharding(

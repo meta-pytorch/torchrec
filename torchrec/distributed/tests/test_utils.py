@@ -43,6 +43,7 @@ from torchrec.distributed.utils import (
     convert_to_fbgemm_types,
     EmbeddingQuantizationUtils,
     get_bucket_metadata_from_shard_metadata,
+    get_device_type,
     get_unsharded_module_names,
     merge_fused_params,
     weights_bytes_in_emb_kernel,
@@ -54,6 +55,22 @@ from torchrec.test_utils import init_process_group_single_rank
 
 
 class UtilsTest(unittest.TestCase):
+    def test_get_device_type_priority(self) -> None:
+        # (cuda, mtia, xpu) availability -> expected device type
+        cases = [
+            ((True, False, False), "cuda"),
+            ((False, True, False), "mtia"),
+            ((False, False, True), "xpu"),
+            ((False, False, False), "cpu"),
+        ]
+        for (cuda, mtia, xpu), expected in cases:
+            with self.subTest(cuda=cuda, mtia=mtia, xpu=xpu), patch(
+                "torch.cuda.is_available", return_value=cuda
+            ), patch("torch.mtia.is_available", return_value=mtia), patch(
+                "torch.xpu.is_available", return_value=xpu
+            ):
+                self.assertEqual(get_device_type(), expected)
+
     def test_get_unsharded_module_names(self) -> None:
         os.environ["RANK"] = "0"
         os.environ["WORLD_SIZE"] = "1"

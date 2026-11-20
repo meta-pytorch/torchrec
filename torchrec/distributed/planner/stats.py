@@ -818,6 +818,7 @@ class EmbeddingStats(Stats):
                 if (
                     topology.compute_device == "cuda"
                     or topology.compute_device == "mtia"
+                    or topology.compute_device == "xpu"
                 )
                 and ((1 - reserved_hbm_percent) * device.storage.hbm) != 0
                 else 0

@@ -91,7 +91,11 @@ def _reserve_dense_storage(
         )
 
     dense_tensor_storage = Storage(
-        hbm=dense_tensor_size if topology.compute_device in {"cuda", "mtia"} else 0,
+        hbm=(
+            dense_tensor_size
+            if topology.compute_device in {"cuda", "mtia", "xpu"}
+            else 0
+        ),
         ddr=dense_tensor_size if topology.compute_device == "cpu" else 0,
         ssd=0,
     )
@@ -110,7 +114,7 @@ def _get_kjt_storage(
 ) -> Storage:
     kjt_size = math.ceil(sum(batch_inputs) * float(input_data_type_size)) * multiplier
     return Storage(
-        hbm=kjt_size if topology.compute_device in {"cuda", "mtia"} else 0,
+        hbm=kjt_size if topology.compute_device in {"cuda", "mtia", "xpu"} else 0,
         ddr=kjt_size if topology.compute_device == "cpu" else 0,
         ssd=0,
     )

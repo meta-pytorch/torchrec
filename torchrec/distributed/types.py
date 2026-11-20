@@ -217,6 +217,8 @@ class ComputeDevice(Enum):
     CPU = "cpu"
     # MTIA compute device
     MTIA = "mtia"
+    # Intel GPU compute device
+    XPU = "xpu"
 
 
 @unique
@@ -1448,12 +1450,14 @@ def compute_storage_usage(
             "cuda": ParameterStorage.HBM,
             "cpu": ParameterStorage.DDR,
             "mtia": ParameterStorage.HBM,
+            "xpu": ParameterStorage.HBM,
         }
     else:
         storage_map = {
             "cuda": ParameterStorage.HBM,
             "cpu": ParameterStorage.DDR,
             "mtia": ParameterStorage.HBM,
+            "xpu": ParameterStorage.HBM,
         }
     return {
         storage_map.get(compute_device_type, ParameterStorage.HBM).value: tensor_bytes
@@ -1542,11 +1546,12 @@ class ModuleSharder(abc.ABC, Generic[M]):
         compute kernel.
         """
 
-        assert compute_device_type in {"cuda", "cpu", "mtia"}
+        assert compute_device_type in {"cuda", "cpu", "mtia", "xpu"}
         storage_map = {
             "cuda": ParameterStorage.HBM,
             "cpu": ParameterStorage.DDR,
             "mtia": ParameterStorage.HBM,
+            "xpu": ParameterStorage.HBM,
         }
         return {storage_map[compute_device_type].value: get_tensor_size_bytes(tensor)}
 

@@ -13,11 +13,21 @@ from typing import Dict, List
 import torch
 from torchrec.distributed.embedding_types import (
     DPLookupAwaitable,
+    EmbeddingComputeKernel,
     KJTList,
     ShardedEmbeddingModule,
 )
-from torchrec.distributed.embeddingbag import EmbeddingBagCollectionContext
-from torchrec.distributed.types import Awaitable, LazyAwaitable, NoWait
+from torchrec.distributed.embeddingbag import (
+    EmbeddingBagCollectionContext,
+    EmbeddingBagCollectionSharder,
+)
+from torchrec.distributed.types import (
+    Awaitable,
+    LazyAwaitable,
+    NoWait,
+    ParameterStorage,
+    ShardingType,
+)
 
 Out = Dict[str, torch.Tensor]
 CompIn = KJTList
@@ -85,3 +95,43 @@ class DPLookupAwaitableTest(unittest.TestCase):
         self.assertEqual(awaitable.wait(), 1)
         self.assertEqual(awaitable.wait(), 1)
         self.assertEqual(calls, 1)
+
+
+class TestEmbeddingBagCollectionSharder(unittest.TestCase):
+    def test_sharding_types(self) -> None:
+        row_wise_types = {
+            ShardingType.ROW_WISE.value,
+            ShardingType.TABLE_ROW_WISE.value,
+            ShardingType.GRID_SHARD.value,
+        }
+        cases = [
+            ("cuda", True),
+            ("mtia", True),
+            ("xpu", True),
+            ("cpu", False),
+        ]
+        sharder = EmbeddingBagCollectionSharder()
+        for compute_device, has_row_wise in cases:
+            with self.subTest(compute_device=compute_device):
+                types = set(sharder.sharding_types(compute_device))
+                if has_row_wise:
+                    self.assertTrue(row_wise_types <= types)
+                else:
+                    self.assertFalse(row_wise_types & types)
+
+    def test_storage_usage(self) -> None:
+        tensor = torch.empty(10, 4, dtype=torch.float32)
+        expected_bytes = tensor.numel() * 4
+        cases = [
+            ("cuda", ParameterStorage.HBM),
+            ("mtia", ParameterStorage.HBM),
+            ("xpu", ParameterStorage.HBM),
+            ("cpu", ParameterStorage.DDR),
+        ]
+        sharder = EmbeddingBagCollectionSharder()
+        for compute_device, storage in cases:
+            with self.subTest(compute_device=compute_device):
+                usage = sharder.storage_usage(
+                    tensor, compute_device, EmbeddingComputeKernel.DENSE.value
+                )
+                self.assertEqual(usage, {storage.value: expected_bytes})
