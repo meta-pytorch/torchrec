@@ -22,6 +22,7 @@ import concurrent.futures
 import contextlib
 import itertools
 import logging
+import multiprocessing.connection
 import multiprocessing.process
 import os
 import sys
@@ -84,6 +85,7 @@ _RING_FULL_WARN_INTERVAL_SEC: float = 30.0
 _WORKER_REQUEST_TIMEOUT_SEC: float = 600.0
 _WORKER_SHUTDOWN_TIMEOUT_SEC: float = 45.0
 _WORKER_JOIN_TIMEOUT_SEC: float = 30.0
+_EXIT_STATUS_TIMEOUT_SEC: float = 1.0
 
 _CUDA_HOST_REGISTER_PORTABLE: int = 1
 _RING_FULL_TIMEOUT_SEC: float = 600.0
@@ -591,11 +593,18 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
 
     def _receive_one(self) -> bool:
         try:
+            # Also wake on the worker's exit: a duplicate of its pipe end can
+            # outlive it and withhold EOF.
+            multiprocessing.connection.wait([self._result_conn, self._process.sentinel])
+            if not self._result_conn.poll():
+                raise EOFError
             message: ReplyMessage = recv(self._result_conn)
         except (EOFError, OSError):
             if self._shutting_down:
                 self._fail_pending(RecMetricException("metric worker is shut down."))
             else:
+                # The sentinel can fire before the exit status is reapable.
+                self._process.join(timeout=_EXIT_STATUS_TIMEOUT_SEC)
                 self._fail(
                     RecMetricException(
                         f"metric worker exited unexpectedly "

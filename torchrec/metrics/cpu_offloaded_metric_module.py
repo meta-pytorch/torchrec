@@ -335,6 +335,9 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
     """
     RecMetricModule that offloads metric update() and compute() to CPU using background threads.
 
+    Deprecated as a trainer-side module: use ``ProcessIsolatedCPUOffloadedRecMetricModule``,
+    which runs this module inside its worker process.
+
     At a high level, this metric module consists of two queues:
     - update queue: stores metric update jobs and synchronization markers. A worker thread
         processes the update queue.
