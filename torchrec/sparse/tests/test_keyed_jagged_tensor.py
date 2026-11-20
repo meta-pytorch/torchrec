@@ -10,6 +10,7 @@
 
 import unittest
 from typing import List, Tuple
+from unittest.mock import patch
 
 import torch
 import torch.utils._pytree as pytree
@@ -486,6 +487,24 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         torch.testing.assert_close(kjt_0.lengths(), torch.Tensor([]), rtol=0, atol=0)
         torch.testing.assert_close(kjt_0.values(), torch.Tensor([]), rtol=0, atol=0)
         self.assertEqual(kjt_0.stride(), 0)
+
+    def test_split_whole(self) -> None:
+        jag_tensor = KeyedJaggedTensor(
+            values=torch.Tensor([1.0, 2.0, 3.0, 4.0]),
+            keys=["index_0", "index_1"],
+            lengths=torch.IntTensor([1, 1, 0, 2]),
+        )
+        flag = "torchrec.sparse.jagged_tensor._KJT_SPLIT_WHOLE_FAST_PATH"
+        with patch(flag, True):
+            (j0,) = jag_tensor.split([2])
+        self.assertIs(j0, jag_tensor)
+        # A single segment covering every key needs no per-key lengths.
+        self.assertIsNone(jag_tensor._length_per_key)
+
+        with patch(flag, False):
+            (j1,) = jag_tensor.split([2])
+        self.assertIs(j1, jag_tensor)
+        self.assertEqual(jag_tensor._length_per_key, [2, 2])
 
     def test_split_vb(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
