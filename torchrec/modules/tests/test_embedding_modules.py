@@ -8,6 +8,7 @@
 # pyre-strict
 
 import unittest
+import weakref
 from functools import partial
 
 import torch
@@ -361,6 +362,79 @@ class EmbeddingCollectionTest(unittest.TestCase):
                 features=features,
                 embedding_names=["item"],
             )
+
+    def test_lean_gather_backward_matches_gather(self) -> None:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["item", "author"],
+            values=torch.tensor([10, 11, 10, 20, 21, 20]),
+            lengths=torch.tensor([2, 1, 2, 1]),
+        )
+        table = torch.randn(4, 3, requires_grad=True)
+        reverse_indices = torch.tensor([0, 1, 0, 2, 3, 2])
+        grad_out = torch.randn(6, 3)
+
+        results = []
+        # 6 indices over 4 rows is within 2x, so sorted select keeps the gather
+        # route and the lean backward applies.
+        for sorted_select, lean in ((False, False), (False, True), (True, True)):
+            table.grad = None
+            output = construct_jagged_tensors(
+                embeddings=table * 2.0,
+                features=features,
+                embedding_names=["item", "author"],
+                original_features=features,
+                reverse_indices=reverse_indices,
+                use_gather_select=True,
+                use_sorted_select=sorted_select,
+                use_lean_gather_backward=lean,
+            )
+            values = torch.cat([output["item"].values(), output["author"].values()])
+            values.backward(grad_out)
+            grad = table.grad
+            if grad is None:
+                self.fail("backward did not populate the table gradient")
+            results.append((values.detach(), grad))
+
+        for values, grad in results[1:]:
+            self.assertTrue(torch.equal(results[0][0], values))
+            self.assertTrue(torch.equal(results[0][1], grad))
+
+    def test_lean_gather_backward_frees_gathered_embeddings(self) -> None:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["item"],
+            values=torch.tensor([10, 11, 10]),
+            lengths=torch.tensor([2, 1]),
+        )
+        table = torch.randn(2, 3, requires_grad=True)
+        reverse_indices = torch.tensor([0, 1, 0])
+
+        # 3 indices over 2 rows is within 2x, so sorted select keeps the gather
+        # route.
+        for sorted_select in (False, True):
+            for lean in (False, True):
+                embeddings = table * 2.0
+                embeddings_ref = weakref.ref(embeddings)
+                output = construct_jagged_tensors(
+                    embeddings=embeddings,
+                    features=features,
+                    embedding_names=["item"],
+                    original_features=features,
+                    reverse_indices=reverse_indices,
+                    use_gather_select=True,
+                    use_sorted_select=sorted_select,
+                    use_lean_gather_backward=lean,
+                )
+                del embeddings
+                self.assertEqual(embeddings_ref() is None, lean)
+                output["item"].values().sum().backward()
+
+    def test_lean_gather_backward_defaults_off(self) -> None:
+        ec = EmbeddingCollection(tables=[])
+        self.assertFalse(ec.use_lean_gather_backward())
+
+        ec.set_use_lean_gather_backward(True)
+
+        self.assertTrue(ec.use_lean_gather_backward())
 
     def test_index_dedup_inherits_enabled_default(self) -> None:
         ec = EmbeddingCollection(tables=[])

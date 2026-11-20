@@ -459,6 +459,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         )
         self._use_index_dedup: Optional[bool] = use_index_dedup
         self._use_sorted_select: bool = False
+        self._use_lean_gather_backward: bool = False
         self._device: torch.device = (
             device if device is not None else torch.device("cpu")
         )
@@ -629,3 +630,27 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
             None
         """
         self._use_sorted_select = use_sorted_select
+
+    def use_lean_gather_backward(self) -> bool:
+        """
+        Returns:
+            bool: Whether the ``use_gather_select`` reorder saves only the index
+            and shape for backward instead of the embeddings it gathers from.
+            Off by default.
+        """
+        return self._use_lean_gather_backward
+
+    def set_use_lean_gather_backward(self, use_lean_gather_backward: bool) -> None:
+        """
+        Opt into (or out of) a ``use_gather_select`` reorder whose backward keeps
+        only the index and shape, so the pre-reorder embeddings can be freed
+        after the forward. Forward and backward kernels are unchanged.
+
+        Args:
+            use_lean_gather_backward (bool): Whether the gather reorder saves
+                only the index and shape for backward.
+
+        Returns:
+            None
+        """
+        self._use_lean_gather_backward = use_lean_gather_backward
