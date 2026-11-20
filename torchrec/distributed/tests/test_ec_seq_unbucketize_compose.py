@@ -5,8 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 import os
 import types
 import unittest
@@ -124,6 +122,7 @@ class ScopedUnbucketizeComposeTest(unittest.TestCase):
                 {"row_wise": True} if per_sharding_gather else None
             ),
             _use_sorted_select=False,
+            _use_lean_gather_backward=False,
             _use_index_dedup=True,
             training=training,
         )
