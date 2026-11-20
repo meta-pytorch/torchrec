@@ -40,6 +40,7 @@ from torchrec.metrics.cpu_offloaded_metric_worker import (
     oss_worker_factory,
     require_handlers,
     WindowStat,
+    WorkerArgs,
 )
 from torchrec.metrics.cpu_offloaded_metric_worker_profiler import WorkerProfiler
 from torchrec.metrics.metric_job_types import MetricUpdateJob
@@ -657,6 +658,27 @@ class ProcessIsolatedCPUOffloadedRecMetricModuleTest(unittest.TestCase):
             for step in range(1, 10_000):
                 isolated.update(_batch(step % 4))
                 isolated.async_compute().resolve()
+
+    def test_worker_exit_detected_while_its_pipe_ends_are_leaked(self) -> None:
+        leaked: list[int] = []
+
+        def launch_and_exit(args: WorkerArgs) -> tuple[Any, tuple[Any, ...]]:
+            leaked.extend(
+                os.dup(conn.fileno()) for conn in (args.control_conn, args.result_conn)
+            )
+            return os._exit, (3,)
+
+        isolated = self._track(
+            _process_module(_metrics_config(), worker_launcher=launch_and_exit)
+        )
+        try:
+            with self.assertRaisesRegex(RecMetricException, r"exitcode=3"):
+                for _ in range(100):
+                    isolated.update(_batch(0))
+                    time.sleep(0.1)
+        finally:
+            for fd in leaked:
+                os.close(fd)
 
     def test_two_ranks_match_threaded_and_restore_from_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
