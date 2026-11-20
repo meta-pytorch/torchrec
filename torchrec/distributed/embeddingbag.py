@@ -149,6 +149,73 @@ except OSError:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Kernels whose tables carry no torch state (state dict / DTensor) in this module.
+_NO_TORCH_STATE_COMPUTE_KERNELS: Set[str] = {
+    EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+    EmbeddingComputeKernel.QUANT_UVM.value,
+}
+
+
+class QuantUvmServingGate:
+    """
+    Refuses to run a sharded module whose plan holds quant_uvm tables until their
+    owner marks them filled.
+
+    A quant_uvm table (the inference TBE in a training plan) has no state dict entry,
+    so no checkpoint load fills it, and its rows start as zeros: its owner writes them
+    after each load, then calls `set_quant_uvm_servable(True)` on every rank. Until
+    then input_dist and compute raise, so nothing serves rows no load has filled. The
+    gate is read from the GLOBAL plan, so a rank holding none of those shards refuses
+    too, before any collective. Every `load_state_dict` that reaches this module closes
+    it again (its own, an ancestor's, or torch.distributed.checkpoint loading it as a
+    Stateful): a load changes the module's checkpoint, and the quant_uvm rows still
+    hold the previous one until their owner refills them. A load that writes into its
+    `state_dict()` tensors in place, or calls only a child's `load_state_dict`, is not
+    seen, so such a loader closes the gate itself.
+
+    A sharder whose module mixes this in sets `supports_quant_uvm = True`. The module
+    must be an `nn.Module` initialized before `_init_quant_uvm_gate`.
+    """
+
+    def _init_quant_uvm_gate(
+        self, module_sharding_plan: Dict[str, ParameterSharding]
+    ) -> None:
+        self._has_quant_uvm_tables: bool = any(
+            parameter_sharding.compute_kernel == EmbeddingComputeKernel.QUANT_UVM.value
+            for parameter_sharding in module_sharding_plan.values()
+        )
+        # Closed from construction whenever there is a table to fill.
+        self._quant_uvm_servable: bool = not self._has_quant_uvm_tables
+        if self._has_quant_uvm_tables:
+            # Registered here, not with the module's other load hooks, so it holds
+            # for every module that mixes this in, whatever hooks it skips.
+            cast(nn.Module, self)._register_load_state_dict_pre_hook(
+                QuantUvmServingGate._close_on_load, with_module=True
+            )
+
+    @staticmethod
+    def _close_on_load(module: "QuantUvmServingGate", *args: Any) -> None:
+        module._quant_uvm_servable = False
+
+    def set_quant_uvm_servable(self, servable: bool) -> None:
+        """Open (True) or close (False) the gate. Call it on every rank."""
+        if not self._has_quant_uvm_tables:
+            raise ValueError(
+                f"{self._quant_uvm_gate_name()}: its sharding plan has no quant_uvm "
+                "table."
+            )
+        self._quant_uvm_servable = servable
+
+    def _check_quant_uvm_servable(self) -> None:
+        if not self._quant_uvm_servable:
+            raise RuntimeError(
+                f"{self._quant_uvm_gate_name()}: its quant_uvm tables are not filled "
+                "for the current checkpoint; refusing to run."
+            )
+
+    def _quant_uvm_gate_name(self) -> str:
+        return getattr(self, "_module_fqn", None) or type(self).__name__
+
 
 def _concatenate_tensors_on_cpu(
     tensors: Sequence[torch.Tensor], dim: int
@@ -569,6 +636,7 @@ class ShardedEmbeddingBagCollection(
     ],
     # TODO remove after compute_kernel X sharding decoupling
     FusedOptimizerModule,
+    QuantUvmServingGate,
 ):
     """
     Sharded implementation of EmbeddingBagCollection.
@@ -858,6 +926,7 @@ class ShardedEmbeddingBagCollection(
 
         # forward pass flow control
         self._has_uninitialized_input_dist: bool = True
+        self._init_quant_uvm_gate(self.module_sharding_plan)
         self._has_features_permute: bool = True
         self._free_features_storage_early: bool = False
         self._enable_feature_score_weight_accumulation: bool = False
@@ -1329,12 +1398,10 @@ class ShardedEmbeddingBagCollection(
             _model_parallel_name_to_compute_kernel[table_name] = (
                 parameter_sharding.compute_kernel
             )
-            if (
-                parameter_sharding.compute_kernel
-                == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
-            ):
+            if parameter_sharding.compute_kernel in _NO_TORCH_STATE_COMPUTE_KERNELS:
                 # Skip state_dict handling for CUSTOMIZED_KERNEL, this should be implemented
-                # in child class for the CUSTOMIZED_KERNEL
+                # in child class for the CUSTOMIZED_KERNEL. A quant_uvm table has no
+                # state dict entry (see QuantUvmServingGate).
                 continue
             self._model_parallel_name_to_local_shards[table_name] = []
             self._model_parallel_name_to_shards_wrapper[table_name] = OrderedDict(
@@ -1359,7 +1426,7 @@ class ShardedEmbeddingBagCollection(
                     table_name = key[: -len(".weight")]
                     if (
                         _model_parallel_name_to_compute_kernel[table_name]
-                        == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+                        in _NO_TORCH_STATE_COMPUTE_KERNELS
                     ):
                         continue
                     if isinstance(v, DTensor):
@@ -1744,6 +1811,7 @@ class ShardedEmbeddingBagCollection(
                 EmbeddingComputeKernel.KEY_VALUE.value,
                 EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                 EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                EmbeddingComputeKernel.QUANT_UVM.value,
             }:
                 continue
             assert table_config.init_fn is not None
@@ -1989,6 +2057,8 @@ class ShardedEmbeddingBagCollection(
                 self._has_features_permute = False  # feature_keys are in order
             # pyrefly: ignore [bad-argument-type]
             features = maybe_td_to_kjt(features, feature_keys)
+        # On every rank, before any collective.
+        self._check_quant_uvm_servable()
         ctx.variable_batch_per_feature = features.variable_stride_per_key()
         ctx.inverse_indices = features.inverse_indices_or_none()
 
@@ -2080,6 +2150,7 @@ class ShardedEmbeddingBagCollection(
         this function is not used in general practice, it's only called by the base class
         ShardedModule.compute_and_output_dist to do the basic function
         """
+        self._check_quant_uvm_servable()
         return [lookup(features) for lookup, features in zip(self._lookups, dist_input)]
 
     def output_dist(
@@ -2188,6 +2259,8 @@ class ShardedEmbeddingBagCollection(
         data-parallel lookup until it is consumed. All other sharding lookups and
         output distributions start immediately.
         """
+        # A batch whose input_dist ran before the gate closed must not run either.
+        self._check_quant_uvm_servable()
         defer_dp = ctx.defer_dp_lookup and self._dp_index is not None
         batch_size_per_feature_pre_a2a: List[int] = []
         awaitables: List[Awaitable[torch.Tensor]] = []
@@ -2482,6 +2555,7 @@ class EmbeddingBagCollectionSharder(BaseEmbeddingSharder[EmbeddingBagCollection]
     """
 
     supports_fused_triton: bool = True
+    supports_quant_uvm: bool = True
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     # pyrefly: ignore [bad-override]

@@ -548,6 +548,10 @@ M = TypeVar("M", bound=nn.Module)
 
 class BaseEmbeddingSharder(ModuleSharder[M]):
     supports_fused_triton: bool = False
+    # Whether this sharder's sharded module can build and serve a quant_uvm table (the
+    # inference TBE in a training plan): it must skip the table's torch state and refuse
+    # to run until the table is filled (QuantUvmServingGate). Opt in per sharder.
+    supports_quant_uvm: bool = False
 
     def __init__(
         self,
@@ -613,6 +617,17 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
                     ret.append(EmbeddingComputeKernel.TRITON_UVM.value)
             if compute_device_type in {"tpu"}:
                 ret += [EmbeddingComputeKernel.UNFUSED_TPU.value]
+            if (
+                self.supports_quant_uvm
+                and compute_device_type in {"cuda", "cpu"}
+                and sharding_type
+                in {ShardingType.COLUMN_WISE.value, ShardingType.TABLE_WISE.value}
+            ):
+                # The inference TBE (IntNBit rows in host memory), e.g. for an eval
+                # of tables too large for the training kernel, on the devices that TBE
+                # is built and tested for. The planner offers it only to a table whose
+                # constraints name it with an INT8/INT4 quantized_weight_dtype.
+                ret += [EmbeddingComputeKernel.QUANT_UVM.value]
         else:
             # TODO re-enable model parallel and dense
             ret += [

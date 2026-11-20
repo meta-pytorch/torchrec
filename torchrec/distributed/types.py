@@ -819,6 +819,9 @@ class ParameterSharding:
         bag_size_hints (Optional[List[int]]): expected bag size for each feature,
             used only by FUSED_TRITON and TRITON_UVM.
         num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span.
+        quantized_weight_dtype (Optional[DataType]): integer dtype (INT8 or INT4) of the
+            rows of a QUANT_UVM table in a training sharding plan, which the planner
+            priced and the inference TBE is built with.
 
     NOTE:
       ShardingType.TABLE_WISE - rank where this embedding is placed
@@ -842,6 +845,7 @@ class ParameterSharding:
     key_value_params: Optional[KeyValueParams] = None
     bag_size_hints: Optional[List[int]] = None
     num_twrw_groups: Optional[int] = None
+    quantized_weight_dtype: Optional[DataType] = None
 
 
 class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterSharding]):
