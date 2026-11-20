@@ -282,6 +282,28 @@ def _vbe_reindex(
     )
 
 
+class _GatherRowsSaveShape(torch.autograd.Function):
+    """``torch.gather`` along dim 0 whose backward keeps only the index and shape.
+
+    aten's gather backward saves the whole source tensor, although its dense
+    path only reads the source shape. Forward and backward run the same kernels
+    as ``torch.gather`` (``new_zeros`` + ``scatter_add_`` in backward).
+    """
+
+    @staticmethod
+    # pyrefly: ignore[bad-override]: autograd.Function base uses a *args signature
+    def forward(ctx, src: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(index)
+        ctx.src_shape = src.shape
+        return torch.gather(src, 0, index)
+
+    @staticmethod
+    # pyrefly: ignore[bad-override]: autograd.Function base uses a *args signature
+    def backward(ctx, grad: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        (index,) = ctx.saved_tensors
+        return grad.new_zeros(ctx.src_shape).scatter_add_(0, index, grad), None
+
+
 def construct_jagged_tensors(
     embeddings: torch.Tensor,
     features: KeyedJaggedTensor,
@@ -294,6 +316,7 @@ def construct_jagged_tensors(
     use_gather_select: bool = False,
     use_sorted_select: bool = False,
     seg_plan: Optional[object] = None,
+    use_lean_gather_backward: bool = False,
 ) -> Dict[str, JaggedTensor]:
     """Construct feature tensors, optionally expanding deduplicated embeddings.
 
@@ -327,6 +350,11 @@ def construct_jagged_tensors(
                     embeddings = sorted_index_select(
                         embeddings, reverse_indices, seg_plan=seg_plan
                     )
+            elif use_gather_select and use_lean_gather_backward:
+                expanded_indices = reverse_indices.unsqueeze(1).expand(
+                    -1, embeddings.size(-1)
+                )
+                embeddings = _GatherRowsSaveShape.apply(embeddings, expanded_indices)
             else:
                 embeddings = select_embeddings(
                     embeddings,

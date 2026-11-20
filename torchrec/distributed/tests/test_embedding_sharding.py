@@ -1029,6 +1029,25 @@ class EmbeddingCollectionAwaitableUseGatherSelectTest(unittest.TestCase):
         self.assertEqual(selected, [True, False, False])
 
     @patch("torchrec.distributed.embedding.construct_jagged_tensors")
+    def test_lean_gather_backward_is_forwarded(self, mock_construct: MagicMock) -> None:
+        mock_construct.return_value = {}
+        w = MagicMock()
+        w.wait.return_value = torch.empty(0)
+        awaitable = EmbeddingCollectionAwaitable(
+            awaitables_per_sharding=[w],
+            features_per_sharding=[MagicMock()],
+            embedding_names_per_sharding=[[]],
+            ctx=EmbeddingCollectionContext(),
+            sharding_types=["row_wise"],
+            use_gather_select=True,
+            use_lean_gather_backward=True,
+        )
+
+        awaitable._wait_impl()
+
+        self.assertTrue(mock_construct.call_args.kwargs["use_lean_gather_backward"])
+
+    @patch("torchrec.distributed.embedding.construct_jagged_tensors")
     def test_no_per_sharding_uses_default(self, mock_construct: MagicMock) -> None:
         mock_construct.return_value = {}
         awaitable = self._build_awaitable(

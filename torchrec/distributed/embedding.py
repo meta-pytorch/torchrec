@@ -647,6 +647,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         use_sorted_select: bool = False,
         resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
         use_packed_jagged_tensor: bool = False,
+        use_lean_gather_backward: bool = False,
     ) -> None:
         super().__init__()
         self._awaitables_per_sharding = awaitables_per_sharding
@@ -662,6 +663,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self._use_sorted_select = use_sorted_select
         self._resize_awaitables = resize_awaitables
         self._use_packed_jagged_tensor = use_packed_jagged_tensor
+        self._use_lean_gather_backward = use_lean_gather_backward
 
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
         jt_dict: Dict[str, JaggedTensor] = {}
@@ -736,6 +738,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     use_gather_select=use_gather_select,
                     use_sorted_select=self._use_sorted_select,
                     seg_plan=seg_plan,
+                    use_lean_gather_backward=self._use_lean_gather_backward,
                 )
                 if composed is not None and _seq_unbucketize_compose_check_due():
                     jts = self._check_composed(
@@ -847,6 +850,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
             reverse_indices=composed.reverse_indices,
             use_gather_select=use_gather_select,
             use_sorted_select=self._use_sorted_select,
+            use_lean_gather_backward=self._use_lean_gather_backward,
         )
 
 
@@ -1027,6 +1031,7 @@ class ShardedEmbeddingCollection(
             module.use_gather_select_per_sharding()
         )
         self._use_sorted_select: bool = module.use_sorted_select()
+        self._use_lean_gather_backward: bool = module.use_lean_gather_backward()
         self._inverse_indices_permute_per_sharding: Optional[List[torch.Tensor]] = None
         self._skip_missing_weight_key: List[str] = []
 
@@ -2155,6 +2160,7 @@ class ShardedEmbeddingCollection(
             use_gather_select_per_sharding=self._use_gather_select_per_sharding,
             use_sorted_select=self._use_sorted_select,
             use_packed_jagged_tensor=self._use_packed_jagged_tensor,
+            use_lean_gather_backward=self._use_lean_gather_backward,
         )
 
     def _compute_and_output_dist_per_sharding(
@@ -2351,6 +2357,7 @@ class ShardedEmbeddingCollection(
             use_gather_select_per_sharding=self._use_gather_select_per_sharding,
             use_sorted_select=self._use_sorted_select,
             use_packed_jagged_tensor=self._use_packed_jagged_tensor,
+            use_lean_gather_backward=self._use_lean_gather_backward,
             resize_awaitables=resize_awaitables,
         )
 
