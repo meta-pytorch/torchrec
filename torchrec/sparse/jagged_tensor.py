@@ -3537,19 +3537,24 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                             )
                             == torch.device("tpu")
                         )
+                    # A recat that covers every segment is a permutation, so the
+                    # output keeps the input size.
+                    size_known = is_tpu or (
+                        recat.numel() == stride_per_rank_per_key.numel()
+                    )
                     lengths, _ = _permute_tensor_by_segments(
                         lengths,
                         stride_per_rank_per_key,
                         torch.jit._unwrap_optional(recat),
                         None,
-                        lengths.numel() if is_tpu else None,
+                        lengths.numel() if size_known else None,
                     )
                     values, weights = _permute_tensor_by_segments(
                         values,
                         length_per_key_tensor,
                         torch.jit._unwrap_optional(recat),
                         weights,
-                        values.numel() if is_tpu else None,
+                        values.numel() if size_known else None,
                     )
 
             if stride_per_key_per_rank.numel() == 0:

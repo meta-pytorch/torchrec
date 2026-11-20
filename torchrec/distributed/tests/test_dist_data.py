@@ -2082,6 +2082,36 @@ class GetRecatOverflowTest(unittest.TestCase):
         self.assertTrue(torch.equal(none_throws(first), expected))
         self.assertTrue(torch.equal(none_throws(second), expected))
 
+    @given(
+        local_split=st.integers(min_value=1, max_value=16),
+        split_config=st.sampled_from(
+            [
+                (num_splits, stagger)
+                for num_splits in range(1, 17)
+                for stagger in range(1, num_splits + 1)
+                if num_splits % stagger == 0
+            ]
+        ),
+        cached=st.booleans(),
+    )
+    @settings(max_examples=50, deadline=None)
+    def test_get_recat_permutes_every_segment(
+        self, local_split: int, split_config: tuple[int, int], cached: bool
+    ) -> None:
+        # KeyedJaggedTensor.dist_init (variable stride) relies on this to pass
+        # the input numel as the permuted output size.
+        num_splits, stagger = split_config
+        recat = none_throws(
+            _get_recat(
+                local_split=local_split,
+                num_splits=num_splits,
+                stagger=stagger,
+                device=torch.device("cpu"),
+                cached=cached,
+            )
+        )
+        self.assertEqual(sorted(recat.tolist()), list(range(local_split * num_splits)))
+
     def test_get_recat_rejects_invalid_stagger(self) -> None:
         for stagger, local_split, cached in itertools.product(
             [4, 7, 0, -2], [0, 2], [False, True]
