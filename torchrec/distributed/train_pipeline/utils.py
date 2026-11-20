@@ -36,6 +36,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten
+from torchrec.distributed.attributed_logging import attributed_logger
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding import EmbeddingCollectionContext
 from torchrec.distributed.embedding_sharding import (
@@ -83,6 +84,9 @@ from torchrec.distributed.model_parallel import (
     get_module,
     ShardedModule,
 )
+from torchrec.distributed.train_pipeline.batch_attribution import (
+    unwrap_attributed_batch,
+)
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
     In,
@@ -90,6 +94,7 @@ from torchrec.distributed.train_pipeline.pipeline_context import (
     PrefetchEmbeddingTrainPipelineContext,
     PrefetchTrainPipelineContext,
     TrainPipelineContext,
+    TrainPipelineContextLite,
 )
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
 from torchrec.distributed.train_pipeline.runtime_forwards import (
@@ -169,11 +174,14 @@ def _batch_tensor_size(batch: Any) -> int:
     return sum(_batch_tensor_size(leaf) for leaf in leaves)
 
 
+@attributed_logger("copy_to_device", owner_kwarg="context")
 def _to_device(
     batch: In,
     device: torch.device,
     non_blocking: bool,
     data_copy_stream: Optional[torch.Stream] = None,
+    *,
+    context: TrainPipelineContextLite | TrainPipelineContext | None = None,
 ) -> In:
     assert isinstance(
         batch, (torch.Tensor, Pipelineable)
@@ -198,8 +206,13 @@ def _to_device(
         )
 
 
+@attributed_logger("wait_for_batch", owner_kwarg="context")
 def _wait_for_batch(
-    batch: In, stream: Optional[torch.Stream], record_stream: bool = True
+    batch: In,
+    stream: Optional[torch.Stream],
+    record_stream: bool = True,
+    *,
+    context: TrainPipelineContextLite | TrainPipelineContext | None = None,
 ) -> None:
     """
     As mentioned in
@@ -854,6 +867,8 @@ class DataLoadingThread(Thread, Generic[In]):
         self._device = device
         self._to_device_non_blocking = to_device_non_blocking
         self._buffered: Optional[In] = None
+        self._buffered_batch_metadata: object | None = None
+        self._next_batch_index: int = 0
         self._exception: Optional[Exception] = None
         self._buffer_empty_event.set()
         one_time_rank0_logger.info(
@@ -879,7 +894,9 @@ class DataLoadingThread(Thread, Generic[In]):
                 return
             with record_function("## load_batch ##"):
                 try:
-                    batch = next(self._dataloader_iter)
+                    batch, batch_metadata = unwrap_attributed_batch(
+                        next(self._dataloader_iter)
+                    )
                 except StopIteration:
                     self._stop = True
                     self._buffer_filled_event.set()
@@ -901,13 +918,28 @@ class DataLoadingThread(Thread, Generic[In]):
                     self._buffer_filled_event.set()
                     return
             with record_function("## copy_batch_to_gpu ##"):
-                with torch.get_device_module(self._device).stream(self._memcpy_stream):
-                    self._buffered = cast(
-                        In,
-                        batch.to(
-                            self._device, non_blocking=self._to_device_non_blocking
-                        ),
-                    )
+                context = TrainPipelineContextLite(
+                    index=self._next_batch_index,
+                    version=1,
+                    batch_metadata=batch_metadata,
+                )
+                try:
+                    with torch.get_device_module(self._device).stream(
+                        self._memcpy_stream
+                    ):
+                        self._buffered = _to_device(
+                            batch,
+                            self._device,
+                            self._to_device_non_blocking,
+                            context=context,
+                        )
+                    self._buffered_batch_metadata = batch_metadata
+                except Exception as e:
+                    self._exception = e
+                    self._stop = True
+                    self._buffer_filled_event.set()
+                    return
+                self._next_batch_index += 1
                 self._buffer_empty_event.clear()
                 self._buffer_filled_event.set()
 
@@ -920,9 +952,20 @@ class DataLoadingThread(Thread, Generic[In]):
         logger.info(f"{self.__class__.__name__}: Data loading thread stopped.")
 
     def get_next_batch(self, none_throws: bool = False) -> Optional[In]:
+        """Return the next raw batch without its attribution metadata.
+
+        Call ``get_next_batch_with_metadata`` when attribution metadata must
+        remain paired with the batch.
         """
-        Get the next batch from the buffer if threading is enabled, otherwise
-        call load_next_batch directly.
+        batch, _ = self.get_next_batch_with_metadata(none_throws)
+        return batch
+
+    def get_next_batch_with_metadata(
+        self,
+        none_throws: bool = False,
+    ) -> Tuple[Optional[In], object | None]:
+        """
+        Get the next raw batch and its attribution metadata from the buffer.
 
         This function is not thread safe. We assume this is only invoked from
         the main thread in the training loop.
@@ -936,11 +979,13 @@ class DataLoadingThread(Thread, Generic[In]):
         if batch is None:
             if none_throws:
                 raise StopIteration
-            return None
+            return None, None
+        batch_metadata = self._buffered_batch_metadata
         self._buffered = None
+        self._buffered_batch_metadata = None
         self._buffer_filled_event.clear()
         self._buffer_empty_event.set()
-        return batch
+        return batch, batch_metadata
 
 
 def prefetch_embeddings(
@@ -1214,6 +1259,8 @@ class AsyncInplaceCopyMixin(Generic[In]):
         batch: In,
         device: torch.device,
         memcpy_stream: Optional[torch.Stream],
+        *,
+        context: TrainPipelineContextLite | TrainPipelineContext | None = None,
     ) -> "Future[In]":
         # Capture the consumer's current stream on the MAIN thread; the worker
         # re-enters it so the destination is allocated on the consumer stream.
@@ -1223,7 +1270,11 @@ class AsyncInplaceCopyMixin(Generic[In]):
             device_module = torch.get_device_module(device)
             with device_module.stream(alloc_stream):
                 return _to_device(
-                    batch, device, non_blocking=True, data_copy_stream=memcpy_stream
+                    batch,
+                    device,
+                    non_blocking=True,
+                    data_copy_stream=memcpy_stream,
+                    context=context,
                 )
 
         assert self._inplace_copy_executor is not None
