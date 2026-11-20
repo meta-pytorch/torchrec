@@ -29,7 +29,12 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
-            const run = context.payload.workflow_run;
+            // context.payload is empty here: the OSDC runner doesn't mount the
+            // event file into the job container.
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              ...context.repo,
+              run_id: ${{ github.event.workflow_run.id }},
+            });
             // A failed or cancelled run may not have built the docs.
             const { data: { total_count } } = await github.rest.actions.listWorkflowRunArtifacts({
               ...context.repo,
@@ -46,7 +51,11 @@ jobs:
               head: `${run.head_repository.owner.login}:${run.head_branch}`,
             });
             const pr = pulls.find((p) => p.head.sha === run.head_sha);
-            if (!pr) throw new Error(`No PR has head ${run.head_sha}`);
+            // The PR may have merged or moved to a newer commit since the run started.
+            if (!pr) {
+              core.notice(`No open PR has head ${run.head_sha}`);
+              return;
+            }
             core.setOutput('number', pr.number);
 
       # Uploaded by build_docs_job in docs.yml.
