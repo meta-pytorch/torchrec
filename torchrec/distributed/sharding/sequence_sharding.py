@@ -30,8 +30,6 @@ class SequenceShardingContext(EmbeddingShardingContext):
         output_splits (List[int]): stores the output splits of KJT AlltoAll.
         unbucketize_permute_tensor (Optional[torch.Tensor]): stores the permute order of
             KJT bucketize (for row-wise sharding only).
-        bucketized_features_before_input_dist (Optional[KeyedJaggedTensor]): stores
-            the source-rank bucketized KJT so an immediate write can reuse routing.
         lengths_after_input_dist (Optional[torch.Tensor]): stores the KJT length after
             input dist.
     """
@@ -41,7 +39,6 @@ class SequenceShardingContext(EmbeddingShardingContext):
     output_splits: List[int] = field(default_factory=list)
     sparse_features_recat: Optional[torch.Tensor] = None
     unbucketize_permute_tensor: Optional[torch.Tensor] = None
-    bucketized_features_before_input_dist: Optional[KeyedJaggedTensor] = None
     lengths_after_input_dist: Optional[torch.Tensor] = None
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -52,9 +49,6 @@ class SequenceShardingContext(EmbeddingShardingContext):
             self.sparse_features_recat.record_stream(stream)
         if self.unbucketize_permute_tensor is not None:
             self.unbucketize_permute_tensor.record_stream(stream)
-        if self.bucketized_features_before_input_dist is not None:
-            # pyrefly: ignore[bad-argument-type]
-            self.bucketized_features_before_input_dist.record_stream(stream)
         if self.lengths_after_input_dist is not None:
             self.lengths_after_input_dist.record_stream(stream)
 
