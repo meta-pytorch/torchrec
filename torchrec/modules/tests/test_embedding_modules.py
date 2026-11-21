@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import importlib.util
 import unittest
 import weakref
 from functools import partial
@@ -427,6 +428,41 @@ class EmbeddingCollectionTest(unittest.TestCase):
                 del embeddings
                 self.assertEqual(embeddings_ref() is None, lean)
                 output["item"].values().sum().backward()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("triton") is not None, "requires optional Triton"
+    )
+    def test_gather_sorted_selection_boundary(self) -> None:
+        table = torch.randn(2, 3, requires_grad=True)
+        for index_count in (4, 5):
+            with self.subTest(index_count=index_count):
+                features = KeyedJaggedTensor.from_lengths_sync(
+                    keys=["item"],
+                    values=torch.arange(index_count),
+                    lengths=torch.tensor([index_count]),
+                )
+                reverse_indices = torch.tensor([0, 1, 0, 1, 0][:index_count])
+                embeddings = table * 2.0
+                embeddings_ref = weakref.ref(embeddings)
+
+                output = construct_jagged_tensors(
+                    embeddings=embeddings,
+                    features=features,
+                    embedding_names=["item"],
+                    reverse_indices=reverse_indices,
+                    use_gather_select=True,
+                    use_sorted_select=True,
+                    use_lean_gather_backward=False,
+                )
+
+                self.assertTrue(
+                    torch.equal(
+                        output["item"].values(),
+                        embeddings.index_select(0, reverse_indices),
+                    )
+                )
+                del embeddings
+                self.assertEqual(embeddings_ref() is None, index_count > 4)
 
     def test_lean_gather_backward_defaults_off(self) -> None:
         ec = EmbeddingCollection(tables=[])

@@ -8,8 +8,6 @@
 
 import copy
 import logging
-import os
-import time
 import warnings
 from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
@@ -20,10 +18,8 @@ from typing import (
     cast,
     Dict,
     List,
-    Mapping,
     MutableMapping,
     Optional,
-    Sequence,
     Tuple,
     Type,
     Union as TypeUnion,
@@ -38,7 +34,6 @@ from torch.distributed._tensor import DTensor
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.dist_data import SequenceEmbeddingsAwaitable, unbucketize_rows
 from torchrec.distributed.embedding_lookup import (
     GroupedEmbeddingsLookup,
     PartiallyMaterializedTensor,
@@ -76,10 +71,7 @@ from torchrec.distributed.sharding.dp_sequence_sharding import (
 from torchrec.distributed.sharding.rw_sequence_sharding import (
     RwSequenceEmbeddingSharding,
 )
-from torchrec.distributed.sharding.rw_sharding import (
-    RwSparseFeaturesDist,
-    RwSparseFeaturesWriteDist,
-)
+from torchrec.distributed.sharding.rw_sharding import RwSparseFeaturesDist
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.sharding.tw_sequence_sharding import (
     TwSequenceEmbeddingSharding,
@@ -159,38 +151,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 EC_INDEX_DEDUP: bool = False
-
-# Env TORCHREC_SEQ_UNBUCKETIZE_COMPOSE=1 (read per call by
-# ShardedEmbeddingCollection.compute_and_output_dist; eager training with index
-# dedup): for a dedup'd sharding whose output dist awaitable is a
-# SequenceEmbeddingsAwaitable with a bijective unbucketize permute (row-wise),
-# compute_and_output_dist builds reverse_indices' =
-# permute.index_select(0, reverse_indices) once the output dists are issued, and
-# the wait skips the unbucketize, along with the packed-row gathers of
-# TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP for that wait: construct_jagged_tensors
-# expands the rows in all-to-all order through reverse_indices'. Row k is
-# all-to-all row permute[reverse_indices[k]] on both paths. In the backward the
-# gradient of all-to-all row permute[j] sums the positions k with
-# reverse_indices[k] == j in the same (stable sort, ascending) order as the old
-# path's gradient of row j, which the old path then permutes into all-to-all
-# order, so both directions are bitwise the old path's (except rows that either
-# path adds with atomics, such as a hot row's chunk sums, whose order is not
-# fixed on either path). The SEG-PRE plans (ONEFLOW_SEG_PRE_PLAN) are built from
-# reverse_indices'; ctx.reverse_indices keeps the original, which write_dist
-# reuses. The wait uses reverse_indices' on its build stream, or on another
-# stream after waiting for an event recorded after the build, else takes the
-# old path. TORCHREC_SEQ_UNBUCKETIZE_COMPOSE_CHECK=1 also compares, on the first
-# few composed waits, the rows they return with the old path's and, in their
-# backward, the gradient of the all-to-all rows with the old path's; a mismatch
-# returns the old path's rows or gradient and turns the flag off for the rest
-# of the process.
-_SEQ_UNBUCKETIZE_COMPOSE_CHECK_CALLS = 3
-_SEQ_UNBUCKETIZE_COMPOSE_CHECK_ROWS = 1 << 16
-_SEQ_UNBUCKETIZE_COMPOSE_DROP_LOGS = 3
-_seq_unbucketize_compose_checks = 0
-_seq_unbucketize_compose_disabled = False
-_seq_unbucketize_compose_logged = False
-_seq_unbucketize_compose_drops = 0
 
 
 def get_device_from_parameter_sharding(
@@ -384,17 +344,11 @@ class EmbeddingCollectionContext(Multistreamable):
     input_features: List[KeyedJaggedTensor] = field(default_factory=list)
     reverse_indices: List[torch.Tensor] = field(default_factory=list)
     seq_vbe_ctx: List[SequenceVBEContext] = field(default_factory=list)
-    # TORCHREC_SEQ_UNBUCKETIZE_COMPOSE: per sharding, the _ComposedReverseIndices
-    # compute_and_output_dist built, or None.
-    composed_reverse_indices: List[Any] = field(default_factory=list)
     table_name_to_unpruned_hash_sizes: Dict[str, int] = field(default_factory=dict)
     early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
     # A pipeline sets this per batch to defer DP lookup until output consumption.
     # `ShardedModule.forward` leaves it false, so eager execution never defers.
     defer_dp_lookup: bool = False
-    # ONEFLOW_SEG_PRE_PLAN: per sharding, the build_sorted_plan of the dedup expand
-    # backward (torchrec.modules.sorted_index_select.SortedSegPlan) or None.
-    seg_plans: List[Any] = field(default_factory=list)
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -406,229 +360,6 @@ class EmbeddingCollectionContext(Multistreamable):
             r.record_stream(stream)
         for s in self.seq_vbe_ctx:
             s.record_stream(stream)
-        for composed in self.composed_reverse_indices:
-            if composed is not None:
-                composed.record_stream(stream)
-
-
-def _compose_reference_grad(
-    composed: "_ComposedReverseIndices",
-    grads: List[Optional[torch.Tensor]],
-    split_sizes: List[int],
-    rows: torch.Tensor,
-    use_sorted_select: bool,
-    use_gather_select: bool = False,
-) -> torch.Tensor:
-    from torchrec.modules.utils import select_embeddings
-
-    with torch.enable_grad():
-        source = rows.detach().new_zeros(rows.shape, requires_grad=True)
-        expanded = select_embeddings(
-            source,
-            composed.reverse_indices,
-            use_gather_select=use_gather_select,
-            use_sorted_select=use_sorted_select,
-        )
-        upstream = torch.cat(
-            [
-                rows.new_zeros((n, rows.size(1))) if g is None else g.detach()
-                for g, n in zip(grads, split_sizes)
-            ]
-        )
-        return torch.autograd.grad(expanded, source, upstream)[0]
-
-
-def _cuda_stream(device: torch.device) -> Optional[torch.cuda.Stream]:
-    """The current stream of a CUDA ``device``; None for other devices."""
-    return torch.cuda.current_stream(device) if device.type == "cuda" else None
-
-
-def _bits(t: torch.Tensor) -> torch.Tensor:
-    """``t`` as integers of its element size, so that NaNs compare equal."""
-    sizes = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
-    return t.view(sizes[t.element_size()])
-
-
-class _ComposedReverseIndices:
-    """TORCHREC_SEQ_UNBUCKETIZE_COMPOSE for one sharding: ``indices`` is
-    ``permute.index_select(0, reverse_indices)``, the dedup reverse_indices into
-    the rows ``awaitable`` returns after skip_unbucketize (all-to-all order).
-    ``stream`` is the CUDA stream that built ``indices`` (None off CUDA) and
-    ``ready`` an event recorded on it after the build (None under graph
-    capture)."""
-
-    def __init__(
-        self,
-        indices: torch.Tensor,
-        permute: torch.Tensor,
-        reverse_indices: torch.Tensor,
-        awaitable: SequenceEmbeddingsAwaitable,
-    ) -> None:
-        self.indices = indices
-        self.permute = permute
-        self.reverse_indices = reverse_indices
-        self.awaitable = awaitable
-        self.stream: Optional[torch.cuda.Stream] = _cuda_stream(indices.device)
-        self.ready: Optional[torch.cuda.Event] = None
-
-    def record_stream(self, stream: torch.Stream) -> None:
-        self.indices.record_stream(stream)
-
-    def for_current_stream(self) -> bool:
-        """Whether the current stream may read ``indices``: it is ``stream``,
-        or it now waits for ``ready`` (a stream wait, no host sync), holds
-        ``indices`` for the caching allocator and becomes ``stream``."""
-        cur = _cuda_stream(self.indices.device)
-        if cur is None or cur == self.stream:
-            return True
-        if self.ready is None:
-            return False
-        cur.wait_event(self.ready)
-        self.record_stream(cur)
-        self.stream = cur
-        return True
-
-
-def _seq_unbucketize_compose_wanted(module: "ShardedEmbeddingCollection") -> bool:
-    """TORCHREC_SEQ_UNBUCKETIZE_COMPOSE=1 (read per call) for a sharded EC
-    with dedup, in eager training, unless its self-check failed:
-    compute_and_output_dist composes the unbucketize permutes into the dedup
-    reverse_indices (see ShardedEmbeddingCollection._compose_reverse_indices)."""
-    return (
-        module._use_index_dedup
-        and not torch.compiler.is_compiling()
-        and os.environ.get("TORCHREC_SEQ_UNBUCKETIZE_COMPOSE", "1") == "1"
-        and not _seq_unbucketize_compose_disabled
-        and module.training
-        and torch.is_grad_enabled()
-        and not torch.jit.is_scripting()
-        and not torch.fx._symbolic_trace.is_fx_tracing()
-    )
-
-
-def _seq_unbucketize_compose_check_due() -> bool:
-    return (
-        _seq_unbucketize_compose_checks < _SEQ_UNBUCKETIZE_COMPOSE_CHECK_CALLS
-        and os.environ.get("TORCHREC_SEQ_UNBUCKETIZE_COMPOSE_CHECK", "0") == "1"
-        and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
-    )
-
-
-def _compose_forward_ok(
-    composed: _ComposedReverseIndices,
-    rows: torch.Tensor,
-    jts: Dict[str, JaggedTensor],
-    names: List[str],
-    features: KeyedJaggedTensor,
-) -> bool:
-    """Whether the values of ``jts`` for ``names`` are bitwise the old path's:
-    the all-to-all ``rows`` gathered by the unbucketize permute, then by the
-    original reverse_indices, split by key. Compared in row blocks, each
-    gathered from ``rows`` through permute[reverse_indices[k]] (the rows the
-    old path's two gathers copy); syncs once."""
-    rows = rows.detach()
-    permute = composed.permute
-    rev = composed.reverse_indices
-    step = _SEQ_UNBUCKETIZE_COMPOSE_CHECK_ROWS
-    bad = torch.zeros((), dtype=torch.int64, device=rows.device)
-    offset = 0
-    for name, n in zip(names, features.length_per_key()):
-        values = jts[name].values().detach()
-        if values.dtype != rows.dtype or values.shape != (n, rows.size(1)):
-            return False
-        for s in range(0, n, step):
-            ids = rev[offset + s : offset + min(n, s + step)]
-            ref = rows.index_select(0, permute.index_select(0, ids))
-            bad += (_bits(ref) != _bits(values[s : s + step])).sum()
-        offset += n
-    return offset == rev.numel() and int(bad) == 0
-
-
-def _compose_grads_match(
-    grad: torch.Tensor,
-    ref: torch.Tensor,
-    composed: _ComposedReverseIndices,
-    use_sorted_select: bool,
-) -> bool:
-    """Compare mapped gradients with bounded GPU accumulation-order error on repeated rows."""
-    if grad.shape != ref.shape or grad.dtype != ref.dtype or ref.dim() != 2:
-        return False
-    num_rows = ref.size(0)
-    permute = composed.permute
-    loose = None
-    if ref.is_cuda:
-        counts = torch.bincount(composed.reverse_indices, minlength=num_rows)
-        loose = counts > 1
-    eps = torch.finfo(ref.dtype).eps
-    step = _SEQ_UNBUCKETIZE_COMPOSE_CHECK_ROWS
-    bad = torch.zeros((), dtype=torch.int64, device=ref.device)
-    for s in range(0, num_rows, step):
-        g = grad.index_select(0, permute[s : s + step])
-        r = ref[s : s + step]
-        ok = _bits(g) == _bits(r)
-        if loose is not None:
-            err = (g.float() - r.float()).abs_()
-            r_abs = r.float().abs_()
-            tol = r_abs.mul(eps).add_(r_abs.amax(1, keepdim=True).mul_(1e-4))
-            ok |= loose[s : s + step, None] & (err <= tol)
-        bad += (~ok).sum()
-    return int(bad) == 0
-
-
-def _compose_check_backward(
-    composed: _ComposedReverseIndices,
-    rows: torch.Tensor,
-    values: List[torch.Tensor],
-    split_sizes: List[int],
-    use_sorted_select: bool,
-    use_gather_select: bool = False,
-) -> None:
-    """The backward half of the TORCHREC_SEQ_UNBUCKETIZE_COMPOSE self-check:
-    once the per-key ``values`` have their gradients (before the expand
-    reduces them), computes the old path's gradient from them; the gradient
-    the expand then hands to the all-to-all ``rows`` is compared with it and,
-    on a mismatch, replaced by it (in all-to-all order)."""
-    if not rows.requires_grad or not all(v.requires_grad for v in values):
-        return
-    refs: List[torch.Tensor] = []
-
-    def capture(grads: Sequence[Optional[torch.Tensor]]) -> None:
-        refs.append(
-            _compose_reference_grad(
-                composed,
-                list(grads),
-                split_sizes,
-                rows,
-                use_sorted_select,
-                use_gather_select,
-            )
-        )
-
-    def compare(grad: torch.Tensor) -> Optional[torch.Tensor]:
-        global _seq_unbucketize_compose_disabled
-        if not refs:
-            return None
-        ref = refs.pop()
-        ok = _compose_grads_match(grad, ref, composed, use_sorted_select)
-        logger.warning(
-            "TORCHREC_SEQ_UNBUCKETIZE_COMPOSE backward self-check: rows=%d "
-            "dim=%d ok=%s",
-            ref.size(0),
-            ref.size(1),
-            ok,
-        )
-        if ok:
-            return None
-        logger.error(
-            "TORCHREC_SEQ_UNBUCKETIZE_COMPOSE backward self-check FAILED; using "
-            "the old path's gradient and disabling the flag for the rest of the "
-            "process"
-        )
-        _seq_unbucketize_compose_disabled = True
-        return ref.new_empty(ref.shape).index_copy_(0, composed.permute.long(), ref)
-
-    torch.autograd.graph.register_multi_grad_hook(values, capture)
-    rows.register_hook(compare)
 
 
 class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
@@ -687,23 +418,12 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
             seq_vbe_ctx = (
                 None if i >= len(self._ctx.seq_vbe_ctx) else self._ctx.seq_vbe_ctx[i]
             )
-            seg_plan = None
-            if i < len(self._ctx.seg_plans):
-                # The autograd node that uses the plan holds it from here on,
-                # and its backward runs on this stream.
-                seg_plan, self._ctx.seg_plans[i] = self._ctx.seg_plans[i], None
-                if seg_plan is not None:
-                    seg_plan = seg_plan.for_current_stream()
+
             with maybe_annotate_embedding_event(
                 EmbeddingEvent.OUTPUT_DIST_WAIT,
                 self._module_fqn,
                 self._sharding_types[i] if self._sharding_types else None,
             ):
-                composed = self._take_composed(i, w)
-                if composed is not None:
-                    # pyrefly: ignore [missing-attribute]
-                    w.skip_unbucketize()
-                    reverse_indices = composed.indices
                 embeddings = w.wait()
 
             sharding_type = self._sharding_types[i] if self._sharding_types else None
@@ -716,7 +436,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
             else:
                 use_gather_select = self._use_gather_select
             if self._use_packed_jagged_tensor:
-                jts = construct_packed_jagged_tensors(
+                constructed_jagged_tensors = construct_packed_jagged_tensors(
                     embeddings=embeddings,
                     features=f,
                     embedding_names=e,
@@ -726,7 +446,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     seq_vbe_ctx=seq_vbe_ctx,
                 )
             else:
-                jts = construct_jagged_tensors(
+                constructed_jagged_tensors = construct_jagged_tensors(
                     embeddings=embeddings,
                     features=f,
                     embedding_names=e,
@@ -737,20 +457,9 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     seq_vbe_ctx=seq_vbe_ctx,
                     use_gather_select=use_gather_select,
                     use_sorted_select=self._use_sorted_select,
-                    seg_plan=seg_plan,
                     use_lean_gather_backward=self._use_lean_gather_backward,
                 )
-                if composed is not None and _seq_unbucketize_compose_check_due():
-                    jts = self._check_composed(
-                        composed,
-                        embeddings,
-                        jts,
-                        f,
-                        e,
-                        original_features,
-                        use_gather_select,
-                    )
-            jt_dict.update(jts)
+            jt_dict.update(constructed_jagged_tensors)
 
         # free memory and resize
         if self._resize_awaitables:
@@ -758,100 +467,6 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                 awaitable.wait()
 
         return jt_dict
-
-    def _take_composed(
-        self, i: int, w: Awaitable[torch.Tensor]
-    ) -> Optional[_ComposedReverseIndices]:
-        """Sharding i's TORCHREC_SEQ_UNBUCKETIZE_COMPOSE indices, once, if this
-        wait may use them: they were built for ``w``, whose unbucketize is still
-        its only callback, and the current stream may read them. Otherwise
-        None (logged), and the wait takes the old path."""
-        global _seq_unbucketize_compose_drops
-        if i >= len(self._ctx.composed_reverse_indices):
-            return None
-        composed = self._ctx.composed_reverse_indices[i]
-        self._ctx.composed_reverse_indices[i] = None
-        if composed is None:
-            return None
-        if (
-            composed.awaitable is w
-            and len(w.callbacks) == 1
-            and composed.for_current_stream()
-        ):
-            return composed
-        _seq_unbucketize_compose_drops += 1
-        if _seq_unbucketize_compose_drops <= _SEQ_UNBUCKETIZE_COMPOSE_DROP_LOGS:
-            logger.warning(
-                "TORCHREC_SEQ_UNBUCKETIZE_COMPOSE: composed reverse_indices of "
-                "sharding %d not used (awaitable, callbacks or stream differ); "
-                "old path",
-                i,
-            )
-        return None
-
-    def _check_composed(
-        self,
-        composed: _ComposedReverseIndices,
-        rows: torch.Tensor,
-        jts: Dict[str, JaggedTensor],
-        features: KeyedJaggedTensor,
-        names: List[str],
-        original_features: Optional[KeyedJaggedTensor],
-        use_gather_select: bool,
-    ) -> Dict[str, JaggedTensor]:
-        """TORCHREC_SEQ_UNBUCKETIZE_COMPOSE_CHECK on a composed wait: ``jts``
-        if its values are the old path's (and then the backward check is set
-        up), else the old path's result, with the flag turned off for the rest
-        of the process."""
-        global _seq_unbucketize_compose_checks, _seq_unbucketize_compose_disabled
-        _seq_unbucketize_compose_checks += 1
-        keyed = original_features if original_features is not None else features
-        # The rows must be in all-to-all order: the Request did not apply the
-        # unbucketize permute (TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP).
-        row_map_applied = composed.awaitable._row_map_applied[0]
-        ok = not row_map_applied and _compose_forward_ok(
-            composed, rows, jts, names, keyed
-        )
-        logger.warning(
-            "TORCHREC_SEQ_UNBUCKETIZE_COMPOSE forward self-check %d/%d: rows=%d "
-            "dim=%d ids=%d row_map_applied=%s ok=%s",
-            _seq_unbucketize_compose_checks,
-            _SEQ_UNBUCKETIZE_COMPOSE_CHECK_CALLS,
-            rows.size(0),
-            rows.size(1),
-            composed.indices.numel(),
-            row_map_applied,
-            ok,
-        )
-        if ok:
-            _compose_check_backward(
-                composed,
-                rows,
-                [jts[name].values() for name in names],
-                keyed.length_per_key(),
-                self._use_sorted_select,
-                use_gather_select,
-            )
-            return jts
-        logger.error(
-            "TORCHREC_SEQ_UNBUCKETIZE_COMPOSE forward self-check FAILED; using the "
-            "old path and disabling the flag for the rest of the process"
-        )
-        _seq_unbucketize_compose_disabled = True
-        return construct_jagged_tensors(
-            embeddings=(
-                rows if row_map_applied else unbucketize_rows(rows, composed.permute)
-            ),
-            features=features,
-            embedding_names=names,
-            need_indices=self._need_indices,
-            features_to_permute_indices=self._features_to_permute_indices,
-            original_features=original_features,
-            reverse_indices=composed.reverse_indices,
-            use_gather_select=use_gather_select,
-            use_sorted_select=self._use_sorted_select,
-            use_lean_gather_backward=self._use_lean_gather_backward,
-        )
 
 
 class ShardedEmbeddingCollection(
@@ -2090,11 +1705,6 @@ class ShardedEmbeddingCollection(
                             if isinstance(input_dist, RwSparseFeaturesDist)
                             else None
                         ),
-                        bucketized_features_before_input_dist=(
-                            input_dist.bucketized_features
-                            if isinstance(input_dist, RwSparseFeaturesDist)
-                            else None
-                        ),
                     )
                 )
             if unpadded_features is not None:
@@ -2169,7 +1779,6 @@ class ShardedEmbeddingCollection(
         features: KeyedJaggedTensor,
         sharding_ctx: SequenceShardingContext,
         resize_awaitables: List[Awaitable[torch.Tensor]],
-        seg_plan_inputs: Optional[List[Tuple[torch.Tensor, int]]] = None,
     ) -> Awaitable[torch.Tensor]:
         """Local lookup plus output dist for a single sharding."""
         lookup = self._lookups[index]
@@ -2198,9 +1807,6 @@ class ShardedEmbeddingCollection(
             if self.post_lookup_tracker_fn is not None:
                 self.post_lookup_tracker_fn(features, embs, self, None)
 
-            if seg_plan_inputs is not None:
-                seg_plan_inputs.append((embs, embedding_dim))
-
         with maybe_annotate_embedding_event(
             EmbeddingEvent.OUTPUT_DIST, self._module_fqn, sharding_type
         ):
@@ -2211,76 +1817,6 @@ class ShardedEmbeddingCollection(
 
         return awaitable
 
-    def _compose_reverse_indices(
-        self,
-        ctx: EmbeddingCollectionContext,
-        awaitables_per_sharding: List[Awaitable[torch.Tensor]],
-    ) -> List[Optional[_ComposedReverseIndices]]:
-        """Per sharding, its _ComposedReverseIndices, or None: for a dedup'd,
-        non-VBE sharding with distinct embedding names whose output dist
-        awaitable gives a bijective unbucketize permute (unbucketize callback
-        only) over the sharding's dedup ids. Records one event after the builds
-        for a wait on another stream."""
-        global _seq_unbucketize_compose_logged
-        composed: List[Optional[_ComposedReverseIndices]] = []
-        for i, (awaitable, sharding_ctx, names) in enumerate(
-            zip(
-                awaitables_per_sharding,
-                ctx.sharding_contexts,
-                self._embedding_names_per_sharding,
-            )
-        ):
-            entry = None
-            features = sharding_ctx.features_before_input_dist
-            permute = None
-            if (
-                isinstance(awaitable, SequenceEmbeddingsAwaitable)
-                and features is not None
-                and i < len(ctx.reverse_indices)
-                and i >= len(ctx.seq_vbe_ctx)
-                and len(set(names)) == len(names)
-            ):
-                permute = awaitable.unbucketize_permute_for_compose()
-            if permute is not None and features is not None:
-                reverse_indices = ctx.reverse_indices[i]
-                if (
-                    permute.dim() == 1
-                    and reverse_indices.dim() == 1
-                    and permute.device == reverse_indices.device
-                    and permute.numel() == features.values().numel()
-                ):
-                    with record_function("## seq_unbucketize_compose ##"):
-                        indices = permute.index_select(0, reverse_indices).to(
-                            reverse_indices.dtype
-                        )
-                    entry = _ComposedReverseIndices(
-                        # pyrefly: ignore [bad-argument-type]
-                        indices,
-                        permute,
-                        reverse_indices,
-                        # pyrefly: ignore [bad-argument-type]
-                        awaitable,
-                    )
-            composed.append(entry)
-        built = [c for c in composed if c is not None and c.stream is not None]
-        if built and not torch.cuda.is_current_stream_capturing():
-            stream = built[0].stream
-            assert stream is not None
-            ready = stream.record_event()
-            for c in built:
-                # pyrefly: ignore [bad-assignment]
-                c.ready = ready
-        if not _seq_unbucketize_compose_logged and any(c is not None for c in composed):
-            _seq_unbucketize_compose_logged = True
-            logger.info(
-                "TORCHREC_SEQ_UNBUCKETIZE_COMPOSE: shardings %s expand the "
-                "all-to-all rows through the composed reverse_indices; their "
-                "waits skip the unbucketize permute (and the "
-                "TORCHREC_SEQ_A2A_UNBUCKETIZE_ROWMAP packed-row gathers)",
-                [i for i, c in enumerate(composed) if c is not None],
-            )
-        return composed
-
     def compute_and_output_dist(
         self, ctx: EmbeddingCollectionContext, input: KJTList
     ) -> LazyAwaitable[Dict[str, JaggedTensor]]:
@@ -2290,15 +1826,7 @@ class ShardedEmbeddingCollection(
         data-parallel lookup until it is consumed. All other sharding lookups and
         output distributions start immediately.
         """
-        seg_plan_inputs: Optional[List[Tuple[torch.Tensor, int]]] = (
-            [] if self._seg_pre_plan_wanted() else None
-        )
-        # The seg pre-plan needs every sharding's lookup output here.
-        defer_dp = (
-            ctx.defer_dp_lookup
-            and self._dp_index is not None
-            and seg_plan_inputs is None
-        )
+        defer_dp = ctx.defer_dp_lookup and self._dp_index is not None
         awaitables_per_sharding: List[Awaitable[torch.Tensor]] = []
         features_before_all2all_per_sharding: List[KeyedJaggedTensor] = []
         resize_awaitables: List[Awaitable[torch.Tensor]] = []
@@ -2326,11 +1854,7 @@ class ShardedEmbeddingCollection(
             else:
                 awaitables_per_sharding.append(
                     self._compute_and_output_dist_per_sharding(
-                        index,
-                        features,
-                        sharding_ctx,
-                        resize_awaitables,
-                        seg_plan_inputs,
+                        index, features, sharding_ctx, resize_awaitables
                     )
                 )
 
@@ -2338,12 +1862,7 @@ class ShardedEmbeddingCollection(
                 # pyrefly: ignore[bad-argument-type]
                 sharding_ctx.features_before_input_dist
             )
-        if _seq_unbucketize_compose_wanted(self):
-            ctx.composed_reverse_indices = self._compose_reverse_indices(
-                ctx, awaitables_per_sharding
-            )
-        if seg_plan_inputs is not None:
-            ctx.seg_plans = self._build_seg_plans(ctx, seg_plan_inputs)
+
         return EmbeddingCollectionAwaitable(
             awaitables_per_sharding=awaitables_per_sharding,
             features_per_sharding=features_before_all2all_per_sharding,
@@ -2360,66 +1879,6 @@ class ShardedEmbeddingCollection(
             use_lean_gather_backward=self._use_lean_gather_backward,
             resize_awaitables=resize_awaitables,
         )
-
-    def _seg_pre_plan_wanted(self) -> bool:
-        """ONEFLOW_SEG_PRE_PLAN=1 (read per call) with dedup and the sorted
-        select on, in eager training: compute_and_output_dist builds the
-        backward plans of the dedup expand (see _build_seg_plans)."""
-        return (
-            self._use_index_dedup
-            and self._use_sorted_select
-            and not torch.compiler.is_compiling()
-            and os.environ.get("ONEFLOW_SEG_PRE_PLAN", "1") == "1"
-            and torch.is_grad_enabled()
-            and not torch.fx._symbolic_trace.is_fx_tracing()
-        )
-
-    def _build_seg_plans(
-        self,
-        ctx: EmbeddingCollectionContext,
-        seg_plan_inputs: List[Tuple[torch.Tensor, int]],
-    ) -> List[Any]:
-        """Per sharding, the build_sorted_plan of the sorted select of
-        construct_jagged_tensors, for the dedup reverse_indices into the
-        sharding's output rows (one per dedup id, a host-known count) of the
-        lookup's width and dtype, or None (no gradient or no reverse_indices).
-        A sharding with TORCHREC_SEQ_UNBUCKETIZE_COMPOSE indices is planned for
-        those. The backward ignores a plan that does not fit its embeddings.
-        The plans record this stream, and an event after them for _wait_impl
-        on another stream to wait for."""
-        from torchrec.modules.sorted_index_select import (
-            build_sorted_plan,
-            EC_PLAN_BUILD_TIMER,
-            record_sorted_plans_ready,
-        )
-
-        t0 = time.perf_counter()
-        plans: List[Any] = []
-        for i, (sharding_ctx, (embs, dim)) in enumerate(
-            zip(ctx.sharding_contexts, seg_plan_inputs)
-        ):
-            features = sharding_ctx.features_before_input_dist
-            plan = None
-            if (
-                embs.requires_grad
-                and features is not None
-                and i < len(ctx.reverse_indices)
-            ):
-                composed = (
-                    ctx.composed_reverse_indices[i]
-                    if i < len(ctx.composed_reverse_indices)
-                    else None
-                )
-                plan = build_sorted_plan(
-                    ctx.reverse_indices[i] if composed is None else composed.indices,
-                    features.values().numel(),
-                    dim,
-                    embs.dtype,
-                )
-            plans.append(plan)
-        record_sorted_plans_ready(plans)
-        EC_PLAN_BUILD_TIMER.add(time.perf_counter() - t0)
-        return plans
 
     def _embedding_dim_for_sharding_type(self, sharding_type: str) -> int:
         return (
@@ -2477,146 +1936,6 @@ class ShardedEmbeddingCollection(
             self._module_fqn,
             list(self._sharding_type_to_sharding.keys()),
         )
-
-    def write_dist_with_reused_input_dist(
-        self,
-        ctx: EmbeddingCollectionContext,
-        embeddings: KeyedJaggedTensor,
-        input_dist_ctx: EmbeddingCollectionContext,
-    ) -> Awaitable[Awaitable[KJTList]]:
-        """Reuse a preceding lookup's row-wise routing for an immediate write."""
-        if not self.enable_embedding_update:
-            raise ValueError("enable_embedding_update is False for this collection")
-        if not self._write_dists:
-            self._create_write_dist()
-        if set(embeddings.keys()) != self._writable_embedding_names:
-            raise ValueError(
-                f"write_dist feature names {embeddings.keys()} do not match expected {self._writable_embedding_names}"
-            )
-
-        embeddings_by_shards = embeddings.split(self._write_splits)
-        if len(embeddings_by_shards) != len(input_dist_ctx.sharding_contexts):
-            return self.write_dist(ctx, embeddings)
-
-        routing_inputs: List[
-            Tuple[
-                RwSparseFeaturesWriteDist,
-                KeyedJaggedTensor,
-                KeyedJaggedTensor,
-                torch.Tensor,
-            ]
-        ] = []
-        for i, (write_dist, write_embeddings, input_sharding_ctx) in enumerate(
-            zip(
-                self._write_dists,
-                embeddings_by_shards,
-                input_dist_ctx.sharding_contexts,
-            )
-        ):
-            bucketized_features = (
-                input_sharding_ctx.bucketized_features_before_input_dist
-            )
-            input_features = input_sharding_ctx.features_before_input_dist
-            unbucketize_permute = input_sharding_ctx.unbucketize_permute_tensor
-            write_weights = write_embeddings.weights_or_none()
-            if (
-                not isinstance(write_dist, RwSparseFeaturesWriteDist)
-                or bucketized_features is None
-                or input_features is None
-                or unbucketize_permute is None
-                or write_embeddings.keys() != input_features.keys()
-                or write_weights is None
-                or write_weights.dim() != 2
-                or write_embeddings.values().numel()
-                != bucketized_features.values().numel()
-            ):
-                return self.write_dist(ctx, embeddings)
-
-            source_to_bucketized_permute = unbucketize_permute
-            if self._use_index_dedup:
-                if i >= len(input_dist_ctx.reverse_indices):
-                    return self.write_dist(ctx, embeddings)
-                reverse_indices = input_dist_ctx.reverse_indices[i]
-                if reverse_indices.numel() != bucketized_features.values().numel():
-                    # Reusing a deduplicated route would drop write payloads. Keep
-                    # the existing path whenever lookup dedup changed cardinality.
-                    return self.write_dist(ctx, embeddings)
-                source_to_bucketized_permute = unbucketize_permute.index_select(
-                    0, reverse_indices
-                )
-
-            routing_inputs.append(
-                (
-                    write_dist,
-                    write_embeddings,
-                    bucketized_features,
-                    source_to_bucketized_permute,
-                )
-            )
-
-        with torch.no_grad(), record_function("## reuse_ec_write_routing ##"):
-            awaitables = [
-                write_dist.forward_with_reused_routing(
-                    write_embeddings,
-                    bucketized_features,
-                    source_to_bucketized_permute,
-                )
-                for (
-                    write_dist,
-                    write_embeddings,
-                    bucketized_features,
-                    source_to_bucketized_permute,
-                ) in routing_inputs
-            ]
-
-        return KJTListSplitsAwaitable(
-            awaitables,
-            ctx,
-            self._module_fqn,
-            list(self._sharding_type_to_sharding.keys()),
-        )
-
-    def write_with_reused_input_dist(
-        self,
-        features: KeyedJaggedTensor,
-        input_dist_ctx: EmbeddingCollectionContext,
-    ) -> None:
-        """Write payloads using routing retained by the matching lookup."""
-        write_ctx = self.create_context()
-        dist_write_input = (
-            self.write_dist_with_reused_input_dist(
-                write_ctx,
-                features,
-                input_dist_ctx,
-            )
-            .wait()
-            .wait()
-        )
-        self.update(write_ctx, dist_write_input)
-
-    def preprocess_input(
-        self,
-        args: List[Any],
-        kwargs: Mapping[str, Any],
-    ) -> Tuple[List[Any], Mapping[str, Any]]:
-        """Keep the runtime-only write flag out of pipelined input_dist."""
-        if "write" not in kwargs:
-            return args, kwargs
-        input_dist_kwargs = dict(kwargs)
-        input_dist_kwargs.pop("write")
-        return args, input_dist_kwargs
-
-    def forward(
-        self, features: KeyedJaggedTensor, write: bool = False
-    ) -> LazyAwaitable[Dict[str, JaggedTensor]]:
-        """Run lookup and optionally an immediate write with shared routing."""
-        input_dist_ctx = self.create_context()
-        dist_input = self.input_dist(input_dist_ctx, features).wait().wait()
-        output = self.compute_and_output_dist(input_dist_ctx, dist_input)
-
-        if write:
-            self.write_with_reused_input_dist(features, input_dist_ctx)
-        return output
 
     def update(self, ctx: EmbeddingCollectionContext, dist_input: KJTList) -> None:
         for update, embeddings in zip(

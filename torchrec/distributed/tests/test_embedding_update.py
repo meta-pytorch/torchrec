@@ -27,9 +27,6 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
-from torchrec.distributed.train_pipeline.runtime_forwards import PipelinedForward
-from torchrec.distributed.train_pipeline.types import CallArgs
 from torchrec.distributed.types import ShardingEnv, ShardingPlan
 from torchrec.modules.embedding_configs import EmbeddingConfig, NoEvictionPolicy
 from torchrec.modules.embedding_modules import EmbeddingCollection
@@ -187,28 +184,6 @@ class TestEmbeddingUpdate(MultiProcessTestBase):
             inputs_per_rank=inputs_per_rank,
             embeddings_per_rank=embeddings_per_rank,
             update_through_dmp=True,
-        )
-
-    def test_embedding_update_reuses_forward_routing_disabled_in_oss_compatibility(
-        self,
-    ) -> None:
-        world_size = 2
-        self._gpu_check(world_size)
-        self._run_multi_process_test(
-            callable=sharded_embedding_update_reuse_routing,
-            world_size=world_size,
-            backend="nccl",
-        )
-
-    def test_embedding_update_reuses_forward_routing_1x8_disabled_in_oss_compatibility(
-        self,
-    ) -> None:
-        world_size = 8
-        self._gpu_check(world_size)
-        self._run_multi_process_test(
-            callable=sharded_embedding_update_reuse_routing,
-            world_size=world_size,
-            backend="nccl",
         )
 
     def test_embedding_update_through_dmp_fail_disabled_in_oss_compatibility(
@@ -634,113 +609,6 @@ def sharded_embedding_update(
             torch.testing.assert_close(
                 torch.cat(embeddings[key].to_dense()),
                 values.to_dense().to(ctx.device),
-                rtol=1e-3,
-                atol=1e-3,
-            )
-
-
-def sharded_embedding_update_reuse_routing(
-    rank: int,
-    world_size: int,
-    backend: str,
-) -> None:
-    with MultiProcessContext(rank, world_size, backend) as ctx:
-        assert ctx.pg is not None
-        embedding_dim = 8
-        table = EmbeddingConfig(
-            num_embeddings=8000,
-            embedding_dim=embedding_dim,
-            name="table_0",
-            feature_names=["feature_0", "feature_1"],
-            total_num_buckets=20,
-            use_virtual_table=True,
-            enable_embedding_update=True,
-            virtual_table_eviction_policy=NoEvictionPolicy(),
-        )
-        model = TestECModel(tables=[table], device=ctx.device)
-        sharder = EmbeddingCollectionSharder(use_index_dedup=True)
-        sharding_plan = construct_module_sharding_plan(
-            model.ec,
-            per_param_sharding={
-                "table_0": row_wise(
-                    compute_kernel=EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value
-                )
-            },
-            world_size=world_size,
-            device_type=ctx.device.type,
-            # pyrefly: ignore[bad-argument-type]
-            sharder=sharder,
-        )
-        set_propogate_device(True)
-        sharded_model = DistributedModelParallel(
-            model,
-            env=ShardingEnv.from_process_group(ctx.pg),
-            plan=ShardingPlan({"ec": sharding_plan}),
-            # pyrefly: ignore[bad-argument-type]
-            sharders=[sharder],
-            device=ctx.device,
-        )
-
-        values = torch.tensor(
-            [
-                1 + rank,
-                401 + rank,
-                1201 + rank,
-                2401 + rank,
-                4001 + rank,
-                5201 + rank,
-                6401 + rank,
-                7601 + rank,
-            ],
-            dtype=torch.long,
-            device=ctx.device,
-        )
-        weights = values.float().unsqueeze(1) + torch.arange(
-            embedding_dim, dtype=torch.float32, device=ctx.device
-        ).unsqueeze(0)
-        features = KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=values,
-            lengths=torch.tensor([2, 2, 2, 2], device=ctx.device),
-            weights=weights,
-        )
-
-        # pyrefly: ignore[missing-attribute]
-        sharded_ec = sharded_model._dmp_wrapped_module.ec
-        # pyrefly: ignore [missing-attribute]
-        input_args, input_kwargs = sharded_ec.preprocess_input(
-            [features], {"write": True}
-        )
-        assert input_args == [features]
-        assert input_kwargs == {}
-        # pyrefly: ignore [missing-attribute]
-        input_dist_ctx = sharded_ec.create_context()
-        # pyrefly: ignore [missing-attribute]
-        input_dist_request = sharded_ec.input_dist(
-            input_dist_ctx, *input_args, **input_kwargs
-        ).wait()
-        pipeline_ctx = TrainPipelineContext()
-        pipeline_ctx.input_dist_tensors_requests["ec"] = input_dist_request
-        pipeline_ctx.module_contexts["ec"] = input_dist_ctx
-        pipelined_forward = PipelinedForward(
-            "ec",
-            CallArgs([], {}),
-            # pyrefly: ignore [bad-argument-type]
-            sharded_ec,
-            pipeline_ctx,
-        )
-        pipelined_forward(features, write=True).wait()
-        torch.cuda.synchronize()
-        # pyrefly: ignore [missing-attribute]
-        self_write_dists = sharded_ec._write_dists
-        assert len(self_write_dists) == 1
-        assert self_write_dists[0]._routing_reuse_count == 1
-
-        updated = sharded_model(features)
-        for feature_name in features.keys():
-            torch.testing.assert_close(
-                torch.cat(updated[feature_name].to_dense()),
-                features[feature_name].weights(),
                 rtol=1e-3,
                 atol=1e-3,
             )
