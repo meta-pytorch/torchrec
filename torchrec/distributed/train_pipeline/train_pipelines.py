@@ -25,7 +25,6 @@ from typing import (
     Iterator,
     List,
     Optional,
-    Set,
     Tuple,
     Type,
     TYPE_CHECKING,
@@ -586,8 +585,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             every consumer of batch tensors to be ordered before the default or
             data_dist stream, and the batch copy to run on the thread that frees
             batches. Ignored when ``enable_inplace_copy_batch`` is set.
-        excluded_pipeline_module_fqns (Optional[Set[str]]): exact ShardedModule
-            FQNs whose forward and input_dist must remain in model forward.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -615,7 +612,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         async_inplace_copy: bool = False,
         async_next_batch: bool = False,
         skip_batch_record_stream: bool = False,
-        excluded_pipeline_module_fqns: Optional[Set[str]] = None,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -633,11 +629,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         self._batch_count = 0
         self._inplace_copy_batch_size_logged = False
         self._clear_data_dist_inputs = clear_data_dist_inputs
-        self._excluded_pipeline_module_fqns = (
-            set(excluded_pipeline_module_fqns)
-            if excluded_pipeline_module_fqns is not None
-            else None
-        )
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
@@ -1035,7 +1026,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             apply_jit=self._apply_jit,
             pipelined_forward=pipelined_forward,
             pipeline_postproc=self._pipeline_postproc,
-            excluded_pipeline_module_fqns=self._excluded_pipeline_module_fqns,
         )
         if self._free_features_storage_early:
             for module in self._pipelined_modules:

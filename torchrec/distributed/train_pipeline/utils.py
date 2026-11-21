@@ -589,7 +589,6 @@ def _rewrite_model(  # noqa C901
     pipelined_forward: Type[BaseForward[TrainPipelineContext]] = PipelinedForward,
     pipeline_postproc: bool = False,
     default_stream: Optional[torch.Stream] = None,
-    excluded_pipeline_module_fqns: Optional[Set[str]] = None,
 ) -> Tuple[
     List[ShardedModule],
     torch.nn.Module,
@@ -623,13 +622,6 @@ def _rewrite_model(  # noqa C901
     for name, m in model.named_modules():
         if isinstance(m, ShardedModule):
             sharded_modules[name] = m
-    excluded_pipeline_module_fqns = excluded_pipeline_module_fqns or set()
-    unknown_exclusions = excluded_pipeline_module_fqns - set(sharded_modules)
-    if unknown_exclusions:
-        raise ValueError(
-            "Pipeline exclusions do not name ShardedModules: "
-            f"{sorted(unknown_exclusions)}"
-        )
 
     ## Trace a model. for more: https://pytorch.org/docs/stable/fx.html
     concrete_args = {}
@@ -665,26 +657,13 @@ def _rewrite_model(  # noqa C901
     else:
         graph = tracer.trace(model, concrete_args=concrete_args)
 
-    graph_sharded_module_fqns = {
-        str(node.target)
-        for node in graph.nodes
-        if node.op == "call_module" and node.target in sharded_modules
-    }
-    uncalled_exclusions = excluded_pipeline_module_fqns - graph_sharded_module_fqns
-    if uncalled_exclusions:
-        raise ValueError(
-            "Pipeline exclusions are absent from the traced forward: "
-            f"{sorted(uncalled_exclusions)}"
-        )
-
     # Select sharded modules, which are top-level in the forward call graph,
     # i.e. don't have input transformations, i.e. rely only on 'builtins.getattr'.
     pipelined_forwards = []
     original_forwards = []
     pipelined_sharded_modules = []
 
-    input_modified_non_pipelined_modules = []
-    explicitly_excluded_modules = []
+    non_pipelined_sharded_modules = []
     non_pipelined_reasons: Dict[str, List[PipeliningDiagnostic]] = {}
 
     args_helper = NodeArgsHelper(
@@ -697,16 +676,6 @@ def _rewrite_model(  # noqa C901
     for node in graph.nodes:
         # only work on the call_module node which is also a sharded module
         if node.op != "call_module" or node.target not in sharded_modules:
-            continue
-
-        if node.target in excluded_pipeline_module_fqns:
-            logger.info(
-                f"Module '{node.target}' is explicitly excluded from pipelining"
-            )
-            one_time_rank0_logger.info(
-                f"Module '{node.target}' is explicitly excluded from pipelining"
-            )
-            explicitly_excluded_modules.append(node.target)
             continue
 
         total_num_args = len(node.args) + len(node.kwargs)
@@ -744,7 +713,7 @@ def _rewrite_model(  # noqa C901
             one_time_rank0_logger.warning(
                 f"Module '{node.target}' will NOT be pipelined, due to input modifications"
             )
-            input_modified_non_pipelined_modules.append(node.target)
+            non_pipelined_sharded_modules.append(node.target)
             non_pipelined_reasons[str(node.target)] = list(
                 dict.fromkeys(diagnostics)
             ) or [PipeliningDiagnostic(reason=PipeliningDiagnosticReason.UNKNOWN)]
@@ -756,16 +725,12 @@ def _rewrite_model(  # noqa C901
         if isinstance(input_model, DistributedModelParallel):
             input_model.module = graph_model
 
-    if input_modified_non_pipelined_modules:
+    if non_pipelined_sharded_modules:
         logger.warning(
             "Sharded modules were not pipelined: %s. "
             + "This should be fixed for pipelining to work to the full extent.",
-            ", ".join(input_modified_non_pipelined_modules),
+            ", ".join(non_pipelined_sharded_modules),
         )
-
-    non_pipelined_sharded_modules = (
-        input_modified_non_pipelined_modules + explicitly_excluded_modules
-    )
 
     log_pipeline_module_info(
         pipelined_module_fqns=pipelined_sharded_modules,
