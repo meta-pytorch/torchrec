@@ -1285,6 +1285,9 @@ class Shard:
     # cached row slots times row size. They are apportioned by shard size, except
     # that data-parallel shards each contain the full cache.
     cache_weight_bytes: int = 0
+    # Populated only for key-value and virtual-table kernels: the part of
+    # `storage.hbm` booked for the table's L1 cache (see `KeyValueL1Booking`).
+    key_value_l1_bytes: int = 0
 
     def __hash__(self) -> int:
         return hash(
@@ -1295,6 +1298,7 @@ class Shard:
                 self.perf,
                 self.rank,
                 self.cache_weight_bytes,
+                self.key_value_l1_bytes,
             )
         )
 
@@ -1780,6 +1784,41 @@ class PlannerErrorType(Enum):
     INPUT_VALIDATION = "input_validation"
     MISSING_MODULE_IN_PLAN = "missing_module_in_plan"
     INVALID_COMPUTE_KERNEL = "invalid_compute_kernel"
+
+
+class KeyValueL1Booking(Enum):
+    """
+    How ``EmbeddingShardingPlanner`` books device memory for the L1 cache of
+    key-value (``EmbeddingComputeKernel.KEY_VALUE``) tables.
+
+    PER_SHARD (default): every shard is charged the L1 of its WHOLE table, capped
+        at ``max_l1_cache_size``. The runtime allocates L1 per TBE, and one TBE
+        groups many tables (and every column-wise shard of a table on one rank),
+        so this can book many times the L1 the runtime allocates.
+    POST_PARTITION: for key-value shards whose sharder can build its per-rank TBE
+        groups before sharding (``BaseEmbeddingSharder.
+        key_value_l1_grouping_sharding_types``), every partitioned proposal is
+        checked against the L1 the runtime would allocate for those groups, and a
+        rank that overflows rejects the proposal. The search first books no L1
+        for those shards; only if no proposal passes does it search again with
+        the PER_SHARD booking, still under the check. Other key-value shards keep
+        the PER_SHARD booking.
+
+        The chosen plan's shard storages carry the PER_SHARD booking, not the
+        checked L1, so every HBM figure read from them (stats, the executor's
+        estimated_max_hbm_bytes, the planner registry and dry-run reports) is not
+        the checked one: it overstates a key-value model's HBM where PER_SHARD
+        over-books L1, and can exceed the device; with no ``max_l1_cache_size`` it
+        understates it, since PER_SHARD books no L1. The checked per-rank L1 is
+        ``EmbeddingShardingPlanner.get_key_value_l1_per_rank()``.
+
+        Not a superset of PER_SHARD: the check also binds the second search, so
+        POST_PARTITION can fail where PER_SHARD under-books and plans (with no
+        ``max_l1_cache_size``, PER_SHARD books no L1 at all).
+    """
+
+    PER_SHARD = "per_shard"
+    POST_PARTITION = "post_partition"
 
 
 class PlannerError(Exception):
@@ -3226,6 +3265,7 @@ def _build_hashable_list(
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
     canonicalize_intra_group_size: bool = False,
+    key_value_l1_booking: KeyValueL1Booking = KeyValueL1Booking.PER_SHARD,
 ) -> List[Any]:
     """Build the canonical hashable list for planner context inputs.
 
@@ -3272,7 +3312,7 @@ def _build_hashable_list(
         )
     )
 
-    return [
+    hashable_list: List[Any] = [
         hashed_topology,
         batch_size,
         [
@@ -3299,6 +3339,11 @@ def _build_hashable_list(
             else None
         ),
     ]
+    # The booking decides which plans are valid. PER_SHARD adds nothing, so the
+    # keys of plans stored before the option existed stay the same.
+    if key_value_l1_booking != KeyValueL1Booking.PER_SHARD:
+        hashable_list.append(key_value_l1_booking.value)
+    return hashable_list
 
 
 class PlannerContextFingerprintError(RuntimeError):
@@ -3313,6 +3358,7 @@ def hash_planner_context_inputs(
     constraints: Optional[Dict[str, ParameterConstraints]],
     canonicalize_intra_group_size: bool = False,
     hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
+    key_value_l1_booking: KeyValueL1Booking = KeyValueL1Booking.PER_SHARD,
 ) -> int:
     hashable_list = _build_hashable_list(
         topology,
@@ -3321,6 +3367,7 @@ def hash_planner_context_inputs(
         storage_reservation,
         constraints,
         canonicalize_intra_group_size,
+        key_value_l1_booking,
     )
     return hash_function(hashable_list)
 
@@ -3333,6 +3380,7 @@ def hash_planner_context_inputs_str(
     constraints: Optional[Dict[str, ParameterConstraints]],
     canonicalize_intra_group_size: bool = False,
     hash_function: Callable[[List[Any]], str] = hash_sha256_str,
+    key_value_l1_booking: KeyValueL1Booking = KeyValueL1Booking.PER_SHARD,
 ) -> str:
     hashable_list = _build_hashable_list(
         topology,
@@ -3341,6 +3389,7 @@ def hash_planner_context_inputs_str(
         storage_reservation,
         constraints,
         canonicalize_intra_group_size,
+        key_value_l1_booking,
     )
     return hash_function(hashable_list)
 

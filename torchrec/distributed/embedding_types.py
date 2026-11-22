@@ -20,6 +20,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     Type,
     TypeVar,
@@ -48,9 +49,11 @@ from torchrec.distributed.types import (
     compute_storage_usage,
     LazyAwaitable,
     ModuleSharder,
+    ParameterSharding,
     QuantizedCommCodecs,
     ShardedModule,
     ShardedTensorMetadata,
+    ShardingEnv,
     ShardingType,
     ShardMetadata,
     StorageUsageType,
@@ -633,6 +636,32 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
         """
         return compute_storage_usage(
             tensor, compute_device_type, compute_kernel, StorageUsageType.BASE
+        )
+
+    def key_value_l1_grouping_sharding_types(self, module: M) -> Set[str]:
+        """
+        Sharding types for which `key_value_grouped_configs_per_rank` can build
+        `module`'s key-value TBE groups before sharding. The planner books the L1
+        of key-value tables sharded these ways from those groups under
+        `KeyValueL1Booking.POST_PARTITION`. Default: none.
+        """
+        return set()
+
+    def key_value_grouped_configs_per_rank(
+        self,
+        module: M,
+        params: Dict[str, ParameterSharding],
+        env: ShardingEnv,
+    ) -> List[List[GroupedEmbeddingConfig]]:
+        """
+        For each rank of `env`, the key-value (`EmbeddingComputeKernel.KEY_VALUE`)
+        `GroupedEmbeddingConfig`s the module sharded by `params` would build, for
+        the tables of the sharding types `key_value_l1_grouping_sharding_types`
+        declares. Implementations must use the functions sharding itself uses, so
+        that the groups cannot drift from the runtime's.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declares no key-value L1 grouping"
         )
 
 

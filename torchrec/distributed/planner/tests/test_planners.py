@@ -6,16 +6,28 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import dataclasses
+import tempfile
 import unittest
-from typing import cast, Dict, List, Optional
+from typing import cast, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 import torch
 from torch import nn
 from torchrec import EmbeddingBagCollection, EmbeddingConfig
+from torchrec.distributed.batched_embedding_kernel import (
+    _populate_ssd_tbe_params,
+    key_value_l1_device_bytes,
+)
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+)
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.fp_embeddingbag import (
+    FeatureProcessedEmbeddingBagCollectionSharder,
+)
 from torchrec.distributed.planner.constants import BATCH_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.estimator.types import (
@@ -28,6 +40,7 @@ from torchrec.distributed.planner.partitioners import (
 )
 from torchrec.distributed.planner.perf_models import NoopPerfModel
 from torchrec.distributed.planner.planners import (
+    _key_value_l1_left_out,
     EmbeddingShardingPlanner,
     extract_plan,
     validate_compute_kernels,
@@ -43,6 +56,8 @@ from torchrec.distributed.planner.storage_reservations import (
 )
 from torchrec.distributed.planner.types import (
     DeviceHardware,
+    hash_planner_context_inputs_str,
+    KeyValueL1Booking,
     ParameterConstraints,
     PartitionByType,
     Perf,
@@ -67,12 +82,15 @@ from torchrec.distributed.types import (
     EnumerableShardingSpec,
     KeyValueParams,
     ModuleSharder,
+    ShardingEnv,
     ShardingPlan,
     ShardingType,
     StorageUsageType,
 )
 from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.feature_processor_ import PositionWeightedModuleCollection
+from torchrec.modules.fp_embedding_modules import FeatureProcessedEmbeddingBagCollection
 
 
 class TWvsRWSharder(EmbeddingBagCollectionSharder):
@@ -2560,3 +2578,397 @@ class TestFixedAbsoluteStorageReservation(unittest.TestCase):
         self.assertIn("0.5", error_message)
         # Should NOT contain percentage-based formatting
         self.assertNotIn("Storage reservation percentage", error_message)
+
+
+# One FP32 key-value table of 1,000,000 rows x 512 cols, column-wise in four 128-col
+# shards. PER_SHARD charges every shard the WHOLE table's L1:
+# min(2048 MiB, ceil(1e6 * 0.2 * 4 B * 512)) = 409,600,000 B. The runtime gives each
+# shard's rows 0.2 * 1e6 / 32 = 6,250 sets x 32 slots, each 128 * 4 B of weights + 16 B
+# of slot state: 105,600,000 B, and shards of one table on one rank share a TBE whose
+# sets scale with the rows, so the four shards' L1 totals 4 x 105,600,000 B wherever
+# they land.
+_KV_ROWS = 1_000_000
+_KV_SHARD_RUNTIME_L1 = 6_250 * 32 * (128 * 4 + 16)
+
+
+class KeyValueL1BookingTest(unittest.TestCase):
+    def _plan(
+        self, booking: KeyValueL1Booking, hbm_cap: int, cap_mib: Optional[int] = 2048
+    ) -> EmbeddingShardingPlanner:
+        ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name="kv",
+                    embedding_dim=512,
+                    num_embeddings=_KV_ROWS,
+                    feature_names=["f_kv"],
+                )
+            ],
+            device=torch.device("meta"),
+        )
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=4,
+                hbm_cap=hbm_cap,
+                ddr_cap=1024**4,
+                compute_device="cuda",
+            ),
+            storage_reservation=HeuristicalStorageReservation(percentage=0.0),
+            constraints={
+                "kv": ParameterConstraints(
+                    sharding_types=[ShardingType.COLUMN_WISE.value],
+                    compute_kernels=[EmbeddingComputeKernel.KEY_VALUE.value],
+                    min_partition=128,
+                    key_value_params=KeyValueParams(max_l1_cache_size=cap_mib),
+                )
+            },
+            key_value_l1_booking=booking,
+        )
+        self.ebc = ebc
+        self.sharding_plan: ShardingPlan = planner.plan(
+            module=ebc, sharders=[EmbeddingBagCollectionSharder()]
+        )
+        return planner
+
+    def _grouped_configs(self) -> List[GroupedEmbeddingConfig]:
+        """The key-value TBE groups of the last `_plan`'s plan, on every rank."""
+        configs_per_rank = (
+            EmbeddingBagCollectionSharder().key_value_grouped_configs_per_rank(
+                self.ebc,
+                cast(EmbeddingModuleShardingPlan, self.sharding_plan.plan[""]),
+                ShardingEnv(world_size=4, rank=0),
+            )
+        )
+        configs = [c for per_rank in configs_per_rank for c in per_rank]
+        self.assertTrue(configs)
+        return configs
+
+    def _assert_plan_storage_is_per_shard(
+        self, planner: EmbeddingShardingPlanner
+    ) -> None:
+        # The chosen plan's storages carry the PER_SHARD booking again (stats read
+        # it): exactly the search space's, so the L1 was added back once, not twice.
+        def key(option: ShardingOption, shard: Shard) -> object:
+            return (
+                option.name,
+                option.sharding_type,
+                option.compute_kernel,
+                tuple(shard.offset),
+                tuple(shard.size),
+            )
+
+        booked = {
+            key(o, s): s.storage
+            for o in none_throws(planner.get_search_space())
+            for s in o.shards
+        }
+        selected = planner.get_selected_options()
+        self.assertTrue(selected)
+        for option in selected:
+            for shard in option.shards:
+                self.assertEqual(shard.storage, booked[key(option, shard)])
+
+    def test_runtime_l1_sizing_is_the_planners(self) -> None:
+        # The SSD TBE parameters the runtime builds and the L1 the planner checks come
+        # from one sizing, with and without the max_l1_cache_size cap biting.
+        for cap_mib, capped in ((2048, False), (16, True)):
+            self._plan(
+                KeyValueL1Booking.POST_PARTITION, hbm_cap=4 * 1024**3, cap_mib=cap_mib
+            )
+            for config in self._grouped_configs():
+                rows = sum(t.local_rows for t in config.embedding_tables)
+                # 16 MiB / (32 slots * 4 B * 128 cols) = 1,024 sets, under 0.2 * rows / 32
+                expected_sets = 1_024 if capped else int(0.2 * rows / 32)
+                with tempfile.TemporaryDirectory() as d:
+                    runtime_config = dataclasses.replace(
+                        config,
+                        fused_params={
+                            **(config.fused_params or {}),
+                            "ssd_storage_directory": d,
+                        },
+                    )
+                    if capped:
+                        with self.assertLogs(level="WARNING") as logs:
+                            ssd_params, _ = _populate_ssd_tbe_params(runtime_config)
+                        self.assertTrue(
+                            any("cap at max_cache_sets" in m for m in logs.output)
+                        )
+                    else:
+                        ssd_params, _ = _populate_ssd_tbe_params(runtime_config)
+                self.assertEqual(ssd_params["cache_sets"], expected_sets)
+                self.assertEqual(
+                    key_value_l1_device_bytes(config),
+                    expected_sets * 32 * (4 * 128 + 16),
+                )
+
+    def test_physical_l1_cap_caps_the_sets_and_refuses_less_than_one_set(
+        self,
+    ) -> None:
+        self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=4 * 1024**3)
+        config = self._grouped_configs()[0]
+
+        def with_physical_cap(mib: int) -> GroupedEmbeddingConfig:
+            return dataclasses.replace(
+                config,
+                fused_params={
+                    **(config.fused_params or {}),
+                    "max_physical_l1_cache_size_mb": mib,
+                },
+            )
+
+        # 1 MiB / (32 slots * 4 B * 128 cols) = 64 sets, under the 6,250 uncapped
+        self.assertEqual(
+            key_value_l1_device_bytes(with_physical_cap(1)), 64 * 32 * (4 * 128 + 16)
+        )
+        with self.assertRaises(ValueError):
+            key_value_l1_device_bytes(with_physical_cap(0))
+
+    def test_default_is_per_shard(self) -> None:
+        planner = self._plan(KeyValueL1Booking.PER_SHARD, hbm_cap=4 * 1024**3)
+        self.assertEqual(
+            EmbeddingShardingPlanner(
+                topology=Topology(world_size=4, compute_device="cuda")
+            )._key_value_l1_booking,
+            KeyValueL1Booking.PER_SHARD,
+        )
+        self.assertIsNone(planner.get_key_value_l1_per_rank())
+
+    def test_rejects_a_booking_that_is_not_the_enum(self) -> None:
+        with self.assertRaises(TypeError):
+            EmbeddingShardingPlanner(
+                topology=Topology(world_size=4, compute_device="cuda"),
+                # pyrefly: ignore[bad-argument-type]
+                key_value_l1_booking="post_partition",
+            )
+
+    def test_post_partition_plans_where_per_shard_overbooks(self) -> None:
+        hbm_cap = 250 * 1000**2  # > a shard's runtime L1, < its PER_SHARD booking
+        with self.assertRaises(PlannerError):
+            self._plan(KeyValueL1Booking.PER_SHARD, hbm_cap=hbm_cap)
+        planner = self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=hbm_cap)
+        self.assertEqual(
+            sum(none_throws(planner.get_key_value_l1_per_rank())),
+            4 * _KV_SHARD_RUNTIME_L1,
+        )
+        # The shards record the L1 part of the PER_SHARD booking their storage carries.
+        self._assert_plan_storage_is_per_shard(planner)
+        for option in planner.get_selected_options():
+            for shard in option.shards:
+                self.assertEqual(shard.key_value_l1_bytes, 409_600_000)
+
+    def test_post_partition_leaves_the_search_space_storage_unchanged(self) -> None:
+        per_shard = self._plan(KeyValueL1Booking.PER_SHARD, hbm_cap=4 * 1024**3)
+        post = self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=4 * 1024**3)
+        self.assertEqual(
+            [
+                [s.storage for s in o.shards]
+                for o in none_throws(per_shard.get_search_space())
+            ],
+            [
+                [s.storage for s in o.shards]
+                for o in none_throws(post.get_search_space())
+            ],
+        )
+
+    def test_l1_left_out_restores_storage_when_its_setup_raises(self) -> None:
+        planner = self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=4 * 1024**3)
+        options = none_throws(planner.get_search_space())
+        shards = options[0].shards
+        first = shards[0].storage
+        shards[1].storage = None  # taking it out raises after shards[0] was swapped
+        with self.assertRaises(AssertionError):
+            with _key_value_l1_left_out(
+                options,
+                {
+                    options[0].module_type_key: cast(
+                        ModuleSharder[nn.Module], EmbeddingBagCollectionSharder()
+                    )
+                },
+                enabled=True,
+            ):
+                pass
+        self.assertIs(shards[0].storage, first)
+
+    def test_post_partition_rejects_a_rank_the_runtime_l1_overflows(self) -> None:
+        with self.assertRaises(PlannerError) as context:
+            self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=100 * 1000**2)
+        self.assertIn("KeyValueL1Booking.POST_PARTITION: rank", str(context.exception))
+
+    def test_post_partition_falls_back_to_the_per_shard_booking(self) -> None:
+        # Make every proposal of the first (L1 left out) search fail the check, so
+        # only the second search, on the PER_SHARD booking, can produce the plan.
+        checked = []
+        original = EmbeddingShardingPlanner._check_key_value_l1
+
+        def first_search_fails(
+            planner: EmbeddingShardingPlanner,
+            plan: List[ShardingOption],
+            storage_constraint: Topology,
+            sharders_by_type: Dict[str, ModuleSharder[nn.Module]],
+            l1_in_storage: bool,
+        ) -> Tuple[List[int], List[int]]:
+            checked.append(l1_in_storage)
+            if not l1_in_storage:
+                raise PlannerError(
+                    "first search", PlannerErrorType.INSUFFICIENT_STORAGE
+                )
+            return original(
+                planner, plan, storage_constraint, sharders_by_type, l1_in_storage
+            )
+
+        with patch.object(
+            EmbeddingShardingPlanner, "_check_key_value_l1", first_search_fails
+        ):
+            planner = self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=4 * 1024**3)
+        self.assertIn(False, checked)
+        self.assertIn(True, checked)
+        self.assertEqual(checked[-1], True)
+        self.assertEqual(
+            sum(none_throws(planner.get_key_value_l1_per_rank())),
+            4 * _KV_SHARD_RUNTIME_L1,
+        )
+        # The fallback's plan was searched on the PER_SHARD booking: nothing added back.
+        self._assert_plan_storage_is_per_shard(planner)
+
+    def test_post_partition_searches_once_when_no_l1_is_booked(self) -> None:
+        # Without max_l1_cache_size PER_SHARD books no L1, so leaving it out would
+        # repeat the same search: only the checked PER_SHARD search runs, and fails
+        # here, since a shard's uncapped runtime L1 (105.6 MB) overflows each rank.
+        with patch.object(
+            EmbeddingShardingPlanner,
+            "_search",
+            autospec=True,
+            side_effect=EmbeddingShardingPlanner._search,
+        ) as search:
+            with self.assertRaises(PlannerError):
+                self._plan(
+                    KeyValueL1Booking.POST_PARTITION,
+                    hbm_cap=100 * 1000**2,
+                    cap_mib=None,
+                )
+        self.assertEqual(search.call_count, 1)
+        self.assertTrue(search.call_args.kwargs["l1_in_storage"])
+        self.assertEqual(search.call_args.kwargs["stats_key_prefix"], "")
+
+    def test_a_sizing_error_fails_the_proposal_not_the_plan(self) -> None:
+        with patch(
+            "torchrec.distributed.planner.planners.key_value_l1_device_bytes",
+            side_effect=ValueError("sizing"),
+        ):
+            with self.assertRaises(PlannerError) as context:
+                self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=4 * 1024**3)
+        self.assertIn("could not size the key-value L1", str(context.exception))
+
+    def test_the_booking_is_in_the_planner_context_fingerprint(self) -> None:
+        per_shard = self._plan(KeyValueL1Booking.PER_SHARD, hbm_cap=4 * 1024**3)
+        post = self._plan(KeyValueL1Booking.POST_PARTITION, hbm_cap=4 * 1024**3)
+        self.assertNotEqual(
+            per_shard.hash_planner_context_inputs(), post.hash_planner_context_inputs()
+        )
+        self.assertNotEqual(
+            per_shard.hash_planner_context_inputs_str(),
+            post.hash_planner_context_inputs_str(),
+        )
+        # PER_SHARD keeps the key a planner without the option computes.
+        self.assertEqual(
+            per_shard.hash_planner_context_inputs_str(),
+            hash_planner_context_inputs_str(
+                per_shard._topology,
+                per_shard._batch_size,
+                per_shard._enumerator,
+                per_shard._storage_reservation,
+                per_shard._constraints,
+            ),
+        )
+
+    def test_table_wise_tables_on_one_rank_share_one_capped_l1(self) -> None:
+        # Two table-wise key-value tables on one rank share one TBE, and the
+        # max_l1_cache_size cap bounds its L1 once: 16 MiB / (32 slots * 4 B * 128
+        # cols) = 1,024 sets of 32 slots, each 128 * 4 B + 16 B. PER_SHARD books the
+        # whole cap for each table.
+        tables = [
+            EmbeddingBagConfig(
+                name=f"kv{i}",
+                embedding_dim=128,
+                num_embeddings=_KV_ROWS,
+                feature_names=[f"f_kv{i}"],
+            )
+            for i in range(2)
+        ]
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=1,
+                hbm_cap=4 * 1024**3,
+                ddr_cap=1024**4,
+                compute_device="cuda",
+            ),
+            storage_reservation=HeuristicalStorageReservation(percentage=0.0),
+            constraints={
+                table.name: ParameterConstraints(
+                    sharding_types=[ShardingType.TABLE_WISE.value],
+                    compute_kernels=[EmbeddingComputeKernel.KEY_VALUE.value],
+                    key_value_params=KeyValueParams(max_l1_cache_size=16),
+                )
+                for table in tables
+            },
+            key_value_l1_booking=KeyValueL1Booking.POST_PARTITION,
+        )
+        planner.plan(
+            module=EmbeddingBagCollection(tables=tables, device=torch.device("meta")),
+            sharders=[EmbeddingBagCollectionSharder()],
+        )
+        self.assertEqual(
+            planner.get_key_value_l1_per_rank(), [1_024 * 32 * (128 * 4 + 16)]
+        )
+        self.assertEqual(
+            sum(
+                shard.key_value_l1_bytes
+                for option in planner.get_selected_options()
+                for shard in option.shards
+            ),
+            2 * 16 * 1024**2,
+        )
+
+    def test_feature_processed_ebc_books_its_inner_ebcs_l1(self) -> None:
+        # The FP-EBC sharder delegates to its EBC sharder, so the same table plans
+        # with the same runtime L1 as the plain EBC's above.
+        fp_ebc = FeatureProcessedEmbeddingBagCollection(
+            EmbeddingBagCollection(
+                tables=[
+                    EmbeddingBagConfig(
+                        name="kv",
+                        embedding_dim=512,
+                        num_embeddings=_KV_ROWS,
+                        feature_names=["f_kv"],
+                    )
+                ],
+                is_weighted=True,
+                device=torch.device("meta"),
+            ),
+            PositionWeightedModuleCollection(max_feature_lengths={"f_kv": 10}),
+        )
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=4,
+                hbm_cap=4 * 1024**3,
+                ddr_cap=1024**4,
+                compute_device="cuda",
+            ),
+            storage_reservation=HeuristicalStorageReservation(percentage=0.0),
+            constraints={
+                "kv": ParameterConstraints(
+                    sharding_types=[ShardingType.COLUMN_WISE.value],
+                    compute_kernels=[EmbeddingComputeKernel.KEY_VALUE.value],
+                    min_partition=128,
+                    key_value_params=KeyValueParams(max_l1_cache_size=2048),
+                )
+            },
+            key_value_l1_booking=KeyValueL1Booking.POST_PARTITION,
+        )
+        planner.plan(
+            module=fp_ebc, sharders=[FeatureProcessedEmbeddingBagCollectionSharder()]
+        )
+        self.assertEqual(
+            sum(none_throws(planner.get_key_value_l1_per_rank())),
+            4 * _KV_SHARD_RUNTIME_L1,
+        )

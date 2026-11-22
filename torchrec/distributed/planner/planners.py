@@ -11,16 +11,22 @@ import json
 import logging
 import time
 from collections import Counter, deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from functools import reduce
 from time import perf_counter
-from typing import Callable, cast, Dict, List, Optional, Tuple, Union
+from typing import Callable, cast, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torchrec.distributed.batched_embedding_kernel import key_value_l1_device_bytes
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embedding_types import (
+    BaseEmbeddingSharder,
+    EmbeddingComputeKernel,
+)
 from torchrec.distributed.logging_handlers import (
     EventLoggingHandler,
     OptimizationTechnique,
@@ -45,6 +51,7 @@ from torchrec.distributed.planner.types import (
     Enumerator,
     hash_planner_context_inputs,
     hash_planner_context_inputs_str,
+    KeyValueL1Booking,
     ParameterConstraints,
     Partitioner,
     PerfModel,
@@ -54,6 +61,7 @@ from torchrec.distributed.planner.types import (
     PlannerError,
     PlannerErrorType,
     Proposer,
+    Shard,
     ShardingOption,
     Stats,
     Storage,
@@ -72,6 +80,7 @@ from torchrec.distributed.types import (
     EnumerableShardingSpec,
     ModuleSharder,
     ParameterSharding,
+    ShardingEnv,
     ShardingPlan,
     ShardingPlanner,
     ShardingType,
@@ -506,6 +515,83 @@ def extract_plan(
     return new_search_space
 
 
+@dataclass
+class _SearchResult:
+    best_plan: Optional[List[ShardingOption]] = None
+    best_perf_rating: float = MAX_SIZE
+    # Under KeyValueL1Booking.POST_PARTITION, for best_plan: each rank's checked L1,
+    # and its checked HBM (placed, less the booked L1, plus the checked L1).
+    best_key_value_l1: Optional[List[int]] = None
+    best_checked_hbm: Optional[List[int]] = None
+    lowest_storage: Storage = field(
+        default_factory=lambda: Storage(MAX_SIZE, MAX_SIZE, MAX_SIZE)
+    )
+    last_planner_error: Optional[PlannerError] = None
+    last_proposal: List[ShardingOption] = field(default_factory=list)
+    # From after the proposers are loaded to the end of the search.
+    seconds: float = 0.0
+
+
+def _is_key_value_l1_eligible(
+    option: ShardingOption, sharders_by_type: Dict[str, ModuleSharder[nn.Module]]
+) -> bool:
+    """Whether POST_PARTITION books this option's L1 from its sharder's TBE groups."""
+    if option.compute_kernel != EmbeddingComputeKernel.KEY_VALUE.value:
+        return False
+    sharder = sharders_by_type.get(option.module_type_key)
+    return isinstance(
+        sharder, BaseEmbeddingSharder
+    ) and option.sharding_type in sharder.key_value_l1_grouping_sharding_types(
+        option.module[1]
+    )
+
+
+@contextmanager
+def _key_value_l1_left_out(
+    search_space: List[ShardingOption],
+    sharders_by_type: Dict[str, ModuleSharder[nn.Module]],
+    enabled: bool,
+) -> Iterator[None]:
+    """
+    While enabled, every eligible key-value shard's storage books no L1 (its
+    `key_value_l1_bytes` taken out of `hbm`); the storage objects are restored on
+    exit, so nothing leaks into a later search or into the shards' estimates.
+    """
+    saved: List[Tuple[Shard, Storage]] = []
+    try:
+        if enabled:
+            for option in search_space:
+                if _is_key_value_l1_eligible(option, sharders_by_type):
+                    for shard in option.shards:
+                        storage = none_throws(shard.storage)
+                        saved.append((shard, storage))
+                        shard.storage = Storage(
+                            hbm=storage.hbm - shard.key_value_l1_bytes,
+                            ddr=storage.ddr,
+                            ssd=storage.ssd,
+                        )
+        yield
+    finally:
+        for shard, storage in saved:
+            shard.storage = storage
+
+
+def _add_back_key_value_l1(
+    plan: List[ShardingOption],
+    sharders_by_type: Dict[str, ModuleSharder[nn.Module]],
+) -> None:
+    """Undoes `_key_value_l1_left_out` on a copy taken while it was in effect."""
+    for option in plan:
+        if _is_key_value_l1_eligible(option, sharders_by_type):
+            for shard in option.shards:
+                storage = none_throws(shard.storage)
+                shard.storage = Storage(
+                    hbm=storage.hbm + shard.key_value_l1_bytes,
+                    ddr=storage.ddr,
+                    ssd=storage.ssd,
+                )
+
+
 class EmbeddingPlannerBase(ShardingPlanner):
     """
     Base class for embedding sharding planners that provides common initialization
@@ -581,6 +667,8 @@ class EmbeddingPlannerBase(ShardingPlanner):
         if timeout_seconds is not None:
             assert timeout_seconds > 0, "Timeout must be positive"
         self._timeout_seconds = timeout_seconds
+        # Part of the planner context fingerprint; EmbeddingShardingPlanner sets it.
+        self._key_value_l1_booking: KeyValueL1Booking = KeyValueL1Booking.PER_SHARD
 
     @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def collective_plan(
@@ -633,6 +721,7 @@ class EmbeddingPlannerBase(ShardingPlanner):
             self._enumerator,
             self._storage_reservation,
             self._constraints,
+            key_value_l1_booking=self._key_value_l1_booking,
         )
 
     def hash_planner_context_inputs_str(self) -> str:
@@ -649,6 +738,7 @@ class EmbeddingPlannerBase(ShardingPlanner):
             self._enumerator,
             self._storage_reservation,
             self._constraints,
+            key_value_l1_booking=self._key_value_l1_booking,
         )
 
     def get_selected_options(self) -> List[ShardingOption]:
@@ -696,6 +786,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         constraints (Optional[Dict[str, ParameterConstraints]]): per table constraints
             for sharding.
         debug (bool): whether to print debug information.
+        key_value_l1_booking (KeyValueL1Booking): how to book device memory for the
+            L1 cache of key-value tables; PER_SHARD (the default) or POST_PARTITION.
 
     Example::
 
@@ -726,6 +818,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         ] = None,
         timeout_seconds: Optional[int] = None,
         plan_loader: Optional[PlanLoader] = None,
+        key_value_l1_booking: KeyValueL1Booking = KeyValueL1Booking.PER_SHARD,
     ) -> None:
         super().__init__(
             topology=topology,
@@ -738,6 +831,13 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             callbacks=callbacks,
             timeout_seconds=timeout_seconds,
         )
+        if not isinstance(key_value_l1_booking, KeyValueL1Booking):
+            raise TypeError(
+                f"key_value_l1_booking must be a KeyValueL1Booking, got {key_value_l1_booking!r}"
+            )
+        self._key_value_l1_booking = key_value_l1_booking
+        # Under POST_PARTITION: each rank's key-value L1 (bytes) on the last plan().
+        self._key_value_l1_per_rank: Optional[List[int]] = None
         self._partitioner: Partitioner = (
             partitioner if partitioner else GreedyPerfPartitioner()
         )
@@ -776,6 +876,19 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         # The full enumerated candidate set from the last plan(); None until plan()
         # runs, then the (possibly empty) enumerated list.
         return self._search_space
+
+    def get_key_value_l1_per_rank(self) -> Optional[List[int]]:
+        """
+        Under ``KeyValueL1Booking.POST_PARTITION``: the device bytes of key-value L1
+        the last plan() checked on each rank for the plan its search chose (the
+        eligible shards' runtime TBE groups; other key-value shards are in their
+        storage). That is the plan before ``callbacks`` run: as under PER_SHARD, a
+        callback's changes are not re-checked. None otherwise: under PER_SHARD, when
+        no plan was found, when the plan was loaded (``plan_loader``) rather than
+        searched, and on every rank but 0 under ``collective_plan``, which plans on
+        rank 0 only.
+        """
+        return self._key_value_l1_per_rank
 
     @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def collective_plan(
@@ -834,6 +947,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         """
         self._num_proposals = 0
         self._num_plans = 0
+        self._key_value_l1_per_rank = None
 
         start_time = perf_counter()
         best_plan = None
@@ -948,119 +1062,69 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             )
             best_plan = copy.deepcopy(loaded_best_plan)
         else:
-            proposal_cache: Dict[
-                Tuple[int, ...],
-                Tuple[bool, Optional[List[ShardingOption]], Optional[float]],
-            ] = {}
-
-            for proposer in self._proposers:
-                proposer.load(search_space=search_space, enumerator=self._enumerator)
-
-            start = time.time()
-            for proposer_idx, proposer in enumerate(self._proposers):
-                proposer_num_proposals = 0
-                proposer_num_plans = 0
-                proposer_cache_hits = 0
-                proposer_timed_out = False
-                proposer_best_perf: Optional[float] = None
-                proposal = proposer.propose()
-
-                while proposal:
-                    end = time.time()
-                    elapsed = end - start
-                    if self._timeout_seconds:
-                        if elapsed > self._timeout_seconds:
-                            logger.info(
-                                f"Exceeded time limit of {self._timeout_seconds}s. Took {elapsed}s"
-                            )
-                            proposer_timed_out = True
-                            break
-                    proposal_key = tuple(sorted(map(hash, proposal)))
-                    if proposal_key in proposal_cache:
-                        proposer_cache_hits += 1
-                        partitionable, plan, perf_rating = proposal_cache[proposal_key]
-                        proposer.feedback(
-                            partitionable=partitionable,
-                            plan=plan,
-                            perf_rating=perf_rating,
-                            storage_constraint=storage_constraint,
+            sharders_by_type = {
+                sharder_name(sharder.module_type): sharder for sharder in sharders
+            }
+            post_partition = (
+                self._key_value_l1_booking == KeyValueL1Booking.POST_PARTITION
+            )
+            # POST_PARTITION searches at most twice: first with the eligible key-value
+            # shards' L1 left out of their storage, and only if no proposal passes the
+            # exact L1 check, again with the PER_SHARD booking, still under the check.
+            # When no eligible shard books any L1, the two searches would be the same,
+            # so only the second runs. Each search gets the whole timeout; the
+            # fallback's stats keys are prefixed.
+            searches = [False]
+            if post_partition and any(
+                shard.key_value_l1_bytes
+                for option in search_space
+                if _is_key_value_l1_eligible(option, sharders_by_type)
+                for shard in option.shards
+            ):
+                searches = [True, False]
+            for l1_left_out in searches:
+                with _key_value_l1_left_out(
+                    search_space, sharders_by_type, enabled=l1_left_out
+                ):
+                    result = self._search(
+                        search_space=search_space,
+                        storage_constraint=storage_constraint,
+                        sharders_by_type=sharders_by_type if post_partition else None,
+                        l1_in_storage=not l1_left_out,
+                        technique=_technique,
+                        proposals_per_proposer=proposals_per_proposer,
+                        stats_key_prefix=(
+                            "per_shard_fallback:"
+                            if len(searches) > 1 and not l1_left_out
+                            else ""
+                        ),
+                    )
+                planner_time_seconds += result.seconds
+                # The last search's storage (the PER_SHARD booking when both ran) bounds
+                # what the model needs; the first search's leaves the eligible L1 out.
+                lowest_storage = result.lowest_storage
+                # When both searches fail, report the first one's last error: the fallback's
+                # can only come from the PER_SHARD over-booking the first one avoids.
+                if result.last_planner_error is not None and last_planner_error is None:
+                    last_planner_error = result.last_planner_error
+                    last_proposal = result.last_proposal
+                best_plan = result.best_plan
+                best_perf_rating = result.best_perf_rating
+                if best_plan:
+                    if l1_left_out:
+                        # best_plan is a copy taken while the L1 was left out: put the
+                        # PER_SHARD booking back, so stats read the same storage as ever.
+                        _add_back_key_value_l1(best_plan, sharders_by_type)
+                    self._key_value_l1_per_rank = result.best_key_value_l1
+                    if post_partition:
+                        logger.info(
+                            "KeyValueL1Booking.POST_PARTITION: checked HBM per rank "
+                            f"(placed + runtime key-value L1): {result.best_checked_hbm} B, "
+                            f"of which key-value L1: {result.best_key_value_l1} B. HBM "
+                            "figures read from the plan's shard storages carry the "
+                            "PER_SHARD booking instead, so they differ from this."
                         )
-                        proposal = proposer.propose()
-                        continue
-
-                    self._num_proposals += 1
-                    proposer_num_proposals += 1
-                    try:
-                        # plan is just proposal where shard.rank is populated
-                        plan = self._partitioner.partition(
-                            proposal=proposal,
-                            storage_constraint=storage_constraint,
-                        )
-                        self._num_plans += 1
-                        proposer_num_plans += 1
-                        perf_rating = self._perf_model.rate(plan=plan)
-                        if (
-                            proposer_best_perf is None
-                            or perf_rating < proposer_best_perf
-                        ):
-                            proposer_best_perf = perf_rating
-                        if perf_rating < best_perf_rating:
-                            best_perf_rating = perf_rating
-                            best_plan = copy.deepcopy(plan)
-                        proposal_cache[proposal_key] = (True, plan, perf_rating)
-                        proposer.feedback(
-                            partitionable=True,
-                            plan=plan,
-                            perf_rating=perf_rating,
-                            storage_constraint=storage_constraint,
-                        )
-                    except PlannerError as planner_error:
-                        last_planner_error = planner_error
-                        # shallow copy of the proposal
-                        last_proposal: List[ShardingOption] = copy.copy(proposal)
-                        current_storage = cast(
-                            Storage,
-                            reduce(
-                                # pyrefly: ignore [unsupported-operation]
-                                lambda x, y: x + y,
-                                [
-                                    shard.storage
-                                    for option in proposal
-                                    for shard in option.shards
-                                ],
-                            ),
-                        )
-                        if current_storage < lowest_storage:
-                            lowest_storage = current_storage
-                        proposal_cache[proposal_key] = (False, proposal, None)
-                        proposer.feedback(
-                            partitionable=False,
-                            plan=proposal,
-                            storage_constraint=storage_constraint,
-                        )
-
-                    # clear shard.rank for each sharding_option
-                    reset_shard_rank(proposal)
-                    proposal = proposer.propose()
-
-                log_proposer_result(
-                    planner_type=self.__class__.__name__,
-                    proposer_name=proposer.__class__.__name__,
-                    proposer_index=proposer_idx,
-                    num_proposals=proposer_num_proposals,
-                    num_plans=proposer_num_plans,
-                    best_perf_rating=proposer_best_perf,
-                    is_winning_proposer=False,
-                    technique=_technique,
-                )
-                proposer_key = f"{proposer.__class__.__name__}_{proposer_idx}"
-                proposals_per_proposer[proposer_key] = {
-                    "proposals": proposer_num_proposals,
-                    "cache_hits": proposer_cache_hits,
-                    "timed_out": proposer_timed_out,
-                }
-
-            planner_time_seconds = time.time() - start
+                    break
 
         if best_plan:
             for callback in self._callbacks:
@@ -1289,6 +1353,213 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     + no_plan_solution
                     + last_planner_error_info,
                 )
+
+    def _search(
+        self,
+        search_space: List[ShardingOption],
+        storage_constraint: Topology,
+        sharders_by_type: Optional[Dict[str, ModuleSharder[nn.Module]]],
+        l1_in_storage: bool,
+        technique: OptimizationTechnique,
+        proposals_per_proposer: Dict[str, Dict[str, object]],
+        stats_key_prefix: str = "",
+    ) -> _SearchResult:
+        """
+        Runs every proposer over `search_space` and keeps the best partitioned
+        proposal. With `sharders_by_type`, a partitioned proposal must also pass
+        `_check_key_value_l1`, or it counts as unpartitionable. The timeout runs
+        from after the proposers are loaded, as `seconds` does. `stats_key_prefix`
+        tells this search's proposer stats and logs apart from another search's.
+        """
+        result = _SearchResult()
+        proposal_cache: Dict[
+            Tuple[int, ...],
+            Tuple[bool, Optional[List[ShardingOption]], Optional[float]],
+        ] = {}
+        for proposer in self._proposers:
+            proposer.load(search_space=search_space, enumerator=self._enumerator)
+
+        start = time.time()
+        for proposer_idx, proposer in enumerate(self._proposers):
+            proposer_num_proposals = 0
+            proposer_num_plans = 0
+            proposer_cache_hits = 0
+            proposer_timed_out = False
+            proposer_best_perf: Optional[float] = None
+            proposal = proposer.propose()
+
+            while proposal:
+                end = time.time()
+                elapsed = end - start
+                if self._timeout_seconds:
+                    if elapsed > self._timeout_seconds:
+                        logger.info(
+                            f"Exceeded time limit of {self._timeout_seconds}s. Took {elapsed}s"
+                        )
+                        proposer_timed_out = True
+                        break
+                proposal_key = tuple(sorted(map(hash, proposal)))
+                if proposal_key in proposal_cache:
+                    proposer_cache_hits += 1
+                    partitionable, plan, perf_rating = proposal_cache[proposal_key]
+                    proposer.feedback(
+                        partitionable=partitionable,
+                        plan=plan,
+                        perf_rating=perf_rating,
+                        storage_constraint=storage_constraint,
+                    )
+                    proposal = proposer.propose()
+                    continue
+
+                self._num_proposals += 1
+                proposer_num_proposals += 1
+                try:
+                    # plan is just proposal where shard.rank is populated
+                    plan = self._partitioner.partition(
+                        proposal=proposal,
+                        storage_constraint=storage_constraint,
+                    )
+                    key_value_l1, checked_hbm = (
+                        self._check_key_value_l1(
+                            plan, storage_constraint, sharders_by_type, l1_in_storage
+                        )
+                        if sharders_by_type is not None
+                        else (None, None)
+                    )
+                    self._num_plans += 1
+                    proposer_num_plans += 1
+                    perf_rating = self._perf_model.rate(plan=plan)
+                    if proposer_best_perf is None or perf_rating < proposer_best_perf:
+                        proposer_best_perf = perf_rating
+                    if perf_rating < result.best_perf_rating:
+                        result.best_perf_rating = perf_rating
+                        result.best_plan = copy.deepcopy(plan)
+                        result.best_key_value_l1 = key_value_l1
+                        result.best_checked_hbm = checked_hbm
+                    proposal_cache[proposal_key] = (True, plan, perf_rating)
+                    proposer.feedback(
+                        partitionable=True,
+                        plan=plan,
+                        perf_rating=perf_rating,
+                        storage_constraint=storage_constraint,
+                    )
+                except PlannerError as planner_error:
+                    result.last_planner_error = planner_error
+                    # shallow copy of the proposal
+                    result.last_proposal = copy.copy(proposal)
+                    current_storage = cast(
+                        Storage,
+                        reduce(
+                            # pyrefly: ignore [unsupported-operation]
+                            lambda x, y: x + y,
+                            [
+                                shard.storage
+                                for option in proposal
+                                for shard in option.shards
+                            ],
+                        ),
+                    )
+                    if current_storage < result.lowest_storage:
+                        result.lowest_storage = current_storage
+                    proposal_cache[proposal_key] = (False, proposal, None)
+                    proposer.feedback(
+                        partitionable=False,
+                        plan=proposal,
+                        storage_constraint=storage_constraint,
+                    )
+
+                # clear shard.rank for each sharding_option
+                reset_shard_rank(proposal)
+                proposal = proposer.propose()
+
+            log_proposer_result(
+                planner_type=self.__class__.__name__,
+                proposer_name=f"{stats_key_prefix}{proposer.__class__.__name__}",
+                proposer_index=proposer_idx,
+                num_proposals=proposer_num_proposals,
+                num_plans=proposer_num_plans,
+                best_perf_rating=proposer_best_perf,
+                is_winning_proposer=False,
+                technique=technique,
+            )
+            proposer_key = (
+                f"{stats_key_prefix}{proposer.__class__.__name__}_{proposer_idx}"
+            )
+            proposals_per_proposer[proposer_key] = {
+                "proposals": proposer_num_proposals,
+                "cache_hits": proposer_cache_hits,
+                "timed_out": proposer_timed_out,
+            }
+        result.seconds = time.time() - start
+        return result
+
+    def _check_key_value_l1(
+        self,
+        plan: List[ShardingOption],
+        storage_constraint: Topology,
+        sharders_by_type: Dict[str, ModuleSharder[nn.Module]],
+        l1_in_storage: bool,
+    ) -> Tuple[List[int], List[int]]:
+        """
+        `KeyValueL1Booking.POST_PARTITION`'s exact check of a partitioned proposal:
+        every rank's placed HBM, less the L1 booked for the eligible key-value
+        shards, plus the L1 the runtime would allocate for their TBE groups on that
+        rank (`key_value_l1_device_bytes`), must fit the rank's HBM. Returns each
+        rank's L1 and that checked HBM; raises PlannerError(INSUFFICIENT_STORAGE)
+        naming an overflowing rank, or PlannerError when the groups or their L1
+        cannot be computed, so a proposal is never accepted without its L1 counted.
+        """
+        world_size = storage_constraint.world_size
+        placed = [0] * world_size
+        eligible_modules: Dict[str, Tuple[nn.Module, BaseEmbeddingSharder]] = {}
+        for option in plan:
+            eligible = _is_key_value_l1_eligible(option, sharders_by_type)
+            if eligible:
+                eligible_modules[option.path] = (
+                    option.module[1],
+                    cast(
+                        BaseEmbeddingSharder, sharders_by_type[option.module_type_key]
+                    ),
+                )
+            for shard in option.shards:
+                placed[none_throws(shard.rank)] += none_throws(shard.storage).hbm - (
+                    shard.key_value_l1_bytes if eligible and l1_in_storage else 0
+                )
+        l1 = [0] * world_size
+        if eligible_modules:
+            sharding_plan = to_sharding_plan(plan, self._topology)
+            env = ShardingEnv(world_size=world_size, rank=0, pg=None)
+            for path, (module, sharder) in eligible_modules.items():
+                # Any failure fails this proposal only; the search goes on.
+                try:
+                    configs_per_rank = sharder.key_value_grouped_configs_per_rank(
+                        module,
+                        cast(EmbeddingModuleShardingPlan, sharding_plan.plan[path]),
+                        env,
+                    )
+                    if len(configs_per_rank) != world_size:
+                        raise ValueError(
+                            f"returned {len(configs_per_rank)} ranks of TBE groups, "
+                            f"not {world_size}"
+                        )
+                    for rank, configs in enumerate(configs_per_rank):
+                        l1[rank] += sum(key_value_l1_device_bytes(c) for c in configs)
+                except Exception as e:
+                    raise PlannerError(
+                        f"KeyValueL1Booking.POST_PARTITION: {type(sharder).__name__} could "
+                        f"not size the key-value L1 of {path}: {e!r}"
+                    ) from e
+        checked_hbm = [placed[rank] + l1[rank] for rank in range(world_size)]
+        for rank in range(world_size):
+            budget = storage_constraint.devices[rank].storage.hbm
+            if checked_hbm[rank] > budget:
+                raise PlannerError(
+                    f"KeyValueL1Booking.POST_PARTITION: rank {rank} needs "
+                    f"{checked_hbm[rank]} B of HBM (placed {placed[rank]} + "
+                    f"key-value L1 {l1[rank]}) > {budget} B",
+                    PlannerErrorType.INSUFFICIENT_STORAGE,
+                )
+        return l1, checked_hbm
 
     def _loader_plan_validation(
         self, current_planner_hash: str, loaded_plan_hash: Optional[str]
