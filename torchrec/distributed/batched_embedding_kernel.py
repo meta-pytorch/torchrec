@@ -16,6 +16,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 from dataclasses import dataclass
 from math import isfinite, sqrt
 from typing import (
@@ -43,6 +44,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     IntNBitTableBatchedEmbeddingBagsCodegen,
 )
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    _next_copy_done_token,
     ComputeDevice,
     DenseTableBatchedEmbeddingBagsCodegen,
     EmbeddingLocation,
@@ -90,6 +92,7 @@ from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
 from torch import nn
 from torch.autograd.profiler import record_function
 from torch.distributed._tensor import DTensor, Replicate, Shard as DTensorShard
+from torchrec.distributed import utils as distributed_utils
 from torchrec.distributed.comm import get_local_rank
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
@@ -176,6 +179,7 @@ ENABLE_HBM_STREAMING_STR = "enable_hbm_streaming"
 RES_HBM_DRAIN_INTERVAL_STR = "res_hbm_drain_interval"
 RES_HBM_DRAIN_INTERVAL_PER_TABLE_STR = "res_hbm_drain_interval_per_table"
 RES_USE_COPY_DONE_TOKEN_STR = "res_use_copy_done_token"
+ENABLE_RES_HBM_GRID_ASSEMBLY_STR = "enable_res_hbm_grid_assembly"
 _DEFAULT_TBE_CHUNK_SIZE_LIMIT: int = 1024**3
 
 
@@ -415,6 +419,316 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
         ):
             res_params.table_offsets.append(local_metadata.shard_offsets[0])
     return (enable_raw_embedding_streaming, res_params)
+
+
+# Stop-gap patch to fix RES for GRID_SHARD tables, gated by the fused param
+# `enable_res_hbm_grid_assembly`. Only IG Reels ESR sets it; enable with care.
+_RES_GRID_CHUNK_ROWS: int = 262144
+
+
+@dataclass
+class _ResGridTable:
+    """A grid-sharded table in one TBE, as seen from this rank."""
+
+    name: str
+    # Any feature of this table, to read the TBE's per-feature weight layout.
+    feature_idx: int
+    # First row of this table in the TBE's linear row space.
+    linear_start: int
+    local_rows: int
+    local_dim: int
+    full_dim: int
+    col_offset: int
+    is_owner: bool
+    owner_rank: int
+    # Owner only: (col_offset, local_dim, rank) of every other column block of
+    # this row block, in column order.
+    peers: List[Tuple[int, int, int]]
+
+
+def _shard_rank(shard: ShardMetadata) -> int:
+    rank = none_throws(shard.placement).rank()
+    return none_throws(rank)
+
+
+def _res_grid_tables(
+    config: GroupedEmbeddingConfig,
+    emb_module: SplitTableBatchedEmbeddingBagsCodegen,
+) -> List[_ResGridTable]:
+    grid_tables: List[_ResGridTable] = []
+    linear_start = 0
+    for table_idx, table in enumerate(config.embedding_tables):
+        local_metadata, global_metadata = table.local_metadata, table.global_metadata
+        is_grid_sharded = (
+            table.local_cols != table.embedding_dim
+            and table.local_rows != table.num_embeddings
+            and local_metadata is not None
+            and global_metadata is not None
+        )
+        if (
+            is_grid_sharded
+            and emb_module.embedding_specs[table_idx][2] != EmbeddingLocation.DEVICE
+        ):
+            # The HBM drain only selects DEVICE rows.
+            logger.warning(
+                f"[RES grid] TBE {emb_module.uuid}: {table.name} is grid sharded but "
+                "not DEVICE placed; it streams partial rows"
+            )
+        elif is_grid_sharded:
+            local_metadata = none_throws(local_metadata)
+            global_metadata = none_throws(global_metadata)
+            row_offset = local_metadata.shard_offsets[0]
+            col_offset = local_metadata.shard_offsets[1]
+            col_blocks = sorted(
+                (shard.shard_offsets[1], shard.shard_sizes[1], _shard_rank(shard))
+                for shard in global_metadata.shards_metadata
+                if shard.shard_offsets[0] == row_offset
+            )
+            assert sum(block[1] for block in col_blocks) == table.embedding_dim, (
+                f"[RES grid] {table.name}: column blocks {col_blocks} do not add up "
+                f"to embedding_dim {table.embedding_dim}"
+            )
+            row_block_offsets = sorted(
+                {shard.shard_offsets[0] for shard in global_metadata.shards_metadata}
+            )
+            # Rotate the owner across row blocks so each column block ships full
+            # rows for an equal share of them.
+            owner_col_offset, _, owner_rank = col_blocks[
+                row_block_offsets.index(row_offset) % len(col_blocks)
+            ]
+            is_owner = owner_col_offset == col_offset
+            grid_tables.append(
+                _ResGridTable(
+                    name=table.name,
+                    feature_idx=emb_module.feature_table_map.index(table_idx),
+                    linear_start=linear_start,
+                    local_rows=table.local_rows,
+                    local_dim=table.local_cols,
+                    full_dim=table.embedding_dim,
+                    col_offset=col_offset,
+                    is_owner=is_owner,
+                    owner_rank=owner_rank,
+                    peers=(
+                        [block for block in col_blocks if block[0] != col_offset]
+                        if is_owner
+                        else []
+                    ),
+                )
+            )
+        linear_start += table.local_rows
+    # Every rank walks its tables in this order, so the P2P ops between any two
+    # ranks are issued in the same order on both.
+    return sorted(grid_tables, key=lambda grid_table: grid_table.name)
+
+
+def _maybe_install_res_grid_assembly(
+    emb_module: SplitTableBatchedEmbeddingBagsCodegen,
+    config: GroupedEmbeddingConfig,
+    enable_res_hbm_grid_assembly: bool,
+) -> None:
+    """Make the TBE's HBM drain ship full-width rows for grid-sharded tables."""
+    if not enable_res_hbm_grid_assembly:
+        return
+    # RES_HBM_STREAMING must read the same on every rank at startup: flip it whole
+    # (0% or 100%), no ramp, no host rules; ranks that disagree hang at the first drain.
+    if not getattr(emb_module, "_res_hbm_streaming", False):
+        if emb_module.enable_raw_embedding_streaming:
+            logger.warning(
+                f"[RES grid] TBE {emb_module.uuid}: enable_res_hbm_grid_assembly is "
+                "set, but the RES HBM lane is off on this rank (RES_HBM_STREAMING JK "
+                "or enable_hbm_streaming); ranks with it on will block in the grid ship"
+            )
+        return
+    grid_tables = _res_grid_tables(config, emb_module)
+    if not grid_tables:
+        return
+    # Same read as BaseGridEmbeddingSharding: without plan row routing, the column
+    # blocks of a row block can hold different rows, and the ship would hang.
+    if not distributed_utils.is_grid_shard_plan_row_routing_enabled():
+        logger.warning(
+            f"[RES grid] TBE {emb_module.uuid}: GRID_SHARD plan row routing is off "
+            "(JK pytorch/torchrec:enable_grid_shard_plan_row_routing); grid-sharded "
+            "tables ship partial rows"
+        )
+        return
+    if not dist.is_initialized():
+        logger.warning(
+            f"[RES grid] TBE {emb_module.uuid}: torch.distributed is not initialized; "
+            "grid-sharded tables ship partial rows"
+        )
+        return
+    setattr(emb_module, "_res_grid_tables", grid_tables)  # noqa: B010
+    setattr(  # noqa: B010
+        emb_module,
+        "_ship_hbm_rows",
+        types.MethodType(_res_grid_ship_hbm_rows, emb_module),
+    )
+    for table in grid_tables:
+        if table.is_owner:
+            peer_ranks = [peer_rank for _, _, peer_rank in table.peers]
+            logger.info(
+                f"[RES grid] TBE {emb_module.uuid} ships full-width rows for "
+                f"{table.name} (owns cols {table.col_offset}+{table.local_dim} of "
+                f"{table.full_dim}; receives from ranks {peer_ranks})"
+            )
+        else:
+            logger.info(
+                f"[RES grid] TBE {emb_module.uuid} sends cols "
+                f"{table.col_offset}+{table.local_dim} of {table.name} "
+                f"({table.full_dim} wide) to owner rank {table.owner_rank}"
+            )
+
+
+def _res_grid_table_view(
+    emb_module: SplitTableBatchedEmbeddingBagsCodegen,
+    table: _ResGridTable,
+    weights_flat: torch.Tensor,
+) -> torch.Tensor:
+    feature_idx = table.feature_idx
+    tbe_dim = int(
+        emb_module._res_D_offsets_cpu[feature_idx + 1]
+        - emb_module._res_D_offsets_cpu[feature_idx]
+    )
+    weights_start = int(emb_module._res_weights_offsets_cpu[feature_idx])
+    tbe_rows = int(emb_module._res_rows_per_table_cpu[feature_idx])
+    assert (tbe_dim, tbe_rows) == (table.local_dim, table.local_rows), (
+        f"[RES grid] {table.name}: TBE layout {tbe_rows}x{tbe_dim} != shard "
+        f"{table.local_rows}x{table.local_dim}"
+    )
+    return weights_flat[weights_start : weights_start + tbe_rows * tbe_dim].view(
+        tbe_rows, tbe_dim
+    )
+
+
+def _res_grid_ship_hbm_rows(  # noqa: C901
+    self: SplitTableBatchedEmbeddingBagsCodegen,
+    prefetched_info: Any,
+) -> None:
+    """Grid-aware replacement for the TBE's `_ship_hbm_rows`."""
+    drained_rows = prefetched_info.res_hbm_indices
+    if drained_rows is None:
+        return
+    if self._res_hbm_row_identities is not None:
+        raise RuntimeError("[RES grid] cannot ship MPZCH identities or runtime_meta")
+    grid_tables = cast(List[_ResGridTable], self._res_grid_tables)
+
+    # no_grad: `weights_dev` can be an nn.Parameter, and nothing here is part of
+    # the training graph.
+    with record_function(
+        f"## res_grid_ship {self.timestep} {self.uuid} ##"
+    ), torch.no_grad():
+        # The staging buffers are reused, so the previous drain's copy pool must be
+        # done reading them.
+        self._raw_embedding_streamer.join_hbm_dispatch_and_workers()
+
+        # Local row ids per grid table, ascending (the drain compacts a bitmap).
+        non_grid_mask = torch.ones_like(drained_rows, dtype=torch.bool)
+        local_row_ids: Dict[str, torch.Tensor] = {}
+        for table in grid_tables:
+            in_table_mask = (drained_rows >= table.linear_start) & (
+                drained_rows < table.linear_start + table.local_rows
+            )
+            non_grid_mask &= ~in_table_mask
+            local_row_ids[table.name] = drained_rows[in_table_mask] - table.linear_start
+        non_grid_rows = drained_rows[non_grid_mask]
+
+        num_non_grid_rows = non_grid_rows.numel()
+        num_rows = num_non_grid_rows + sum(
+            local_row_ids[table.name].numel() for table in grid_tables if table.is_owner
+        )
+        width = max(
+            [self.max_D] + [table.full_dim for table in grid_tables if table.is_owner]
+        )
+        weights = cast(torch.Tensor, self.weights_dev)
+
+        indices_buf = self._grown_res_host_buf_if_needed(
+            getattr(self, "_res_grid_indices_buf", None), num_rows, (), torch.long
+        )
+        weights_buf = self._grown_res_host_buf_if_needed(
+            getattr(self, "_res_grid_weights_buf", None),
+            num_rows,
+            (width,),
+            weights.dtype,
+        )
+        setattr(self, "_res_grid_indices_buf", indices_buf)  # noqa: B010
+        setattr(self, "_res_grid_weights_buf", weights_buf)  # noqa: B010
+
+        # Non-grid rows are zero-padded to `width`; the PS slices each table back to
+        # its own width.
+        if num_non_grid_rows:
+            indices_buf[:num_non_grid_rows].copy_(non_grid_rows)
+            self._gather_res_rows(
+                non_grid_rows, weights_buf[:num_non_grid_rows], weights
+            )
+
+        weights_flat = weights.flatten() if weights.dim() == 2 else weights
+        buf_offset = num_non_grid_rows
+        for table in grid_tables:
+            table_view = _res_grid_table_view(self, table, weights_flat)
+            # Every column block of this row block drained these rows, in this
+            # order, so each peer sends exactly `num_row_ids` rows.
+            row_ids = local_row_ids[table.name]
+            num_row_ids = row_ids.numel()
+            if not table.is_owner:
+                for chunk_start in range(0, num_row_ids, _RES_GRID_CHUNK_ROWS):
+                    chunk = table_view.index_select(
+                        0, row_ids[chunk_start : chunk_start + _RES_GRID_CHUNK_ROWS]
+                    )
+                    dist.send(chunk, dst=table.owner_rank)
+                continue
+            indices_buf[buf_offset : buf_offset + num_row_ids].copy_(
+                row_ids + table.linear_start
+            )
+            full_rows = weights_buf[buf_offset : buf_offset + num_row_ids]
+            for chunk_start in range(0, num_row_ids, _RES_GRID_CHUNK_ROWS):
+                chunk_end = min(chunk_start + _RES_GRID_CHUNK_ROWS, num_row_ids)
+                full_rows[
+                    chunk_start:chunk_end,
+                    table.col_offset : table.col_offset + table.local_dim,
+                ].copy_(table_view.index_select(0, row_ids[chunk_start:chunk_end]))
+            for peer_col_offset, peer_dim, peer_rank in table.peers:
+                recv_buf = torch.empty(
+                    (min(_RES_GRID_CHUNK_ROWS, num_row_ids), peer_dim),
+                    dtype=weights.dtype,
+                    device=self.current_device,
+                )
+                for chunk_start in range(0, num_row_ids, _RES_GRID_CHUNK_ROWS):
+                    chunk_end = min(chunk_start + _RES_GRID_CHUNK_ROWS, num_row_ids)
+                    chunk = recv_buf[: chunk_end - chunk_start]
+                    dist.recv(chunk, src=peer_rank)
+                    full_rows[
+                        chunk_start:chunk_end,
+                        peer_col_offset : peer_col_offset + peer_dim,
+                    ].copy_(chunk)
+            self.log(f"[RES grid] {table.name}: shipping {num_row_ids} full-width rows")
+            buf_offset += num_row_ids
+
+        if num_rows == 0:
+            return
+        hbm_count_buf = cast(torch.Tensor, self._res_hbm_count_buf)
+        hbm_copy_done = cast(torch.Tensor, self._res_hbm_copy_done)
+        hbm_count_buf[:1].fill_(num_rows)
+        if self.res_params.res_use_copy_done_token:
+            self._res_hbm_copy_done_token = _next_copy_done_token(
+                self._res_hbm_copy_done_token
+            )
+            expected_flag = self._res_hbm_copy_done_token
+            hbm_copy_done.fill_(expected_flag)
+        else:
+            expected_flag = None
+            hbm_copy_done.fill_(1)
+        self._raw_embedding_streamer.stream(
+            indices=indices_buf[:num_rows],
+            weights=weights_buf[:num_rows],
+            identities=None,
+            runtime_meta=None,
+            count=hbm_count_buf[:1],
+            require_tensor_copy=self._res_require_copy,
+            blocking_tensor_copy=False,
+            copy_done_flag=hbm_copy_done,
+            use_hbm=True,
+            expected_flag_value=expected_flag,
+        )
 
 
 def _populate_ssd_tbe_params(  # noqa: C901
@@ -3116,6 +3430,9 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
 
         enable_res, res_params = _populate_res_params(config)
         fused_params = config.fused_params or {}
+        enable_res_hbm_grid_assembly = fused_params.pop(
+            ENABLE_RES_HBM_GRID_ASSEMBLY_STR, False
+        )
         if FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER in fused_params:
             fused_params = dict(fused_params)
             fused_params.pop(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER)
@@ -3152,6 +3469,9 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
                 res_params=res_params,
                 **fused_params,
             )
+        )
+        _maybe_install_res_grid_assembly(
+            self._emb_module, config, enable_res_hbm_grid_assembly
         )
         self._optim: EmbeddingFusedOptimizer = EmbeddingFusedOptimizer(
             config,
@@ -4330,6 +4650,9 @@ class BatchedFusedEmbeddingBag(
         weights_precision = data_type_to_sparse_type(config.data_type)
         enable_res, res_params = _populate_res_params(config)
         fused_params = config.fused_params or {}
+        enable_res_hbm_grid_assembly = fused_params.pop(
+            ENABLE_RES_HBM_GRID_ASSEMBLY_STR, False
+        )
         if FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER in fused_params:
             fused_params = dict(fused_params)
             fused_params.pop(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER)
@@ -4368,6 +4691,9 @@ class BatchedFusedEmbeddingBag(
                 res_params=res_params,
                 **fused_params,
             )
+        )
+        _maybe_install_res_grid_assembly(
+            self._emb_module, config, enable_res_hbm_grid_assembly
         )
         self._optim: EmbeddingFusedOptimizer = EmbeddingFusedOptimizer(
             config,
