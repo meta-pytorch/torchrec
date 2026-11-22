@@ -9,14 +9,16 @@
 import unittest
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
 from torchrec.distributed.maglev.input_dist import (
+    _flatten_kjt_metadata,
     flatten_to_tensors,
     input_data_dist,
     input_size_dist,
+    InputDistDriver,
     prepare_input_buffers,
     split_dense_inputs,
     unflatten_from_tensors,
@@ -138,18 +140,19 @@ class InputDistTest(unittest.TestCase):
             stride_per_key_per_rank=torch.tensor([[2], [4]], dtype=torch.int32),
             inverse_indices=(keys, inverse_indices),
         )
+        # The receiver's own batch: same shape, other strides.
         example = KeyedJaggedTensor(
             keys=keys,
             values=torch.zeros(8),
             lengths=torch.zeros(6, dtype=torch.int64),
-            stride_per_key_per_rank=torch.tensor([[2], [4]], dtype=torch.int32),
+            stride_per_key_per_rank=torch.tensor([[4], [2]], dtype=torch.int32),
             inverse_indices=(keys, torch.zeros_like(inverse_indices)),
         )
 
         rebuilt = unflatten_from_tensors(
             flatten_to_tensors(obj),
             example,
-            [*obj.stride_per_key(), *obj.length_per_key()],
+            [*obj.stride_per_key(), *obj.length_per_key(), 2, 4],
         )
 
         self.assertTrue(rebuilt.variable_stride_per_key())
@@ -163,6 +166,41 @@ class InputDistTest(unittest.TestCase):
         rebuilt_inverse_indices = rebuilt.inverse_indices()
         self.assertEqual(rebuilt_inverse_indices[0], keys)
         torch.testing.assert_close(rebuilt_inverse_indices[1], inverse_indices)
+
+    def test_variable_strides_travel_as_host_metadata(self) -> None:
+        """stride_per_key_per_rank crosses in the host metadata, not as a tensor,
+        so the receiver's copy is on the CPU and reading it never syncs."""
+        keys = ["f1", "f2"]
+        strides = torch.tensor([[2, 1], [4, 3]], dtype=torch.int32)
+        obj = KeyedJaggedTensor(
+            keys=keys,
+            values=torch.arange(10),
+            lengths=torch.ones(10, dtype=torch.int64),
+            stride_per_key_per_rank=strides,
+        )
+        tensors = flatten_to_tensors(obj)
+        self.assertFalse(any(t is obj._stride_per_key_per_rank for t in tensors))
+        metadata: List[int] = []
+        _flatten_kjt_metadata(obj, metadata)
+        self.assertEqual(metadata[-4:], [2, 1, 4, 3])
+
+        # The receiver's own batch: same shape, other strides, on another device.
+        example = KeyedJaggedTensor(
+            keys=keys,
+            values=torch.zeros(10, device="meta"),
+            lengths=torch.ones(10, dtype=torch.int64, device="meta"),
+            stride_per_key_per_rank=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+        )
+        rebuilt = unflatten_from_tensors(
+            [tensor.to("meta") for tensor in tensors], example, metadata
+        )
+        rebuilt_strides = rebuilt.stride_per_key_per_rank_tensor_or_none()
+        assert rebuilt_strides is not None
+        self.assertEqual(rebuilt_strides.device.type, "cpu")
+        self.assertEqual(rebuilt_strides.dtype, torch.int32)
+        self.assertEqual(rebuilt.stride_per_key_per_rank(), [[2, 1], [4, 3]])
+        with self.assertRaisesRegex(ValueError, "source's KJT metadata"):
+            unflatten_from_tensors(tensors, example)
 
     def test_too_few_tensors_raises(self) -> None:
         tensors = flatten_to_tensors(_instance())
@@ -243,6 +281,27 @@ class InputDistTest(unittest.TestCase):
             split_dense_inputs(value, batch_size=2, num_microbatches=3)
         with self.assertRaisesRegex(ValueError, "divide evenly"):
             split_dense_inputs(value, batch_size=6, num_microbatches=4)
+
+
+class InputDistDriverTakeTest(unittest.TestCase):
+    def test_a_round_runs_only_when_the_queue_is_dry(self) -> None:
+        driver: InputDistDriver[str] = InputDistDriver(
+            MagicMock(), MagicMock(), self_index=0
+        )
+        rounds: list[list[str]] = []
+
+        def exchange(send: list[str]) -> MagicMock:
+            rounds.append(send)
+            return MagicMock(wait=MagicMock(return_value=list(send)))
+
+        sends = iter([["a0", "a1"], ["b0", "b1"]])
+        with patch.object(driver, "exchange", side_effect=exchange):
+            taken = [driver.take(lambda: next(sends), 1) for _ in range(3)]
+        self.assertEqual(taken, [["a0"], ["a1"], ["b0"]])
+        self.assertEqual(len(rounds), 2)
+        self.assertEqual(driver.pending, 1)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            driver.take(lambda: next(sends), 0)
 
 
 _DENSE_DIM = 4

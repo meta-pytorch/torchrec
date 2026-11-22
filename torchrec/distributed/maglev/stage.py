@@ -6,369 +6,147 @@
 # LICENSE file in the root directory of this source tree.
 
 
-"""Distributing a Maglev model: cutting it into stages and parallelizing them.
+"""Cutting a Maglev model into stages and running one stage's share of a pass.
 
-Everything that knows about ranks lives here -- process-group builders, the
-layers-to-stages partitioning, the parallelism strategies, and
-:class:`StageWrapper`, which binds one stage's layers to its HSD and owns the
-wire between stages. The authoring side is in
-:mod:`torchrec.distributed.maglev.module`.
+Three concepts, one section each, in this order:
+
+* Layer: one ``MaglevLayer``, an optional sparse net and a required dense net
+  joined at a seam, which keeps ``MaglevLayer``'s own ``forward``;
+  :func:`~torchrec.distributed.maglev.checks.reject_unsplit_layers` refuses any
+  other layer at build. :data:`SparseSeam`, the seam helpers, and
+  :class:`_LayerChain`, the stage's layers as one module, whose
+  ``_run_<net>_<global|micro>`` modes each phase calls.
+* Global batch and microbatch: what one pass carries. :class:`MaglevPassState`
+  and the per-microbatch split of the sparse nets' global-batch outputs.
+* Stage: MaglevPP-infra does two jobs. Allocation, here: :class:`StageWrapper`
+  places the model's layers on stages under ``layers_per_stage`` and binds this
+  rank's layers to its HSD (cut and bind). The global-/micro-batch schedule, in
+  :mod:`torchrec.distributed.maglev.pipeline`, calls the phase methods below.
+  Splitting the input batch (feed), owning the wire between stages (connect)
+  and running one pass at a time (pass discipline) are the stage's means to
+  both. Its phase methods, named ``<net>_<direction>[_<part>]_<global|micro>``,
+  follow in pass order: ``StageWrapper.<net>_forward_<granularity>`` calls
+  ``_LayerChain._run_<net>_<granularity>``.
+
+The process groups are in :mod:`torchrec.distributed.maglev.process_groups`; the
+authoring side in :mod:`torchrec.distributed.maglev.module`; the data-parallel
+drivers in :mod:`torchrec.distributed.maglev.data_parallel`; the order of the
+phases is the schedule's, in :mod:`torchrec.distributed.maglev.pipeline`.
 """
 
+
+from __future__ import annotations
+
+import weakref
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from typing import (
     Any,
     Callable,
     cast,
     Deque,
+    Dict,
     Iterator,
     List,
-    Mapping,
     Optional,
     Sequence,
     Tuple,
+    TYPE_CHECKING,
+    Union,
 )
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.autograd.profiler import record_function
-from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining._backward import (
     _get_grad_fn_or_grad_acc,
     stage_backward_input,
     stage_backward_weight,
 )
+from torchrec.distributed.maglev.checks import (
+    check_sparse_output,
+    DenseWeightChecks,
+    reject_parameters_outside_layers,
+    reject_parameters_outside_nets,
+    reject_unsplit_layers,
+)
 from torchrec.distributed.maglev.input_dist import InputDistDriver
 from torchrec.distributed.maglev.module import (
     Activations,
     ActivationSpec,
+    check_activations,
     check_layers_chain,
     MaglevLayer,
     MaglevModuleList,
 )
-from torchrec.distributed.types import LazyAwaitable, ShardingPlan
+from torchrec.distributed.maglev.process_groups import MaglevProcessGroups
 from torchrec.distributed.utils import init_parameters
 
-
-class HandoffPGMode(Enum):
-    """How activation and gradient handoffs share process groups."""
-
-    SHARED = "shared"
-    SPLIT = "split"
+if TYPE_CHECKING:
+    from torchrec.distributed.maglev.data_parallel import PassReduction
 
 
-@dataclass(frozen=True)
-class MaglevProcessGroups:
-    """The rank-local process groups and global rank layout for a Maglev stage.
+# ======== Layer ========
 
-    Device-mesh integrations use :meth:`from_device_mesh`. Standalone users such
-    as the benchmark use :meth:`from_scratch`, which creates every group in a
-    fixed collective order. Keeping the rank layout beside the groups lets
-    :class:`StageWrapper` support non-contiguous layouts without independently
-    inferring the topology.
+# What a sparse net returns and a dense net receives: one batch-major tensor,
+# or a tuple of them (mixed dtypes, or MaglevLayer.shared_sparse_outputs).
+SparseSeam = Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+
+
+def _unpack_seam(seam: SparseSeam) -> Tuple[torch.Tensor, ...]:
+    return (seam,) if isinstance(seam, torch.Tensor) else tuple(seam)
+
+
+def _detach_seam(layer: nn.Module, output: Any) -> SparseSeam:
+    """Detach one microbatch's sparse output into the leaves its dense net reads.
+
+    A leaf requires grad only where its source does, so an integer output or a
+    frozen table's output stays a plain tensor.
+
+    Raises:
+        TypeError: If the output is neither a tensor nor a tuple of tensors.
     """
-
-    stage_ranks: Tuple[Tuple[int, ...], ...]
-    stage_pg: dist.ProcessGroup
-    handoff_pgs: Tuple[dist.ProcessGroup, dist.ProcessGroup]
-    cascade_pg: dist.ProcessGroup
-    cascade_gloo_pg: dist.ProcessGroup
-    handoff_pg_mode: HandoffPGMode
-
-    def __post_init__(self) -> None:
-        normalized_ranks = self._normalize_stage_ranks(self.stage_ranks)
-        object.__setattr__(self, "stage_ranks", normalized_ranks)
-        handoff_pgs_are_shared = self.handoff_pgs[0] is self.handoff_pgs[1]
-        if (self.handoff_pg_mode is HandoffPGMode.SHARED) != handoff_pgs_are_shared:
-            raise ValueError(
-                f"{self.handoff_pg_mode.value} handoff mode does not match the "
-                "supplied process groups"
-            )
-
-    @classmethod
-    def build_stage_process_groups(
-        cls,
-        stage_ranks: Sequence[Sequence[int]],
-    ) -> List[dist.ProcessGroup]:
-        """Create one data-parallel process group per Maglev stage.
-
-        Every rank must call this collective for every stage in the same order.
-        The returned list is index-aligned with ``stage_ranks``.
-        """
-        return [
-            cast(dist.ProcessGroup, dist.new_group(ranks=list(ranks)))
-            for ranks in stage_ranks
-        ]
-
-    @classmethod
-    def build_handoff_process_groups(
-        cls,
-        stage_ranks: Sequence[Sequence[int]],
-        handoff_pg_mode: HandoffPGMode,
-    ) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
-        """Create the activation and gradient handoff communicators.
-
-        Shared mode returns the same communicator twice. Split mode creates one
-        communicator per direction, preserving the original P2P behavior.
-        """
-        ranks = sorted(rank for stage in stage_ranks for rank in stage)
-        activation_pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
-        gradient_pg = (
-            activation_pg
-            if handoff_pg_mode is HandoffPGMode.SHARED
-            else cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
-        )
-        return activation_pg, gradient_pg
-
-    @classmethod
-    def build_cascade_process_groups(
-        cls,
-        stage_ranks: Sequence[Sequence[int]],
-        backend: Optional[str] = None,
-    ) -> List[dist.ProcessGroup]:
-        """Create one same-position input-distribution group across all stages.
-
-        Position ``p`` joins ``stage_ranks[0][p]``, ``stage_ranks[1][p]``, and
-        so on. The default backend carries tensors; Gloo carries CPU metadata.
-        """
-        stage_size = len(stage_ranks[0]) if stage_ranks else 0
-        return [
-            cast(
-                dist.ProcessGroup,
-                dist.new_group(
-                    ranks=[stage[position] for stage in stage_ranks],
-                    backend=backend,
-                ),
-            )
-            for position in range(stage_size)
-        ]
-
-    @classmethod
-    def from_device_mesh(
-        cls,
-        device_mesh: DeviceMesh,
-        *,
-        stage_mesh_dim_name: str,
-        pipeline_mesh_dim_name: str,
-        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SPLIT,
-    ) -> "MaglevProcessGroups":
-        """Build Maglev process groups from a two-dimensional device mesh.
-
-        The mesh remains the topology owner. Its stage-dimension group is reused
-        for data parallelism, and its pipeline-dimension group is reused for
-        accelerator input distribution. Maglev creates only its dedicated P2P
-        handoff groups and the Gloo counterpart used for input metadata.
-
-        Every rank must call this method with the same mesh and handoff mode.
-        """
-        mesh_dim_names = device_mesh.mesh_dim_names
-        if device_mesh.ndim != 2 or mesh_dim_names is None:
-            raise ValueError("Maglev requires a named two-dimensional device mesh")
-        if (
-            stage_mesh_dim_name not in mesh_dim_names
-            or pipeline_mesh_dim_name not in mesh_dim_names
-            or stage_mesh_dim_name == pipeline_mesh_dim_name
-        ):
-            raise ValueError(
-                "stage and pipeline dimensions must be distinct dimensions of "
-                f"the device mesh, got {mesh_dim_names}"
-            )
-
-        stage_dim = mesh_dim_names.index(stage_mesh_dim_name)
-        pipeline_dim = mesh_dim_names.index(pipeline_mesh_dim_name)
-        stage_ranks = tuple(
-            tuple(int(rank) for rank in ranks)
-            for ranks in device_mesh.mesh.permute(pipeline_dim, stage_dim).tolist()
-        )
-        _, position = cls.locate_rank(stage_ranks, dist.get_rank())
-        handoff_pgs = cls.build_handoff_process_groups(stage_ranks, handoff_pg_mode)
-        cascade_gloo_pgs = cls.build_cascade_process_groups(stage_ranks, backend="gloo")
-        return cls(
-            stage_ranks=stage_ranks,
-            stage_pg=cast(
-                dist.ProcessGroup,
-                device_mesh[stage_mesh_dim_name].get_group(),
-            ),
-            handoff_pgs=handoff_pgs,
-            cascade_pg=cast(
-                dist.ProcessGroup,
-                device_mesh[pipeline_mesh_dim_name].get_group(),
-            ),
-            cascade_gloo_pg=cascade_gloo_pgs[position],
-            handoff_pg_mode=handoff_pg_mode,
-        )
-
-    @classmethod
-    def from_scratch(
-        cls,
-        stage_size: int,
-        num_stages: int,
-        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SPLIT,
-    ) -> "MaglevProcessGroups":
-        """Create every Maglev process group for a contiguous rank layout.
-
-        Process-group creation is collective. Every rank must call this method
-        with identical arguments and before any sharding component creates
-        groups. Stage, handoff, tensor-cascade, and Gloo metadata-cascade groups
-        are created contiguously in that order.
-        """
-        if stage_size <= 0:
-            raise ValueError(f"stage_size must be positive, got {stage_size}")
-        if num_stages <= 0:
-            raise ValueError(f"num_stages must be positive, got {num_stages}")
-        stage_ranks = tuple(
-            tuple(range(stage * stage_size, (stage + 1) * stage_size))
-            for stage in range(num_stages)
-        )
-        stage_pgs = cls.build_stage_process_groups(stage_ranks)
-        handoff_pgs = cls.build_handoff_process_groups(stage_ranks, handoff_pg_mode)
-        cascade_pgs = cls.build_cascade_process_groups(stage_ranks)
-        cascade_gloo_pgs = cls.build_cascade_process_groups(stage_ranks, backend="gloo")
-        stage_index, position = cls.locate_rank(stage_ranks, dist.get_rank())
-        return cls(
-            stage_ranks=stage_ranks,
-            stage_pg=stage_pgs[stage_index],
-            handoff_pgs=handoff_pgs,
-            cascade_pg=cascade_pgs[position],
-            cascade_gloo_pg=cascade_gloo_pgs[position],
-            handoff_pg_mode=handoff_pg_mode,
-        )
-
-    @classmethod
-    def locate_rank(
-        cls,
-        stage_ranks: Sequence[Sequence[int]],
-        global_rank: int,
-    ) -> Tuple[int, int]:
-        """Return a rank's stage index and position within that stage."""
-        for stage_index, ranks in enumerate(stage_ranks):
-            if global_rank in ranks:
-                return stage_index, ranks.index(global_rank)
-        raise ValueError(f"rank {global_rank} is absent from the Maglev rank layout")
-
-    @classmethod
-    def _normalize_stage_ranks(
-        cls,
-        stage_ranks: Sequence[Sequence[int]],
-    ) -> Tuple[Tuple[int, ...], ...]:
-        normalized = tuple(tuple(ranks) for ranks in stage_ranks)
-        if not normalized or not normalized[0]:
-            raise ValueError("stage_ranks must contain at least one non-empty stage")
-        stage_size = len(normalized[0])
-        if any(len(ranks) != stage_size for ranks in normalized):
-            raise ValueError("every Maglev stage must contain the same number of ranks")
-        flattened = tuple(rank for ranks in normalized for rank in ranks)
-        if len(set(flattened)) != len(flattened):
-            raise ValueError("each rank must occur exactly once in stage_ranks")
-        return normalized
-
-    @property
-    def stage_size(self) -> int:
-        return len(self.stage_ranks[0])
-
-    @property
-    def num_stages(self) -> int:
-        return len(self.stage_ranks)
-
-
-def remap_plan_to_process_group(
-    plan: ShardingPlan, pg: dist.ProcessGroup, device: torch.device
-) -> None:
-    """Rewrite a plan's shard placements from group-local to global, in place.
-
-    A planner built over a sub-process-group topology emits *group-local* ranks
-    and devices -- ``rank:0/cuda:0``, ``rank:1/cuda:1`` for a 2-rank group. Shard
-    placements are interpreted against the *global* rank space, though:
-    ``DistributedModelParallel`` maps ``placement.rank()`` back through the
-    process group, and the shard tensor lives on the process's actual device. For
-    a group whose ranks are global ``{2, 3}`` on ``cuda:{2, 3}`` the group-local
-    plan is wrong twice over -- rank 0 is not in the group at all, and the device
-    is ``cuda:0`` rather than ``cuda:2``.
-
-    Call this on a plan produced by a planner whose ``Topology`` was sized to
-    ``pg`` rather than to the world, before handing it to
-    ``DistributedModelParallel``. Group-local rank ``r`` is remapped to global
-    rank ``g = get_global_rank(pg, r)``, placed on ``cuda:{g % device_count}``.
-    Deterministic given ``(plan, pg)``, so every rank in the group produces the
-    same result.
-
-    A no-op for non-CUDA devices, which carry no ordinal to correct.
-
-    Args:
-        plan: the sharding plan to rewrite, modified in place.
-        pg: the process group the plan was planned over.
-        device: the compute device; only ``cuda`` placements are remapped.
-
-    .. note::
-        Assumes one host -- global rank ``g`` is taken to be on local device
-        ``g % torch.cuda.device_count()``.
-    """
-    if device.type != "cuda":
-        return
-    device_count = torch.cuda.device_count()
-    for module_plan in plan.plan.values():
-        # ModuleShardingPlan is dict-like at runtime (param name -> ParameterSharding).
-        # pyrefly: ignore[missing-attribute]
-        for param_sharding in module_plan.values():
-            spec = getattr(param_sharding, "sharding_spec", None)
-            if spec is None:
-                continue
-            for shard in spec.shards:
-                g = dist.get_global_rank(pg, shard.placement.rank())
-                dev = g % device_count if device_count else 0
-                shard.placement = torch.distributed._remote_device(
-                    f"rank:{g}/cuda:{dev}"
-                )
+    if isinstance(output, torch.Tensor):
+        return output.detach().requires_grad_(output.requires_grad)
+    if (
+        isinstance(output, tuple)
+        and output
+        and all(isinstance(t, torch.Tensor) for t in output)
+    ):
+        return tuple(t.detach().requires_grad_(t.requires_grad) for t in output)
+    raise TypeError(
+        f"{type(layer).__name__} sparse net returned {type(output).__name__}; "
+        "the stage hands its dense net a tensor or a non-empty tuple of "
+        "tensors. Return a tensor or a non-empty tuple of tensors"
+    )
 
 
 class _LayerChain(nn.Module):
-    """Runs a stage's layers back to back, threading the activation through.
+    """The layers this stage owns under layers_per_stage, as one module: e.g.
+    layers_per_stage=[3, 2] gives stage 1 layers 3 and 4, registered as layers.3
+    and layers.4.
 
-    Not part of the Maglev API -- it exists only because the parallelizers need a
-    single callable ``nn.Module`` to own the stage's layers:
-    ``DistributedModelParallel`` shards exactly one module, and a bare
-    ``nn.ModuleList`` has no ``forward``. :class:`StageWrapper` builds one from
-    the layer list it is given and exposes it as :attr:`StageWrapper.module`.
+    Registering the layers under their global model indices keeps the authored
+    model's parameter FQNs; the layers run in insertion order. This is the
+    module the parallelizers wrap.
 
-    Layers are registered in an ``nn.ModuleDict`` whose keys are their global
-    model indices. This preserves checkpoint FQNs after non-local layers are
-    discarded: for example, a stage beginning at layer 10 owns parameters under
-    ``layers.10`` rather than renumbering them under ``layers.0``. Execution does
-    not derive its order by sorting those string keys (which would place ``10``
-    before ``2``). ``nn.ModuleDict`` preserves insertion order, the constructor
-    inserts the supplied sequence in execution order, and :meth:`forward`
-    iterates :meth:`nn.ModuleDict.values` in that same order.
-
-    The stage holding the model's *final* layer is also given the model's
-    :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.postproc`, and
-    applies it to the last activation. By default its complete result is
-    preserved. A caller that wraps the chain in DDP can enable loss-only output,
-    keeping auxiliary predictions out of DDP's backward-root traversal.
-    ``postproc`` still runs inside the parallelized module, so its head and loss
-    remain in the autograd graph and its parameters shard with the rest of the
-    stage.
-
-    ``postproc`` is handed the last layer's *input* as well as its activation,
-    because that is where the target lives -- which is why the pipeline never has
-    to carry labels.
+    :meth:`forward` runs one microbatch through every layer, or one phase, so
+    a wrapper observes every call: given ``sparse_only``, every sparse net on
+    one microbatch; given ``sparse_outputs``, one dense microbatch; given
+    ``batch_size`` and ``num_microbatches``, every sparse net on the pass's
+    whole batch.
 
     Args:
         layers: the stage's layers, in execution order.
-        postproc: the model's output seam, on the stage that owns the final
-            layer; ``None`` on every other stage, which must hand a plain
-            activation tuple to the next HSD. Called as
-            ``postproc(activations, layer_inputs[-1])``.
-        first_layer_index: global index of this stage's first layer, used for
-            parameter FQNs and tracing.
-        loss_only_output: whether to expose only the loss from ``postproc``.
-
-    Example::
-
-        chain = _LayerChain([layer0, layer1])
-        (out,) = chain([layer_input0, layer_input1])
+        postproc: the model's output seam on the stage that owns the final
+            layer, called as ``postproc(activations, layer_inputs[-1])``;
+            ``None`` elsewhere.
+        first_layer_index: global index of this stage's first layer.
+        loss_only_output: whether the last stage returns only ``postproc``'s
+            loss, keeping auxiliary predictions out of a wrapper's output
+            traversal.
     """
 
     def __init__(
@@ -385,9 +163,14 @@ class _LayerChain(nn.Module):
                 for index, layer in enumerate(layers)
             }
         )
-        self._profile_names: List[str] = [
+        self._layer_profile_names: List[str] = [
             f"## torchrec_maglev:layer[{first_layer_index + index}] "
             f"{type(layer).__name__.lstrip('_')} ##"
+            for index, layer in enumerate(layers)
+        ]
+        self._sparse_net_profile_names: List[str] = [
+            f"## torchrec_maglev:layer[{first_layer_index + index}] "
+            f"{type(layer).__name__.lstrip('_')} sparse ##"
             for index, layer in enumerate(layers)
         ]
         # Plain attribute, not a submodule: postproc is a bound method of the
@@ -395,221 +178,40 @@ class _LayerChain(nn.Module):
         self._postproc = postproc
         self._loss_only_output = loss_only_output
 
-    def forward(
-        self,
-        layer_inputs: Sequence[Any],
-        in_activations: Activations = (),
-    ) -> Any:
-        """Chain the layers, threading each layer's activation into the next.
-
-        Args:
-            layer_inputs: one input per layer, index-aligned with :attr:`layers`.
-            in_activations: the activation entering the stage. Default is ``()``.
-
-        Returns:
-            Any: a plain ``Activations`` tuple, except on the stage owning the
-            final layer, where the model's ``postproc`` result is returned. In
-            loss-only mode, that result is reduced to a singleton ``(losses,)``.
-
-        Raises:
-            ValueError: if the input count does not match the layer count.
-        """
-        if len(layer_inputs) != len(self.layers):
-            raise ValueError(
-                f"expected {len(self.layers)} layer inputs, got {len(layer_inputs)}"
-            )
-        activations = in_activations
-        for layer, layer_input, profile_name in zip(
-            self.layers.values(), layer_inputs, self._profile_names
-        ):
-            maglev_layer = cast(MaglevLayer, layer)
-            with record_function(profile_name):
-                activations = maglev_layer(layer_input, activations)
-        if self._postproc is not None:
-            # The last layer's input carries the target postproc scores against.
-            with record_function("## torchrec_maglev:postproc ##"):
-                output = self._postproc(activations, layer_inputs[-1])
-            if self._loss_only_output:
-                # DDP treats every returned tensor as a backward root. Auxiliary
-                # predictions must stay out when only the loss is backpropagated.
-                losses, _model_output = output
-                return (losses,)
-            return output
-        return activations
-
-
-@dataclass
-class LayerSparseOutput:
-    r"""LayerSparseOutput(pooled, seams)
-
-    Store one whole-pass sparse output and its detached microbatch leaves.
-
-    Args:
-        pooled (torch.Tensor): Whole-pass output attached to the sparse graph.
-        seams (List[torch.Tensor]): Detached leaves consumed by dense forwards.
-    """
-
-    pooled: torch.Tensor
-    seams: List[torch.Tensor]
-
-
-@dataclass
-class MaglevRailPassState:
-    r"""MaglevRailPassState(sparse_outputs, dense_inputs)
-
-    Hold data shared by the sparse and dense phases of one Rail pass.
-
-    Args:
-        sparse_outputs (List[Optional[LayerSparseOutput]]): Per-layer sparse
-            graphs and seams. ``None`` identifies a dense-only layer.
-        dense_inputs (List[List[Any]]): Per-microbatch inputs for local layers.
-    """
-
-    sparse_outputs: List[Optional[LayerSparseOutput]]
-    dense_inputs: List[List[Any]]
-
-    def seams_for(self, microbatch_id: int) -> List[Optional[torch.Tensor]]:
-        r"""seams_for(microbatch_id) -> List[Optional[torch.Tensor]]
-
-        Return one sparse seam per local layer for a dense microbatch.
-
-        Args:
-            microbatch_id (int): Dense microbatch index.
-
-        Returns:
-            List[Optional[torch.Tensor]]: Per-layer sparse outputs.
-        """
-        return [
-            None if output is None else output.seams[microbatch_id]
-            for output in self.sparse_outputs
-        ]
-
-
-_RailLayerForward = Tuple[Optional[torch.Tensor], List[Any]]
-
-
-def _reject_unhalved_parameters(layers: Sequence[MaglevLayer]) -> None:
-    """Require every trainable layer parameter to live in one of the two halves.
-
-    The split backward computes weight gradients for ``dense_parameters()`` only,
-    and reaches the sparse side through the seams. A parameter registered on the
-    layer body is in neither set: ``torch.autograd.grad`` runs no
-    ``AccumulateGrad`` for it, so its ``.grad`` stays ``None`` after
-    ``zero_grad()`` and the optimizer skips it. It never trains, with no error --
-    which is exactly the mistake a layer migrating to the split API makes by
-    leaving one submodule behind.
-
-    Raises:
-        ValueError: if a layer owns a trainable parameter outside both halves.
-    """
-    for index, layer in enumerate(layers):
-        halved = {
-            id(parameter)
-            for half in (layer.sparse, layer.dense)
-            if half is not None
-            for parameter in half.parameters()
-        }
-        stray = sorted(
-            name
-            for name, parameter in layer.named_parameters()
-            if parameter.requires_grad and id(parameter) not in halved
-        )
-        if stray:
-            raise ValueError(
-                f"{type(layer).__name__} at index {index} owns trainable "
-                f"parameters outside its sparse and dense halves: {stray}. "
-                "MaglevRail computes weight gradients from the dense half only, "
-                "so these would silently never train -- move them into the "
-                "sparse or dense submodule"
-            )
-
-
-def _reject_uncovered_weights(
-    param_groups: Sequence[Mapping[str, Any]],
-    weights: Sequence[nn.Parameter],
-) -> None:
-    """Refuse a weight half that would silently skip some of its parameters.
-
-    ``get_param_groups`` records a parameter only when its reverse closure
-    intersects the closure of the ``input_values`` it was given, and upstream's
-    own coverage assertion for that is commented out
-    (``pipelining/_backward.py``). A dense parameter whose path to the output
-    never merges with a path descended from a received activation or a sparse
-    seam therefore produces no weight group, ``stage_backward_weight`` writes no
-    ``.grad`` for it, and it never trains -- with no exception anywhere.
-
-    Cheap: a set of ids over the stage's dense parameters, once per microbatch.
-
-    Raises:
-        RuntimeError: if a trainable dense parameter has no weight group.
-    """
-    trainable = [weight for weight in weights if weight.requires_grad]
-    # By identity, not by count. ``param_groups`` holds grad-accumulator nodes,
-    # the same keys ``stage_backward_weight`` looks weights up by, and a count
-    # comparison passes when one node appears in two groups while another
-    # parameter is missing entirely -- which is exactly the case this exists to
-    # catch.
-    covered = {id(node) for group in param_groups for node in group["params"]}
-    missing = [
-        weight
-        for weight in trainable
-        if id(_get_grad_fn_or_grad_acc(weight)) not in covered
-    ]
-    if not missing:
-        return
-    raise RuntimeError(
-        f"the split backward reached {len(trainable) - len(missing)} of "
-        f"{len(trainable)} trainable dense parameters, so {len(missing)} would "
-        "receive no gradient and never train. A dense parameter is reachable "
-        "only if its path to the stage output merges with one descended from an "
-        "incoming activation or a sparse seam; one fed solely by "
-        "non-differentiable inputs is not"
-    )
-
-
-class _RailLayerChain(_LayerChain):
-    r"""A layer chain with separate sparse and dense Rail execution phases."""
-
-    def __init__(
-        self,
-        layers: Sequence[MaglevLayer],
-        postproc: Optional[Callable[[Activations, Any], Any]] = None,
-        first_layer_index: int = 0,
-        loss_only_output: bool = False,
-    ) -> None:
-        super().__init__(layers, postproc, first_layer_index, loss_only_output)
-        # Author time, before any wrapper obscures which half owns what.
-        _reject_unhalved_parameters(layers)
-
-    def forward(
+    def forward(  # noqa: C901
         self,
         layer_inputs: Sequence[Any],
         in_activations: Activations = (),
         *,
-        sparse_outputs: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        sparse_only: bool = False,
+        sparse_outputs: Optional[Sequence[Optional[SparseSeam]]] = None,
         batch_size: Optional[int] = None,
         num_microbatches: Optional[int] = None,
     ) -> Any:
-        r"""forward(layer_inputs, in_activations=(), *, sparse_outputs=None, batch_size=None, num_microbatches=None) -> Any
+        r"""forward(layer_inputs, in_activations=(), *, sparse_only=False, sparse_outputs=None, batch_size=None, num_microbatches=None) -> Any
 
-        Run the global sparse phase, or dispatch a dense microbatch through the
-        wrapper-visible ``forward`` entry point.
+        Run one microbatch, one microbatch's sparse nets, the sparse phase, or
+        one dense microbatch.
 
         Args:
             layer_inputs (Sequence[Any]): One input per local layer.
-            in_activations (Activations): Activation entering the stage.
-                Default: ``()``
-            sparse_outputs (Sequence[Optional[torch.Tensor]], optional): One
-                precomputed sparse output per layer. Supplying this dispatches
-                to :meth:`forward_dense`. Default: ``None``
-            batch_size (int, optional): Whole-pass batch size. Required when
-                ``sparse_outputs`` is ``None``. Default: ``None``
-            num_microbatches (int, optional): Number of dense microbatches,
-                required when ``sparse_outputs`` is ``None``. Default: ``None``
+            in_activations (Activations): Activation entering the stage; dense
+                phase only. Default: ``()``
+            sparse_only (bool): Run every sparse net on this microbatch and
+                return their outputs, ``None`` for a layer without one.
+                Default: ``False``
+            sparse_outputs (Sequence[Optional[SparseSeam]], optional): One
+                sparse seam per layer, which selects the dense phase. Default:
+                ``None``
+            batch_size (int, optional): Whole-pass batch size; sparse phase
+                only. Default: ``None``
+            num_microbatches (int, optional): Dense microbatches; sparse phase
+                only. Default: ``None``
 
         Returns:
-            Any: Per-layer sparse outputs and dense inputs, or the result of
-            :meth:`forward_dense` when ``sparse_outputs`` is supplied.
+            Any: The sparse phase's ``(sparse output, dense inputs)`` per layer,
+            or the dense phase's activation (``postproc``'s result on the last
+            stage).
 
         Raises:
             ValueError: If the input counts or phase arguments are invalid.
@@ -618,143 +220,209 @@ class _RailLayerChain(_LayerChain):
             raise ValueError(
                 f"expected {len(self.layers)} layer inputs, got {len(layer_inputs)}"
             )
+        if sparse_only:
+            if (
+                in_activations
+                or sparse_outputs is not None
+                or batch_size is not None
+                or num_microbatches is not None
+            ):
+                raise ValueError(
+                    "a microbatch's sparse nets take no other phase argument"
+                )
+            return self._run_sparse_micro(layer_inputs)
         if sparse_outputs is not None:
-            # Dispatch through forward so an outer DMP/DDP/FSDP wrapper observes
-            # the dense call before this implementation-specific method runs.
             if batch_size is not None or num_microbatches is not None:
                 raise ValueError(
                     "dense forward does not accept batch_size or num_microbatches"
                 )
-            return self.forward_dense(
-                layer_inputs,
-                in_activations,
-                sparse_outputs,
+            return self._run_dense_micro(layer_inputs, in_activations, sparse_outputs)
+        if batch_size is None and num_microbatches is None:
+            return self._run_dense_micro(
+                layer_inputs, in_activations, self._run_sparse_micro(layer_inputs)
             )
         if in_activations:
             raise ValueError("sparse forward does not accept incoming activations")
         if batch_size is None or num_microbatches is None:
             raise ValueError("sparse forward requires batch_size and num_microbatches")
+        return self._run_sparse_global(layer_inputs, batch_size, num_microbatches)
 
-        rail_outputs: List[_RailLayerForward] = []
+    def _run_sparse_micro(self, layer_inputs: Sequence[Any]) -> List[Any]:
+        """Every layer's sparse net on its input; ``None`` where there is none."""
+        sparse_outputs: List[Any] = []
         for layer, layer_input, profile_name in zip(
-            self.layers.values(), layer_inputs, self._profile_names
+            self.layers.values(), layer_inputs, self._sparse_net_profile_names
+        ):
+            sparse = cast(MaglevLayer, layer).sparse
+            with record_function(profile_name):
+                sparse_outputs.append(None if sparse is None else sparse(layer_input))
+        return sparse_outputs
+
+    def _run_sparse_global(
+        self, layer_inputs: Sequence[Any], batch_size: int, num_microbatches: int
+    ) -> List[_GlobalSparseOutput]:
+        outputs: List[_GlobalSparseOutput] = []
+        for layer, layer_input, profile_name in zip(
+            self.layers.values(), layer_inputs, self._layer_profile_names
         ):
             maglev_layer = cast(MaglevLayer, layer)
             with record_function(profile_name):
                 sparse = maglev_layer.sparse
                 pooled = None if sparse is None else sparse(layer_input)
                 if sparse is not None:
-                    if not isinstance(pooled, torch.Tensor):
-                        raise TypeError(
-                            f"{type(maglev_layer).__name__} sparse half returned "
-                            f"{type(pooled).__name__}, expected torch.Tensor"
-                        )
-                    if pooled.ndim == 0 or pooled.shape[0] != batch_size:
-                        raise ValueError(
-                            f"{type(maglev_layer).__name__} sparse output has shape "
-                            f"{tuple(pooled.shape)}, expected leading dimension "
-                            f"{batch_size}"
-                        )
-                    if not pooled.dtype.is_floating_point:
-                        raise ValueError(
-                            f"{type(maglev_layer).__name__} sparse output must be "
-                            f"floating point, got {pooled.dtype}"
-                        )
+                    check_sparse_output(
+                        maglev_layer,
+                        pooled,
+                        batch_size,
+                        shared=maglev_layer.shared_sparse_outputs(),
+                    )
                 dense_inputs = maglev_layer.split_dense_input(
-                    layer_input,
-                    batch_size,
-                    num_microbatches,
+                    layer_input, batch_size, num_microbatches
                 )
                 if len(dense_inputs) != num_microbatches:
                     raise ValueError(
                         f"{type(maglev_layer).__name__}.split_dense_input() returned "
                         f"{len(dense_inputs)} inputs, expected {num_microbatches}"
                     )
-            rail_outputs.append((pooled, dense_inputs))
-        return rail_outputs
+            outputs.append((pooled, dense_inputs))
+        return outputs
 
-    def forward_dense(
+    def _run_dense_micro(
         self,
         layer_inputs: Sequence[Any],
         in_activations: Activations,
-        sparse_outputs: Sequence[Optional[torch.Tensor]],
+        sparse_outputs: Sequence[Optional[SparseSeam]],
     ) -> Any:
-        r"""forward_dense(layer_inputs, in_activations, sparse_outputs) -> Any
-
-        Run one dense microbatch through the stage's layers and postprocessor.
-
-        Args:
-            layer_inputs (Sequence[Any]): One dense input per local layer.
-            in_activations (Activations): Activation entering the stage.
-            sparse_outputs (Sequence[Optional[torch.Tensor]]): One precomputed
-                sparse output per local layer.
-
-        Returns:
-            Any: The stage activation or final-stage postprocessor result.
-
-        Raises:
-            ValueError: If an input count does not match the layer count.
-        """
-        if len(layer_inputs) != len(self.layers):
-            raise ValueError(
-                f"expected {len(self.layers)} layer inputs, got {len(layer_inputs)}"
-            )
         if len(sparse_outputs) != len(self.layers):
             raise ValueError(
                 f"expected {len(self.layers)} sparse outputs, got "
                 f"{len(sparse_outputs)}"
             )
         activations = in_activations
-        for index, (layer, layer_input, profile_name) in enumerate(
-            zip(self.layers.values(), layer_inputs, self._profile_names)
+        for layer, layer_input, sparse_output, profile_name in zip(
+            self.layers.values(),
+            layer_inputs,
+            sparse_outputs,
+            self._layer_profile_names,
         ):
-            maglev_layer = cast(MaglevLayer, layer)
             with record_function(profile_name):
-                activations = maglev_layer.require_dense()(
-                    sparse_outputs[index], layer_input, activations
+                activations = cast(MaglevLayer, layer).require_dense()(
+                    sparse_output, layer_input, activations
                 )
-        if self._postproc is not None:
-            with record_function("## torchrec_maglev:postproc ##"):
-                output = self._postproc(activations, layer_inputs[-1])
-            if self._loss_only_output:
-                losses, _model_output = output
-                return (losses,)
-            return output
-        return activations
+        return self._apply_postproc(activations, layer_inputs)
+
+    def _apply_postproc(
+        self, activations: Activations, layer_inputs: Sequence[Any]
+    ) -> Any:
+        if self._postproc is None:
+            return activations
+        with record_function("## torchrec_maglev:postproc ##"):
+            output = self._postproc(activations, layer_inputs[-1])
+        if self._loss_only_output:
+            # DDP treats every returned tensor as a backward root. Auxiliary
+            # predictions must stay out when only the loss is backpropagated.
+            losses, _model_output = output
+            return (losses,)
+        return output
 
 
-class _StageLoss(torch.autograd.Function):
-    """Expose a stage's ordered cross-rank backward as an autograd edge."""
+# ======== Global batch and microbatch: the pass's data ========
 
-    @staticmethod
-    def forward(ctx: Any, value: torch.Tensor, stage: "StageWrapper") -> torch.Tensor:
-        ctx.stage = stage
-        return value.clone()
+_GlobalSparseOutput = Tuple[Optional[SparseSeam], List[Any]]
 
-    @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> Any:
-        stage = cast(StageWrapper, ctx.stage)
-        stage._backward_round(cast(torch.Tensor, grad_outputs[0]))
-        return None, None
+
+def _split_seams_per_microbatch(
+    pooled: SparseSeam, num_microbatches: int, shared: Sequence[int] = ()
+) -> List[SparseSeam]:
+    """Cut one whole-pass sparse output into detached per-microbatch seams.
+
+    A batch-major tensor is split by rows; a tensor at a ``shared`` position is
+    one leaf that every microbatch's seam holds, so the dense backwards'
+    gradients accumulate into its ``.grad``.
+    """
+    leaves = [
+        (
+            [tensor.detach().requires_grad_(True)] * num_microbatches
+            if position in shared
+            else [
+                part.detach().requires_grad_(True)
+                for part in torch.tensor_split(tensor, num_microbatches, dim=0)
+            ]
+        )
+        for position, tensor in enumerate(_unpack_seam(pooled))
+    ]
+    return [
+        (
+            leaves[0][index]
+            if isinstance(pooled, torch.Tensor)
+            else tuple(parts[index] for parts in leaves)
+        )
+        for index in range(num_microbatches)
+    ]
+
+
+@dataclass
+class MaglevPassState:
+    r"""MaglevPassState(sparse_outputs, seams, dense_inputs)
+
+    What a pass's sparse forward hands its dense microbatches and its sparse
+    backward.
+
+    Args:
+        sparse_outputs (List[Optional[SparseSeam]]): Per local layer, the
+            sparse net's whole-pass output; ``None`` for a layer with no sparse
+            net.
+        seams (List[List[Optional[SparseSeam]]]): Per microbatch, a detached
+            slice of each ``sparse_outputs`` entry. A shared position
+            (``MaglevLayer.shared_sparse_outputs``) holds one whole-pass leaf.
+        dense_inputs (List[List[Any]]): Per microbatch, one dense input per
+            local layer.
+    """
+
+    sparse_outputs: List[Optional[SparseSeam]]
+    seams: List[List[Optional[SparseSeam]]]
+    dense_inputs: List[List[Any]]
+
+
+@dataclass
+class _PendingMicrobatch:
+    """A dense microbatch forwarded but not yet backwarded."""
+
+    in_activations: Activations
+    outputs: Any
+    microbatch_id: int
+    seams: Sequence[Optional[SparseSeam]]
+
+
+# ======== Stage ========
 
 
 class StageWrapper(nn.Module):
     """Takes a whole Maglev model and keeps the one stage this rank owns.
 
-    Every rank passes the same ``model`` and ``layers_per_stage``; only
-    ``dist.get_rank()`` differs. The wrapper locates that rank in the process-group
-    layout, keeps the corresponding contiguous run of layers, and drops the rest.
-    The kept layers are the model's *own* modules, not copies, so the standalone
-    and pipelined executions share parameters.
+    Every rank passes the same ``model`` and ``layers_per_stage``; the wrapper
+    keeps this rank's contiguous run of the model's own layers, not copies.
 
-    By default :class:`MaglevProcessGroups` creates a contiguous topology. A
-    runtime that already owns process-group construction can pass its bundle via
-    ``process_groups`` instead, keeping one source of truth for rank placement.
+    It runs the stage's share of each phase of a pass, in whatever order a
+    schedule (:mod:`~torchrec.distributed.maglev.pipeline`) calls them:
+
+    * :meth:`sparse_forward_micro` runs every sparse net on one microbatch
+      and hands the dense phase detached seams, or
+      :meth:`sparse_forward_global` runs every sparse net once on the pass's
+      whole batch and cuts each output into detached per-microbatch seams;
+    * :meth:`dense_forward_micro` runs one dense microbatch, between the
+      activation handoffs;
+    * :meth:`dense_backward_micro` backwards one microbatch whole, or
+      :meth:`dense_backward_act_micro` and :meth:`dense_backward_weight_micro`
+      split it into its input-gradient and weight-gradient phases;
+    * :meth:`sparse_backward_micro` resumes one microbatch's sparse graph from
+      its seams' gradients, or :meth:`sparse_backward_global` resumes every
+      sparse graph from its seams' summed gradients.
 
     **Parallelism is the caller's job.** The wrapper cuts the model, builds the
-    process-group bundle, and reads the boundary contract; it does not shard. Wrap
-    :attr:`module` however you like, assign it back, then :meth:`to` to
-    materialize whatever is still on ``meta``::
+    stage's process groups, and reads the boundary contract; it does not shard.
+    Wrap :attr:`module`, assign it back, then :meth:`to` to materialize whatever
+    is still on ``meta``::
 
         stage = StageWrapper(model, layers_per_stage, stage_size)
         stage.module = DistributedModelParallel(
@@ -762,17 +430,8 @@ class StageWrapper(nn.Module):
         )
         stage.to(device)
 
-    Wrap before materializing, so a sharder places the tables rather than
-    resharding ones already allocated at full size.
-
-    The stage reduces no gradients itself. Functional execution combines the
-    microbatch graphs into one autograd traversal, while explicit schedules use
-    their DP wrapper's synchronization controls; either way, that wrapper's
-    reducer fires once per pass (see
-    :class:`~torchrec.distributed.maglev.pipeline.MaglevPipelineBase`).
-
     The activation specs are captured in the constructor, before any wrapping,
-    since a wrapped module may no longer re-expose the
+    since a wrapped module may no longer expose the
     :class:`~torchrec.distributed.maglev.module.MaglevLayer` API.
 
     Args:
@@ -782,96 +441,20 @@ class StageWrapper(nn.Module):
         stage_size: ranks per stage -- the size of one hardware scale-up domain
             (HSD). Used to build the default contiguous topology and validated
             against ``process_groups`` when one is provided.
-        loss_only_output: whether the final stage returns only the loss. Enable
-            this before wrapping the stage module in DDP so auxiliary prediction
-            tensors are not treated as backward roots.
+        loss_only_output: whether the final stage returns only the loss.
         process_groups: optional externally constructed Maglev process groups.
-        enable_rail: whether to build the Rail-specific sparse/dense stage module.
-            This must be selected before wrapping :attr:`module`. Default is
-            ``False``.
 
     Raises:
-        ValueError: if ``layers_per_stage`` does not describe ``model``, the
+        ValueError: if a layer has no dense net or overrides ``forward``
+            (:func:`~torchrec.distributed.maglev.checks.reject_unsplit_layers`),
+            a layer owns a trainable parameter outside its sparse and dense
+            nets, ``layers_per_stage`` does not describe ``model``, the
             process-group layout does not match ``stage_size`` or
             ``layers_per_stage``, or the kept layers disagree on the activation
             they exchange.
-
-    Example::
-
-        # Authored on meta: no storage anywhere yet.
-        model = MaglevModuleList([l0, l1, l2, l3])
-        # World size 4, so two stages of two ranks. On rank 3: position 1 of
-        # stage 1, so layers l2 and l3 -- and only those are materialized.
-        stage = StageWrapper(model, [2, 2], stage_size=2)
-        stage.to(device)
-        loss = stage(raw_batch)
-        loss.backward()
     """
 
-    @classmethod
-    def count_stages(cls, stage_size: int, world_size: Optional[int] = None) -> int:
-        """How many pipeline stages a job of ``world_size`` ranks holds.
-
-        The layout is implicit: stage ``i`` is the contiguous block of
-        ``stage_size`` ranks starting at ``i * stage_size``.
-
-        Args:
-            stage_size: ranks per stage (one HSD).
-            world_size: total ranks in the job. Defaults to
-                ``dist.get_world_size()``.
-
-        Returns:
-            int: the number of stages.
-
-        Raises:
-            ValueError: if ``stage_size`` is not positive, or ``world_size`` is
-                not a whole number of stages.
-
-        Example::
-
-            StageWrapper.count_stages(2, world_size=8)   # 4
-        """
-        if world_size is None:
-            world_size = dist.get_world_size()
-        if stage_size <= 0:
-            raise ValueError(f"stage_size must be positive, got {stage_size}")
-        if world_size % stage_size:
-            raise ValueError(
-                f"world_size {world_size} is not a whole number of stages of "
-                f"{stage_size} ranks"
-            )
-        return world_size // stage_size
-
-    @classmethod
-    def locate_rank(cls, stage_size: int, global_rank: int) -> Tuple[int, int]:
-        """Find which stage a rank belongs to, and where in that stage's HSD.
-
-        With HSDs laid out as contiguous blocks of ``stage_size`` ranks, a rank's
-        whole role is one ``divmod``: the stage it owns, and its *position* within
-        that stage, which is what pairs it with the corresponding rank of the
-        neighbouring HSDs for the hand-off.
-
-        Args:
-            stage_size: ranks per stage.
-            global_rank: the rank to locate.
-
-        Returns:
-            Tuple[int, int]: ``(stage_index, position)``.
-
-        Raises:
-            ValueError: if ``stage_size`` is not positive, or ``global_rank`` is
-                negative.
-
-        Example::
-
-            StageWrapper.locate_rank(2, 3)   # (1, 1)
-        """
-        if stage_size <= 0:
-            raise ValueError(f"stage_size must be positive, got {stage_size}")
-        if global_rank < 0:
-            raise ValueError(f"global_rank must not be negative, got {global_rank}")
-        stage_index, position = divmod(global_rank, stage_size)
-        return stage_index, position
+    # ---- Stage: cut and bind ----
 
     def __init__(
         self,
@@ -880,19 +463,28 @@ class StageWrapper(nn.Module):
         stage_size: int,  # number of ranks for each stage
         loss_only_output: bool = False,
         process_groups: Optional[MaglevProcessGroups] = None,
-        enable_rail: bool = False,
     ) -> None:
         super().__init__()
+        # On every rank, before any collective: a stage that refused alone would
+        # leave its peers blocked in group creation.
+        reject_unsplit_layers(list(model))
+        reject_parameters_outside_nets(
+            [layer for layer in model if isinstance(layer, MaglevLayer)]
+        )
+        self._outside_layers_error: Optional[str] = None
+        try:
+            reject_parameters_outside_layers(model)
+        except ValueError as error:
+            self._outside_layers_error = str(error)
         if process_groups is None:
-            num_stages = self.count_stages(stage_size)
-            process_groups = MaglevProcessGroups.from_scratch(stage_size, num_stages)
+            process_groups = MaglevProcessGroups.from_scratch(stage_size)
         else:
-            num_stages = process_groups.num_stages
             if process_groups.stage_size != stage_size:
                 raise ValueError(
                     f"stage_size {stage_size} does not match process-group layout "
                     f"size {process_groups.stage_size}"
                 )
+        num_stages = process_groups.num_stages
         if len(layers_per_stage) != num_stages:
             raise ValueError(
                 f"layers_per_stage describes {len(layers_per_stage)} stages, but "
@@ -906,8 +498,8 @@ class StageWrapper(nn.Module):
         for s, count in enumerate(layers_per_stage):
             if count <= 0:
                 raise ValueError(f"stage {s} must own at least one layer, got {count}")
-        # This rank's own role: the wrapper shards collectively, so it can only
-        # ever be built for the calling rank.
+        # The wrapper shards collectively, so it is only ever built for the
+        # calling rank.
         stage_index, position = MaglevProcessGroups.locate_rank(
             process_groups.stage_ranks, dist.get_rank()
         )
@@ -915,11 +507,9 @@ class StageWrapper(nn.Module):
         self.position: int = position
         self.stage_size: int = stage_size
         self.num_stages: int = num_stages
-        # How the model is cut is the source of truth; which layers this stage
-        # owns is derived from it (see layer_indices), never stored twice.
         self.layers_per_stage: List[int] = list(layers_per_stage)
         layers: List[MaglevLayer] = [
-            cast(MaglevLayer, model[i]) for i in self.layer_indices
+            cast(MaglevLayer, model[i]) for i in self._layer_indices
         ]
         check_layers_chain(layers, f"stage {stage_index}")
         self._process_groups = process_groups
@@ -935,101 +525,94 @@ class StageWrapper(nn.Module):
         self._send_act: List[Tuple[Any, torch.Tensor]] = []
         # pyre-ignore[4]
         self._send_grad: List[Tuple[Any, torch.Tensor]] = []
-        # The model's own input seam. Kept as the bound method, not the model:
-        # holding the model would register every other stage's layers as
-        # submodules of this wrapper.
+        # The model's own input seam, kept as bound methods: holding the model
+        # would register every other stage's layers as submodules.
         self._preproc: Callable[[Any], List[Any]] = model.preproc
         self._get_batch_size: Callable[[Sequence[Any]], int] = model.get_batch_size
-        # Holds this stage's inputs between all-to-all rounds and the schedule
-        # asking for microbatches.
         self._input_driver: InputDistDriver[List[Any]] = InputDistDriver(
             pg_gloo=process_groups.cascade_gloo_pg,
             pg_nccl=process_groups.cascade_pg,
             self_index=stage_index,
         )
-        # Microbatches forwarded but not yet backwarded, oldest first:
-        # (incoming activation, this stage's output, microbatch id).
-        self._pending: List[Tuple[Activations, Any, int]] = []
-        # Read the boundary contract off the authored layers; parallelize() may
-        # return a wrapper that hides it.
+        self._pending_microbatches: Deque[_PendingMicrobatch] = deque()
+        # The weight work each input-gradient phase deferred, oldest first.
+        self._pending_weight_backwards: Deque[Tuple[List[Dict[str, Any]], int]] = (
+            deque()
+        )
+        # Sparse forwards whose backward has not run yet, oldest first: each
+        # layer's sparse output, the seams the dense phase read, microbatch id.
+        self._pending_sparse_microbatches: Deque[
+            Tuple[List[Any], List[Optional[SparseSeam]], int]
+        ] = deque()
         self._in_specs: Tuple[ActivationSpec, ...] = layers[0].in_activation_specs()
         self._out_specs: Tuple[ActivationSpec, ...] = layers[-1].out_activation_specs()
-        # The stage owning the model's final layer also owns its output seam, so
-        # the pipelined run ends exactly where MaglevModuleList.forward does.
-        self.is_last_stage: bool = stage_index == num_stages - 1
-        # Public and reassignable: wrap it in DMP/FSDP/nothing and assign back.
-        layer_chain = _RailLayerChain if enable_rail else _LayerChain
-        self.module: nn.Module = layer_chain(
+        chain = _LayerChain(
             layers,
-            model.postproc if self.is_last_stage else None,
-            first_layer_index=self.layer_indices.start,
+            model.postproc if stage_index == num_stages - 1 else None,
+            first_layer_index=self._layer_indices.start,
             loss_only_output=loss_only_output,
         )
-        self._rail_enabled: bool = enable_rail
-        # Kept because :attr:`module` is reassignable: once a caller wraps it in
-        # DMP/DDP/FSDP the authored layers are no longer reachable from it, and
-        # the split backward needs their dense halves by then.
+        # Public and reassignable: wrap it in DMP/DDP/FSDP2 and assign it back.
+        self.module: nn.Module = chain
+        # The authored layers, reachable after :attr:`module` is wrapped. Not a
+        # submodule: registering it twice would duplicate every state_dict key.
+        object.__setattr__(self, "_layer_chain", chain)
         self._layers: List[MaglevLayer] = list(layers)
-        # Rail only. Sparse seams parallel to :attr:`_pending`, so the split
-        # backward can list them among its differentiable inputs; and the weight
-        # work each ``I`` deferred, oldest first.
-        self._rail_seams: List[Optional[Sequence[Optional[torch.Tensor]]]] = []
-        self._wdense: List[Tuple[Any, int]] = []
-        self._loss_only_output = loss_only_output
-        # Set by to(): a meta-authored model has no device to infer, which is the
-        # whole point of authoring it there.
+        self._pass_active = False
+        self._pass_failed = False
+        self._checks = DenseWeightChecks(
+            stage_index,
+            stage_size,
+            process_groups.stage_pg,
+            lambda: self._placed_device,
+        )
+        self._loss_scale: float = 1.0
+        # The schedule that configured the last pass. Weak, so a collected
+        # schedule's successor still counts as a change.
+        self._schedule: Optional[weakref.ReferenceType[object]] = None
+        # The configuring schedule's gradient reduction; None until configured.
+        self._reduction: Optional[PassReduction] = None
+        self._pass_losses: List[torch.Tensor] = []
+        # Set by to(): a meta-authored model has no device to infer.
         self.device: Optional[torch.device] = None
 
     @property
-    def loss_only_output(self) -> bool:
-        """Whether the final stage exposes only the postprocessed loss."""
-        return self._loss_only_output
-
-    @property
-    def rail_enabled(self) -> bool:
-        r"""Return whether this stage was built with Rail phase support."""
-        return self._rail_enabled
-
-    @property
-    def num_layers(self) -> int:
+    def _num_layers(self) -> int:
         """How many layers this stage owns (== how many inputs it takes)."""
         return self.layers_per_stage[self.stage_index]
 
     @property
-    def layer_indices(self) -> range:
-        """Which of the model's layers this stage owns, in model order.
-
-        Derived from :attr:`layers_per_stage` rather than stored: this stage's
-        layers are the ones following every earlier stage's.
-
-        Example::
-
-            (out,) = stage([layer_inputs[i] for i in stage.layer_indices])
-        """
+    def _layer_indices(self) -> range:
+        """Which of the model's layers this stage owns, in model order."""
         start = sum(self.layers_per_stage[: self.stage_index])
-        return range(start, start + self.num_layers)
+        return range(start, start + self._num_layers)
 
     @property
-    def handoff_pgs(self) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
+    def _handoff_pgs(self) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
         """The activation and gradient handoff process groups."""
         return self._process_groups.handoff_pgs
-
-    @property
-    def handoff_pg_mode(self) -> HandoffPGMode:
-        """Whether activation and gradient handoffs share one communicator."""
-        return self._process_groups.handoff_pg_mode
 
     @property
     def cascade_pg(self) -> dist.ProcessGroup:
         """This rank's input-distribution group (one rank per stage)."""
         return self._process_groups.cascade_pg
 
-    def neighbor_rank(self, offset: int) -> int:
-        """The global rank at this position in the HSD ``offset`` stages away.
+    @property
+    def stage_pg(self) -> dist.ProcessGroup:
+        return self._process_groups.stage_pg
 
-        The hand-off is by position: ``neighbor_rank(-1)`` and
-        ``neighbor_rank(+1)`` are the ranks this one exchanges activations and
-        gradients with.
+    @property
+    def is_first(self) -> bool:
+        """Whether this stage starts the pipeline (nothing to receive)."""
+        return self.stage_index == 0
+
+    @property
+    def is_last(self) -> bool:
+        """Whether this stage ends the pipeline (nothing to send)."""
+        return self.stage_index == self.num_stages - 1
+
+    def _neighbor_rank(self, offset: int) -> int:
+        """The global rank at this position in the HSD ``offset`` stages away.
 
         Args:
             offset: stages to move, e.g. ``-1`` for the previous HSD.
@@ -1039,10 +622,6 @@ class StageWrapper(nn.Module):
 
         Raises:
             ValueError: if the offset lands outside the pipeline.
-
-        Example::
-
-            prev_rank = stage.neighbor_rank(-1)
         """
         stage_index = self.stage_index + offset
         if not 0 <= stage_index < self.num_stages:
@@ -1053,22 +632,32 @@ class StageWrapper(nn.Module):
         return self._process_groups.stage_ranks[stage_index][self.position]
 
     @property
-    def stage_pg(self) -> dist.ProcessGroup:
-        return self._process_groups.stage_pg
+    def layer_chain(self) -> _LayerChain:
+        """This stage's layers as authored, even after :attr:`module` is wrapped."""
+        return cast(_LayerChain, self._layer_chain)
+
+    def reject_untrained_parameters(self) -> None:
+        """Refuse a model MaglevRail cannot train.
+
+        Raises:
+            ValueError: if a trainable weight sits outside every layer, where
+                the pass never runs it.
+        """
+        if self._outside_layers_error is not None:
+            raise ValueError(self._outside_layers_error)
 
     # pyre-ignore[14]: narrower than nn.Module.to by design -- this one
     # materializes meta parameters, which nn.Module.to cannot.
     def to(self, device: torch.device) -> "StageWrapper":
         """Place this stage on ``device``, materializing anything still on ``meta``.
 
-        Call after wrapping :attr:`module`, not before: a meta-authored stage
-        materialized first allocates full-size embedding tables a sharder is
-        about to cut up. Idempotent, and a no-op for parameters a wrapper
-        (``DistributedModelParallel``) already placed.
+        Call after wrapping :attr:`module`, so a sharder places the tables rather
+        than resharding ones already allocated at full size. Idempotent, and a
+        no-op for parameters a wrapper already placed.
 
         Args:
-            device: where this stage runs. Also where the hand-off allocates its
-                receive buffers, so it must be set before the pipeline runs.
+            device: where this stage runs, and where the handoffs allocate their
+                receive buffers.
         """
         init_parameters(self.module, device)
         self.device = device
@@ -1090,12 +679,10 @@ class StageWrapper(nn.Module):
         """The activation this stage receives from the previous HSD."""
         return self._in_specs
 
-    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-        """The activation this stage sends to the next HSD."""
-        return self._out_specs
+    # ---- Stage: feed (input distribution) ----
 
-    def get_batch_size(self, stage_input: Sequence[Any]) -> int:
-        r"""get_batch_size(stage_input) -> int
+    def _batch_size(self, stage_input: Sequence[Any]) -> int:
+        r"""_batch_size(stage_input) -> int
 
         Return and validate the logical batch size of local layer inputs.
 
@@ -1123,342 +710,14 @@ class StageWrapper(nn.Module):
             raise ValueError(
                 "stage input is required for a batch-size-dependent activation"
             )
-        return self.get_batch_size(stage_input)
+        return self._batch_size(stage_input)
 
-    def forward(self, model_input: Any) -> torch.Tensor:
-        """Distribute and forward every microbatch produced by one raw batch.
-
-        Args:
-            model_input: one raw dataloader batch. The model's ``preproc`` creates
-                per-layer inputs, and one input-distribution round exchanges them
-                across the cascade. The batch is already a microbatch; it is not
-                split.
-
-        Returns:
-            torch.Tensor: the summed microbatch loss on the final stage, and a
-            zero-valued backward token on earlier stages. Every rank must call
-            ``backward`` on this tensor; its autograd edge drains the matching
-            cross-stage backwards in order.
-
-        Pipeline schedules use the lower-level ``*_micro`` methods to choose a
-        different forward/backward ordering. The returned value is meaningful
-        for reporting only on the final stage.
-        """
-        with record_function("## torchrec_maglev:input_driver ##"):
-            microbatch_inputs = self._input_driver.exchange(
-                self.send_set(model_input)
-            ).wait()
-
-        outputs: List[Any] = []
-        for microbatch_id, stage_input in enumerate(microbatch_inputs):
-            self.start_recv_act(stage_input)
-            outputs.append(self.forward_micro(stage_input, microbatch_id))
-        self.finish_send_act()
-        if self.is_last:
-            value = torch.stack([output[0] for output in outputs]).sum().detach()
-        else:
-            first_outputs = cast(Activations, outputs[0])
-            value = first_outputs[0].new_zeros(())
-        value.requires_grad_(True)
-        return cast(torch.Tensor, _StageLoss.apply(value, self))
-
-    # ---- cross-HSD hand-off ----
-    #
-    # The stage owns the wire, not just the compute: it knows its neighbours
-    # (:meth:`neighbor_rank`), the configured communicators
-    # (:attr:`handoff_pgs`), and the specs that fix the wire layout. A schedule
-    # (see :mod:`torchrec.distributed.maglev.pipeline`) decides
-    # *when* to call these; it does not need to know how a boundary is wired.
-    # This mirrors ``torch.distributed.pipelining``, where ``PipelineStage`` owns
-    # the send/recv ops and the schedule only orders them.
-    #
-    # SPLIT mode uses independent activation and gradient PGs with the start/wait
-    # methods. SHARED mode additionally permits the paired exchange methods:
-    # batch_isend_irecv requires every operation in a batch to use one PG.
-
-    @property
-    def is_first(self) -> bool:
-        """Whether this stage starts the pipeline (nothing to receive)."""
-        return self.stage_index == 0
-
-    @property
-    def is_last(self) -> bool:
-        """Whether this stage ends the pipeline (nothing to send)."""
-        return self.stage_index == self.num_stages - 1
-
-    def start_recv_act(self, stage_input: Optional[Sequence[Any]] = None) -> None:
-        """Ensure a receive is posted for the previous HSD's activation.
-
-        Allocates one buffer per incoming spec and issues the receives in spec
-        order, so both sides of the boundary agree without exchanging metadata.
-        Collect them with :meth:`wait_for_act`.
-
-        No-op on the first stage. Otherwise each call posts another receive and
-        queues it, so a schedule can run several boundaries ahead of the compute;
-        :meth:`wait_for_act` dequeues them in issue order.
-
-        Args:
-            stage_input: the local inputs for the activation being received. Only
-                required when an incoming spec has a dynamic batch dimension.
-        """
-        if self.is_first:
-            return
-        batch_size = self._activation_batch_size(stage_input)
-        act_pg, _ = self.handoff_pgs
-        src = self.neighbor_rank(-1)
-        works: List[Any] = []
-        tensors: List[torch.Tensor] = []
-        for spec in self._in_specs:
-            tensor = torch.empty(
-                spec.materialize_shape(batch_size),
-                device=self._placed_device,
-                dtype=spec.dtype,
-            )
-            works.append(dist.irecv(tensor, src=src, group=act_pg))
-            tensors.append(tensor)
-        self._recv_act.append((works, tensors))
-
-    def wait_for_act(self) -> Activations:
-        """Dequeue the oldest receive posted by :meth:`start_recv_act`.
-
-        Returns:
-            Activations: the received activation; ``()`` on the first stage.
-
-        Raises:
-            ValueError: if no receive is queued.
-        """
-        if self.is_first:
-            return ()
-        if not self._recv_act:
-            raise ValueError(
-                f"stage {self.stage_index}: wait_for_act() with no activation "
-                "receive in flight; call start_recv_act() first"
-            )
-        works, tensors = self._recv_act.popleft()
-        for work in works:
-            work.wait()
-        for spec, tensor in zip(self._in_specs, tensors):
-            if spec.requires_grad:
-                # Only now the receive has landed: making it a leaf that requires
-                # grad any earlier would make the incoming write an in-place op on
-                # a grad-requiring leaf. As a leaf it collects the gradient this
-                # stage hands back to the previous one.
-                tensor.requires_grad_(True)
-        return tuple(tensors)
-
-    def start_send_act(self, outputs: Activations) -> None:
-        """Send this stage's activation to the next HSD; no-op if last.
-
-        One activation send is in flight at a time, so the caller must
-        :meth:`finish_send_act` the previous one first, bounding the buffers held
-        open to a single transfer. The peer must have posted its matching receive.
-
-        Args:
-            outputs: this stage's output activation.
-
-        Raises:
-            ValueError: if an activation send is still in flight.
-        """
-        if self.is_last:
-            return
-        if self._send_act:
-            raise ValueError(
-                f"stage {self.stage_index}: an activation send is still in "
-                "flight; call finish_send_act() before starting the next"
-            )
-        act_pg, _ = self.handoff_pgs
-        self._send_act = self._isend(outputs, self.neighbor_rank(1), act_pg)
-
-    def finish_send_act(self) -> None:
-        """Complete the activation send in flight, if any."""
-        self._drain(self._send_act)
-
-    def start_recv_grad(self) -> None:
-        """Ensure a receive is posted for the next HSD's output gradients.
-
-        One receive per grad-carrying output slot. No-op on the last stage, which
-        takes its gradient from the loss its own ``postproc`` computed. Otherwise
-        each call queues another, as :meth:`start_recv_act`.
-        """
-        if self.is_last:
-            return
-        _, grad_pg = self.handoff_pgs
-        src = self.neighbor_rank(1)
-        works: List[Any] = []
-        tensors: List[torch.Tensor] = []
-        outputs = cast(Activations, self._pending[len(self._recv_grad)][1])
-        for output, spec in zip(outputs, self._out_specs):
-            if not spec.requires_grad:
-                continue
-            grad = torch.empty_like(output, memory_format=torch.contiguous_format)
-            works.append(dist.irecv(grad, src=src, group=grad_pg))
-            tensors.append(grad)
-        self._recv_grad.append((works, tensors))
-
-    def wait_for_grad(self) -> List[torch.Tensor]:
-        """Dequeue the oldest receive posted by :meth:`start_recv_grad`.
-
-        Returns:
-            List[torch.Tensor]: the gradients, in spec order; empty on the last
-            stage.
-
-        Raises:
-            ValueError: if no receive is queued.
-        """
-        if self.is_last:
-            return []
-        if not self._recv_grad:
-            raise ValueError(
-                f"stage {self.stage_index}: wait_for_grad() with no gradient "
-                "receive in flight; call start_recv_grad() first"
-            )
-        works, tensors = self._recv_grad.popleft()
-        for work in works:
-            work.wait()
-        return tensors
-
-    def send_act_recv_grad(self, outputs: Activations) -> List[torch.Tensor]:
-        """Exchange a forward activation for its downstream gradient.
-
-        Available only in ``SHARED`` mode because ``batch_isend_irecv`` requires
-        every operation in its batch to use the same process group.
-        """
-        if self.is_last:
-            return []
-        if self.handoff_pg_mode is not HandoffPGMode.SHARED:
-            raise RuntimeError("batched handoff requires handoff_pg_mode=shared")
-        peer = self.neighbor_rank(1)
-        pg = self.handoff_pgs[0]
-        send_buffers = [tensor.detach().contiguous() for tensor in outputs]
-        backward_outputs = cast(Activations, self._pending[0][1])
-        grad_buffers = [
-            torch.empty_like(output, memory_format=torch.contiguous_format)
-            for output, spec in zip(backward_outputs, self._out_specs)
-            if spec.requires_grad
-        ]
-        ops = [dist.P2POp(dist.isend, tensor, peer, pg) for tensor in send_buffers]
-        ops.extend(dist.P2POp(dist.irecv, tensor, peer, pg) for tensor in grad_buffers)
-        works = dist.batch_isend_irecv(ops) if ops else []
-        for work in works:
-            work.wait()
-        return grad_buffers
-
-    def send_grad_recv_act(
-        self,
-        in_activations: Activations,
-        recv_next: bool,
-        next_stage_input: Optional[Sequence[Any]] = None,
-    ) -> Activations:
-        """Exchange an upstream gradient for the next forward activation.
-
-        Available only in ``SHARED`` mode; see :meth:`send_act_recv_grad`.
-
-        Args:
-            in_activations: activations whose gradients are sent upstream.
-            recv_next: whether to receive the next forward activation.
-            next_stage_input: local inputs for the next activation microbatch.
-                Only required when ``recv_next`` and an incoming spec has a
-                dynamic batch dimension.
-        """
-        if self.is_first:
-            return ()
-        if self.handoff_pg_mode is not HandoffPGMode.SHARED:
-            raise RuntimeError("batched handoff requires handoff_pg_mode=shared")
-        peer = self.neighbor_rank(-1)
-        pg = self.handoff_pgs[0]
-        batch_size = (
-            self._activation_batch_size(next_stage_input) if recv_next else None
-        )
-        grad_buffers = [
-            (tensor.grad if tensor.grad is not None else torch.zeros_like(tensor))
-            for tensor, spec in zip(in_activations, self._in_specs)
-            if spec.requires_grad
-        ]
-        activation_buffers = (
-            [
-                torch.empty(
-                    spec.materialize_shape(batch_size),
-                    device=self._placed_device,
-                    dtype=spec.dtype,
-                )
-                for spec in self._in_specs
-            ]
-            if recv_next
-            else []
-        )
-        ops = [dist.P2POp(dist.isend, tensor, peer, pg) for tensor in grad_buffers]
-        ops.extend(
-            dist.P2POp(dist.irecv, tensor, peer, pg) for tensor in activation_buffers
-        )
-        works = dist.batch_isend_irecv(ops) if ops else []
-        for work in works:
-            work.wait()
-        for spec, tensor in zip(self._in_specs, activation_buffers):
-            if spec.requires_grad:
-                tensor.requires_grad_(True)
-        return tuple(activation_buffers)
-
-    def start_send_grad(self, in_activations: Activations) -> None:
-        """Send this stage's input gradients upstream; no-op if first.
-
-        A slot unused by the stage's graph has no ``.grad``; zeros are sent so the
-        previous stage's receive still matches -- the wire layout is fixed by the
-        specs, not by graph connectivity. The previous gradient send must already
-        have been finished and the peer must have posted its matching receive.
-
-        Args:
-            in_activations: the activation this stage received.
-
-        Raises:
-            ValueError: if a gradient send is still in flight.
-        """
-        if self.is_first:
-            return
-        if self._send_grad:
-            raise ValueError(
-                f"stage {self.stage_index}: a gradient send is still in flight; "
-                "call finish_send_grad() before starting the next"
-            )
-        _, grad_pg = self.handoff_pgs
-        grads: List[torch.Tensor] = []
-        for tensor, spec in zip(in_activations, self._in_specs):
-            if not spec.requires_grad:
-                continue
-            grads.append(
-                tensor.grad if tensor.grad is not None else torch.zeros_like(tensor)
-            )
-        self._send_grad = self._isend(grads, self.neighbor_rank(-1), grad_pg)
-
-    def finish_send_grad(self) -> None:
-        """Complete the gradient send in flight, if any."""
-        self._drain(self._send_grad)
-
-    def group_by_stage(self, layer_inputs: Sequence[Any]) -> List[List[Any]]:
-        """Regroup a full per-layer input list into one carrier per stage.
-
-        The inverse of :attr:`layer_indices`, and the form :meth:`input_dist`
-        needs: ``result[s]`` holds the inputs for stage ``s``'s layers, so it is
-        what that stage's rank in the cascade should receive.
-
-        Derived from :attr:`layers_per_stage`, so a non-uniform cut like
-        ``[1, 3]`` groups correctly -- which hand-slicing by a single
-        layers-per-stage number does not.
-
-        Args:
-            layer_inputs: one input per layer of the whole model, in model order.
-
-        Returns:
-            List[List[Any]]: one carrier per stage, index-aligned with the
-            pipeline.
-
-        Raises:
-            ValueError: if there is not exactly one input per model layer.
-
-        Example::
-
-            send_set = stage.group_by_stage(layer_inputs)
-            microbatches = stage.input_dist(send_set, send_set[stage.stage_index]).wait()
-        """
+    def _split_batch_per_stage(self, model_input: Any) -> List[List[Any]]:
+        """Turn one raw batch into the cascade send set: ``result[s]`` is the
+        input list for stage ``s``, from the model's :meth:`preproc` split of the
+        batch, under ``no_grad``."""
+        with record_function("## torchrec_maglev:preproc ##"), torch.no_grad():
+            layer_inputs = self._preproc(model_input)
         grouped: List[List[Any]] = []
         offset = 0
         for count in self.layers_per_stage:
@@ -1466,71 +725,12 @@ class StageWrapper(nn.Module):
             offset += count
         return grouped
 
-    def input_dist(self, layer_inputs: Sequence[Any]) -> LazyAwaitable[List[List[Any]]]:
-        """All-to-all a full per-layer input set over this rank's cascade.
-
-        A *cascade* holds one rank from every stage (see :attr:`cascade_pg`), so
-        this is the exchange that turns "the whole batch, held by every rank" into
-        "this stage's inputs, delivered here". The inputs are grouped per stage
-        (:meth:`group_by_stage`), each group is sent to that stage's rank in the
-        cascade, and what comes back is one group from every stage's rank -- i.e.
-        ``num_stages`` microbatches, all of them for *this* stage.
-
-        One round, unwaited. Use :meth:`take_inputs` when the schedule wants a
-        microbatch count that does not divide evenly into rounds.
-
-        Two cascade groups with identical membership drive the exchange:
-        CPU/Gloo carries the small size metadata, while CUDA/NCCL carries the
-        tensor payload. Keeping their collective order independent avoids a
-        backend mismatch when inputs contain tensors of several dtypes.
-
-        Args:
-            layer_inputs: one input per layer of the whole model, in model order
-                -- what
-                :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.preproc`
-                produces.
-
-        Returns:
-            LazyAwaitable[List[List[Any]]]: ``wait()`` yields ``num_stages``
-            microbatches for this stage, each one input per layer this stage
-            owns. Returned unwaited so the caller can overlap other work with the
-            exchange.
-
-        Raises:
-            ValueError: if there is not exactly one input per model layer.
-
-        Example::
-
-            microbatches = stage.input_dist(layer_inputs).wait()
-            stage.forward_micro(microbatches[0])
-        """
-        return self._input_driver.exchange(self.group_by_stage(layer_inputs))
-
-    def send_set(self, model_input: Any) -> List[List[Any]]:
-        """Turn one raw batch into the cascade send set: one carrier per stage.
-
-        The model's own :meth:`preproc` seam splits the batch into one input per
-        layer (under ``no_grad``, as in
-        :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.forward`),
-        then :meth:`group_by_stage` regroups those by destination stage.
-
-        Args:
-            model_input: the raw batch, as the dataloader yields it.
-
-        Returns:
-            List[List[Any]]: ``result[s]`` is the input list destined for stage
-            ``s``'s rank in this cascade.
-        """
-        with record_function("## torchrec_maglev:preproc ##"), torch.no_grad():
-            layer_inputs = self._preproc(model_input)
-        return self.group_by_stage(layer_inputs)
-
     def take_inputs(self, dataloader_iter: Iterator[Any], n: int) -> List[List[Any]]:
         """Hand the schedule ``n`` redistributed inputs for this stage.
 
         This method redistributes batches but never chunks them. The schedule
         decides whether each input is a microbatch or a whole pass. It runs as
-        many :meth:`input_dist` rounds as needed and keeps the remainder queued,
+        many input-distribution rounds as needed and keeps the remainder queued,
         so the requested count need not equal the ``num_stages`` a round
         produces, and a batch is consumed only when a round actually runs.
         Every rank in the cascade runs the same number of rounds, so every rank
@@ -1544,60 +744,198 @@ class StageWrapper(nn.Module):
         Returns:
             List[List[Any]]: ``n`` inputs, each containing one value per local
             layer.
+
+        Raises:
+            RuntimeError: If a previous pass failed or a pass is running: the
+                round is a collective, and the peers it would wait on are out of
+                step.
         """
+        self._refuse_out_of_step()
         with record_function("## torchrec_maglev:input_driver ##"):
             return self._input_driver.take(
-                lambda: self.send_set(next(dataloader_iter)), n
+                lambda: self._split_batch_per_stage(next(dataloader_iter)), n
             )
 
-    def take_global_inputs(self, dataloader_iter: Iterator[Any]) -> List[Any]:
-        r"""take_global_inputs(dataloader_iter) -> List[Any]
+    # ---- Stage: connect (cross-HSD hand-off) ----
+    #
+    # The stage owns the wire: its neighbours (_neighbor_rank), the handoff
+    # communicators, and the specs that fix the wire layout. A schedule decides
+    # when to call these, as with torch.distributed.pipelining's PipelineStage.
 
-        Return one local-stage input whose batch covers an entire Rail pass.
+    def start_recv_act(self, stage_input: Optional[Sequence[Any]] = None) -> None:
+        """Post a receive for the previous HSD's activation.
 
-        The input driver does not reshape the batch. A Rail dataloader therefore
-        supplies whole-pass batches, while ordinary schedules supply individual
-        microbatches through :meth:`take_inputs`.
+        Allocates one buffer per incoming spec and issues the receives in spec
+        order, so both sides of the boundary agree without exchanging metadata.
+        No-op on the first stage. Each call queues another receive;
+        :meth:`_wait_for_act` dequeues them in issue order.
 
         Args:
-            dataloader_iter (Iterator[Any]): Iterator over whole-pass batches.
+            stage_input: the local inputs for the activation being received. Only
+                required when an incoming spec has a dynamic batch dimension.
+        """
+        if self.is_first:
+            return
+        batch_size = self._activation_batch_size(stage_input)
+        act_pg, _ = self._handoff_pgs
+        src = self._neighbor_rank(-1)
+        works: List[Any] = []
+        tensors: List[torch.Tensor] = []
+        for spec in self._in_specs:
+            tensor = torch.empty(
+                spec.materialize_shape(batch_size),
+                device=self._placed_device,
+                dtype=spec.dtype,
+            )
+            works.append(dist.irecv(tensor, src=src, group=act_pg))
+            tensors.append(tensor)
+        self._recv_act.append((works, tensors))
+
+    def _wait_for_act(self) -> Activations:
+        """Dequeue the oldest receive posted by :meth:`start_recv_act`.
 
         Returns:
-            List[Any]: One whole-pass input per local layer.
-        """
-        with record_function("## torchrec_maglev:global_inputs ##"):
-            (global_inputs,) = self.take_inputs(dataloader_iter, 1)
-        return global_inputs
+            Activations: the received activation; ``()`` on the first stage.
 
-    def _backward_activations(
-        self, outputs: Activations, grads: Sequence[torch.Tensor]
-    ) -> None:
-        """Backward through this stage from the gradients its outputs received.
+        Raises:
+            ValueError: if no receive is queued.
+        """
+        if self.is_first:
+            return ()
+        if not self._recv_act:
+            raise ValueError(
+                f"stage {self.stage_index}: waiting for an activation with no "
+                "receive in flight; call start_recv_act() first"
+            )
+        works, tensors = self._recv_act.popleft()
+        for work in works:
+            work.wait()
+        for spec, tensor in zip(self._in_specs, tensors):
+            if spec.requires_grad:
+                # Only once landed: before that, the incoming write would be an
+                # in-place op on a leaf that requires grad.
+                tensor.requires_grad_(True)
+        return tuple(tensors)
+
+    def _start_send_act(self, outputs: Activations) -> None:
+        """Send this stage's activation to the next HSD; no-op if last.
+
+        The caller must :meth:`_finish_send_act` the previous send first. The send
+        is checked against the output specs the next stage receives with: a
+        mismatch (a mixed-precision cast, say) would hang or read garbage.
 
         Args:
             outputs: this stage's output activation.
-            grads: the matching gradients, from :meth:`wait_for_grad`.
+
+        Raises:
+            ValueError: if an activation send is still in flight, or ``outputs``
+                does not match the stage's output specs.
         """
-        grad_carrying = [
-            t for t, spec in zip(outputs, self._out_specs) if spec.requires_grad
-        ]
-        pairs = [
-            (out, grad) for out, grad in zip(grad_carrying, grads) if out.requires_grad
-        ]
-        if pairs:
-            torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
+        if self.is_last:
+            return
+        if self._send_act:
+            raise ValueError(
+                f"stage {self.stage_index}: an activation send is still in "
+                "flight; call _finish_send_act() before starting the next"
+            )
+        check_activations(
+            self._out_specs, outputs, f"stage {self.stage_index} output activation"
+        )
+        act_pg, _ = self._handoff_pgs
+        self._send_act = self._isend(outputs, self._neighbor_rank(1), act_pg)
+
+    def _finish_send_act(self) -> None:
+        """Complete the activation send in flight, if any."""
+        self._drain(self._send_act)
+
+    def start_recv_grad(self) -> None:
+        """Post a receive for the next HSD's gradient of the oldest awaiting output.
+
+        One receive per grad-carrying output slot. No-op on the last stage, whose
+        gradient starts at its own loss. Each call queues another receive.
+        """
+        if self.is_last:
+            return
+        _, grad_pg = self._handoff_pgs
+        src = self._neighbor_rank(1)
+        works: List[Any] = []
+        tensors: List[torch.Tensor] = []
+        outputs = cast(
+            Activations, self._pending_microbatches[len(self._recv_grad)].outputs
+        )
+        for output, spec in zip(outputs, self._out_specs):
+            if not spec.requires_grad:
+                continue
+            grad = torch.empty_like(output, memory_format=torch.contiguous_format)
+            works.append(dist.irecv(grad, src=src, group=grad_pg))
+            tensors.append(grad)
+        self._recv_grad.append((works, tensors))
+
+    def _wait_for_grad(self) -> List[torch.Tensor]:
+        """Dequeue the oldest receive posted by :meth:`start_recv_grad`.
+
+        Returns:
+            List[torch.Tensor]: the gradients, in spec order; empty on the last
+            stage.
+
+        Raises:
+            ValueError: if no receive is queued.
+        """
+        if self.is_last:
+            return []
+        if not self._recv_grad:
+            raise ValueError(
+                f"stage {self.stage_index}: waiting for a gradient with no "
+                "receive in flight; call start_recv_grad() first"
+            )
+        works, tensors = self._recv_grad.popleft()
+        for work in works:
+            work.wait()
+        return tensors
+
+    def _start_send_grad(self, in_activations: Activations) -> None:
+        """Send this stage's input gradients upstream; no-op if first.
+
+        A slot unused by the stage's graph has no ``.grad``; zeros are sent so
+        the previous stage's receive still matches the specs.
+
+        Args:
+            in_activations: the activation this stage received.
+
+        Raises:
+            ValueError: if a gradient send is still in flight.
+        """
+        if self.is_first:
+            return
+        if self._send_grad:
+            raise ValueError(
+                f"stage {self.stage_index}: a gradient send is still in flight; "
+                "call _finish_send_grad() before starting the next"
+            )
+        _, grad_pg = self._handoff_pgs
+        grads: List[torch.Tensor] = []
+        for tensor, spec in zip(in_activations, self._in_specs):
+            if not spec.requires_grad:
+                continue
+            grads.append(
+                tensor.grad if tensor.grad is not None else torch.zeros_like(tensor)
+            )
+        self._send_grad = self._isend(grads, self._neighbor_rank(-1), grad_pg)
+
+    def _finish_send_grad(self) -> None:
+        """Complete the gradient send in flight, if any."""
+        self._drain(self._send_grad)
+
+    def drain_sends(self) -> None:
+        """Complete the send in flight in each direction; a pass ends here."""
+        self._finish_send_act()
+        self._finish_send_grad()
 
     # pyre-ignore[3]: dist work handle has no public type
     def _isend(
         self, tensors: Sequence[torch.Tensor], dst: int, pg: dist.ProcessGroup
     ) -> List[Tuple[Any, torch.Tensor]]:
-        """Issue non-blocking sends, in order, for a later drain.
-
-        The detached buffer is returned alongside the work handle so it stays
-        alive until the send completes. ``.contiguous()`` is a no-op for an
-        already contiguous tensor, so this aliases the activation rather than
-        copying it.
-        """
+        """Issue non-blocking sends, in order; each buffer stays alive with its work."""
         out: List[Tuple[Any, torch.Tensor]] = []
         for tensor in tensors:
             buffer = tensor.detach().contiguous()
@@ -1611,210 +949,148 @@ class StageWrapper(nn.Module):
             work.wait()
         sends.clear()
 
-    # ---- one microbatch of this stage's work ----
+    # ---- Stage: pass discipline ----
 
-    def compute_forward_micro(
+    @contextmanager
+    def pass_scope(self) -> Iterator[None]:
+        """Run one pass, from ``zero_grad`` to the optimizer step.
+
+        A pass that raises poisons the stage (:meth:`abandon_pass`), so a
+        later pass is refused rather than run against wreckage.
+
+        Raises:
+            RuntimeError: If a previous pass failed or a pass is already running.
+        """
+        self._refuse_out_of_step()
+        self._pass_active = True
+        try:
+            yield
+        except BaseException:
+            self.abandon_pass()
+            raise
+        finally:
+            self._pass_active = False
+        self._checks.end_first_pass()
+
+    def _refuse_out_of_step(self) -> None:
+        """Refuse a new pass, or its inputs, after a failed pass or during one."""
+        if self._pass_failed or self._pass_active:
+            raise RuntimeError(
+                f"stage {self.stage_index}: a previous pass failed or is still "
+                "running, so the handoffs are out of step; restart the job"
+            )
+
+    def abandon_pass(self) -> None:
+        r"""abandon_pass() -> None
+
+        Drop the state a pass accumulates and mark the stage failed.
+
+        The queues are FIFOs, appended in forward and popped in backward, so a
+        retried pass would pair one microbatch's saved activations with
+        another's gradients. Outstanding point-to-point work is abandoned rather
+        than waited on: its peer is typically the rank that already failed.
+        The handoffs are then out of step across ranks, so the job must restart;
+        :meth:`pass_scope` refuses every later pass.
+        """
+        self._pass_failed = True
+        self._send_act = []
+        self._send_grad = []
+        self._recv_act.clear()
+        self._recv_grad.clear()
+        self._pending_microbatches.clear()
+        self._pending_weight_backwards.clear()
+        self._pending_sparse_microbatches.clear()
+        self._pass_losses = []
+
+    def configure_pass(
         self,
-        stage_input: Sequence[Any],
-        in_activations: Activations,
-        microbatch_id: int,
-    ) -> Any:
-        """Compute one forward and retain its graph for the matching backward."""
-        with record_function(f"## forward mb{microbatch_id} ##"):
-            outputs = self.module(stage_input, in_activations)
-        self._pending.append((in_activations, outputs, microbatch_id))
-        return outputs
+        schedule: object,
+        *,
+        loss_scale: float,
+        allow_unreached: bool,
+        reduction: Optional[PassReduction] = None,
+    ) -> None:
+        r"""configure_pass(schedule, *, loss_scale, allow_unreached, reduction=None) -> None
 
-    def compute_backward_micro(
-        self, grads: Sequence[torch.Tensor]
-    ) -> Tuple[Optional[torch.Tensor], Activations]:
-        """Compute the oldest pending backward and return its input activation."""
-        in_activations, outputs, microbatch_id = self._pending.pop(0)
-        loss: Optional[torch.Tensor] = None
-        if self.is_last:
-            with record_function(f"## backward mb{microbatch_id} ##"):
-                loss = outputs[0]
-                # pyrefly: ignore [missing-attribute]
-                loss.backward()
-        else:
-            with record_function(f"## backward mb{microbatch_id} ##"):
-                self._backward_activations(outputs, grads)
-        return loss, in_activations
-
-    def forward_micro(
-        self,
-        stage_input: Sequence[Any],
-        microbatch_id: int = 0,
-    ) -> Any:
-        """One microbatch forward: recv activation, compute, send activation.
-
-        The result is parked on an internal FIFO for the matching
-        :meth:`backward_micro`, so a schedule can run several forwards before the
-        first backward without tracking in-flight state itself.
-
-        Does *not* post its own activation receive: the schedule starts that
-        ahead of time (:meth:`start_recv_act`) so the transfer overlaps earlier
-        work, and this dequeues it.
-
-        Neither receive is posted here -- the schedule owns both (see the
-        warning on :meth:`backward_micro` for the constraint the gradient one
-        carries).
+        Set what the next pass's backwards need, for the schedule running it.
+        The first pass after the schedule changes repeats the first-pass checks
+        on every replica: another order builds another graph.
 
         Args:
-            stage_input: one input per layer this stage owns.
-            microbatch_id: tags the profiler ranges (and is carried to the
-                matching backward) so a trace shows which microbatch each
-                comm/compute belongs to.
+            schedule (object): The schedule about to run a pass.
+            loss_scale (float): The gradient seeded at each microbatch loss;
+                ``1 / m`` over ``m`` mean-loss microbatches trains on the mean
+                over the whole batch.
+            allow_unreached (bool): Whether a trainable dense weight that no
+                output of a microbatch reaches may keep ``grad=None``.
+            reduction (PassReduction, optional): The schedule's gradient
+                reduction, which runs the deferred weight backwards and maps
+                the dense parameters to the ones a backward's graph holds
+                (:class:`~torchrec.distributed.maglev.data_parallel.PassReduction`).
+                ``None`` runs upstream ``stage_backward_weight`` on the
+                parameters as registered. Default: ``None``
         """
-        # Posted by the schedule ahead of this call, so the transfer has already
-        # been in flight; wait_for_act raises if it was never started.
-        with record_function(f"## recv_act mb{microbatch_id} ##"):
-            in_activations = self.wait_for_act()
+        previous = None if self._schedule is None else self._schedule()
+        if previous is not schedule:
+            self._schedule = weakref.ref(schedule)
+            self._checks.restart()
+        self._loss_scale = loss_scale
+        self._checks.set_unreached_allowed(allow_unreached)
+        self._reduction = reduction
 
-        outputs = self.compute_forward_micro(stage_input, in_activations, microbatch_id)
+    def _seed_loss_grads(self, loss: torch.Tensor) -> Optional[List[torch.Tensor]]:
+        if self._loss_scale == 1.0:
+            return None
+        return [torch.full_like(loss, self._loss_scale)]
 
-        # The previous microbatch's send, drained before this one is issued.
-        with record_function(f"## finish_send_act mb{microbatch_id} ##"):
-            self.finish_send_act()
-        with record_function(f"## send_act mb{microbatch_id} ##"):
-            self.start_send_act(outputs)
-        return outputs
+    def take_pass_losses(self) -> List[torch.Tensor]:
+        r"""take_pass_losses() -> List[torch.Tensor]
 
-    def backward_micro(self) -> Optional[torch.Tensor]:
-        """One microbatch backward: recv grad, backward, send input grad.
-
-        Pops the oldest microbatch parked by :meth:`forward_micro`. Gradients
-        accumulate across microbatches (no ``zero_grad`` here); the schedule runs
-        the DP all-reduce and optimizer step once per batch. Profiler ranges are
-        tagged with the ``microbatch_id`` recorded at forward time.
-
-        The last stage takes its gradient from the loss its own ``postproc``
-        computed; every other stage collects the receive the schedule posted, and
-        :meth:`wait_for_grad` raises if it did not.
-
-        Returns:
-            Optional[torch.Tensor]: the microbatch loss on the last stage,
-            ``None`` on every other stage.
+        The microbatch losses the last stage's dense backwards ran since the last
+        call, in order, detached; empty on other stages.
         """
-        microbatch_id = self._pending[0][2]
-        with record_function(f"## recv_grad mb{microbatch_id} ##"):
-            grads = self.wait_for_grad()
-        loss, in_activations = self.compute_backward_micro(grads)
+        losses, self._pass_losses = self._pass_losses, []
+        return losses
 
-        with record_function(f"## finish_send_grad mb{microbatch_id} ##"):
-            self.finish_send_grad()
-        with record_function(f"## send_grad mb{microbatch_id} ##"):
-            self.start_send_grad(in_activations)
-
-        return loss
-
-    def _backward_round(self, loss_grad: torch.Tensor) -> None:
-        """Drain one functional forward as a single autograd traversal.
-
-        DDP shares one reducer across all outstanding forwards. Separate
-        backwards would therefore reduce the first microbatch before the later
-        graphs contribute their gradients; one traversal makes its parameter
-        hooks observe the accumulated pass instead.
-        """
-        pending = self._pending
-        if self.is_last:
-            losses = [outputs[0] for _inputs, outputs, _id in pending]
-            with record_function("## backward round ##"):
-                torch.autograd.backward(losses, [loss_grad] * len(losses))
-        else:
-            for _ in pending:
-                self.start_recv_grad()
-
-            backward_outputs: List[torch.Tensor] = []
-            backward_grads: List[torch.Tensor] = []
-            for _in_activations, outputs, microbatch_id in pending:
-                with record_function(f"## recv_grad mb{microbatch_id} ##"):
-                    grads = self.wait_for_grad()
-                grad_carrying = [
-                    output
-                    for output, spec in zip(cast(Activations, outputs), self._out_specs)
-                    if spec.requires_grad
-                ]
-                for output, grad in zip(grad_carrying, grads):
-                    if output.requires_grad:
-                        backward_outputs.append(output)
-                        backward_grads.append(grad)
-            if backward_outputs:
-                with record_function("## backward round ##"):
-                    torch.autograd.backward(backward_outputs, backward_grads)
-
-        self._pending = []
-        for in_activations, _outputs, microbatch_id in pending:
-            with record_function(f"## finish_send_grad mb{microbatch_id} ##"):
-                self.finish_send_grad()
-            with record_function(f"## send_grad mb{microbatch_id} ##"):
-                self.start_send_grad(in_activations)
-        self.finish_send_grad()
-
-    def drain_sends(self) -> None:
-        """Complete the in-flight send in each direction, if any.
-
-        ``forward_micro`` / ``backward_micro`` each finish the *previous* send
-        before starting the next, so at the end of a pass exactly one send per
-        direction is still outstanding. Left unwaited, its work handle leaks and
-        its buffer stays pinned while NCCL may still be reading it -- and
-        :meth:`start_send_act` refuses to start another while one is in flight.
-        A schedule therefore ends every pass here.
-        """
-        self.finish_send_act()
-        self.finish_send_grad()
-
-    # ---- MaglevRail's global sparse pass and dense microbatch work ----
-
-    def _prepare_rail_layer(
-        self,
-        pooled: Optional[torch.Tensor],
-        dense_inputs: List[Any],
-        num_microbatches: int,
-    ) -> Tuple[Optional[LayerSparseOutput], List[Any]]:
-        sparse_output: Optional[LayerSparseOutput] = None
-        if pooled is not None:
-            seams = [
-                part.detach().requires_grad_(True)
-                for part in torch.tensor_split(pooled, num_microbatches, dim=0)
-            ]
-            sparse_output = LayerSparseOutput(pooled=pooled, seams=seams)
-        return sparse_output, dense_inputs
+    # ---- Global batch and microbatch: phases, in pass order ----
 
     def sparse_forward_global(
         self,
         global_inputs: Sequence[Any],
         num_microbatches: int,
-    ) -> MaglevRailPassState:
-        r"""sparse_forward_global(global_inputs, num_microbatches) -> MaglevRailPassState
+        *,
+        unwrapped: bool = False,
+    ) -> MaglevPassState:
+        r"""sparse_forward_global(global_inputs, num_microbatches, *, unwrapped=False) -> MaglevPassState
 
-        Run each sparse half once and create detached dense microbatch seams.
+        Run each sparse net once and cut its output into detached dense seams.
 
         Args:
             global_inputs (Sequence[Any]): One whole-pass input per local layer.
             num_microbatches (int): Number of dense microbatches.
+            unwrapped (bool): Call :attr:`layer_chain` directly, past the
+                wrappers
+                :func:`~torchrec.distributed.maglev.data_parallel.only_data_parallel_wraps`
+                allows. Default: ``False``
 
         Returns:
-            MaglevRailPassState: Sparse graphs, seams, and dense inputs.
+            MaglevPassState: Sparse graphs, seams, and dense inputs.
 
         Raises:
-            RuntimeError: If this stage was not built with Rail support.
-            TypeError: If a sparse half does not return a tensor.
-            ValueError: If input counts or batch dimensions are invalid.
+            TypeError: If a sparse net returns neither a tensor nor a
+                non-empty tuple of tensors.
+            ValueError: If input counts, batch dimensions or shared positions
+                are invalid.
         """
-        if not self.rail_enabled:
-            raise RuntimeError(
-                "sparse_forward_global requires StageWrapper(..., enable_rail=True)"
-            )
-        if len(global_inputs) != self.num_layers:
+        if len(global_inputs) != self._num_layers:
             raise ValueError(
-                f"expected {self.num_layers} layer inputs, got {len(global_inputs)}"
+                f"expected {self._num_layers} layer inputs, got {len(global_inputs)}"
             )
         if num_microbatches <= 0:
             raise ValueError(
                 f"num_microbatches must be positive, got {num_microbatches}"
             )
-        batch_size = self.get_batch_size(global_inputs)
+        batch_size = self._batch_size(global_inputs)
         if batch_size < num_microbatches:
             raise ValueError(
                 f"batch size {batch_size} cannot produce {num_microbatches} "
@@ -1826,323 +1102,483 @@ class StageWrapper(nn.Module):
                 f"{num_microbatches} microbatches"
             )
 
-        sparse_outputs: List[Optional[LayerSparseOutput]] = []
-        dense_inputs_by_layer: List[List[Any]] = []
+        module = cast(nn.Module, self._layer_chain) if unwrapped else self.module
         with record_function("## torchrec_maglev:sparse_forward_global ##"):
             layer_outputs = cast(
-                List[_RailLayerForward],
-                self.module(
+                List[_GlobalSparseOutput],
+                module(
                     global_inputs,
                     batch_size=batch_size,
                     num_microbatches=num_microbatches,
                 ),
             )
-            if len(layer_outputs) != self.num_layers:
+            if len(layer_outputs) != self._num_layers:
                 raise ValueError(
                     f"sparse phase returned {len(layer_outputs)} layer outputs, "
-                    f"expected {self.num_layers}"
+                    f"expected {self._num_layers}"
                 )
-            for pooled, dense_inputs in layer_outputs:
-                sparse_output, dense_inputs = self._prepare_rail_layer(
-                    pooled,
-                    dense_inputs,
-                    num_microbatches,
+            sparse_outputs = [output for output, _dense_inputs in layer_outputs]
+            cuts = [
+                (
+                    None
+                    if output is None
+                    else _split_seams_per_microbatch(
+                        output, num_microbatches, layer.shared_sparse_outputs()
+                    )
                 )
-                sparse_outputs.append(sparse_output)
-                dense_inputs_by_layer.append(dense_inputs)
-
-        dense_inputs = [
-            [
-                dense_inputs_by_layer[layer][microbatch]
-                for layer in range(self.num_layers)
+                for layer, output in zip(self._layers, sparse_outputs)
             ]
+
+        # Microbatch-major, as the dense phase consumes them.
+        seams = [
+            [None if cut is None else cut[microbatch] for cut in cuts]
+            for microbatch in range(num_microbatches)
+        ]
+        dense_inputs = [
+            [layer_inputs[microbatch] for _output, layer_inputs in layer_outputs]
             for microbatch in range(num_microbatches)
         ]
         expected_batch_size = batch_size // num_microbatches
         for microbatch, dense_input in enumerate(dense_inputs):
-            actual_batch_size = self.get_batch_size(dense_input)
+            actual_batch_size = self._batch_size(dense_input)
             if actual_batch_size != expected_batch_size:
                 raise ValueError(
                     f"dense microbatch {microbatch} has batch size "
                     f"{actual_batch_size}, expected {expected_batch_size}"
                 )
-        return MaglevRailPassState(
-            sparse_outputs=sparse_outputs,
-            dense_inputs=dense_inputs,
+        return MaglevPassState(
+            sparse_outputs=sparse_outputs, seams=seams, dense_inputs=dense_inputs
         )
 
-    def sparse_backward_global(self, state: MaglevRailPassState) -> None:
-        r"""sparse_backward_global(state) -> None
+    def sparse_net_buffers(self) -> List[torch.Tensor]:
+        """The buffers the local layers' sparse nets hold."""
+        return [
+            buffer
+            for layer in self._layers
+            if layer.sparse is not None
+            for buffer in layer.sparse.buffers()
+        ]
 
-        Resume each whole-pass sparse graph from its dense seam gradients.
+    def sparse_forward_micro(
+        self,
+        stage_input: Sequence[Any],
+        microbatch_id: int = 0,
+        *,
+        unwrapped: bool = False,
+    ) -> List[Optional[SparseSeam]]:
+        r"""sparse_forward_micro(stage_input, microbatch_id=0, *, unwrapped=False) -> List[Optional[SparseSeam]]
+
+        Run every local layer's sparse net on one microbatch and return the
+        detached seams its dense phase reads; :meth:`sparse_backward_micro`
+        resumes the sparse graph from the seams' gradients.
+
+        A seam requires grad only where its sparse output does.
 
         Args:
-            state (MaglevRailPassState): State produced by
-                :meth:`sparse_forward_global`.
-        """
-        with record_function("## torchrec_maglev:sparse_backward_global ##"):
-            for output in state.sparse_outputs:
-                if output is None or not output.pooled.requires_grad:
-                    continue
-                gradient = torch.cat(
-                    [
-                        seam.grad if seam.grad is not None else torch.zeros_like(seam)
-                        for seam in output.seams
-                    ],
-                    dim=0,
-                )
-                torch.autograd.backward(output.pooled, gradient)
+            stage_input (Sequence[Any]): One input per local layer.
+            microbatch_id (int): Identifier used in profiler ranges. Default: ``0``
+            unwrapped (bool): Call :attr:`layer_chain` directly, past the
+                wrappers
+                :func:`~torchrec.distributed.maglev.data_parallel.only_data_parallel_wraps`
+                allows. Default: ``False``
 
-    def compute_dense_forward_micro(
+        Returns:
+            List[Optional[SparseSeam]]: Per local layer, its seam, or ``None``
+            for a layer without a sparse net.
+
+        Raises:
+            TypeError: If a sparse net returns neither a tensor nor a non-empty
+                tuple of tensors.
+        """
+        module = cast(nn.Module, self._layer_chain) if unwrapped else self.module
+        with record_function(f"## sparse_forward mb{microbatch_id} ##"):
+            outputs = list(module(stage_input, sparse_only=True))
+        seams: List[Optional[SparseSeam]] = [
+            None if output is None else _detach_seam(layer, output)
+            for layer, output in zip(self._layers, outputs)
+        ]
+        self._pending_sparse_microbatches.append((outputs, seams, microbatch_id))
+        return seams
+
+    def _compute_dense_forward_micro(
         self,
         stage_input: Sequence[Any],
         in_activations: Activations,
         microbatch_id: int,
-        sparse_outputs: Sequence[Optional[torch.Tensor]],
+        sparse_outputs: Sequence[Optional[SparseSeam]],
     ) -> Any:
-        r"""compute_dense_forward_micro(stage_input, in_activations, microbatch_id, sparse_outputs) -> Any
+        r"""_compute_dense_forward_micro(stage_input, in_activations, microbatch_id, sparse_outputs) -> Any
 
-        Compute one dense-only forward and retain its graph for backward.
+        Compute one dense forward, without the handoffs, and keep its graph for
+        the backward.
 
         Args:
             stage_input (Sequence[Any]): One dense input per local layer.
             in_activations (Activations): Activation entering this stage.
             microbatch_id (int): Identifier used in profiler ranges.
-            sparse_outputs (Sequence[Optional[torch.Tensor]]): Precomputed sparse
-                outputs for each local layer.
+            sparse_outputs (Sequence[Optional[SparseSeam]]): One sparse seam per
+                local layer, ``None`` for a layer without a sparse net.
 
         Returns:
-            Any: Stage outputs retained for backward.
-
-        Raises:
-            RuntimeError: If this stage was not built with Rail support.
+            Any: The stage's output, kept for the backward.
         """
-        if not self.rail_enabled:
-            raise RuntimeError(
-                "compute_dense_forward_micro requires "
-                "StageWrapper(..., enable_rail=True)"
-            )
         with record_function(f"## dense_forward mb{microbatch_id} ##"):
             outputs = self.module(
-                stage_input,
-                in_activations,
-                sparse_outputs=sparse_outputs,
+                stage_input, in_activations, sparse_outputs=sparse_outputs
             )
-        self._pending.append((in_activations, outputs, microbatch_id))
-        # A whole backward fills every leaf's ``.grad`` implicitly; the split
-        # backward fills only the inputs it is handed, so the seams must survive.
-        self._rail_seams.append(sparse_outputs)
+        # The seams survive with the microbatch: a split backward fills only the
+        # leaves it is handed.
+        self._pending_microbatches.append(
+            _PendingMicrobatch(in_activations, outputs, microbatch_id, sparse_outputs)
+        )
         return outputs
 
     def dense_forward_micro(
         self,
         stage_input: Sequence[Any],
         microbatch_id: int,
-        sparse_outputs: Sequence[Optional[torch.Tensor]],
+        sparse_outputs: Sequence[Optional[SparseSeam]],
     ) -> Any:
         r"""dense_forward_micro(stage_input, microbatch_id, sparse_outputs) -> Any
 
-        Receive, compute, and send one Rail dense microbatch.
+        Receive, compute and send one microbatch's dense phase. The schedule
+        posts the activation receive (:meth:`start_recv_act`) before calling
+        this.
 
         Args:
             stage_input (Sequence[Any]): One dense input per local layer.
             microbatch_id (int): Identifier used in profiler ranges.
-            sparse_outputs (Sequence[Optional[torch.Tensor]]): Precomputed sparse
-                outputs for each local layer.
+            sparse_outputs (Sequence[Optional[SparseSeam]]): One sparse seam per
+                local layer, ``None`` for a layer without a sparse net.
 
         Returns:
-            Any: Stage outputs retained for dense backward.
+            Any: The stage's output, kept for the backward.
         """
         with record_function(f"## dense_recv_act mb{microbatch_id} ##"):
-            in_activations = self.wait_for_act()
-        outputs = self.compute_dense_forward_micro(
-            stage_input,
-            in_activations,
-            microbatch_id,
-            sparse_outputs,
+            in_activations = self._wait_for_act()
+        outputs = self._compute_dense_forward_micro(
+            stage_input, in_activations, microbatch_id, sparse_outputs
         )
         with record_function(f"## dense_finish_send_act mb{microbatch_id} ##"):
-            self.finish_send_act()
+            self._finish_send_act()
         with record_function(f"## dense_send_act mb{microbatch_id} ##"):
-            self.start_send_act(outputs)
+            self._start_send_act(outputs)
         return outputs
-
-    def reset_pass_state(self) -> None:
-        r"""reset_pass_state() -> None
-
-        Drop the per-microbatch state a pass accumulates.
-
-        The queues are FIFOs: appended in forward, popped in backward. A pass
-        that raises part-way leaves them populated, and a caller that catches
-        the exception and calls :meth:`progress` again then pops the *previous*
-        pass's entries, pairing one microbatch's saved activations with
-        another's gradients. Clearing them turns that silent mispairing into an
-        ordinary empty-queue error.
-
-        This is local cleanup, not recovery. Outstanding point-to-point work is
-        abandoned rather than waited on -- waiting deadlocks, because the peer
-        that would match a posted recv is typically the rank that already
-        failed. After a raised pass the handoff communicators are out of step
-        across ranks and the job cannot continue; restart it. What this buys is
-        that the wreckage is loud rather than quiet.
-        """
-        self._send_act = []
-        self._send_grad = []
-        self._recv_act.clear()
-        self._recv_grad.clear()
-        self._pending = []
-        self._rail_seams = []
-        self._wdense = []
 
     def dense_parameters(self) -> List[nn.Parameter]:
         r"""dense_parameters() -> List[nn.Parameter]
 
-        The parameters the split backward computes weight gradients for.
-
-        A list, not an iterator: the ``I`` and ``W`` halves each need the full
-        set, and handing the same exhausted generator to both fails as a
-        ``KeyError`` deep inside torch rather than as anything legible.
-
-        Exact by construction rather than by name filtering: whatever the layers'
-        dense halves own. A final-stage postprocessor with parameters of its own
-        is therefore *not* included -- a Rail model's head must have no
-        parameters of its own.
+        The trainable parameters of the layers' dense nets, in layer order,
+        as the modules register them.
 
         Returns:
-            Iterator[nn.Parameter]: dense parameters, in layer order.
+            List[nn.Parameter]: Trainable dense parameters.
         """
         return [
             parameter
             for layer in self._layers
             for parameter in layer.dense_parameters()
+            if parameter.requires_grad
         ]
+
+    def _dense_parameters_in_graph(self) -> List[nn.Parameter]:
+        """:meth:`dense_parameters` as a backward's graph holds them, mapped by
+        the configured reduction
+        (:meth:`~torchrec.distributed.maglev.data_parallel.PassReduction.graph_parameters`);
+        as registered when no schedule configured one.
+        """
+        parameters = self.dense_parameters()
+        if self._reduction is None:
+            return parameters
+        return self._reduction.graph_parameters(
+            [layer.require_dense() for layer in self._layers], parameters
+        )
 
     @property
     def pending_weight_work(self) -> int:
-        """Microbatches whose input gradient is done but weight gradient is not."""
-        return len(self._wdense)
+        """``W`` phases :meth:`dense_backward_act_micro` queued and none ran yet."""
+        return len(self._pending_weight_backwards)
+
+    def _compute_dense_backward_micro(
+        self, grads: Sequence[torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], Activations]:
+        r"""_compute_dense_backward_micro(grads) -> Tuple[Optional[torch.Tensor], Activations]
+
+        The oldest pending dense microbatch's whole backward, without the
+        handoffs, through the dense weights' ``AccumulateGrad`` nodes so a
+        data-parallel wrapper's hooks observe them: from its loss on the last
+        stage, else from ``grads``, the gradients its outputs received. It
+        stops at the seams, filling their ``.grad``.
+
+        Args:
+            grads (Sequence[torch.Tensor]): The next stage's gradients for this
+                microbatch's grad-carrying outputs; ignored on the last stage.
+
+        Returns:
+            Tuple[Optional[torch.Tensor], Activations]: The microbatch loss on
+            the last stage (else ``None``), and the activation it received, whose
+            ``.grad`` goes upstream.
+
+        Raises:
+            ValueError: if the gradients do not match this stage's grad-carrying
+                outputs.
+            RuntimeError: on the first pass, if a trainable dense weight is
+                unreached while unreached weights are not allowed.
+        """
+        microbatch, roots, root_grads, loss = self._pop_backward_roots(grads)
+        self._checks.before_whole_backward(roots, self._dense_parameters_in_graph)
+        if roots:
+            with record_function(f"## dense_backward mb{microbatch.microbatch_id} ##"):
+                torch.autograd.backward(roots, root_grads)
+        return loss, microbatch.in_activations
+
+    def dense_backward_micro(self) -> Optional[torch.Tensor]:
+        r"""dense_backward_micro() -> Optional[torch.Tensor]
+
+        Receive, compute and send the oldest pending dense microbatch's whole
+        backward (:meth:`_compute_dense_backward_micro`). The schedule posts
+        :meth:`start_recv_grad` first.
+
+        Returns:
+            Optional[torch.Tensor]: the microbatch loss on the last stage, ``None``
+            elsewhere.
+
+        Raises:
+            ValueError: if the received gradients do not match this stage's
+                grad-carrying outputs.
+            RuntimeError: on the first pass, if a trainable dense weight is
+                unreached while unreached weights are not allowed.
+        """
+        microbatch = self._pending_microbatches[0]
+        loss, _in_activations = self._compute_dense_backward_micro(
+            self._receive_grads(microbatch)
+        )
+        self._send_input_grads(microbatch)
+        return loss
 
     def dense_backward_act_micro(self) -> Optional[torch.Tensor]:
         r"""dense_backward_act_micro() -> Optional[torch.Tensor]
 
-        The ``I`` half: gradients w.r.t. this stage's inputs, and nothing else.
-
-        Computes only what the pipeline is waiting for. The input gradient is what
-        the previous stage needs, so it is produced and sent immediately; the
-        weight gradient gates nothing until the optimizer step, so it is deferred
-        to :meth:`dense_backward_weight_micro`.
-
-        The win is not that ``W`` fills this stage's idle time -- during warmup a
-        stage has run forwards and no backwards, so no ``W`` exists yet. It is
-        that every hop of the returning gradient wave costs ``I`` instead of
-        ``I + W``, so the wave reaches stage 0 sooner and its stall is shorter.
-
-        ``stage_backward_input`` writes ``.grad`` on everything in
-        ``input_values``, which is why both classes of input go in together: the
-        received activations, whose gradients go upstream, and the sparse seams,
-        whose gradients :meth:`sparse_backward_global` resumes from. The seams are
-        filled here, by ``I``, never by the weight half.
+        The ``I`` phase: gradients w.r.t. this stage's inputs (the received
+        activations and the sparse seams), sent upstream at once; the ``W``
+        phase waits for :meth:`dense_backward_weight_micro`. With no
+        differentiable input the backward runs whole and leaves an empty ``W``.
 
         Returns:
-            Optional[torch.Tensor]: the microbatch loss on the last stage, ``None``
-            elsewhere. ``stage_backward_input`` detaches its roots, so that loss
-            keeps its value but is no longer a graph root.
+            Optional[torch.Tensor]: the microbatch loss on the last stage,
+            ``None`` elsewhere; detached unless it is a view.
+
+        Raises:
+            RuntimeError: if a trainable dense weight would not be trained.
         """
-        in_activations, outputs, microbatch_id = self._pending.pop(0)
-        seams = self._rail_seams.pop(0)
-
-        loss: Optional[torch.Tensor] = None
-        root_grads: Optional[List[torch.Tensor]] = None
-        if self.is_last:
-            # postproc produced the loss; it is the graph root and its gradient
-            # is implicit, so no output gradients are supplied.
-            loss = cast(Activations, outputs)[0]
-            roots: List[torch.Tensor] = [loss]
-        else:
-            with record_function(f"## dense_recv_grad mb{microbatch_id} ##"):
-                grads = self.wait_for_grad()
-            grad_carrying = [
-                tensor
-                for tensor, spec in zip(cast(Activations, outputs), self._out_specs)
-                if spec.requires_grad
-            ]
-            if len(grads) != len(grad_carrying):
-                # zip would truncate to the shorter side and drop the tail
-                # output's gradient without a word -- a spec/wire mismatch is a
-                # wiring bug, not something to silently absorb.
-                raise ValueError(
-                    f"stage {self.stage_index} received {len(grads)} gradients "
-                    f"for {len(grad_carrying)} grad-carrying outputs"
-                )
-            pairs = [
-                (output, grad)
-                for output, grad in zip(grad_carrying, grads)
-                if output.requires_grad
-            ]
-            roots = [output for output, _ in pairs]
-            root_grads = [grad for _, grad in pairs]
-
+        microbatch, roots, root_grads, loss = self._pop_backward_roots()
+        microbatch_id = microbatch.microbatch_id
         input_values: List[torch.Tensor] = [
             tensor
-            for tensor, spec in zip(in_activations, self._in_specs)
+            for tensor, spec in zip(microbatch.in_activations, self._in_specs)
             if spec.requires_grad
         ]
-        if seams is not None:
-            input_values.extend(seam for seam in seams if seam is not None)
+        for seam in microbatch.seams:
+            if seam is not None:
+                input_values.extend(_unpack_seam(seam))
 
         if roots and input_values:
+            weights = self._dense_parameters_in_graph()
+            # stage_backward_input detaches the roots that are not views in
+            # place; the checks walk the graph from their nodes afterwards.
+            root_nodes = [_get_grad_fn_or_grad_acc(root) for root in roots]
             with record_function(f"## dense_backward_act mb{microbatch_id} ##"):
                 _input_grads, param_groups = stage_backward_input(
                     stage_outputs_or_loss=roots,
                     output_grads=root_grads,
                     input_values=input_values,
-                    # iter() only to satisfy upstream's Iterator annotation;
-                    # both halves traverse the same list, so the weight groups
-                    # the I half records line up with what W looks up.
-                    weights=iter(self.dense_parameters()),
+                    # One list for both phases, so the groups that I records
+                    # line up with what W looks up.
+                    weights=iter(weights),
                 )
-            _reject_uncovered_weights(param_groups, self.dense_parameters())
-            self._wdense.append((param_groups, microbatch_id))
-        elif roots:
-            # Nothing differentiable coming in: the first stage, holding only
-            # layers with no sparse half. ``stage_backward_input`` traces *from*
-            # the inputs, so with none it returns empty weight groups and the
-            # weight gradients would silently never be computed. There is also
-            # nothing worth deferring -- no input gradient means no wave to start,
-            # which is the only reason to split -- so run the whole backward.
-            with record_function(f"## dense_backward_act mb{microbatch_id} (whole) ##"):
-                torch.autograd.backward(roots, root_grads)
-
-        with record_function(f"## dense_finish_send_grad mb{microbatch_id} ##"):
-            self.finish_send_grad()
-        with record_function(f"## dense_send_grad mb{microbatch_id} ##"):
-            self.start_send_grad(in_activations)
+            self._checks.after_backward_act(
+                param_groups, weights, root_nodes, input_values
+            )
+            del root_nodes
+            self._pending_weight_backwards.append((param_groups, microbatch_id))
+        else:
+            self._checks.before_whole_backward(roots, self._dense_parameters_in_graph)
+            if roots:
+                with record_function(
+                    f"## dense_backward_act mb{microbatch_id} (whole) ##"
+                ):
+                    torch.autograd.backward(roots, root_grads)
+            # An empty W, so every I still pairs with one.
+            self._pending_weight_backwards.append(([], microbatch_id))
+        self._send_input_grads(microbatch)
         return loss
 
     def dense_backward_weight_micro(self) -> None:
         r"""dense_backward_weight_micro() -> None
 
-        The ``W`` half: gradients w.r.t. the dense weights, for one microbatch.
-
-        Runs what :meth:`dense_backward_act_micro` deferred, resuming from the
-        intermediates it saved. It writes ``.grad`` through ``torch.autograd.grad``
-        rather than through an ``AccumulateGrad`` node, so no data-parallel
-        wrapper's hook observes it -- which is why a schedule using this must
-        either issue the pass's gradient reduction itself or refuse to run under a
-        wrapper. The accumulation order also differs from a whole backward, so the
-        two dense schedules agree to floating-point tolerance, not bit-exactly.
-
-        Gates nothing: place it wherever the stage would otherwise idle. The queue
-        must be drained before the optimizer step.
+        The ``W`` phase :meth:`dense_backward_act_micro` deferred, for its oldest
+        microbatch; the queue must be empty before the optimizer step. It agrees
+        with a whole backward to floating-point tolerance, not bit-exactly. The
+        configured reduction runs it
+        (:meth:`~torchrec.distributed.maglev.data_parallel.PassReduction.weight_backward`:
+        under DDP, through each weight's ``AccumulateGrad``); upstream
+        ``stage_backward_weight`` when no schedule configured one.
 
         Raises:
             ValueError: if no deferred weight work is queued.
         """
-        if not self._wdense:
+        if not self._pending_weight_backwards:
             raise ValueError(
                 f"stage {self.stage_index}: dense_backward_weight_micro() with no "
                 "deferred weight work; call dense_backward_act_micro() first"
             )
-        param_groups, microbatch_id = self._wdense.pop(0)
+        param_groups, microbatch_id = self._pending_weight_backwards.popleft()
+        if not param_groups:
+            return
         with record_function(f"## dense_backward_weight mb{microbatch_id} ##"):
-            stage_backward_weight(iter(self.dense_parameters()), param_groups)
+            if self._reduction is None:
+                stage_backward_weight(
+                    iter(self._dense_parameters_in_graph()), param_groups
+                )
+            else:
+                self._reduction.weight_backward(
+                    self._dense_parameters_in_graph, param_groups
+                )
+
+    def sparse_backward_micro(self) -> None:
+        r"""sparse_backward_micro() -> None
+
+        Resume the oldest pending microbatch's sparse graphs from its seams'
+        gradients, in one backward for every layer; afterwards the seams hold
+        no ``.grad``. A sparse output whose seam received no gradient is left
+        out, as a single backward through both nets would leave it (unlike
+        :meth:`sparse_backward_global`, which must concatenate a whole-pass
+        gradient and zero-fills).
+        """
+        outputs, seams, microbatch_id = self._pending_sparse_microbatches.popleft()
+        roots: List[torch.Tensor] = []
+        gradients: List[torch.Tensor] = []
+        for output, seam in zip(outputs, seams):
+            if output is None or seam is None:
+                continue
+            for whole, leaf in zip(_unpack_seam(output), _unpack_seam(seam)):
+                grad = leaf.grad
+                leaf.grad = None
+                if whole.requires_grad and grad is not None:
+                    roots.append(whole)
+                    gradients.append(grad)
+        if roots:
+            with record_function(f"## sparse_backward mb{microbatch_id} ##"):
+                torch.autograd.backward(roots, gradients)
+
+    def sparse_backward_global(self, state: MaglevPassState) -> None:
+        r"""sparse_backward_global(state) -> None
+
+        Resume every whole-pass sparse graph from its seams' gradients, in one
+        backward; afterwards every seam leaf's ``.grad`` is ``None``.
+
+        One backward for every layer, not one per layer: a wrapper may join the
+        layers' outputs in one autograd node (DDP's output sink does), and layers
+        may share a sparse frontend, whose graph a per-layer backward would free.
+
+        Args:
+            state (MaglevPassState): State produced by
+                :meth:`sparse_forward_global`.
+        """
+        roots: List[torch.Tensor] = []
+        gradients: List[torch.Tensor] = []
+        for index, (layer, pooled) in enumerate(
+            zip(self._layers, state.sparse_outputs)
+        ):
+            if pooled is None:
+                continue
+            shared = layer.shared_sparse_outputs()
+            layer_seams = [cast(SparseSeam, seams[index]) for seams in state.seams]
+            for position, whole in enumerate(_unpack_seam(pooled)):
+                leaves = [_unpack_seam(seam)[position] for seam in layer_seams]
+                if position in shared:
+                    leaves = leaves[:1]
+                if not whole.requires_grad:
+                    for leaf in leaves:
+                        leaf.grad = None
+                    continue
+                parts: List[torch.Tensor] = []
+                for leaf in leaves:
+                    parts.append(
+                        leaf.grad if leaf.grad is not None else torch.zeros_like(leaf)
+                    )
+                    leaf.grad = None
+                roots.append(whole)
+                gradients.append(parts[0] if len(parts) == 1 else torch.cat(parts))
+                del parts
+        if not roots:
+            return
+        with record_function("## torchrec_maglev:sparse_backward_global ##"):
+            torch.autograd.backward(roots, gradients)
+
+    # ---- Global batch and microbatch: backward helpers ----
+
+    def _receive_grads(self, microbatch: _PendingMicrobatch) -> List[torch.Tensor]:
+        """The next stage's gradients for ``microbatch``; none on the last stage."""
+        if self.is_last:
+            return []
+        with record_function(f"## dense_recv_grad mb{microbatch.microbatch_id} ##"):
+            return self._wait_for_grad()
+
+    def _pop_backward_roots(
+        self, grads: Optional[Sequence[torch.Tensor]] = None
+    ) -> Tuple[
+        _PendingMicrobatch,
+        List[torch.Tensor],
+        Optional[List[torch.Tensor]],
+        Optional[torch.Tensor],
+    ]:
+        """Pop the oldest pending microbatch with its backward's roots: the
+        loss-scaled ``postproc`` loss on the last stage, else the grad-carrying
+        outputs paired with the next stage's gradients.
+
+        Args:
+            grads: the next stage's gradients, already received; received here
+                when ``None``.
+
+        Returns:
+            The microbatch, the roots, their gradients, and the loss (last stage
+            only).
+
+        Raises:
+            ValueError: if the received gradients do not match the grad-carrying
+                outputs.
+        """
+        microbatch = self._pending_microbatches.popleft()
+        if self.is_last:
+            loss = cast(Activations, microbatch.outputs)[0]
+            self._pass_losses.append(loss.detach())
+            return microbatch, [loss], self._seed_loss_grads(loss), loss
+        if grads is None:
+            grads = self._receive_grads(microbatch)
+        grad_carrying = [
+            tensor
+            for tensor, spec in zip(
+                cast(Activations, microbatch.outputs), self._out_specs
+            )
+            if spec.requires_grad
+        ]
+        if len(grads) != len(grad_carrying):
+            raise ValueError(
+                f"stage {self.stage_index} received {len(grads)} gradients "
+                f"for {len(grad_carrying)} grad-carrying outputs"
+            )
+        pairs = [
+            (output, grad)
+            for output, grad in zip(grad_carrying, grads)
+            if output.requires_grad
+        ]
+        return microbatch, [o for o, _ in pairs], [g for _, g in pairs], None
+
+    def _send_input_grads(self, microbatch: _PendingMicrobatch) -> None:
+        with record_function(
+            f"## dense_finish_send_grad mb{microbatch.microbatch_id} ##"
+        ):
+            self._finish_send_grad()
+        with record_function(f"## dense_send_grad mb{microbatch.microbatch_id} ##"):
+            self._start_send_grad(microbatch.in_activations)

@@ -524,9 +524,12 @@ def check_activations(
             f"{what}: expected {len(specs)} activation tensors, got {len(activations)}"
         )
     for i, (spec, tensor) in enumerate(zip(specs, activations)):
-        expected_shape = spec.materialize_shape(
-            tensor.shape[0] if spec.batch_size_dependent and tensor.ndim > 0 else None
-        )
+        expected_shape = spec.shape
+        if spec.batch_size_dependent and tensor.ndim == len(spec.shape):
+            # The spec's -1 marks the batch dimension, wherever it sits.
+            expected_shape = spec.materialize_shape(
+                tensor.shape[tuple(spec.shape).index(-1)]
+            )
         if tuple(tensor.shape) != tuple(expected_shape):
             raise ValueError(
                 f"{what}[{i}]: expected shape {tuple(expected_shape)}, got "
@@ -615,16 +618,20 @@ class MaglevLayer(nn.Module, abc.ABC):
     layer list directly. There is no separate stage type: a stage is just a run
     of layers plus the wrapper that distributes it.
 
-    A layer may expose two structural halves:
+    A layer has two nets:
 
     * ``sparse(layer_input)`` performs work independent of the incoming
-      activation, such as embedding pooling. It may be ``None``.
+      activation, such as embedding pooling. It may be ``None``. It returns one
+      batch-major tensor, or a tuple of them so that blocks of different dtypes
+      need not be promoted to one. A tuple may also hold whole-pass tensors,
+      which :meth:`shared_sparse_outputs` names.
     * ``dense(sparse_output, layer_input, in_activations)`` performs the
       remaining work and returns the layer's activation tuple.
 
-    The default :meth:`forward` composes those halves. Existing subclasses may
-    continue to override :meth:`forward` and omit both halves; schedules that
-    need the split call :meth:`require_dense` and receive a descriptive error.
+    The default :meth:`forward` composes the two nets.
+    :class:`~torchrec.distributed.maglev.stage.StageWrapper` refuses a layer
+    without a dense net or with its own :meth:`forward`
+    (:func:`~torchrec.distributed.maglev.checks.reject_unsplit_layers`).
 
     Args:
         sparse (nn.Module, optional): Module that consumes ``layer_input`` and
@@ -673,31 +680,31 @@ class MaglevLayer(nn.Module, abc.ABC):
     def require_dense(self) -> nn.Module:
         r"""require_dense() -> nn.Module
 
-        Return the dense half required by split-aware schedules.
+        Return the dense net, which every schedule requires.
 
         Returns:
-            nn.Module: The layer's dense half.
+            nn.Module: The layer's dense net.
 
         Raises:
-            ValueError: If the layer was built without a dense half.
+            ValueError: If the layer was built without a dense net.
         """
         if self.dense is None:
             raise ValueError(
-                f"{type(self).__name__} was built without a dense half; provide "
-                "dense= to MaglevLayer or use a schedule that executes whole layers"
+                f"{type(self).__name__} was built without a dense net; provide "
+                "dense= to MaglevLayer"
             )
         return self.dense
 
     def dense_parameters(self) -> Iterator[nn.Parameter]:
         r"""dense_parameters() -> Iterator[nn.Parameter]
 
-        Return the parameters owned by the dense half.
+        Return the parameters owned by the dense net.
 
         Returns:
             Iterator[nn.Parameter]: Dense parameters in module registration order.
 
         Raises:
-            ValueError: If the layer was built without a dense half.
+            ValueError: If the layer was built without a dense net.
         """
         return self.require_dense().parameters()
 
@@ -715,6 +722,10 @@ class MaglevLayer(nn.Module, abc.ABC):
         the layer lets each architecture identify its batch-major fields without
         adding sparse-input dependencies to the Maglev authoring API.
 
+        The split must be contiguous and in row order: part ``i`` holds rows
+        ``[i * B / n, (i + 1) * B / n)``, the rows of the sparse output's
+        microbatch ``i`` that the pass hands the same dense call.
+
         Args:
             layer_input (Any): This layer's whole-pass input.
             batch_size (int): Logical whole-pass batch size.
@@ -731,6 +742,21 @@ class MaglevLayer(nn.Module, abc.ABC):
             "with MaglevRail"
         )
 
+    def shared_sparse_outputs(self) -> Tuple[int, ...]:
+        r"""shared_sparse_outputs() -> Tuple[int, ...]
+
+        Positions of the sparse outputs that every dense microbatch reads whole.
+
+        Such an output (deduplicated embedding rows, say) is handed to every
+        microbatch as one leaf whose gradient sums over them, instead of being
+        cut by rows. Positions index the sparse net's tuple, ``0`` for a lone
+        tensor.
+
+        Returns:
+            Tuple[int, ...]: Positions of whole-pass outputs. Default: ``()``
+        """
+        return ()
+
     @abc.abstractmethod
     def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
         """The activation tuple this layer consumes; ``()`` if it consumes none."""
@@ -746,7 +772,7 @@ class MaglevLayer(nn.Module, abc.ABC):
     ) -> Activations:
         r"""forward(layer_input, in_activations=()) -> Activations
 
-        Run the sparse half followed by the dense half.
+        Run the sparse net followed by the dense net.
 
         Args:
             layer_input: this layer's own input (its feature partition).
@@ -759,8 +785,7 @@ class MaglevLayer(nn.Module, abc.ABC):
                 :meth:`out_activation_specs`.
 
         Raises:
-            ValueError: If the layer has no dense half and does not override this
-                method.
+            ValueError: If the layer has no dense net.
         """
         sparse_output = None if self.sparse is None else self.sparse(layer_input)
         return self.require_dense()(sparse_output, layer_input, in_activations)
@@ -910,7 +935,9 @@ class MaglevModuleList(nn.ModuleList):
         Unlike :meth:`preproc`, this runs **inside** the autograd graph -- it
         computes the very loss that is backpropagated, so everything here is
         differentiated. It also runs on the last pipeline stage, inside the
-        parallelized module, so a head with parameters shards with that stage.
+        parallelized module, so under ``Maglev1F1B`` a head with parameters
+        shards with that stage. MaglevRail refuses weights outside the
+        layers: there a head belongs in the last layer's dense net.
 
         There is no meaningful default: a model has to say how it scores itself.
         Subclass and override.
