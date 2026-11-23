@@ -106,7 +106,7 @@ if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.0' ]]; then
         export CUDA_VERSION="cu130"
     else
-        export CUDA_VERSION="cu126"
+        export CUDA_VERSION="cu130"
     fi
 else
     export CUDA_VERSION="cpu"
@@ -209,8 +209,8 @@ fi
 
 conda run -n "${CONDA_ENV}" python --version
 
-# we only have one cuda version for pypi build
-if [[ ${MATRIX_GPU_ARCH_VERSION} != '12.6' ]]; then
+# we only have one cuda version for pypi build (fbgemm-gpu 1.10.0 ships CUDA 13.0 only)
+if [[ ${MATRIX_GPU_ARCH_VERSION} != '13.0' ]]; then
     exit 0
 fi
 

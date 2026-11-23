@@ -26,23 +26,23 @@ jobs:
           - os: mt-l-x86iavx512-8-64
             python-version: '3.11'
             python-tag: "py311"
-            cuda-tag: "cu126"
+            cuda-tag: "cu130"
           - os: mt-l-x86iavx512-8-64
             python-version: '3.12'
             python-tag: "py312"
-            cuda-tag: "cu126"
+            cuda-tag: "cu130"
           - os: mt-l-x86iavx512-8-64
             python-version: '3.13'
             python-tag: "py313"
-            cuda-tag: "cu126"
+            cuda-tag: "cu130"
           - os: mt-l-x86iavx512-8-64
             python-version: '3.14'
             python-tag: "py314"
-            cuda-tag: "cu126"
+            cuda-tag: "cu130"
           - os: mt-l-x86iavx512-8-64
             python-version: '3.15'
             python-tag: "py315"
-            cuda-tag: "cu126"
+            cuda-tag: "cu130"
     steps:
       # Checkout the repository to the GitHub Actions runner
       - name: Check ldd --version
@@ -118,7 +118,7 @@ jobs:
           - "3.14"
           - "3.15"
         cuda-tag:
-          - "cu126"
+          - "cu130"
     needs: build_on_cpu
     # the glibc version should match the version of the one we used to build the binary
     steps:

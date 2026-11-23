@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda-tag: ["cu126", "cu130"]
+        cuda-tag: ["cu130"]
         os:
           - mt-l-x86aavx2-45-167-a10g-4
         python:
@@ -72,38 +72,6 @@ jobs:
           - ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         exclude:
           - is_pr: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.11"
-          - is_pr: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.12"
-          - is_pr: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.13"
-          - is_pr: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.14"
-              free_threaded: false
-          - is_pr: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.14"
-              free_threaded: true
-          - is_pr: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.15"
-              free_threaded: false
-          - is_pr: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.15"
-              free_threaded: true
-          - is_pr: true
             cuda-tag: "cu130"
             python:
               version: "3.11"
@@ -124,25 +92,6 @@ jobs:
             cuda-tag: "cu130"
             python:
               version: "3.14"
-              free_threaded: true
-          - is_main_push: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.13"
-          - is_main_push: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.14"
-              free_threaded: false
-          - is_main_push: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.15"
-              free_threaded: false
-          - is_main_push: true
-            cuda-tag: "cu126"
-            python:
-              version: "3.15"
               free_threaded: true
           - is_main_push: true
             cuda-tag: "cu130"
