@@ -18,6 +18,8 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.maglev.checks import reject_unsplit_layers
+from torchrec.distributed.maglev.data_parallel import DDPPassReduction
 from torchrec.distributed.maglev.module import (
     activation_specs_from_tensors,
     Activations,
@@ -31,18 +33,12 @@ from torchrec.distributed.maglev.module import (
     StructuredActivations,
     StructuredActivationsLayout,
 )
-from torchrec.distributed.maglev.pipeline import (
-    Maglev1F1B,
-    Maglev1F1BRecvAhead,
-    MaglevPipelineBase,
-    MaglevRail,
-)
-from torchrec.distributed.maglev.stage import (
-    _RailLayerChain,
-    HandoffPGMode,
+from torchrec.distributed.maglev.pipeline import Maglev1F1B, MaglevPipelineBase
+from torchrec.distributed.maglev.process_groups import (
+    _count_stages,
     MaglevProcessGroups,
-    StageWrapper,
 )
+from torchrec.distributed.maglev.stage import _LayerChain, StageWrapper
 from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
@@ -111,11 +107,12 @@ def _test_deferred_ddp_gradient_matches_full_batch(
             (torch.tensor([[2.0]]), torch.tensor([[1.5]])),
         )
 
-        for microbatch, (value, target) in enumerate(zip(inputs[rank], targets[rank])):
-            with pipeline._forward_context(microbatch, len(inputs[rank])):
-                loss = (module(value) - target).square().sum()
-            loss.backward()
-            pipeline._finalize_ddp_backward(microbatch, len(inputs[rank]))
+        with pipeline._reduction.accumulate():
+            for value, target in zip(inputs[rank], targets[rank]):
+                with pipeline._forward_no_sync():
+                    loss = (module(value) - target).square().sum()
+                loss.backward()
+        pipeline._reduction.reduce()
 
         full_input = torch.cat(
             [value for rank_inputs in inputs for value in rank_inputs]
@@ -242,49 +239,6 @@ def _build_model(
     return MaglevTestModel(layers, activation_layout)
 
 
-class _SplitSpyLayer(MaglevLayer):
-    """A minimal Rail layer whose halves and splitter can be made misbehave."""
-
-    def __init__(
-        self,
-        sparse: Optional[torch.nn.Module] = None,
-        split_count: Optional[int] = None,
-    ) -> None:
-        super().__init__(
-            sparse=sparse if sparse is not None else _GoodSparse(),
-            dense=_PassThroughDense(),
-        )
-        self._split_count = split_count
-        self._spec: ActivationSpec = ActivationSpec(torch.Size([-1, 2]), torch.float32)
-
-    def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-        return ()
-
-    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-        return (self._spec,)
-
-    def split_dense_input(
-        self, layer_input: Any, batch_size: int, num_microbatches: int
-    ) -> List[Any]:
-        count = self._split_count or num_microbatches
-        return [layer_input] * count
-
-
-class _GoodSparse(torch.nn.Module):
-    def forward(self, layer_input: Any) -> torch.Tensor:
-        return torch.ones(layer_input.float_features.shape[0], 2)
-
-
-class _PassThroughDense(torch.nn.Module):
-    def forward(
-        self,
-        sparse_output: Any,
-        layer_input: Any,
-        in_activations: Activations = (),
-    ) -> Activations:
-        return (sparse_output,)
-
-
 class MaglevModuleListTest(unittest.TestCase):
     """Single-process checks of the authoring API (no distributed setup needed)."""
 
@@ -341,10 +295,8 @@ class MaglevModuleListTest(unittest.TestCase):
     @patch("torchrec.distributed.maglev.stage.InputDistDriver")
     @patch("torchrec.distributed.maglev.stage.MaglevProcessGroups.from_scratch")
     @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    @patch("torchrec.distributed.maglev.stage.dist.get_world_size", return_value=1)
     def test_last_stage_loss_only_output_is_opt_in(
         self,
-        _get_world_size: Any,
         _get_rank: Any,
         init_process_groups: Any,
         _input_dist_driver: Any,
@@ -356,10 +308,9 @@ class MaglevModuleListTest(unittest.TestCase):
         init_process_groups.return_value = MaglevProcessGroups(
             stage_ranks=((0,),),
             stage_pg=process_group,
-            handoff_pgs=(process_group, process_group),
+            handoff_pgs=(MagicMock(), MagicMock()),
             cascade_pg=process_group,
             cascade_gloo_pg=process_group,
-            handoff_pg_mode=HandoffPGMode.SHARED,
         )
         stage = StageWrapper(model, layers_per_stage=[1], stage_size=1)
 
@@ -379,58 +330,6 @@ class MaglevModuleListTest(unittest.TestCase):
         torch.testing.assert_close(outputs[0], expected_loss)
 
     @patch("torchrec.distributed.maglev.stage.InputDistDriver")
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    def test_stage_forward_and_backward_drain_an_input_dist_round(
-        self,
-        _get_rank: Any,
-        input_dist_driver: Any,
-    ) -> None:
-        process_group = MagicMock()
-        process_groups = MaglevProcessGroups(
-            stage_ranks=((0,), (1,)),
-            stage_pg=process_group,
-            handoff_pgs=(process_group, process_group),
-            cascade_pg=process_group,
-            cascade_gloo_pg=process_group,
-            handoff_pg_mode=HandoffPGMode.SHARED,
-        )
-        model = self._model(num_layers=2)
-        raw_batch = self._inputs(num_layers=2, batch_size=4)
-        stage = StageWrapper(
-            model,
-            layers_per_stage=[1, 1],
-            stage_size=1,
-            process_groups=process_groups,
-        )
-        microbatch_inputs = [[raw_batch[0]], [raw_batch[0]]]
-        driver = input_dist_driver.return_value
-        driver.exchange.return_value.wait.return_value = microbatch_inputs
-        gradient_hook = MagicMock(side_effect=lambda _grad: None)
-        hook_handle = next(stage.module.parameters()).register_hook(gradient_hook)
-
-        with (
-            patch.object(stage, "finish_send_act"),
-            patch.object(stage, "start_send_act"),
-        ):
-            loss = stage(raw_batch)
-
-        torch.testing.assert_close(loss, torch.tensor(0.0))
-        driver.exchange.assert_called_once()
-        send_set = driver.exchange.call_args.args[0]
-        self.assertIs(send_set[0][0], raw_batch[0])
-        self.assertIs(send_set[1][0], raw_batch[1])
-        received_grads = [[torch.ones(4, 6)], [torch.ones(4, 6)]]
-        with (
-            patch.object(stage, "start_recv_grad") as start_recv_grad,
-            patch.object(stage, "wait_for_grad", side_effect=received_grads),
-        ):
-            loss.backward()
-
-        self.assertEqual(start_recv_grad.call_count, 2)
-        gradient_hook.assert_called_once()
-        hook_handle.remove()
-
-    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
     def test_stage_parameter_names_keep_global_layer_indices(
         self,
         _input_dist_driver: Any,
@@ -439,10 +338,9 @@ class MaglevModuleListTest(unittest.TestCase):
         process_groups = MaglevProcessGroups(
             stage_ranks=((0,), (1,)),
             stage_pg=process_group,
-            handoff_pgs=(process_group, process_group),
+            handoff_pgs=(MagicMock(), MagicMock()),
             cascade_pg=process_group,
             cascade_gloo_pg=process_group,
-            handoff_pg_mode=HandoffPGMode.SHARED,
         )
         with patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0):
             first_stage = StageWrapper(
@@ -469,112 +367,50 @@ class MaglevModuleListTest(unittest.TestCase):
 
     @patch("torchrec.distributed.maglev.stage.InputDistDriver")
     @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    def test_last_stage_loss_backward_drains_retained_graph(
-        self,
-        _get_rank: Any,
-        input_dist_driver: Any,
-    ) -> None:
-        process_group = MagicMock()
-        process_groups = MaglevProcessGroups(
-            stage_ranks=((0,),),
-            stage_pg=process_group,
-            handoff_pgs=(process_group, process_group),
-            cascade_pg=process_group,
-            cascade_gloo_pg=process_group,
-            handoff_pg_mode=HandoffPGMode.SHARED,
-        )
-        model = self._model(num_layers=1)
-        raw_batch = self._inputs(num_layers=1, batch_size=4)
-        expected_loss, _output = model(raw_batch)
-        stage = StageWrapper(
-            model,
-            layers_per_stage=[1],
-            stage_size=1,
-            process_groups=process_groups,
-        )
-        input_dist_driver.return_value.exchange.return_value.wait.return_value = [
-            raw_batch
-        ]
-
-        loss = stage(raw_batch)
-        torch.testing.assert_close(loss, expected_loss)
-        loss.backward()
-
-        self.assertTrue(
-            any(parameter.grad is not None for parameter in stage.module.parameters())
-        )
-
-    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    def test_rail_sparse_and_dense_phases_match_whole_batch(
+    def test_1f1b_phase_ops_match_the_whole_microbatch(
         self,
         _get_rank: Any,
         _input_dist_driver: Any,
     ) -> None:
-        class ForwardWrapper(torch.nn.Module):
-            def __init__(self, module: torch.nn.Module) -> None:
-                super().__init__()
-                self.module = module
-                self.phases: List[str] = []
-
-            def forward(self, *args: Any, **kwargs: Any) -> Any:
-                self.phases.append(
-                    "dense" if kwargs.get("sparse_outputs") is not None else "sparse"
-                )
-                return self.module(*args, **kwargs)
-
+        """Seams change no gradient: the phase ops give the whole microbatch's
+        gradients bit for bit, over two microbatches in 1F1B warmup order."""
         process_group = MagicMock()
         process_groups = MaglevProcessGroups(
             stage_ranks=((0,),),
             stage_pg=process_group,
-            handoff_pgs=(process_group, process_group),
+            handoff_pgs=(MagicMock(), MagicMock()),
             cascade_pg=process_group,
             cascade_gloo_pg=process_group,
-            handoff_pg_mode=HandoffPGMode.SHARED,
         )
-        model = self._model(num_layers=2)
-        reference = self._model(num_layers=2)
-        inputs = self._inputs(num_layers=2, batch_size=4)
-        stage = StageWrapper(
-            model,
-            layers_per_stage=[2],
-            stage_size=1,
-            process_groups=process_groups,
-            enable_rail=True,
+        whole = StageWrapper(
+            self._model(num_layers=2), [2], 1, process_groups=process_groups
         )
-        wrapper = ForwardWrapper(stage.module)
-        stage.module = wrapper
-
-        state = stage.sparse_forward_global(inputs, num_microbatches=2)
-        for microbatch in range(2):
-            stage.compute_dense_forward_micro(
-                state.dense_inputs[microbatch],
-                (),
-                microbatch,
-                state.seams_for(microbatch),
-            )
-            stage.dense_backward_act_micro()
-            stage.dense_backward_weight_micro()
-        self.assertEqual(wrapper.phases, ["sparse", "dense", "dense"])
-        self.assertTrue(
-            all(
-                seam.grad is not None
-                for output in state.sparse_outputs
-                if output is not None
-                for seam in output.seams
-            )
+        phased = StageWrapper(
+            self._model(num_layers=2), [2], 1, process_groups=process_groups
         )
-        stage.sparse_backward_global(state)
-
-        reference_loss, _output = reference(inputs)
-        (reference_loss * 2).backward()
-        reference_parameters = dict(reference.named_parameters())
-        for name, parameter in model.named_parameters():
-            self.assertIsNotNone(parameter.grad)
-            expected = reference_parameters[name].grad
-            self.assertIsNotNone(expected)
-            assert parameter.grad is not None and expected is not None
-            torch.testing.assert_close(parameter.grad, expected)
+        microbatches = [
+            self._inputs(num_layers=2, batch_size=4),
+            self._inputs(num_layers=2, batch_size=3),
+        ]
+        whole_losses: List[torch.Tensor] = []
+        for microbatch_id, stage_input in enumerate(microbatches):
+            # The plain call runs each layer's sparse then dense net in one
+            # graph, with no detached seam between them.
+            whole_losses.append(whole.module(stage_input, ())[0])
+            seams = phased.sparse_forward_micro(stage_input, microbatch_id)
+            phased._compute_dense_forward_micro(stage_input, (), microbatch_id, seams)
+        for whole_loss in whole_losses:
+            whole_loss.backward()
+            phased_loss, _ = phased._compute_dense_backward_micro([])
+            phased.sparse_backward_micro()
+            assert phased_loss is not None
+            self.assertTrue(torch.equal(whole_loss, phased_loss))
+        phased_parameters = dict(phased.module.named_parameters())
+        for name, parameter in whole.module.named_parameters():
+            expected = parameter.grad
+            actual = phased_parameters[name].grad
+            assert expected is not None and actual is not None, name
+            self.assertTrue(torch.equal(actual, expected), name)
 
     def test_base_postproc_must_be_overridden(self) -> None:
         """MaglevModuleList itself cannot score a model."""
@@ -583,15 +419,16 @@ class MaglevModuleListTest(unittest.TestCase):
 
     def test_locate_rank_maps_every_rank_to_a_stage_slot(self) -> None:
         """Each rank resolves to its stage and its position within that HSD."""
-        located = [StageWrapper.locate_rank(2, r) for r in range(6)]
+        stage_ranks = ((0, 1), (2, 3), (4, 5))
+        located = [MaglevProcessGroups.locate_rank(stage_ranks, r) for r in range(6)]
         self.assertEqual(located, [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)])
 
     def test_count_stages_requires_whole_stages(self) -> None:
-        self.assertEqual(StageWrapper.count_stages(2, world_size=8), 4)
+        self.assertEqual(_count_stages(2, world_size=8), 4)
         with self.assertRaises(ValueError):
-            StageWrapper.count_stages(3, world_size=8)
+            _count_stages(3, world_size=8)
         with self.assertRaises(ValueError):
-            StageWrapper.count_stages(0, world_size=8)
+            _count_stages(0, world_size=8)
 
     @patch("torchrec.distributed.maglev.stage.InputDistDriver")
     @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=2)
@@ -601,16 +438,14 @@ class MaglevModuleListTest(unittest.TestCase):
         _input_dist_driver: Any,
     ) -> None:
         stage_pg = MagicMock(name="stage_pg")
-        handoff_pg = MagicMock(name="handoff_pg")
         cascade_pg = MagicMock(name="cascade_pg")
         cascade_gloo_pg = MagicMock(name="cascade_gloo_pg")
         process_groups = MaglevProcessGroups(
             stage_ranks=((0, 2), (1, 3)),
             stage_pg=stage_pg,
-            handoff_pgs=(handoff_pg, handoff_pg),
+            handoff_pgs=(MagicMock(), MagicMock()),
             cascade_pg=cascade_pg,
             cascade_gloo_pg=cascade_gloo_pg,
-            handoff_pg_mode=HandoffPGMode.SHARED,
         )
 
         stage = StageWrapper(
@@ -622,7 +457,7 @@ class MaglevModuleListTest(unittest.TestCase):
 
         self.assertEqual(stage.stage_index, 0)
         self.assertEqual(stage.position, 1)
-        self.assertEqual(stage.neighbor_rank(1), 3)
+        self.assertEqual(stage._neighbor_rank(1), 3)
         self.assertIs(stage.stage_pg, stage_pg)
         self.assertIs(stage.cascade_pg, cascade_pg)
 
@@ -782,35 +617,60 @@ class MaglevModuleListTest(unittest.TestCase):
 
         self.assertIsInstance(layer, FSDPModule)
 
-    def test_pipeline_configures_fsdp2_on_each_backward(self) -> None:
-        pipeline = cast(Any, object.__new__(MaglevPipelineBase))
-        fsdp_module = MagicMock(spec=FSDPModule)
-        pipeline._fsdp_modules = [fsdp_module]
+    def test_1f1b_reduces_once_after_the_pass(self) -> None:
+        stage = MagicMock(spec=StageWrapper)
+        stage.module = torch.nn.Linear(1, 1)
+        stage.num_stages = 2
+        stage.stage_index = 0
+        stage.is_first = True
+        stage.in_activation_specs.return_value = ()
+        stage.take_inputs.return_value = [["first"], ["second"]]
+        optimizer = MagicMock(spec=torch.optim.Optimizer)
+        pipeline = Maglev1F1B(stage, optimizer, num_microbatches=2)
+        reduction = MagicMock()
+        pipeline._reduction = reduction
+        order = MagicMock()
+        order.attach_mock(optimizer.zero_grad, "zero_grad")
+        order.attach_mock(reduction.accumulate, "accumulate")
+        order.attach_mock(reduction.no_sync, "no_sync")
+        order.attach_mock(stage.sparse_forward_micro, "sparse_forward_micro")
+        order.attach_mock(stage.dense_forward_micro, "dense_forward_micro")
+        order.attach_mock(stage.dense_backward_micro, "dense_backward_micro")
+        order.attach_mock(stage.sparse_backward_micro, "sparse_backward_micro")
+        order.attach_mock(stage.drain_sends, "drain_sends")
+        order.attach_mock(reduction.reduce, "reduce")
+        order.attach_mock(optimizer.step, "step")
 
-        pipeline._configure_fsdp_backward(0, 2)
-        pipeline._configure_fsdp_backward(1, 2)
+        self.assertIsNone(pipeline.progress(iter([])))
 
+        events = [
+            entry[0]
+            for entry in order.mock_calls
+            if not entry[0].endswith(("__enter__", "__exit__"))
+        ]
         self.assertEqual(
-            fsdp_module.set_requires_gradient_sync.call_args_list,
-            [call(False, recurse=False), call(True, recurse=False)],
+            events,
+            [
+                "zero_grad",
+                "accumulate",
+                # Stage 0 of 2 warms up one microbatch ahead.
+                "no_sync",
+                "sparse_forward_micro",
+                "dense_forward_micro",
+                "no_sync",
+                "sparse_forward_micro",
+                "dense_forward_micro",
+                "dense_backward_micro",
+                "sparse_backward_micro",
+                "dense_backward_micro",
+                "sparse_backward_micro",
+                "drain_sends",
+                "reduce",
+                "step",
+            ],
         )
-        self.assertEqual(
-            fsdp_module.set_is_last_backward.call_args_list,
-            [call(False), call(True)],
-        )
-
-    def test_pipeline_flushes_ddp_only_after_final_backward(self) -> None:
-        pipeline = cast(Any, object.__new__(MaglevPipelineBase))
-        ddp_module = MagicMock()
-        pipeline._ddp_modules = [ddp_module]
-
-        pipeline._finalize_ddp_backward(0, 2)
-        ddp_module.reducer.prepare_for_backward.assert_not_called()
-        ddp_module.reducer._delay_all_reduce.assert_not_called()
-
-        pipeline._finalize_ddp_backward(1, 2)
-        ddp_module.reducer.prepare_for_backward.assert_called_once_with([])
-        ddp_module.reducer._delay_all_reduce.assert_called_once_with()
+        pipeline.close()
+        reduction.close.assert_called_once_with()
 
     def test_1f1b_ddp_reduces_after_the_final_backward(self) -> None:
         class PartiallyUsed(torch.nn.Module):
@@ -847,87 +707,35 @@ class MaglevModuleListTest(unittest.TestCase):
                     MagicMock(spec=torch.optim.Optimizer),
                     num_microbatches=2,
                 )
+                self.assertIsInstance(pipeline._reduction, DDPPassReduction)
 
-                for microbatch in range(2):
-                    with pipeline._forward_context(microbatch, 2):
-                        loss = module(torch.ones(1, 2))
-                    loss.backward()
-                    pipeline._finalize_ddp_backward(microbatch, 2)
+                with pipeline._reduction.accumulate():
+                    for _ in range(2):
+                        with pipeline._forward_no_sync():
+                            loss = module(torch.ones(1, 2))
+                        loss.backward()
+                pipeline._reduction.reduce()
 
                 torch.testing.assert_close(
                     module.module.used.weight.grad,
                     torch.full((1, 2), 2.0),
                 )
                 self.assertIsNone(module.module.unused.weight.grad)
-                with pipeline._forward_context(0, 2):
-                    module(torch.ones(1, 2))
+                self.assertTrue(module.require_forward_param_sync)
+                pipeline.close()
             finally:
                 dist.destroy_process_group()
 
-    def test_base_pipeline_delegates_full_round_to_stage(self) -> None:
+    def test_base_pipeline_is_not_a_schedule(self) -> None:
         stage = MagicMock(spec=StageWrapper)
         stage.module = torch.nn.Linear(1, 1)
-        stage.num_stages = 4
+        stage.num_stages = 1
         stage.is_first = True
         stage.in_activation_specs.return_value = ()
-        stage_loss = torch.tensor(2.0, requires_grad=True)
-        stage.return_value = stage_loss
-        optimizer = MagicMock(spec=torch.optim.Optimizer)
-        pipeline = MaglevPipelineBase(stage, optimizer)
-        raw_batch = object()
-
-        loss = pipeline.progress(iter([raw_batch]))
-
-        self.assertEqual(stage.call_count, 1)
-        self.assertIs(stage.call_args.args[0], raw_batch)
-        self.assertIs(loss, stage_loss)
-        torch.testing.assert_close(stage_loss.grad, torch.tensor(1.0))
-        self.assertEqual(pipeline.microbatches_per_pass, 4)
-        optimizer.zero_grad.assert_called_once_with()
-        optimizer.step.assert_called_once_with()
-
-    def test_1f1b_pairs_steady_state_handoffs(self) -> None:
-        stage = MagicMock(spec=StageWrapper)
-        stage.module = torch.nn.Linear(1, 1)
-        stage.num_stages = 2
-        stage.stage_index = 0
-        stage.is_first = True
-        stage.handoff_pg_mode = HandoffPGMode.SHARED
-        stage.in_activation_specs.return_value = ()
-        stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
-        stage.wait_for_act.return_value = ()
-        output = (torch.ones(1, requires_grad=True),)
-        grads = [torch.ones(1)]
-        stage.compute_forward_micro.return_value = output
-        stage.send_act_recv_grad.return_value = grads
-        stage.compute_backward_micro.return_value = (None, ())
-        stage.send_grad_recv_act.return_value = ()
         optimizer = MagicMock(spec=torch.optim.Optimizer)
 
-        pipeline = Maglev1F1B(stage, optimizer, num_microbatches=3)
-        pipeline.progress(iter([object()]))
-
-        stage.start_send_act.assert_called_once_with(output)
-        self.assertEqual(
-            stage.compute_forward_micro.call_args_list,
-            [
-                call(["first"], (), 0),
-                call(["second"], (), 1),
-                call(["third"], (), 2),
-            ],
-        )
-        stage.send_act_recv_grad.assert_has_calls([call(output), call(output)])
-        stage.send_grad_recv_act.assert_called_once_with(
-            (), recv_next=True, next_stage_input=["third"]
-        )
-        stage.compute_backward_micro.assert_has_calls(
-            [
-                call(grads),
-                call(grads),
-                call(stage.wait_for_grad.return_value),
-            ]
-        )
-        optimizer.step.assert_called_once_with()
+        with self.assertRaisesRegex(TypeError, "not a schedule"):
+            MaglevPipelineBase(stage, optimizer, num_microbatches=1)
 
     def test_1f1b_split_uses_direction_specific_handoffs(self) -> None:
         stage = MagicMock(spec=StageWrapper)
@@ -935,7 +743,6 @@ class MaglevModuleListTest(unittest.TestCase):
         stage.num_stages = 2
         stage.stage_index = 0
         stage.is_first = True
-        stage.handoff_pg_mode = HandoffPGMode.SPLIT
         stage.in_activation_specs.return_value = ()
         stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
         optimizer = MagicMock(spec=torch.optim.Optimizer)
@@ -943,202 +750,45 @@ class MaglevModuleListTest(unittest.TestCase):
         pipeline = Maglev1F1B(stage, optimizer, num_microbatches=3)
         pipeline.progress(iter([object()]))
 
-        self.assertEqual(stage.forward_micro.call_count, 3)
-        self.assertEqual(stage.backward_micro.call_count, 3)
+        seams = stage.sparse_forward_micro.return_value
         self.assertEqual(
-            stage.forward_micro.call_args_list,
+            stage.dense_forward_micro.call_args_list,
             [
-                call(["first"], 0),
-                call(["second"], 1),
-                call(["third"], 2),
+                call(["first"], 0, seams),
+                call(["second"], 1, seams),
+                call(["third"], 2, seams),
             ],
         )
+        self.assertEqual(stage.sparse_forward_micro.call_count, 3)
+        self.assertEqual(stage.dense_backward_micro.call_count, 3)
+        self.assertEqual(stage.sparse_backward_micro.call_count, 3)
         self.assertEqual(
             stage.start_recv_act.call_args_list,
             [call(["first"]), call(["second"]), call(["third"])],
         )
-        stage.send_act_recv_grad.assert_not_called()
-        stage.send_grad_recv_act.assert_not_called()
-        optimizer.step.assert_called_once_with()
-
-    def test_1f1b_recv_ahead_preserves_split_schedule(self) -> None:
-        stage = MagicMock(spec=StageWrapper)
-        stage.module = torch.nn.Linear(1, 1)
-        stage.num_stages = 2
-        stage.stage_index = 0
-        stage.handoff_pg_mode = HandoffPGMode.SPLIT
-        stage.in_activation_specs.return_value = ()
-        stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
-        optimizer = MagicMock(spec=torch.optim.Optimizer)
-
-        pipeline = Maglev1F1BRecvAhead(stage, optimizer, num_microbatches=3)
-        pipeline.progress(iter([object()]))
-
+        # Stage 0 of 2: one warmup forward, two steady pairs, one cooldown
+        # backward; each receive is posted right before its op.
         events = [
             entry[0]
             for entry in stage.method_calls
             if entry[0]
             in {
-                "backward_micro",
-                "forward_micro",
                 "start_recv_act",
+                "sparse_forward_micro",
+                "dense_forward_micro",
                 "start_recv_grad",
+                "dense_backward_micro",
+                "sparse_backward_micro",
             }
         ]
+        forward = ["start_recv_act", "sparse_forward_micro", "dense_forward_micro"]
+        backward = ["start_recv_grad", "dense_backward_micro", "sparse_backward_micro"]
         self.assertEqual(
-            events,
-            [
-                "start_recv_act",
-                "start_recv_act",
-                "forward_micro",
-                "start_recv_grad",
-                "forward_micro",
-                "start_recv_act",
-                "backward_micro",
-                "start_recv_grad",
-                "forward_micro",
-                "start_recv_grad",
-                "backward_micro",
-                "backward_micro",
-            ],
+            events, forward + forward + backward + forward + backward + backward
         )
-        self.assertEqual(
-            stage.start_recv_act.call_args_list,
-            [call(["first"]), call(["second"]), call(["third"])],
-        )
+        optimizer.step.assert_called_once_with()
 
-    def test_rail_requires_rail_enabled_stage(self) -> None:
-        stage = MagicMock(spec=StageWrapper)
-        stage.rail_enabled = False
-        stage.module = torch.nn.Linear(1, 1)
-        stage.num_stages = 1
-        stage.stage_index = 0
-        stage.is_first = True
-        stage.in_activation_specs.return_value = ()
-        optimizer = MagicMock(spec=torch.optim.Optimizer)
-
-        with self.assertRaisesRegex(ValueError, "enable_rail=True"):
-            MaglevRail(stage, optimizer, num_microbatches=1)
-
-    def _rail_stage_mock(self, num_stages: int) -> MagicMock:
-        stage = MagicMock(spec=StageWrapper)
-        stage.rail_enabled = True
-        stage.module = torch.nn.Linear(1, 1)
-        stage.num_stages = num_stages
-        stage.stage_index = 0
-        stage.is_first = True
-        stage.handoff_pg_mode = HandoffPGMode.SPLIT
-        stage.in_activation_specs.return_value = ()
-        return stage
-
-    def _rail_stage(self, layers: List[Any]) -> StageWrapper:
-        """A single-stage Rail StageWrapper over hand-built layers."""
-        process_group = MagicMock()
-        return StageWrapper(
-            MaglevTestModel(
-                cast(List[MaglevTestLayer], layers),
-                StructuredActivationsLayout[MaglevTestActivations](),
-            ),
-            layers_per_stage=[len(layers)],
-            stage_size=1,
-            process_groups=MaglevProcessGroups(
-                stage_ranks=((0,),),
-                stage_pg=process_group,
-                handoff_pgs=(process_group, process_group),
-                cascade_pg=process_group,
-                cascade_gloo_pg=process_group,
-                handoff_pg_mode=HandoffPGMode.SHARED,
-            ),
-            enable_rail=True,
-        )
-
-    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    def test_rail_rejects_bad_sparse_output(self, _get_rank: Any, _driver: Any) -> None:
-        """The sparse half must return one batch-major floating-point tensor."""
-
-        class BadSparse(torch.nn.Module):
-            def __init__(self, value: Any) -> None:
-                super().__init__()
-                self.value = value
-
-            def forward(self, layer_input: Any) -> Any:
-                return self.value
-
-        cases = [
-            ("not a tensor", "expected torch.Tensor", "nope"),
-            ("wrong leading dim", "expected leading dimension", torch.ones(3, 2)),
-            ("integral dtype", "must be floating point", torch.ones(4, 2).long()),
-        ]
-        for label, message, value in cases:
-            with self.subTest(label):
-                layer = _SplitSpyLayer(sparse=BadSparse(value))
-                stage = self._rail_stage([layer])
-                inputs = self._inputs(num_layers=1, batch_size=4)
-                with self.assertRaisesRegex((TypeError, ValueError), message):
-                    stage.sparse_forward_global(inputs, num_microbatches=2)
-
-    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    def test_rail_rejects_bad_microbatch_count(
-        self, _get_rank: Any, _driver: Any
-    ) -> None:
-        stage = self._rail_stage([_SplitSpyLayer()])
-        inputs = self._inputs(num_layers=1, batch_size=4)
-        with self.assertRaisesRegex(ValueError, "must be positive"):
-            stage.sparse_forward_global(inputs, num_microbatches=0)
-        with self.assertRaisesRegex(ValueError, "non-empty microbatches"):
-            stage.sparse_forward_global(inputs, num_microbatches=8)
-        with self.assertRaisesRegex(ValueError, "divide evenly"):
-            stage.sparse_forward_global(inputs, num_microbatches=3)
-
-    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    def test_rail_rejects_wrong_split_count(self, _get_rank: Any, _driver: Any) -> None:
-        """A layer whose splitter disagrees with the schedule is caught."""
-        stage = self._rail_stage([_SplitSpyLayer(split_count=3)])
-        inputs = self._inputs(num_layers=1, batch_size=4)
-        with self.assertRaisesRegex(ValueError, "expected 2"):
-            stage.sparse_forward_global(inputs, num_microbatches=2)
-
-    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    def test_rail_weight_backward_without_queued_work(
-        self, _get_rank: Any, _driver: Any
-    ) -> None:
-        """The guard that turns a drain-loop bug into a loud failure."""
-        stage = self._rail_stage([_SplitSpyLayer()])
-        with self.assertRaisesRegex(ValueError, r"no\s+deferred weight work"):
-            stage.dense_backward_weight_micro()
-
-    def test_rail_rejects_parameters_outside_the_halves(self) -> None:
-        """A parameter on the layer body would silently never train."""
-
-        class Dense(torch.nn.Module):
-            def forward(
-                self,
-                sparse_output: Any,
-                layer_input: torch.Tensor,
-                in_activations: Activations = (),
-            ) -> Activations:
-                return (layer_input,)
-
-        class StrayLayer(MaglevLayer):
-            def __init__(self) -> None:
-                super().__init__(dense=Dense())
-                # Belongs in the dense half; the split backward cannot see it.
-                self.stray = torch.nn.Linear(3, 3)
-
-            def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-                return ()
-
-            def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-                return (ActivationSpec(torch.Size([-1, 3])),)
-
-        with self.assertRaisesRegex(ValueError, "outside its sparse and dense"):
-            _RailLayerChain([StrayLayer()])
-
-    def test_maglev_layer_composes_sparse_and_dense_halves(self) -> None:
+    def test_maglev_layer_composes_sparse_and_dense_nets(self) -> None:
         class Sparse(torch.nn.Module):
             def forward(self, value: torch.Tensor) -> torch.Tensor:
                 return value * 2
@@ -1167,7 +817,7 @@ class MaglevModuleListTest(unittest.TestCase):
         (output,) = Layer()(value, (4 * value,))
         torch.testing.assert_close(output, torch.full_like(value, 7))
 
-    def test_maglev_layer_composes_dense_half_without_sparse_half(self) -> None:
+    def test_maglev_layer_composes_dense_net_without_sparse_net(self) -> None:
         class Dense(torch.nn.Module):
             def forward(
                 self,
@@ -1192,7 +842,7 @@ class MaglevModuleListTest(unittest.TestCase):
         value = torch.ones(2, 3)
         self.assertIs(Layer()(value)[0], value)
 
-    def test_maglev_layer_default_forward_requires_dense_half(self) -> None:
+    def test_maglev_layer_default_forward_requires_dense_net(self) -> None:
         class Layer(MaglevLayer):
             def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
                 return ()
@@ -1200,10 +850,10 @@ class MaglevModuleListTest(unittest.TestCase):
             def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
                 return (ActivationSpec(torch.Size([-1, 3])),)
 
-        with self.assertRaisesRegex(ValueError, "without a dense half"):
+        with self.assertRaisesRegex(ValueError, "without a dense net"):
             Layer()(torch.ones(2, 3))
 
-    def test_maglev_layer_preserves_forward_override_without_halves(self) -> None:
+    def test_maglev_layer_preserves_forward_override_without_nets(self) -> None:
         class LegacyLayer(MaglevLayer):
             def __init__(self) -> None:
                 super().__init__()
@@ -1225,10 +875,14 @@ class MaglevModuleListTest(unittest.TestCase):
         self.assertEqual(layer(torch.ones(2, 3))[0].shape, torch.Size([2, 3]))
         self.assertIsNone(layer.sparse)
         self.assertIsNone(layer.dense)
-        with self.assertRaisesRegex(ValueError, "without a dense half"):
+        with self.assertRaisesRegex(ValueError, "without a dense net"):
             list(layer.dense_parameters())
+        with self.assertRaisesRegex(
+            ValueError, "LegacyLayer at index 0 has no dense net"
+        ):
+            reject_unsplit_layers([layer])
 
-    def test_maglev_test_layer_halves_partition_parameters(self) -> None:
+    def test_maglev_test_layer_nets_partition_parameters(self) -> None:
         layer = cast(MaglevTestLayer, self._model(num_layers=2)[1])
         sparse = layer.sparse
         self.assertIsNotNone(sparse)
@@ -1255,8 +909,8 @@ class MaglevModuleListTest(unittest.TestCase):
             ],
         )
 
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    @patch("torchrec.distributed.maglev.stage.dist.new_group")
+    @patch("torchrec.distributed.maglev.process_groups.dist.get_rank", return_value=0)
+    @patch("torchrec.distributed.maglev.process_groups.dist.new_group")
     def test_from_scratch_split_builds_direction_specific_handoffs(
         self,
         new_group: Any,
@@ -1268,7 +922,6 @@ class MaglevModuleListTest(unittest.TestCase):
         process_groups = MaglevProcessGroups.from_scratch(
             stage_size=2,
             num_stages=3,
-            handoff_pg_mode=HandoffPGMode.SPLIT,
         )
 
         self.assertEqual(
@@ -1287,8 +940,8 @@ class MaglevModuleListTest(unittest.TestCase):
         )
         self.assertIsNot(process_groups.handoff_pgs[0], process_groups.handoff_pgs[1])
 
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=2)
-    @patch("torchrec.distributed.maglev.stage.dist.new_group")
+    @patch("torchrec.distributed.maglev.process_groups.dist.get_rank", return_value=2)
+    @patch("torchrec.distributed.maglev.process_groups.dist.new_group")
     def test_from_device_mesh_reuses_mesh_process_groups(
         self,
         new_group: Any,
@@ -1320,7 +973,6 @@ class MaglevModuleListTest(unittest.TestCase):
             cast(DeviceMesh, device_mesh),
             stage_mesh_dim_name="dp",
             pipeline_mesh_dim_name="pp",
-            handoff_pg_mode=HandoffPGMode.SPLIT,
         )
 
         self.assertEqual(process_groups.stage_ranks, ((0, 1), (2, 3)))
@@ -1338,36 +990,440 @@ class MaglevModuleListTest(unittest.TestCase):
             ],
         )
 
-    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
-    @patch("torchrec.distributed.maglev.stage.dist.new_group")
-    def test_from_scratch_shared_reuses_one_handoff_pg(
+    def test_one_handoff_group_for_both_directions_is_refused_across_stages(
         self,
-        new_group: Any,
-        _get_rank: Any,
     ) -> None:
-        groups = [MagicMock(name=f"group_{index}") for index in range(8)]
-        new_group.side_effect = groups
+        group = MagicMock()
+        with self.assertRaisesRegex(ValueError, "two distinct process groups"):
+            MaglevProcessGroups(
+                stage_ranks=((0,), (1,)),
+                stage_pg=group,
+                handoff_pgs=(group, group),
+                cascade_pg=group,
+                cascade_gloo_pg=group,
+            )
+        one_stage = MaglevProcessGroups(
+            stage_ranks=((0,),),
+            stage_pg=group,
+            handoff_pgs=(group, group),
+            cascade_pg=group,
+            cascade_gloo_pg=group,
+        )
+        self.assertEqual(one_stage.num_stages, 1)
 
-        process_groups = MaglevProcessGroups.from_scratch(
-            stage_size=2,
-            num_stages=3,
-            handoff_pg_mode=HandoffPGMode.SHARED,
+
+class _RecordingSparse(torch.nn.Module):
+    def __init__(self, name: str, events: List[str]) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2)
+        self._name = name
+        self._events = events
+
+    def forward(self, layer_input: torch.Tensor) -> torch.Tensor:
+        self._events.append(f"sparse{self._name}")
+        return self.projection(layer_input)
+
+
+class _RecordingDense(torch.nn.Module):
+    def __init__(self, name: str, events: List[str]) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2)
+        self._name = name
+        self._events = events
+
+    def forward(
+        self,
+        sparse_output: torch.Tensor,
+        layer_input: torch.Tensor,
+        in_activations: Activations = (),
+    ) -> Activations:
+        self._events.append(f"dense{self._name}")
+        value = sparse_output + in_activations[0] if in_activations else sparse_output
+        return (self.projection(value).tanh(),)
+
+
+class _SplitLayer(MaglevLayer):
+    def __init__(self, name: str, events: List[str], body: bool = False) -> None:
+        super().__init__(
+            sparse=_RecordingSparse(name, events),
+            dense=_RecordingDense(name, events),
+        )
+        self.body: Optional[torch.nn.Module] = torch.nn.Linear(2, 2) if body else None
+        self._name = name
+        self._events = events
+
+    def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return (ActivationSpec(torch.Size([-1, 2])),)
+
+    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return (ActivationSpec(torch.Size([-1, 2])),)
+
+
+class _ForwardLayer(_SplitLayer):
+    """Overrides ``forward``, which no schedule calls."""
+
+    def forward(
+        self, layer_input: Any, in_activations: Activations = ()
+    ) -> Activations:
+        return super().forward(layer_input, in_activations)
+
+
+class LayerChainTest(unittest.TestCase):
+    """A stage's layers on their nets: sparse nets first, then the dense chain."""
+
+    def test_split_layers_run_every_sparse_net_first(self) -> None:
+        events: List[str] = []
+        torch.manual_seed(7)
+        layers = [_SplitLayer("0", events), _SplitLayer("1", events)]
+        chain = _LayerChain(layers)
+        value = torch.randn(3, 2)
+
+        (out,) = chain([value, value])
+
+        self.assertEqual(events, ["sparse0", "sparse1", "dense0", "dense1"])
+        expected = layers[1](value, layers[0](value))[0]
+        torch.testing.assert_close(out, expected)
+
+    # StageWrapper refuses before it builds a process group, so these build no
+    # group: a refusal that came later would fail on the missing one instead.
+
+    def test_a_layer_that_overrides_forward_is_refused(self) -> None:
+        events: List[str] = []
+        layers = [_SplitLayer("0", events), _ForwardLayer("1", events)]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"_ForwardLayer at index 1 overrides forward \(_ForwardLayer\.forward\)\. "
+            "MaglevPP runs each layer as its sparse net and its dense net",
+        ):
+            StageWrapper(_SeamModel(layers), [2], 1)
+        self.assertEqual(events, [])
+
+    def test_a_layer_without_a_dense_net_is_refused(self) -> None:
+        events: List[str] = []
+        sparse_only = _SplitLayer("0", events)
+        sparse_only.dense = None
+        with self.assertRaisesRegex(ValueError, "at index 0 has no dense net"):
+            StageWrapper(_SeamModel([sparse_only]), [1], 1)
+
+    def test_parameters_outside_a_split_layers_nets_are_refused(self) -> None:
+        events: List[str] = []
+        with self.assertRaisesRegex(ValueError, "outside its sparse and dense nets"):
+            StageWrapper(_SeamModel([_SplitLayer("0", events, body=True)]), [1], 1)
+
+
+class _TupleSparse(torch.nn.Module):
+    """A float output that trains, integer ids, a frozen output, and a float
+    output the dense net never reads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2)
+        self.unread = torch.nn.Linear(2, 2)
+
+    def forward(self, layer_input: torch.Tensor) -> Any:
+        ids = torch.arange(layer_input.shape[0]).unsqueeze(1).expand(-1, 2)
+        return (
+            self.projection(layer_input),
+            ids,
+            layer_input * 2,
+            self.unread(layer_input),
         )
 
-        self.assertEqual(
-            new_group.call_args_list,
-            [
-                call(ranks=[0, 1]),
-                call(ranks=[2, 3]),
-                call(ranks=[4, 5]),
-                call(ranks=[0, 1, 2, 3, 4, 5]),
-                call(ranks=[0, 2, 4], backend=None),
-                call(ranks=[1, 3, 5], backend=None),
-                call(ranks=[0, 2, 4], backend="gloo"),
-                call(ranks=[1, 3, 5], backend="gloo"),
-            ],
+
+class _TupleDense(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2)
+
+    def forward(
+        self,
+        sparse_output: Any,
+        layer_input: torch.Tensor,
+        in_activations: Activations = (),
+    ) -> Activations:
+        trained, ids, frozen, _unread = sparse_output
+        return (self.projection(trained + ids.float() + frozen).tanh(),)
+
+
+class _TupleLayer(MaglevLayer):
+    def __init__(self, sparse: Optional[torch.nn.Module] = None) -> None:
+        super().__init__(
+            sparse=sparse if sparse is not None else _TupleSparse(),
+            dense=_TupleDense(),
         )
-        self.assertIs(process_groups.handoff_pgs[0], process_groups.handoff_pgs[1])
+
+    def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return ()
+
+    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return (ActivationSpec(torch.Size([-1, 2])),)
+
+
+class _SharedSparse(torch.nn.Module):
+    """Per-row output, plus a whole table every row of the microbatch reads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2)
+        self.table = torch.nn.Parameter(torch.randn(5, 2))
+
+    def forward(self, layer_input: torch.Tensor) -> Any:
+        return (self.projection(layer_input), self.table * 2)
+
+
+class _SharedDense(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2)
+
+    def forward(
+        self,
+        sparse_output: Any,
+        layer_input: torch.Tensor,
+        in_activations: Activations = (),
+    ) -> Activations:
+        rows, table = sparse_output
+        return (self.projection(rows + table.sum(0)).tanh(),)
+
+
+class _SharedLayer(MaglevLayer):
+    def __init__(self) -> None:
+        super().__init__(sparse=_SharedSparse(), dense=_SharedDense())
+
+    def shared_sparse_outputs(self) -> Tuple[int, ...]:
+        return (1,)
+
+    def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return ()
+
+    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return (ActivationSpec(torch.Size([-1, 2])),)
+
+
+class _DictSparse(torch.nn.Module):
+    def forward(self, layer_input: torch.Tensor) -> Any:
+        return {"pooled": layer_input}
+
+
+class _SeamModel(MaglevModuleList):
+    def preproc(self, model_input: torch.Tensor) -> List[torch.Tensor]:
+        return [model_input] * len(self)
+
+    def get_batch_size(self, layer_inputs: Any) -> int:
+        return layer_inputs[0].shape[0]
+
+    def postproc(
+        self, activations: Activations, layer_input: Any
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return activations[0].square().sum(), activations[0].detach()
+
+
+class _CallRecorder(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+        self.calls: List[str] = []
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("sparse_only"):
+            self.calls.append("sparse")
+        elif kwargs.get("sparse_outputs") is not None:
+            self.calls.append("dense")
+        return self.module(*args, **kwargs)
+
+
+@patch("torchrec.distributed.maglev.stage.InputDistDriver")
+@patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
+class StagePhaseTest(unittest.TestCase):
+    """One microbatch on a stage's sparse and dense phases."""
+
+    @staticmethod
+    def _stage(layer: MaglevLayer) -> StageWrapper:
+        torch.manual_seed(11)
+        process_group = MagicMock()
+        return StageWrapper(
+            _SeamModel([layer]),
+            [1],
+            1,
+            process_groups=MaglevProcessGroups(
+                stage_ranks=((0,),),
+                stage_pg=process_group,
+                handoff_pgs=(MagicMock(), MagicMock()),
+                cascade_pg=process_group,
+                cascade_gloo_pg=process_group,
+            ),
+        )
+
+    def test_seams_are_detached_leaves_that_follow_their_source(
+        self, _get_rank: Any, _driver: Any
+    ) -> None:
+        stage = self._stage(_TupleLayer())
+        value = torch.randn(3, 2)
+
+        seams = stage.sparse_forward_micro([value], 0)
+
+        assert seams is not None
+        trained, ids, frozen, unread = cast(Tuple[torch.Tensor, ...], seams[0])
+        for leaf in (trained, ids, frozen, unread):
+            self.assertTrue(leaf.is_leaf)
+            self.assertIsNone(leaf.grad_fn)
+        self.assertTrue(trained.requires_grad)
+        self.assertEqual(ids.dtype, torch.int64)
+        self.assertFalse(ids.requires_grad)
+        self.assertFalse(frozen.requires_grad)
+        self.assertTrue(unread.requires_grad)
+
+    def test_sparse_backward_skips_a_seam_without_gradient(
+        self, _get_rank: Any, _driver: Any
+    ) -> None:
+        # A seam the dense net never reads gets no gradient, and its sparse
+        # output gets no backward: zero-filling it would still step an optimizer
+        # (momentum, say) that a single backward through both nets never runs.
+        layer = _TupleLayer()
+        stage = self._stage(layer)
+        value = torch.randn(3, 2)
+        seams = stage.sparse_forward_micro([value], 0)
+        stage._compute_dense_forward_micro([value], (), 0, seams)
+        stage._compute_dense_backward_micro([])
+        assert seams is not None
+        trained, _ids, _frozen, unread = cast(Tuple[torch.Tensor, ...], seams[0])
+        self.assertIsNotNone(trained.grad)
+        self.assertIsNone(unread.grad)
+
+        stage.sparse_backward_micro()
+
+        sparse = cast(_TupleSparse, layer.sparse)
+        self.assertIsNotNone(sparse.projection.weight.grad)
+        self.assertIsNone(sparse.unread.weight.grad)
+        self.assertIsNone(trained.grad)
+
+        reference = _TupleLayer()
+        reference.load_state_dict(layer.state_dict())
+        loss, _ = _SeamModel([reference])(value)
+        loss.backward()
+        for (name, actual), expected in zip(
+            layer.named_parameters(), reference.parameters()
+        ):
+            if expected.grad is None:
+                self.assertIsNone(actual.grad, name)
+            else:
+                assert actual.grad is not None, name
+                self.assertTrue(torch.equal(actual.grad, expected.grad), name)
+
+    def test_split_stage_calls_its_module_per_phase(
+        self, _get_rank: Any, _driver: Any
+    ) -> None:
+        stage = self._stage(_TupleLayer())
+        recorder = _CallRecorder(stage.module)
+        stage.module = recorder
+        value = torch.randn(3, 2)
+
+        seams = stage.sparse_forward_micro([value], 0)
+        stage._compute_dense_forward_micro([value], (), 0, seams)
+        # Past the wrapper, straight to the stage's authored layers.
+        stage.sparse_forward_micro([value], 1, unwrapped=True)
+
+        self.assertEqual(recorder.calls, ["sparse", "dense"])
+
+    def test_a_non_tensor_sparse_output_is_refused(
+        self, _get_rank: Any, _driver: Any
+    ) -> None:
+        stage = self._stage(_TupleLayer(sparse=_DictSparse()))
+        with self.assertRaisesRegex(
+            TypeError, "_TupleLayer sparse net returned dict; the stage hands"
+        ):
+            stage.sparse_forward_micro([torch.randn(3, 2)], 0)
+
+    def test_shared_position_is_one_uncut_leaf_and_matches_whole(
+        self, _get_rank: Any, _driver: Any
+    ) -> None:
+        # Per microbatch, a shared position is that microbatch's whole tensor:
+        # one leaf, uncut, with the whole forward's gradients bit for bit.
+        layer = _SharedLayer()
+        stage = self._stage(layer)
+        reference = _SharedLayer()
+        reference.load_state_dict(layer.state_dict())
+        value = torch.randn(3, 2)
+
+        seams = stage.sparse_forward_micro([value], 0)
+        stage._compute_dense_forward_micro([value], (), 0, seams)
+        stage._compute_dense_backward_micro([])
+        stage.sparse_backward_micro()
+
+        assert seams is not None
+        rows, table = cast(Tuple[torch.Tensor, ...], seams[0])
+        self.assertEqual(rows.shape, torch.Size([3, 2]))
+        self.assertEqual(table.shape, torch.Size([5, 2]))
+        loss, _ = _SeamModel([reference])(value)
+        loss.backward()
+        for (name, actual), expected in zip(
+            layer.named_parameters(), reference.parameters()
+        ):
+            assert actual.grad is not None and expected.grad is not None, name
+            self.assertTrue(torch.equal(actual.grad, expected.grad), name)
+
+    def test_1f1b_drains_the_pass_losses(self, _get_rank: Any, driver: Any) -> None:
+        stage = self._stage(_TupleLayer())
+        value = torch.randn(4, 2)
+        driver.return_value.take.return_value = [[value[:2]], [value[2:]]]
+        optimizer = torch.optim.SGD(stage.module.parameters(), lr=0.01, foreach=True)
+        pipeline = Maglev1F1B(stage, optimizer, num_microbatches=2)
+
+        self.assertIsNone(pipeline.progress(iter([])))
+
+        self.assertEqual(stage.take_pass_losses(), [])
+
+    def test_1f1b_failed_pass_poisons_the_stage(
+        self, _get_rank: Any, driver: Any
+    ) -> None:
+        stage = self._stage(_TupleLayer())
+        optimizer = torch.optim.SGD(stage.module.parameters(), lr=0.01, foreach=True)
+        pipeline = Maglev1F1B(stage, optimizer, num_microbatches=2)
+        # An exhausted dataloader ends training; it does not poison the stage.
+        driver.return_value.take.side_effect = StopIteration
+        with self.assertRaises(StopIteration):
+            pipeline.progress(iter([]))
+        driver.return_value.take.side_effect = None
+        driver.return_value.take.return_value = [[torch.randn(2, 2)]] * 2
+        pipeline.progress(iter([]))
+        # A pass that raises does.
+        with patch.object(
+            stage, "dense_backward_micro", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                pipeline.progress(iter([]))
+        with self.assertRaisesRegex(RuntimeError, "out of step"):
+            pipeline.progress(iter([]))
+
+    def test_abandon_pass_drops_pending_sparse_forwards(
+        self, _get_rank: Any, _driver: Any
+    ) -> None:
+        stage = self._stage(_TupleLayer())
+        stage.sparse_forward_micro([torch.randn(3, 2)], 0)
+        stage.abandon_pass()
+        with self.assertRaises(IndexError):
+            stage.sparse_backward_micro()
+
+
+class Maglev1F1BTrackerTest(unittest.TestCase):
+    """A stage calls its module per phase, so trackers would count each
+    microbatch more than once."""
+
+    @staticmethod
+    def _stage() -> MagicMock:
+        stage = MagicMock(spec=StageWrapper)
+        stage.module = torch.nn.Linear(1, 1)
+        vars(stage.module)["model_trackers"] = {"tracker": object()}
+        stage.num_stages = 1
+        stage.stage_index = 0
+        stage.is_first = True
+        stage.in_activation_specs.return_value = ()
+        stage.sparse_net_buffers.return_value = []
+        return stage
+
+    def test_1f1b_refuses_model_trackers_on_a_split_stage(self) -> None:
+        with self.assertRaisesRegex(ValueError, "model trackers"):
+            Maglev1F1B(self._stage(), MagicMock(spec=torch.optim.Optimizer), 1)
 
 
 class MaglevDDPNumericsTest(MultiProcessTestBase):

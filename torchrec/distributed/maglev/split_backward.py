@@ -18,7 +18,7 @@ backward node computes only the outputs the current graph task consumes, so
 one ``autograd.Function``, and a Function only knows the ``needs_input_grad``
 recorded at forward time. ``I`` therefore runs the entire backward and discards
 the weight gradients, and ``W`` re-enters the same node and runs the entire
-backward again -- every compiled dense half pays for its backward twice.
+backward again -- every compiled dense net pays for its backward twice.
 
 :class:`SplitBackwardBackend` restores the split the way GraphPP does for LLM
 pipelines (torchtitan ``graph_trainer/graph_pp/split_di_dw.py``): export the
@@ -86,7 +86,7 @@ class _LazyGraph:
 
 @dataclass(frozen=True)
 class _BackwardSplit:
-    """A backward graph cut into its input-gradient and weight-gradient halves.
+    """A backward graph cut into its input-gradient and weight-gradient graphs.
 
     ``input_grads`` takes the backward's inputs and returns the input gradients
     followed by the live-ins ``weight_grads`` takes. Slots index the outputs of
@@ -138,9 +138,10 @@ def _split_backward(
 
     ``bw`` must return one gradient per forward input with the ``num_weights``
     weight gradients first, the convention GraphPP's ``split_di_dw_graph``
-    uses. Everything the weight half needs is either computed by the input half
-    or is one of the backward's own inputs; both reach it as outputs of the
-    input half, so the weight graph runs on its live-ins alone.
+    uses. Everything the weight-gradient graph needs is either computed by the
+    input-gradient graph or is one of the backward's own inputs; both reach it
+    as outputs of the input-gradient graph, so the weight-gradient graph runs on
+    its live-ins alone.
     """
     (output,) = bw.graph.find_nodes(op="output")
     grads = output.args[0]
@@ -333,18 +334,18 @@ class _SplitBackwardFunction(torch.autograd.Function):
 class SplitBackwardBackend:
     r"""SplitBackwardBackend(compiler=inductor_compiler)
 
-    ``torch.compile`` backend whose backward runs its input and weight halves
-    separately.
+    ``torch.compile`` backend whose backward runs its input-gradient and
+    weight-gradient parts separately.
 
-    A drop-in for the default backend on a Maglev dense half: the forward, the
-    input-gradient half and the weight-gradient half are each compiled, and
+    A drop-in for the default backend on a Maglev dense net: the forward, the
+    input-gradient graph and the weight-gradient graph are each compiled, and
     ``stage_backward_input`` / ``stage_backward_weight`` run only their own
-    half. A plain ``loss.backward()`` runs both, so the monolithic schedules
+    part. A plain ``loss.backward()`` runs both, so the monolithic schedules
     are unaffected.
 
     Weights are the graph inputs that are trainable ``nn.Parameter`` s, which
     is what dynamo lifts a module's parameters to; every other differentiable
-    input belongs to the input half.
+    input belongs to the input-gradient graph.
 
     Limitations: static shapes only, and the region must neither mutate its
     inputs nor return a view of one -- the constraints of

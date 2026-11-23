@@ -13,11 +13,11 @@ from torchrec.distributed.maglev.customized_pipeline import (
     ScheduleValidator,
 )
 
-# What MaglevRail._dense_zero_bubble actually runs, for p=4 m=8. s0 is
-# transcribed from the rank-0 Kineto trace of a MAST job; s1..s3 from the op
-# order in that method's docstring. The generator exists to reproduce these, so
-# they are the regression that keeps a given order and a derived one the same
-# thing said two ways.
+# What MaglevRailZB._dense runs for p=4 m=8, from the op order in
+# MaglevRailZB's docstring: each stage holds its W back by its own index, so
+# stage 0 runs each W right after its I. The generator exists to reproduce
+# these, so they are the regression that keeps a given order and a derived one
+# the same thing said two ways.
 ZERO_BUBBLE_P4_M8 = [
     "F0 F1 F2 F3 I0 W0 F4 I1 W1 F5 I2 W2 F6 I3 W3 F7 I4 W4 I5 W5 I6 W6 I7 W7",
     "F0 F1 F2 I0 F3 I1 W0 F4 I2 W1 F5 I3 W2 F6 I4 W3 F7 I5 W4 I6 W5 I7 W6 W7",
@@ -29,13 +29,6 @@ ZERO_BUBBLE_P4_M8 = [
 class GenerateTest(unittest.TestCase):
     def test_reproduces_the_derived_order(self) -> None:
         self.assertEqual(ScheduleValidator.generate(4, 8), ZERO_BUBBLE_P4_M8)
-
-    def test_deeper_stages_defer_weight_work_longer(self) -> None:
-        # The direction is easy to get backwards, so pin it: stage 0 runs every
-        # W straight after its own I, stage 3 holds the first one back.
-        rows = ScheduleValidator.generate(4, 8)
-        self.assertTrue(rows[0].startswith("F0 F1 F2 F3 I0 W0"))
-        self.assertTrue(rows[3].startswith("F0 I0 F1 I1 F2 I2 F3 I3 W0"))
 
     def test_generated_order_validates(self) -> None:
         rows = ScheduleValidator.generate(4, 8)
@@ -53,12 +46,27 @@ class ValidateTest(unittest.TestCase):
         with self.assertRaisesRegex(ScheduleError, "bad action token"):
             ScheduleValidator.parse(["F0 X1"])
 
-    def test_rejects_a_monolithic_backward(self) -> None:
-        # Rail's seams are popped by I and by nothing else, so a B would leave
-        # them out of step and the sparse graph resuming from gradients nobody
-        # filled. It is not part of the grammar.
-        with self.assertRaisesRegex(ScheduleError, "bad action token"):
-            ScheduleValidator.parse(["F0 B0"])
+    def test_accepts_whole_backwards_mixed_with_split_ones(self) -> None:
+        # B and I share the forward queue, so each names the next microbatch;
+        # W names the microbatch whose I ran, not a count of Ws.
+        rows = ["F0 F1 B0 I1 F2 I2 W1 W2"]
+        ScheduleValidator.validate(ScheduleValidator.parse(rows), 1, 3)
+
+    def test_rejects_a_backward_weight_named_for_the_wrong_microbatch(self) -> None:
+        with self.assertRaisesRegex(ScheduleError, "this slot is W1"):
+            ScheduleValidator.validate(
+                ScheduleValidator.parse(["F0 F1 B0 I1 W0"]), 1, 2
+            )
+
+    def test_rejects_a_whole_backward_with_no_outstanding_forward(self) -> None:
+        with self.assertRaisesRegex(ScheduleError, "no forward to consume"):
+            ScheduleValidator.validate(ScheduleValidator.parse(["B0 F0"]), 1, 1)
+
+    def test_rejects_a_backward_act_whose_backward_weight_never_runs(self) -> None:
+        with self.assertRaisesRegex(ScheduleError, r"microbatches \[1\] never run"):
+            ScheduleValidator.validate(
+                ScheduleValidator.parse(["F0 F1 I0 W0 I1"]), 1, 2
+            )
 
     def test_rejects_an_index_that_disagrees_with_the_queue_order(self) -> None:
         with self.assertRaisesRegex(ScheduleError, "out of order"):
@@ -107,7 +115,7 @@ class SimulateTest(unittest.TestCase):
         # The memory lever: one less microbatch in flight on stage 0, paid for
         # in idle slots rather than rejected.
         default = ScheduleValidator.generate(2, 4)
-        shallow = ["F0 I0 W0 F1 I1 W1 F2 I2 W2 F3 I3 W3", default[1]]
+        shallow = ["F0 B0 F1 B1 F2 B2 F3 B3", default[1]]
         self.assertGreater(
             len(ScheduleValidator.validate(ScheduleValidator.parse(shallow), 2, 4)[0]),
             len(ScheduleValidator.validate(ScheduleValidator.parse(default), 2, 4)[0]),
