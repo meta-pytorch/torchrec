@@ -19,6 +19,7 @@ Requires an attached TPU -- the cases skip off-hardware. On the pod:
 """
 
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -58,6 +59,81 @@ def _register_tpu_kernels() -> None:
 
 
 class FusedAdagradCpuTest(unittest.TestCase):
+    def test_rejects_mismatched_vbe_batch_sizes_before_device_work(self) -> None:
+        module = PallasTableBatchedEmbeddingBags(
+            embedding_specs=[(3, EMB_DIM), (2, EMB_DIM)],
+            device=torch.device("cpu"),
+        )
+        batch_sizes = [[1, 1], [1, 1]]
+        indices = torch.tensor([0], dtype=torch.int64)
+        for num_bags in (3, 5):
+            with self.subTest(num_bags=num_bags):
+                offsets = torch.tensor([0] * num_bags + [1], dtype=torch.int64)
+                with patch.object(
+                    torch.Tensor,
+                    "to",
+                    side_effect=AssertionError("Unexpected device work"),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"VBE batch sizes sum to 4 bags, but offsets describe {num_bags}",
+                    ):
+                        module(
+                            indices,
+                            offsets,
+                            batch_size_per_feature_per_rank=batch_sizes,
+                        )
+
+    def test_context_saves_precomputed_vbe_offsets(self) -> None:
+        indices = torch.tensor([0, 1], dtype=torch.int32)
+        offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
+        row_offsets = torch.zeros(2, dtype=torch.int32)
+        weights = torch.zeros(2 * EMB_DIM)
+        momentum = torch.zeros(2)
+        for row_output_offsets in (None, torch.tensor([EMB_DIM, 0])):
+            cases = (
+                (
+                    ops._setup_pooled_batched_offset_context,
+                    (
+                        indices,
+                        offsets,
+                        weights,
+                        row_offsets,
+                        EMB_DIM,
+                        row_output_offsets,
+                    ),
+                ),
+                (
+                    ops._setup_fused_adagrad_context,
+                    (
+                        indices,
+                        offsets,
+                        weights,
+                        row_offsets,
+                        momentum,
+                        0.1,
+                        0.01,
+                        EMB_DIM,
+                        row_output_offsets,
+                    ),
+                ),
+            )
+            for setup_context, inputs in cases:
+                with self.subTest(
+                    setup=setup_context.__name__, vbe=row_output_offsets is not None
+                ):
+                    ctx = Mock()
+                    with patch.object(
+                        ops,
+                        "_generate_vbe_row_output_offsets",
+                        side_effect=AssertionError("VBE offsets must be reused"),
+                    ):
+                        setup_context(ctx, inputs, output=None)
+                    ctx.save_for_backward.assert_called_once()
+                    self.assertIs(
+                        ctx.save_for_backward.call_args.args[-1], row_output_offsets
+                    )
+
     def test_batched_module_updates_rows_without_a_weight_gradient(self) -> None:
         module = PallasTableBatchedEmbeddingBags(
             embedding_specs=[(5, EMB_DIM)],
@@ -139,6 +215,55 @@ class FusedAdagradCpuTest(unittest.TestCase):
         torch.testing.assert_close(grad[dim : 2 * dim], torch.full((dim,), 2.0))
         torch.testing.assert_close(grad[2 * dim :], torch.ones(3 * dim))
 
+    def test_vbe_offsets_for_backward_and_fused_update(self) -> None:
+        indices = torch.tensor([2, 2, 1, 0, 1, 0, 0, 0], dtype=torch.int32)
+        offsets = torch.tensor([0, 2, 2, 3, 5], dtype=torch.int32)
+        row_offsets = torch.tensor([0, 0, 3, 3], dtype=torch.int32)
+        row_output_offsets = torch.tensor([0, 4, 2, 6], dtype=torch.int64)
+        grad_out = torch.tensor([[1.0, 2.0], [3.0, 4.0], [99.0, 99.0], [5.0, 12.0]])
+        expected_grad = torch.tensor(
+            [[0.0, 0.0], [0.0, 0.0], [2.0, 4.0], [5.0, 12.0], [8.0, 16.0]]
+        )
+        for flat_weights in (False, True):
+            with self.subTest(flat_weights=flat_weights):
+                grad = (
+                    torch.ops.torchrec.embedding_pooled_batched_lookup_offset_backward(
+                        grad_out,
+                        indices,
+                        offsets,
+                        row_offsets,
+                        5,
+                        2,
+                        flat_weights,
+                        row_output_offsets=row_output_offsets,
+                    )
+                )
+                torch.testing.assert_close(
+                    grad, expected_grad.flatten() if flat_weights else expected_grad
+                )
+
+        weights = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+        initial_weights = weights.clone()
+        momentum = torch.zeros(5)
+        torch.ops.torchrec.embedding_pooled_batched_lookup_offset_adagrad_update(
+            grad_out,
+            indices,
+            offsets,
+            row_offsets,
+            weights,
+            momentum,
+            0.1,
+            0.01,
+            row_output_offsets=row_output_offsets,
+        )
+        expected_momentum = expected_grad.square().mean(dim=1)
+        torch.testing.assert_close(momentum, expected_momentum)
+        torch.testing.assert_close(
+            weights,
+            initial_weights
+            - 0.1 * expected_grad / (expected_momentum.sqrt().unsqueeze(1) + 0.01),
+        )
+
     def test_duplicate_rows_empty_bag_and_padding(self) -> None:
         indices = torch.tensor([2, 2, 1, 0, 1, 0, 0, 0], dtype=torch.int32)
         offsets = torch.tensor([0, 2, 2, 3, 5], dtype=torch.int32)
@@ -192,6 +317,56 @@ class V2FwdBwdTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+    def test_vbe_int64_offsets_forward_backward_and_fused_update(self) -> None:
+        dim = EMB_DIM
+        indices = torch.tensor([2, 2, 1, 0, 1] + [0] * 11, dtype=torch.int32)
+        offsets = torch.tensor([0, 2, 2, 3, 5], dtype=torch.int32)
+        row_offsets = torch.tensor([0, 0, 3, 3], dtype=torch.int32)
+        output_order = torch.tensor([0, 2, 1, 3])
+        row_output_offsets = torch.tensor([0, 2 * dim, dim, 3 * dim], dtype=torch.int64)
+        grad_out = torch.tensor([1.0, 3.0, 99.0, 5.0])[:, None].repeat(1, dim)
+        initial_weights = torch.arange(64 * dim, dtype=torch.float32) * 0.01
+
+        for fused in (False, True):
+            with self.subTest(fused=fused):
+                weights_cpu = initial_weights.clone().requires_grad_()
+                weights_tpu = initial_weights.to("tpu").requires_grad_()
+                momentum_cpu = torch.zeros(64)
+                momentum_tpu = torch.zeros(64, device="tpu")
+                if fused:
+                    op = (
+                        torch.ops.torchrec.embedding_pooled_batched_lookup_offset_fused_adagrad
+                    )
+                    cpu_args = (momentum_cpu, 0.1, 0.01, dim)
+                    tpu_args = (momentum_tpu, 0.1, 0.01, dim)
+                else:
+                    op = torch.ops.torchrec.embedding_pooled_batched_lookup_offset
+                    cpu_args = (dim,)
+                    tpu_args = (dim,)
+
+                expected = op(indices, offsets, weights_cpu, row_offsets, *cpu_args)
+                actual = op(
+                    indices.to("tpu"),
+                    offsets.to("tpu"),
+                    weights_tpu,
+                    row_offsets.to("tpu"),
+                    *tpu_args,
+                    row_output_offsets=row_output_offsets.to("tpu"),
+                )
+                torch.testing.assert_close(actual.cpu(), expected[output_order])
+                expected.backward(grad_out[output_order])
+                actual.backward(grad_out.to("tpu"))
+                if fused:
+                    self.assertIsNone(weights_tpu.grad)
+                    torch.testing.assert_close(
+                        weights_tpu.detach().cpu(), weights_cpu.detach()
+                    )
+                    torch.testing.assert_close(momentum_tpu.cpu(), momentum_cpu)
+                else:
+                    self.assertIsNotNone(weights_tpu.grad)
+                    self.assertIsNotNone(weights_cpu.grad)
+                    torch.testing.assert_close(weights_tpu.grad.cpu(), weights_cpu.grad)
 
     def test_nonmonotonic_row_offsets_empty_bags_and_padding(self) -> None:
         from torch_tpu._internal import pallas  # pyrefly: ignore[missing-import]

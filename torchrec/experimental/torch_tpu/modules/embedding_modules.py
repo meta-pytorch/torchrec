@@ -13,6 +13,10 @@ from typing import cast, List, Optional, Tuple
 
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
+from fbgemm_gpu.split_table_batched_embeddings_ops_training_common import (
+    generate_vbe_metadata,
+)
 from torch import nn
 
 # Imported is needed: defines torchrec::embedding_lookup
@@ -335,7 +339,7 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
         embedding_specs: Local row count and dimension for each table.
         feature_table_map: Table index used by each feature.
         weights_precision: Weight dtype; currently only torch.float32.
-        mode: Pooling mode, either sum or mean.
+        mode: PoolingMode.SUM or PoolingMode.MEAN.
         device: Device on which weights and lookup buffers are allocated.
         optimizer: NONE (external optimizer) or EXACT_ROWWISE_ADAGRAD.
         learning_rate: Learning rate for the fused optimizer.
@@ -354,7 +358,7 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
         embedding_specs: List[Tuple[int, int]],
         feature_table_map: Optional[List[int]] = None,
         weights_precision: torch.dtype = torch.float32,
-        mode: str = "sum",
+        mode: PoolingMode = PoolingMode.SUM,
         device: Optional[torch.device] = None,
         optimizer: OptimType = OptimType.NONE,
         learning_rate: float = 0.01,
@@ -362,8 +366,10 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
     ) -> None:
         super().__init__()
         self.device = device if device is not None else torch.device("tpu")
-        if mode not in {"sum", "mean"}:
-            raise ValueError(f"mode must be 'sum' or 'mean', got {mode}")
+        if mode not in {PoolingMode.SUM, PoolingMode.MEAN}:
+            raise ValueError(
+                f"mode must be PoolingMode.SUM or PoolingMode.MEAN, got {mode}"
+            )
         if optimizer not in (OptimType.NONE, OptimType.EXACT_ROWWISE_ADAGRAD):
             raise ValueError(
                 f"TPU batched lookup supports only NONE or EXACT_ROWWISE_ADAGRAD, got {optimizer}"
@@ -411,6 +417,7 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
         ]
 
         feature_dims = [dims[t] for t in self.feature_table_map]  # Needed for VBE
+        self.feature_dims = torch.tensor(feature_dims, dtype=torch.int64, device="cpu")
         D_offsets = [0] + list(accumulate(feature_dims))
         self.total_D: int = D_offsets[-1]
         self.max_D: int = max(dims)
@@ -498,7 +505,19 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
             Fixed batch: [batch, features * dimension]. VBE: flat, rank-major.
         """
         num_features = len(self.feature_table_map)
-        fixed_batch_size = (offsets.numel() - 1) // num_features
+        num_bags = offsets.numel() - 1
+        batch_sizes_per_feature = (
+            tuple(sum(ranks) for ranks in batch_size_per_feature_per_rank)
+            if batch_size_per_feature_per_rank
+            else None
+        )
+        if batch_sizes_per_feature is not None:
+            vbe_num_bags = sum(batch_sizes_per_feature)
+            if vbe_num_bags != num_bags:
+                raise ValueError(
+                    f"VBE batch sizes sum to {vbe_num_bags} bags, but offsets describe {num_bags}"
+                )
+        fixed_batch_size = num_bags // num_features
 
         # TODO: Re-evaluate int32 on TPUs
         indices = indices.to(dtype=torch.int32)
@@ -508,11 +527,6 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
         # Also Cache the result because fixed-batch workloads otherwise rebuild the same
         # device tensor on every forward. VBE case would have repeat, as well
 
-        batch_sizes_per_feature = (
-            tuple(sum(ranks) for ranks in batch_size_per_feature_per_rank)
-            if batch_size_per_feature_per_rank
-            else None
-        )
         cache_key = (
             batch_sizes_per_feature
             if batch_sizes_per_feature is not None
@@ -546,6 +560,23 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
         if bucket != indices.numel():
             indices = nn.functional.pad(indices, (0, bucket - indices.numel()))
 
+        # Need VBE metadata (on device) to re-order from feature-major order to rank-major order
+        vbe_metadata = generate_vbe_metadata(
+            offsets,
+            batch_size_per_feature_per_rank or None,
+            pooling_mode=self.mode,
+            feature_dims_cpu=self.feature_dims,
+            device=offsets.device,
+        )
+
+        row_output_offsets = ops._generate_vbe_row_output_offsets(
+            vbe_metadata.B_offsets,
+            vbe_metadata.B_offsets_rank_per_feature,
+            vbe_metadata.output_offsets_feature_rank,
+            num_bags=num_bags,
+            emb_dim=self.max_D,
+        )
+
         if self.optimizer == OptimType.EXACT_ROWWISE_ADAGRAD:
             pooled_embs = (
                 torch.ops.torchrec.embedding_pooled_batched_lookup_offset_fused_adagrad(
@@ -557,44 +588,33 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
                     self.learning_rate,
                     self.eps,
                     self.max_D,
+                    row_output_offsets=row_output_offsets,
                 )
             )
         else:
             pooled_embs = torch.ops.torchrec.embedding_pooled_batched_lookup_offset(
-                indices, offsets, self.weights, row_offsets, self.max_D
+                indices,
+                offsets,
+                self.weights,
+                row_offsets,
+                self.max_D,
+                row_output_offsets=row_output_offsets,
             )
-        if self.mode == "mean":
+        if self.mode == PoolingMode.MEAN:
             lengths = offsets[1:] - offsets[:-1]
+            if row_output_offsets is not None:
+                output_rows = torch.div(
+                    row_output_offsets, self.max_D, rounding_mode="floor"
+                ).long()
+                lengths = torch.zeros_like(lengths).index_copy(0, output_rows, lengths)
             pooled_embs = pooled_embs / lengths.clamp(min=1).unsqueeze(1).to(
                 pooled_embs.dtype
             )
 
         if batch_size_per_feature_per_rank:
-            # For VBE: Need to re-order from feature-major order to rank-major order
-            # TODO: investigate to change the pallas kernel to immediately output
-            # the correct order.
-            n_ranks = len(batch_size_per_feature_per_rank[0])
-            segment_lengths = [
-                count * self.max_D
-                for counts in batch_size_per_feature_per_rank
-                for count in counts
-            ]
-            order = [
-                feature * n_ranks + rank
-                for rank in range(n_ranks)
-                for feature in range(num_features)
-            ]
-            _, reordered, _ = torch.ops.fbgemm.permute_1D_sparse_data(
-                torch.tensor(order, dtype=torch.int32, device=pooled_embs.device),
-                torch.tensor(
-                    segment_lengths, dtype=torch.int32, device=pooled_embs.device
-                ),
-                pooled_embs.flatten(),
-                None,
-                pooled_embs.numel(),
-            )
-            return reordered
+            return pooled_embs.flatten()
 
+        # TODO: Make the kernel return in the correct order, to remove extra permute/reshape
         return (
             pooled_embs.view(num_features, fixed_batch_size, self.max_D)
             .permute(1, 0, 2)

@@ -6496,7 +6496,7 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
                 embedding_specs=list(zip(self._local_rows, self._local_cols)),
                 feature_table_map=self._feature_table_map,
                 weights_precision=dtype,
-                mode="mean" if self._pooling == PoolingMode.MEAN else "sum",
+                mode=self._pooling,
                 device=device,
                 optimizer=optimizer,
                 learning_rate=learning_rate,
