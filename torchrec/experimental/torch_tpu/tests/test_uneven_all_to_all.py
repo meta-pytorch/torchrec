@@ -94,6 +94,60 @@ class PaddedLayoutTest(unittest.TestCase):
                 self.assertIsNotNone(packed.grad)
                 torch.testing.assert_close(packed.grad, torch.zeros_like(packed))
 
+    @parameterized.expand(
+        [
+            ("uneven", [3, 0, 5, 1], 7, (2, 3)),
+            ("all_empty", [0, 0, 0], 1, (2,)),
+            ("one_rank_full", [0, 7, 0], 7, ()),
+            ("single_rank", [3], 4, (2,)),
+        ]
+    )
+    def test_unpad_ignores_padding_values_and_gradients(
+        self, _name: str, splits: list[int], padded_size: int, trailing: tuple[int, ...]
+    ) -> None:
+        padded = torch.arange(
+            len(splits) * padded_size * math.prod(trailing), dtype=torch.float32
+        ).reshape(len(splits) * padded_size, *trailing)
+        padded.requires_grad_()
+        output = _unpad_segments(padded, splits, padded_size)
+        torch.testing.assert_close(
+            output, _reference_unpad(padded, splits, padded_size)
+        )
+        grad_output = (torch.arange(output.numel()) + 1).reshape(output.shape).float()
+        output.backward(grad_output)
+
+        expected_grad = torch.zeros_like(padded)
+        start = 0
+        for rank, size in enumerate(splits):
+            expected_grad[rank * padded_size : rank * padded_size + size] = grad_output[
+                start : start + size
+            ]
+            start += size
+        torch.testing.assert_close(padded.grad, expected_grad)
+
+    @parameterized.expand(
+        [
+            ("uneven", [3, 0, 5, 1], 7),
+            ("all_full", [3, 3, 3], 3),
+        ]
+    )
+    def test_pad_strided_input_and_gradients(
+        self, _name: str, splits: list[int], padded_size: int
+    ) -> None:
+        packed = (
+            torch.arange(sum(splits) * 6, dtype=torch.float32).reshape(6, sum(splits)).T
+        )
+        packed.requires_grad_()
+        self.assertFalse(packed.is_contiguous())
+        padded = _pad_segments(packed, splits, padded_size)
+        torch.testing.assert_close(padded, _reference_pad(packed, splits, padded_size))
+
+        grad_output = (torch.arange(padded.numel()) + 1).reshape(padded.shape).float()
+        padded.backward(grad_output)
+        torch.testing.assert_close(
+            packed.grad, _reference_unpad(grad_output, splits, padded_size)
+        )
+
     def test_gradients_match_loop_reference(self) -> None:
         splits, padded_size = [3, 0, 5, 1], 5
         weights = torch.randn(len(splits) * padded_size, 2)
