@@ -290,6 +290,83 @@ def embedding_pooled_lookup_bwd_seg_jax(
     return jnp.zeros((num_rows, emb_dim), grad_out.dtype).at[indices].add(grad_per_id)
 
 
+def _validate_vbe_metadata(
+    B_offsets: jax.Array | None,
+    B_offsets_rank_per_feature: jax.Array | None,
+    output_offsets_feature_rank: jax.Array | None,
+) -> None:
+    if B_offsets is None:
+        assert (
+            B_offsets_rank_per_feature is None
+        ), "VBE metadata must be all None or all provided"
+        assert (
+            output_offsets_feature_rank is None
+        ), "VBE metadata must be all None or all provided"
+    else:
+        assert (
+            B_offsets_rank_per_feature is not None
+        ), "B_offsets_rank_per_feature is required for VBE"
+        assert (
+            output_offsets_feature_rank is not None
+        ), "output_offsets_feature_rank is required for VBE"
+        assert B_offsets.ndim == 1, "B_offsets must be 1D"
+        assert (
+            B_offsets_rank_per_feature.ndim == 2
+        ), "B_offsets_rank_per_feature must be 2D"
+        assert (
+            output_offsets_feature_rank.ndim == 1
+        ), "output_offsets_feature_rank must be 1D"
+        num_features = B_offsets.shape[0] - 1
+        num_ranks = B_offsets_rank_per_feature.shape[1] - 1
+        assert num_features > 0, "VBE requires at least one feature"
+        assert num_ranks > 0, "VBE requires at least one rank"
+        assert (
+            B_offsets_rank_per_feature.shape[0] == num_features
+        ), "VBE feature counts must match"
+        assert (
+            output_offsets_feature_rank.shape[0] == num_ranks * num_features + 1
+        ), "VBE output offsets must have num_ranks * num_features + 1 entries"
+
+
+def _generate_row_output_offsets(
+    B_offsets,
+    B_offsets_rank_per_feature,
+    output_offsets_feature_rank,
+    num_batches,
+    aligned_emb_dim,
+    dtype,
+):
+    """Generate the output row offsets used to get rank-major order for VBE lookups"""
+    # Follows fbgemm_gpu generate_vbe_metadata.cu
+    row_output_offsets = jnp.zeros((num_batches,), dtype=dtype)
+    num_tables = B_offsets.shape[0] - 1
+    num_ranks = B_offsets_rank_per_feature.shape[1] - 1
+    # Gets the global input bag of shape [F, W + 1]
+    # e.g. F=2, W=2, [[0, 2, 5], [5, 6, 8]], so f0: rank0: [0, 2), f1:rank0:[5, 6]
+    bag_boundaries_for_each_feature = (
+        B_offsets[:-1, None] + B_offsets_rank_per_feature
+    )  # Shape [F, W + 1], F=num_feature, W=world-size
+    chunk_counts = jnp.diff(B_offsets_rank_per_feature, axis=1).reshape(-1)
+
+    chunk_ids = jnp.repeat(
+        jnp.arange(num_tables * num_ranks),
+        chunk_counts,
+        total_repeat_length=num_batches,
+    )
+    t = chunk_ids // num_ranks
+    r = chunk_ids % num_ranks
+    input_bag_ids = jnp.arange(num_batches, dtype=B_offsets.dtype)
+
+    # Bag index within its feature/rank chunk.
+    b = input_bag_ids - bag_boundaries_for_each_feature[t, r]
+
+    # Output metadata is indexed in rank-major order.
+    output_chunk_starts = output_offsets_feature_rank[r * num_tables + t]
+
+    row_output_offsets = output_chunk_starts + b * aligned_emb_dim
+    return row_output_offsets
+
+
 @functools.partial(jax.jit, static_argnames=["emb_dim"])  # pyre-ignore[20]
 def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
     indices: jax.Array,
@@ -297,6 +374,7 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
     dev_weights: jax.Array,
     row_offsets: jax.Array,
     emb_dim: int,
+    row_output_offsets: jax.Array | None = None,
 ) -> jax.Array:
     """
     Batched pooled embedding lookup on sparse-core parallelizes over batches.
@@ -345,6 +423,9 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
     TODO: xla compiler for sparseCore can only supports 16 GiB of HBM per tensor, so if we have large stacked embeddings
           then we would need to either split them up, or re-think how we want to shard.
     TODO: Remove the output from [F, B, D] = [F* B, D] shape to [B, F * D] so that we can remove operations inside PallasTBE class.
+    TODO: For vbe metadata to calculat ehte row_output_offsets, test whether it should be inside it's own kernel (similar to generate_vbe_metadata.cu)
+          or, put it inside this pallas kernel.
+    TODO: Return the correct order in non-VBE as well.
     """
     # Only do eight batch at a time since it can fit inside a 16-lane offset load
     NUMB_BATCHES_PER_ITERATION = 8  # TODO: Tune this parameter
@@ -402,6 +483,21 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
         constant_values=0,
     )
 
+    if row_output_offsets is None:
+        row_output_offsets = jnp.arange(num_batches, dtype=jnp.int32) * emb_dim
+    else:
+        assert row_output_offsets.ndim == 1, "row_output_offsets must be 1D"
+        assert (
+            row_output_offsets.shape[0] == num_batches
+        ), "row_output_offsets must have one entry per input bag"
+    # Row indices for your uniform-width with shape (num_batches,)
+    output_rows = (row_output_offsets // emb_dim).astype(jnp.int32)
+    output_rows = jnp.pad(
+        output_rows,
+        (0, grid_rows + LANE_SIZE - output_rows.shape[0]),
+        constant_values=-1,
+    )
+
     mesh = plsc.VectorSubcoreMesh(
         core_axis_name="c",
         subcore_axis_name="s",
@@ -430,7 +526,9 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
                 (NUMB_BATCHES_PER_ITERATION, aligned_emb_dim),
                 dev_weights.dtype,  # post pooled emb in vmem
             ),
+            pltpu.VMEM((LANE_SIZE,), offsets.dtype),  # output row offsets
             pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA(()),
         ],
@@ -441,15 +539,18 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
         indices_hbm,
         offsets_hbm,
         row_offsets_hbm,
+        output_rows_hbm,
         out_hbm,
         offsets_vmem,
         indices_vmem,
         row_offsets_vmem,
         buf_vmem,
         post_pooled_emb_vmem,
+        output_rows_vmem,
         sem,
         offset_sem,
         row_offset_sem,
+        output_rows_sem,
     ):
         @functools.partial(
             pltpu.emit_pipeline,
@@ -490,8 +591,20 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
                 row_offsets_vmem,
                 row_offset_sem,
             )
+
+            output_offsets_start = pltpu.make_async_copy(
+                output_rows_hbm.at[
+                    pl.ds(
+                        base,
+                        LANE_SIZE,
+                    )
+                ],
+                output_rows_vmem,
+                output_rows_sem,
+            )
             offset_start.start()
             row_offset_start.start()
+            output_offsets_start.start()
 
             # Zero out the temporary embedding rows in VMEM
             for i in range(NUMB_BATCHES_PER_ITERATION):
@@ -503,6 +616,7 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
             # Bring from VMEM to registers
             offset_start.wait()
             row_offset_start.wait()
+            output_offsets_start.wait()
             offsets_reg = offsets_vmem[...]
             row_offsets_reg = row_offsets_vmem[...]
 
@@ -534,11 +648,6 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
                     buf_vmem.at[slot],
                     sem.at[slot],
                 ).wait()
-
-            output_start = pl.multiple_of(
-                chunk_id * NUMB_BATCHES_PER_ITERATION,
-                TILE,
-            )
 
             # Go through each batch per iteration
             for i_batch in range(NUMB_BATCHES_PER_ITERATION):
@@ -644,14 +753,18 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
                             total = total + masked_emb * masks[row]
                         post_pooled_emb_vmem[i, col_ids] = total
 
+            # Post pooled_emb_vmem has size (NUMB_BATCHES_PER_ITERATION, aligned_emb_dim)
+            destination_indices = output_rows_vmem.at[
+                pl.ds(0, NUMB_BATCHES_PER_ITERATION)
+            ]
             pltpu.sync_copy(
                 post_pooled_emb_vmem,
-                out_hbm.at[pl.ds(output_start, NUMB_BATCHES_PER_ITERATION)],
+                out_hbm.at[plsc.Indices(destination_indices, ignored_value=-1)],
             )
 
         _inner()
 
-    return lookup_kernel(dev_weights, indices, offsets, row_offsets)[
+    return lookup_kernel(dev_weights, indices, offsets, row_offsets, output_rows)[
         :num_batches, :emb_dim
     ]
 
@@ -662,9 +775,15 @@ def embedding_pooled_batched_lookup_jax(
     dev_weights: jax.Array,
     row_offsets: jax.Array,
     emb_dim: int,
+    row_output_offsets: jax.Array | None = None,
 ) -> jax.Array:
     return run_sc_pooled_lookup_batch_parallel(
-        indices, offsets, dev_weights.reshape((-1, emb_dim)), row_offsets, emb_dim
+        indices,
+        offsets,
+        dev_weights.reshape((-1, emb_dim)),
+        row_offsets,
+        emb_dim,
+        row_output_offsets=row_output_offsets,
     )
 
 
@@ -707,6 +826,7 @@ def embedding_pooled_batched_lookup_bwd_jax(
     num_rows: int,
     emb_dim: int,
     flat_weights: bool = False,
+    row_output_offsets: jax.Array | None = None,
 ) -> jax.Array:
     """Preprocessing for dense gradient for a stacked table-batched sum-pooled lookup."""
     safe_weight_indices, safe_bag_indices, valid = (
@@ -718,6 +838,10 @@ def embedding_pooled_batched_lookup_bwd_jax(
     safe_weight_indices = safe_weight_indices[ind]
     safe_bag_indices = safe_bag_indices[ind]
     valid = valid[ind]
+    if row_output_offsets is not None:
+        safe_bag_indices = (row_output_offsets[safe_bag_indices] // emb_dim).astype(
+            jnp.int32
+        )
 
     grad_per_id = jnp.where(
         valid[:, None],

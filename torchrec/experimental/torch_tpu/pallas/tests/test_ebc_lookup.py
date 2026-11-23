@@ -134,6 +134,22 @@ def _grouped_config(
     )
 
 
+def _cpu_vbe_lookup(
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    weights: torch.Tensor,
+    row_offsets: torch.Tensor,
+    emb_dim: int,
+    row_output_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """CPU stand-in for the Pallas VBE forward kernel."""
+    feature_major = ops.embedding_pooled_batched_lookup_offset_cpu(
+        indices, offsets, weights, row_offsets, emb_dim
+    )
+    output_rows = torch.div(row_output_offsets, emb_dim, rounding_mode="floor").long()
+    return torch.zeros_like(feature_major).index_copy(0, output_rows, feature_major)
+
+
 class EBCLookupTest(TestCase):
     def _setup_device(self, device: str) -> None:
         """Skip the TPU cases off-hardware; bind the Pallas kernels on it.
@@ -253,6 +269,157 @@ class EBCLookupTest(TestCase):
         )
 
     @parameterized.expand(
+        [
+            (
+                "unfused",
+                PooledLookupKernel.BATCHED_OFFSET,
+                "embedding_pooled_batched_lookup_offset",
+            ),
+            (
+                "fused_adagrad",
+                PooledLookupKernel.BATCHED_OFFSET_FUSED_ADAGRAD,
+                "embedding_pooled_batched_lookup_offset_fused_adagrad",
+            ),
+        ]
+    )
+    def test_vbe_flat_output_merges_and_backpropagates(
+        self, _name: str, kernel: PooledLookupKernel, op_name: str
+    ) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                name=f"table_{t}",
+                embedding_dim=dim,
+                num_embeddings=8,
+                feature_names=[f"feature_{t}"],
+            )
+            for t, dim in enumerate((16, 32))
+        ]
+        with patch(
+            "torchrec.distributed.embedding_lookup.dist.get_world_size",
+            return_value=2,
+        ):
+            lookup = GroupedPooledEmbeddingsLookup(
+                grouped_configs=[
+                    _grouped_config(
+                        EmbeddingComputeKernel.UNFUSED_TPU,
+                        [table],
+                        PoolingType.SUM,
+                        fused_params={
+                            "pooled_lookup_kernel": kernel,
+                            "learning_rate": 0.1,
+                        },
+                    )
+                    for table in tables
+                ],
+                device=torch.device("cpu"),
+            )
+        features = KeyedJaggedTensor(
+            keys=["feature_0", "feature_1"],
+            values=torch.arange(6, dtype=torch.int32),
+            lengths=torch.ones(6, dtype=torch.int32),
+            stride_per_key_per_rank=[[2, 1], [1, 2]],
+        )
+        # CPU VBE kernels are unsupported; supply the Pallas kernel's 2D output.
+        pooled = [
+            torch.arange(3 * dim, dtype=torch.float32).reshape(3, dim).requires_grad_()
+            for dim in (16, 32)
+        ]
+        with patch.object(torch.ops.torchrec, op_name, side_effect=pooled) as op:
+            actual = lookup(features)
+        self.assertEqual(op.call_count, 2)
+        self.assertEqual(actual.shape, torch.Size([144]))
+        expected = torch.cat(
+            [
+                pooled[0][:2].flatten(),
+                pooled[1][:1].flatten(),
+                pooled[0][2:].flatten(),
+                pooled[1][1:].flatten(),
+            ]
+        )
+        torch.testing.assert_close(actual, expected)
+
+        grad = torch.arange(actual.numel(), dtype=torch.float32)
+        actual.backward(grad)
+        torch.testing.assert_close(
+            pooled[0].grad, torch.cat([grad[:32], grad[64:80]]).reshape(3, 16)
+        )
+        torch.testing.assert_close(
+            pooled[1].grad, torch.cat([grad[32:64], grad[80:]]).reshape(3, 32)
+        )
+
+    @parameterized.expand(
+        [
+            (
+                "unfused",
+                PooledLookupKernel.BATCHED_OFFSET,
+                "embedding_pooled_batched_lookup_offset",
+            ),
+            (
+                "fused_adagrad",
+                PooledLookupKernel.BATCHED_OFFSET_FUSED_ADAGRAD,
+                "embedding_pooled_batched_lookup_offset_fused_adagrad",
+            ),
+        ]
+    )
+    def test_vbe_mean_uses_rank_major_lengths(
+        self, _name: str, pooled_lookup_kernel: PooledLookupKernel, op_name: str
+    ) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                name=f"table_{t}",
+                embedding_dim=16,
+                num_embeddings=8,
+                feature_names=[f"feature_{t}"],
+                pooling=PoolingType.MEAN,
+            )
+            for t in range(2)
+        ]
+        kernel = BatchedTPUEmbeddingBag(
+            config=_grouped_config(
+                EmbeddingComputeKernel.UNFUSED_TPU,
+                tables,
+                PoolingType.MEAN,
+                fused_params={"learning_rate": 0.1},
+            ),
+            device=torch.device("cpu"),
+            pooled_lookup_kernel=pooled_lookup_kernel,
+        )
+        features = KeyedJaggedTensor(
+            keys=["feature_0", "feature_1"],
+            values=torch.zeros(15, dtype=torch.int32),
+            lengths=torch.tensor([0, 2, 3, 4, 1, 5], dtype=torch.int32),
+            stride_per_key_per_rank=[[2, 1], [1, 2]],
+        )
+        pooled = (
+            torch.tensor([0, 4, 20, 12, 6, 35], dtype=torch.float32)[:, None]
+            .repeat(1, 16)
+            .requires_grad_()
+        )
+        with (
+            patch.object(
+                ops,
+                "_generate_vbe_row_output_offsets",
+                wraps=ops._generate_vbe_row_output_offsets,
+            ) as generate_offsets,
+            patch.object(torch.ops.torchrec, op_name, return_value=pooled) as op,
+        ):
+            actual = kernel(features)
+        generate_offsets.assert_called_once()
+        assert op.call_args is not None
+        torch.testing.assert_close(
+            op.call_args.kwargs["row_output_offsets"],
+            torch.tensor([0, 16, 48, 32, 64, 80], dtype=torch.int64),
+        )
+        expected = torch.tensor([0, 2, 5, 4, 6, 7], dtype=torch.float32)[:, None]
+        torch.testing.assert_close(actual, expected.expand(6, 16).reshape(-1))
+
+        actual.sum().backward()
+        rank_major_lengths = torch.tensor([1, 2, 4, 3, 1, 5], dtype=torch.float32)
+        torch.testing.assert_close(
+            pooled.grad, rank_major_lengths.reciprocal()[:, None].expand(6, 16)
+        )
+
+    @parameterized.expand(
         [(device, groups) for device in ("cpu", "tpu") for groups in (1, 2)]
     )
     def test_vbe_rank_major_output_and_grad(self, device: str, num_groups: int) -> None:
@@ -317,7 +484,16 @@ class EBCLookupTest(TestCase):
                     + 10 * (table_idx + 1)
                 )
 
-        actual = lookup(features)
+        if device == "cpu":
+            with patch.object(
+                torch.ops.torchrec,
+                "embedding_pooled_batched_lookup_offset",
+                side_effect=_cpu_vbe_lookup,
+            ) as op:
+                actual = lookup(features)
+            self.assertEqual(op.call_count, num_groups)
+        else:
+            actual = lookup(features)
         self.assertEqual(actual.shape, expected.shape)
         torch.testing.assert_close(actual, expected)
 
