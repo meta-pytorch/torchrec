@@ -22,7 +22,7 @@ backward again -- every compiled dense half pays for its backward twice.
 
 :class:`SplitBackwardBackend` restores the split the way GraphPP does for LLM
 pipelines (torchtitan ``graph_trainer/graph_pp/split_di_dw.py``): export the
-joint graph, partition it with the min-cut partitioner Inductor uses, cut the
+joint graph, partition it with the partitioner Inductor uses, cut the
 backward graph into an input-gradient graph and a weight-gradient graph, and
 compile each separately. The graphs run behind one autograd node that asks the
 engine which of its inputs the current graph task needs, so the pipelining
@@ -30,7 +30,7 @@ helpers drive it unchanged.
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable, cast, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch._inductor
@@ -46,6 +46,27 @@ from torch.fx._lazy_graph_module import _make_graph_module
 
 # Compiles one extracted aten graph against example inputs.
 Compiler = Callable[[fx.GraphModule, Sequence[torch.Tensor]], Callable[..., Any]]
+
+# The name :func:`register_maglev_split_backend` registers by default.
+MAGLEV_SPLIT_BACKEND_NAME = "maglev_split_backward"
+
+
+def _partition(
+    joint: fx.GraphModule,
+    num_fwd_outputs: int,
+    static_lifetime_input_indices: List[int],
+) -> Tuple[fx.GraphModule, fx.GraphModule]:
+    """Partition the joint graph with the partitioner Inductor would use."""
+    custom = torch._inductor.config.custom_partitioner_fn
+    partitioner = min_cut_rematerialization_partition if custom is None else custom
+    # The export returns no joint inputs; the partitioners read the placeholders.
+    return partitioner(
+        joint,
+        (),
+        compiler="inductor",
+        num_fwd_outputs=num_fwd_outputs,
+        static_lifetime_input_indices=static_lifetime_input_indices,
+    )
 
 
 def inductor_compiler(
@@ -227,9 +248,8 @@ class _SplitProgram:
                 "SplitBackwardBackend needs every output to be differentiable; "
                 f"{self.num_outputs - len(tangents)} of {self.num_outputs} are not"
             )
-        fw, bw = min_cut_rematerialization_partition(
+        fw, bw = _partition(
             joint,
-            None,
             num_fwd_outputs=self.num_outputs,
             static_lifetime_input_indices=list(range(len(weights))),
         )
@@ -346,9 +366,13 @@ class SplitBackwardBackend:
     is what dynamo lifts a module's parameters to; every other differentiable
     input belongs to the input half.
 
+    The joint graph is partitioned with Inductor's ``custom_partitioner_fn``
+    when one is set, else with the min-cut partitioner, as Inductor does.
+
     Limitations: static shapes only, and the region must neither mutate its
     inputs nor return a view of one -- the constraints of
-    ``aot_export_joint_simple``, which traces it.
+    ``aot_export_joint_simple``, which traces it. Inductor's joint-graph passes
+    do not run on the region.
 
     Args:
         compiler (Callable): compiles each extracted aten graph against example
@@ -376,3 +400,48 @@ class SplitBackwardBackend:
         ):
             return self._compiler(gm, example_inputs)
         return _SplitProgram(gm, example_inputs, self._compiler)
+
+
+def register_maglev_split_backend(
+    name: str = MAGLEV_SPLIT_BACKEND_NAME, compiler: Compiler = inductor_compiler
+) -> None:
+    """Register :class:`SplitBackwardBackend` as a named ``torch.compile`` backend.
+
+    A config that names its compile backend can then select the split backward.
+    ``torch.compile`` passes a named backend its ``options``, which are Inductor
+    config keys; the registered backend compiles each extracted graph under
+    them. A name that is already registered is left as is.
+
+    Args:
+        name (str): the backend name. Default: ``"maglev_split_backward"``
+        compiler (Callable): compiles each extracted aten graph against example
+            inputs. Default: :func:`inductor_compiler`
+
+    Example::
+
+        >>> register_maglev_split_backend()
+        >>> layer.dense = torch.compile(layer.dense, backend="maglev_split_backward")
+    """
+    if name in torch._dynamo.list_backends():
+        return
+
+    def split_backend(
+        gm: fx.GraphModule,
+        example_inputs: Sequence[Any],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Callable[..., Any]:
+        return SplitBackwardBackend(_with_inductor_options(compiler, options or {}))(
+            gm, example_inputs
+        )
+
+    torch._dynamo.register_backend(split_backend, name=name)
+
+
+def _with_inductor_options(compiler: Compiler, options: Dict[str, Any]) -> Compiler:
+    def compile_with_options(
+        gm: fx.GraphModule, example_inputs: Sequence[torch.Tensor]
+    ) -> Callable[..., Any]:
+        with torch._inductor.config.patch(options):
+            return compiler(gm, example_inputs)
+
+    return compile_with_options
