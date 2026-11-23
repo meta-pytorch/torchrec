@@ -37,6 +37,7 @@ def fused_rowwise_adagrad_update(  # noqa: C901
     indices: jax.Array,
     bag_ids: jax.Array,
     run_offsets: jax.Array,
+    row_output_offsets: jax.Array | None,
     num_runs: jax.Array,
     grad_out: jax.Array,
     emb_tables: jax.Array,
@@ -52,7 +53,8 @@ def fused_rowwise_adagrad_update(  # noqa: C901
         grad_out: [M, D] Gradient for each bag
         indices: [N] the sorted global indices of the table
         bag_index: [N] which bag the index is part of, used to get grad_out
-        run_offsets: Offset of each uniqu eindex
+        run_offsets: Offset of each unique index
+        row_output_offsets: [num_bags] start element offset in grad_out for each input bag.
         emb_tables: Full (stacked) embedding table
         emb_dim: Dimension D of embedding table
 
@@ -103,6 +105,9 @@ def fused_rowwise_adagrad_update(  # noqa: C901
     )
     num_runs_tile = jnp.full((LANE_SIZE,), num_runs, dtype=run_offsets.dtype)
     indices = jnp.pad(indices, (0, LANE_SIZE))
+    if row_output_offsets is not None:
+        # If VBE, rewrite the bag_ids to use the actual output offsets in rank-major order.
+        bag_ids = (row_output_offsets[bag_ids] // emb_dim).astype(jnp.int32)
     bag_ids = jnp.pad(bag_ids, (0, NUMB_IDS_PROCESSED_PER_BAG))
 
     @pl.kernel(  # pyrefly: ignore [missing-attribute]
@@ -315,6 +320,7 @@ def embedding_pooled_batched_lookup_fused_adagrad_bwd_jax(
     lr: jax.Array,
     eps: float,
     emb_dim: int,
+    row_output_offsets: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     sorted_rows, bag_ids, run_offsets, num_runs = (
         pooled_lookup_offset.embedding_pooled_batched_lookup_row_runs_jax(
@@ -329,6 +335,7 @@ def embedding_pooled_batched_lookup_fused_adagrad_bwd_jax(
         sorted_rows,
         bag_ids,
         run_offsets,
+        row_output_offsets,
         num_runs,
         grad_out,
         emb_tables.reshape((-1, emb_dim)),
