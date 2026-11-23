@@ -391,7 +391,6 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
     each embedding is added to it. The embedding dimensions are split to lane size, and so
     only `LANE_SIZE` columns are processed in each step.
 
-
     Notes:
     - Embedding dimensions are padded only for VMEM but not HBM saving memory. However non-16
         multiple embedding dimension is not yet supported.
@@ -430,11 +429,14 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
     # Only do eight batch at a time since it can fit inside a 16-lane offset load
     NUMB_BATCHES_PER_ITERATION = 8  # TODO: Tune this parameter
     LANE_SIZE = 16
-    NUMB_IDS_PROCESSED_PER_STEP = 16  # TODO: Explicitly figure out this formula # IDS gathered per chunk wihtin one batch
+    NUMB_IDS_PROCESSED_PER_STEP = 16  # Gather X number of IDS, indices per bag can vary so we need a fix size here
+    IDS_PER_FETCH = 32  # How many embedding rows to fetch into each buffer
     TILE = 8
     assert NUMB_BATCHES_PER_ITERATION % TILE == 0
     assert NUMB_IDS_PROCESSED_PER_STEP % TILE == 0
     assert NUMB_BATCHES_PER_ITERATION + 1 <= LANE_SIZE
+    assert IDS_PER_FETCH % TILE == 0
+    assert IDS_PER_FETCH % LANE_SIZE == 0
     assert emb_dim == 8 or emb_dim % LANE_SIZE == 0
     num_batches = offsets.shape[0] - 1
 
@@ -474,7 +476,7 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
 
     # Tail-pad the ids so a batch's last tile-aligned chunk cannot read past the end
     # of the array (bounds checks are disabled); the extra rows are masked out.
-    indices = jnp.pad(indices, (0, NUMB_IDS_PROCESSED_PER_STEP), constant_values=0)
+    indices = jnp.pad(indices, (0, IDS_PER_FETCH), constant_values=0)
 
     # Pad the feature/row offsets
     row_offsets = jnp.pad(
@@ -516,10 +518,10 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
         ),
         scratch_types=[
             pltpu.VMEM((LANE_SIZE,), offsets.dtype),  # offsets
-            pltpu.VMEM((2, NUMB_IDS_PROCESSED_PER_STEP), indices.dtype),  # indices
+            pltpu.VMEM((2, IDS_PER_FETCH), indices.dtype),  # indices
             pltpu.VMEM((LANE_SIZE,), offsets.dtype),  # per-batch row offsets
             pltpu.VMEM(
-                (2, NUMB_IDS_PROCESSED_PER_STEP, aligned_emb_dim),
+                (2, IDS_PER_FETCH, aligned_emb_dim),
                 dev_weights.dtype,  # embedding in vmem
             ),
             pltpu.VMEM(
@@ -566,6 +568,7 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
             chunk_id = chunk_id * total_num_subcores + core_id
 
             # Fetch all the offsets in bulk at once that requires to be processed by subcore
+            # in bulk implies it grabs all `NUMB_BATCHES_PER_ITERATION` offsets
             base = pl.multiple_of(
                 chunk_id * NUMB_BATCHES_PER_ITERATION,
                 TILE,
@@ -620,138 +623,183 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
             offsets_reg = offsets_vmem[...]
             row_offsets_reg = row_offsets_vmem[...]
 
-            def _gather(base, slot, off_start, off_end, row_offset):
-                # Copy the sync indices on chunks based due to VMEM shortage
+            def _gather_group_of_embeddings(
+                base,
+                slot,
+                group_start,
+                group_end,
+                group_offsets,
+                group_row_offsets,
+                num_group_bags,
+            ):
+                """Gather a `IDS_PER_FETCH` number of embedding rows from `indices`."""
+                # 1. Grab `IDS_PER_FETCH` indices
                 base = pl.multiple_of(base, TILE)
                 pltpu.sync_copy(
-                    indices_hbm.at[pl.ds(base, NUMB_IDS_PROCESSED_PER_STEP)],
+                    indices_hbm.at[pl.ds(base, IDS_PER_FETCH)],
                     indices_vmem.at[slot],
                 )
 
-                positions = base + jnp.arange(NUMB_IDS_PROCESSED_PER_STEP)
-                valid = (positions >= off_start) & (positions < off_end)
+                # 2. Convert indices to be global across tables
+                # Go through each lane_size of IDS_PER_FETCH
+                @pl.loop(0, IDS_PER_FETCH, step=LANE_SIZE, unroll=True)
+                def _create_global_indices(i_lane, indices_vmem=indices_vmem):
+                    # Make sure the indices grabbed are within the group of bag offsets.
+                    positions = base + jnp.arange(LANE_SIZE) + i_lane
+                    valid = (positions >= group_start) & (positions < group_end)
 
-                indices_vmem[slot, ...] = (
-                    jnp.where(valid, indices_vmem[slot, ...], 0) + row_offset
-                )
+                    # `per_id_offsets` is where the global offsets are stored
+                    indices_offsets = jnp.zeros(
+                        (LANE_SIZE,), dtype=row_offsets_reg.dtype
+                    )
 
-                # Start copying the weights
+                    # Bags can cross boundaries of indices, e.g. [i_0, i_1, i_2] can be 2/3 bags
+                    # TODO: Check if better to make this unrolled loop
+                    for i_bag in range(num_group_bags):
+                        is_part_of_this_bag = (positions >= group_offsets[i_bag]) & (
+                            positions < group_offsets[i_bag + 1]
+                        )
+
+                        # Update the indices of this bag
+                        indices_offsets = jnp.where(
+                            is_part_of_this_bag,
+                            group_row_offsets[i_bag],
+                            indices_offsets,
+                        )
+
+                    # Figure out which indices are part of which table/feature
+                    indices_vmem[slot, pl.ds(i_lane, LANE_SIZE)] = jnp.where(
+                        valid,
+                        indices_vmem[slot, pl.ds(i_lane, LANE_SIZE)] + indices_offsets,
+                        0,
+                    )
+
+                # 3. Grab the `IDS_PER_FETCH` embeddings rows from global indices
                 pltpu.make_async_copy(
                     weights_hbm.at[plsc.Indices(indices_vmem.at[slot])],
                     buf_vmem.at[slot],
                     sem.at[slot],
                 ).start()
 
-            def _wait(slot):
+            def _wait_for_embeddings(slot):
                 pltpu.make_async_copy(
                     weights_hbm.at[plsc.Indices(indices_vmem.at[slot])],
                     buf_vmem.at[slot],
                     sem.at[slot],
                 ).wait()
 
-            # Go through each batch per iteration
-            for i_batch in range(NUMB_BATCHES_PER_ITERATION):
-                # Grab the offset start and end
-                off_start, off_end = offsets_reg[i_batch], offsets_reg[i_batch + 1]
+            # First bag and last bag to calculate the number of IDS to do at a time
+            off_start = offsets_reg[0]
+            off_end = offsets_reg[NUMB_BATCHES_PER_ITERATION]
+            aligned_start = (off_start // TILE) * TILE
+            num_group_bags = NUMB_BATCHES_PER_ITERATION
+            num_id_chunks = jnp.where(
+                off_start == off_end,
+                0,
+                (off_end - aligned_start + IDS_PER_FETCH - 1) // IDS_PER_FETCH,
+            )
 
-                # Row offset of the table this batch's feature maps into.
-                feat_offset = row_offsets_reg[i_batch]
-
-                # An HBM slice has to start on a tile boundary, and so masking is required
-                aligned_start = (off_start // TILE) * TILE
-
-                # Mask the number of batches needed to be processed per step
-                numb_id_chunks = jnp.where(
-                    off_end == off_start,
-                    0,
-                    (off_end - aligned_start + NUMB_IDS_PROCESSED_PER_STEP - 1)
-                    // NUMB_IDS_PROCESSED_PER_STEP,
-                )
+            @pl.loop(0, num_id_chunks)
+            def _process_shared_id_chunk(i_id_chunk):
+                # The goal is to fetch `IDS_PER_FETCH` at a time
+                new_base = aligned_start + i_id_chunk * IDS_PER_FETCH
 
                 # Grab the initial chunk of ids and rows
-                @pl.when(numb_id_chunks > 0)
-                def _(
-                    aligned_start=aligned_start,
+                @pl.when(i_id_chunk == 0)
+                def _get_initial_emb(
+                    new_base=new_base,
                     off_start=off_start,
                     off_end=off_end,
-                    feat_offset=feat_offset,
+                    offsets_reg=offsets_reg,
+                    row_offsets_reg=row_offsets_reg,
                 ):
                     pingpong_id = 0
-                    _gather(aligned_start, pingpong_id, off_start, off_end, feat_offset)
+                    _gather_group_of_embeddings(
+                        new_base,
+                        pingpong_id,
+                        off_start,
+                        off_end,
+                        offsets_reg,
+                        row_offsets_reg,
+                        num_group_bags,
+                    )
 
-                @pl.loop(0, numb_id_chunks)
-                def _process_cols(
-                    i_id_chunk,
-                    i=i_batch,
-                    numb_id_chunks=numb_id_chunks,
-                    off_end=off_end,
-                    off_start=off_start,
-                    aligned_start=aligned_start,
-                    feat_offset=feat_offset,
-                ):
+                @pl.when(i_id_chunk >= 0)
+                def _start_emb_pool_loop():
                     # Current pingpong id/batch
                     pingpong_id = i_id_chunk % 2
 
-                    @pl.when(i_id_chunk + 1 < numb_id_chunks)
-                    def _(
+                    @pl.when(i_id_chunk + 1 < num_id_chunks)
+                    def _gather_next_set_of_embeddings(
                         i_id_chunk=i_id_chunk,
-                        aligned_start=aligned_start,
                         off_start=off_start,
                         off_end=off_end,
-                        feat_offset=feat_offset,
+                        offsets_reg=offsets_reg,
+                        row_offsets_reg=row_offsets_reg,
                     ):
                         # Alternate to do the next set of ids
                         next_pingpong_id = (i_id_chunk + 1) % 2
 
                         # Grab the next chunk of ids and their embedding.
-                        _gather(
-                            aligned_start
-                            + (i_id_chunk + 1) * NUMB_IDS_PROCESSED_PER_STEP,
+                        _gather_group_of_embeddings(
+                            aligned_start + (i_id_chunk + 1) * IDS_PER_FETCH,
                             next_pingpong_id,
                             off_start,
                             off_end,
-                            feat_offset,
+                            offsets_reg,
+                            row_offsets_reg,
+                            num_group_bags,
                         )
 
                     # Wait for the ids/embedding rows to arrive
-                    _wait(pingpong_id)
+                    _wait_for_embeddings(pingpong_id)
 
-                    # Do masking over ids within a batch. The chunk is tile-aligned
-                    # so it can start before the batch does: mask both ends.
-                    chunk_base = (
-                        aligned_start + i_id_chunk * NUMB_IDS_PROCESSED_PER_STEP
-                    )
-                    one = jnp.ones((LANE_SIZE,), dtype=post_pooled_emb_vmem.dtype)
-                    zero = jnp.zeros((LANE_SIZE,), dtype=post_pooled_emb_vmem.dtype)
-                    masks = [
-                        jnp.where(
-                            (chunk_base + row >= off_start)
-                            & (chunk_base + row < off_end),
-                            one,
-                            zero,
+                    for i_batch in range(NUMB_BATCHES_PER_ITERATION):
+                        # Get the offsets for this bag
+                        bag_start, bag_end = (
+                            offsets_reg[i_batch],
+                            offsets_reg[i_batch + 1],
                         )
-                        for row in range(NUMB_IDS_PROCESSED_PER_STEP)
-                    ]
 
-                    # Do pooling of the embedding table by going through column dimension
-                    # TODO: Benchmark with different temp arrays for the summation.
-                    @plsc.parallel_loop(0, aligned_emb_dim, step=LANE_SIZE)
-                    def _cols(i_col, i=i, masks=masks, pingpong_id=pingpong_id):
-                        col_ids = pl.ds(i_col, LANE_SIZE)
+                        # Do masking over ids within a batch. The chunk is tile-aligned
+                        # so it can start before the batch does: mask both ends.
+                        # Because our IDs chuck can span across different bags
+                        chunk_base = aligned_start + i_id_chunk * IDS_PER_FETCH
+                        one = jnp.ones((LANE_SIZE,), dtype=post_pooled_emb_vmem.dtype)
+                        zero = jnp.zeros((LANE_SIZE,), dtype=post_pooled_emb_vmem.dtype)
+                        masks = [
+                            jnp.where(
+                                (chunk_base + row >= bag_start)
+                                & (chunk_base + row < bag_end),
+                                one,
+                                zero,
+                            )
+                            for row in range(IDS_PER_FETCH)
+                        ]
 
-                        # Mask due to the embedding dimension not being alined to the lane-size
-                        lane_ids = i_col + jnp.arange(LANE_SIZE)
-                        valid_lanes = lane_ids < emb_dim
+                        # Do pooling of the embedding table by going through column dimension
+                        # TODO: Benchmark with different temp arrays for the summation.
+                        @plsc.parallel_loop(0, aligned_emb_dim, step=LANE_SIZE)
+                        def _cols(
+                            i_col, i=i_batch, masks=masks, pingpong_id=pingpong_id
+                        ):
+                            col_ids = pl.ds(i_col, LANE_SIZE)
 
-                        # Accumulate it in the first row of temp buffer
-                        total = post_pooled_emb_vmem[i, col_ids]
+                            # Mask due to the embedding dimension not being alined to the lane-size
+                            lane_ids = i_col + jnp.arange(LANE_SIZE)
+                            valid_lanes = lane_ids < emb_dim
 
-                        # Each subcore goes through certain number of IDS within its batch
-                        for row in range(NUMB_IDS_PROCESSED_PER_STEP):
-                            embs_out = buf_vmem[pingpong_id, row, col_ids]
-                            masked_emb = jnp.where(valid_lanes, embs_out, 0)
-                            total = total + masked_emb * masks[row]
-                        post_pooled_emb_vmem[i, col_ids] = total
+                            # Accumulate it in the first row of temp buffer
+                            total = post_pooled_emb_vmem[i, col_ids]
+
+                            # Each subcore goes through certain number of IDS within its batch
+                            for row in range(IDS_PER_FETCH):
+                                embs_out = buf_vmem[pingpong_id, row, col_ids]
+                                masked_emb = jnp.where(valid_lanes, embs_out, 0)
+                                total = total + jnp.where(
+                                    masks[row] != 0, masked_emb, 0
+                                )
+                            post_pooled_emb_vmem[i, col_ids] = total
 
             # Post pooled_emb_vmem has size (NUMB_BATCHES_PER_ITERATION, aligned_emb_dim)
             destination_indices = output_rows_vmem.at[
