@@ -161,34 +161,74 @@ def embedding_pooled_lookup_offset_backward_tpu(
     )
 
 
+def _vbe_options(
+    row_output_offsets: torch.Tensor | None, emb_dim: int
+) -> dict[str, torch.Tensor]:
+    if row_output_offsets is None:
+        return {}
+    if (row_output_offsets.numel() - 1) * emb_dim > torch.iinfo(torch.int32).max:
+        raise ValueError("VBE row output offsets must fit in int32")
+    # TODO: Enable int64 once model parity is reached
+    return {"row_output_offsets": row_output_offsets.to(torch.int32)}
+
+
 def embedding_pooled_batched_lookup_offset_tpu(
-    indices, offsets, weights, row_offsets, emb_dim
+    indices,
+    offsets,
+    weights,
+    row_offsets,
+    emb_dim,
+    row_output_offsets=None,
 ):
+    vbe_options = _vbe_options(row_output_offsets, emb_dim)
     return _pooled_batched_offset_fwd(
         indices=indices,
         offsets=offsets,
         dev_weights=weights,
         row_offsets=row_offsets,
         emb_dim=emb_dim,
+        **vbe_options,
     )
 
 
 def embedding_pooled_batched_lookup_offset_fused_adagrad_tpu(
-    indices, offsets, weights, row_offsets, momentum, lr, eps, emb_dim
+    indices,
+    offsets,
+    weights,
+    row_offsets,
+    momentum,
+    lr,
+    eps,
+    emb_dim,
+    row_output_offsets=None,
 ):
     return embedding_pooled_batched_lookup_offset_tpu(
-        indices, offsets, weights, row_offsets, emb_dim
+        indices,
+        offsets,
+        weights,
+        row_offsets,
+        emb_dim,
+        row_output_offsets=row_output_offsets,
     )
 
 
 def embedding_pooled_batched_lookup_offset_adagrad_update_tpu(
-    grad_out, indices, offsets, row_offsets, weights, momentum, lr, eps
+    grad_out,
+    indices,
+    offsets,
+    row_offsets,
+    weights,
+    momentum,
+    lr,
+    eps,
+    row_output_offsets=None,
 ):
     if grad_out.dtype != torch.float32:
         raise NotImplementedError(
             "Fused TPU rowwise Adagrad requires float32 gradients; "
             f"got {grad_out.dtype}. Ask TorchRec for feature request."
         )
+    vbe_options = _vbe_options(row_output_offsets, grad_out.shape[1])
     lr = torch.tensor(lr, dtype=grad_out.dtype, device=weights.device)
     new_weights, new_momentum = _pooled_batched_offset_adagrad_update(
         grad_out=grad_out,
@@ -200,14 +240,23 @@ def embedding_pooled_batched_lookup_offset_adagrad_update_tpu(
         lr=lr,
         eps=eps,
         emb_dim=grad_out.shape[1],
+        **vbe_options,
     )
     weights.set_(new_weights)
     momentum.set_(new_momentum)
 
 
 def embedding_pooled_batched_lookup_offset_backward_tpu(
-    grad_out, indices, offsets, row_offsets, num_rows, emb_dim, flat_weights=False
+    grad_out,
+    indices,
+    offsets,
+    row_offsets,
+    num_rows,
+    emb_dim,
+    flat_weights=False,
+    row_output_offsets=None,
 ):
+    vbe_options = _vbe_options(row_output_offsets, emb_dim)
     return _pooled_batched_offset_bwd(
         grad_out=grad_out,
         indices=indices,
@@ -216,6 +265,7 @@ def embedding_pooled_batched_lookup_offset_backward_tpu(
         num_rows=num_rows,
         emb_dim=emb_dim,
         flat_weights=flat_weights,
+        **vbe_options,
     )
 
 
