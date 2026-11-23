@@ -42,23 +42,24 @@ def _padded_rows(
 def _pad_segments(
     packed: torch.Tensor, split_sizes: Sequence[int], padded_split_size: int
 ) -> torch.Tensor:
-    rows, valid = _padded_rows(split_sizes, padded_split_size, packed.device)
-    if packed.shape[0] == 0:
-        padding = packed.new_zeros((rows.numel(), *packed.shape[1:]))
-        return torch.cat([packed, padding], dim=0)
-    gathered = packed.index_select(0, torch.where(valid, rows, 0))
-    return gathered.masked_fill(~valid.view(-1, *[1] * (packed.ndim - 1)), 0)
+    pieces: list[torch.Tensor] = []
+    for segment, size in zip(packed.split(list(split_sizes), dim=0), split_sizes):
+        pieces.append(segment)
+        if size < padded_split_size:
+            pieces.append(
+                packed.new_zeros((padded_split_size - size, *packed.shape[1:]))
+            )
+    return torch.cat(pieces, dim=0)
 
 
 def _unpad_segments(
     padded: torch.Tensor, split_sizes: Sequence[int], padded_split_size: int
 ) -> torch.Tensor:
-    rows, valid = _padded_rows(split_sizes, padded_split_size, padded.device)
-    total = sum(split_sizes)
-    # Padding rows all land in one extra row that is sliced off.
-    destination = torch.where(valid, rows, total)
-    packed = padded.new_zeros((total + 1, *padded.shape[1:]))
-    return packed.index_copy(0, destination, padded)[:total]
+    source_blocks = padded.split(padded_split_size, dim=0)
+    return torch.cat(
+        [source_block[:size] for source_block, size in zip(source_blocks, split_sizes)],
+        dim=0,
+    )
 
 
 def _pad_dim0(tensor: torch.Tensor, size: int) -> torch.Tensor:
@@ -88,7 +89,7 @@ def padded_all_to_all_single(
     KJT uses the default raw collective. Pooled embeddings inject TorchRec's existing
     autograd-aware even collective to preserve backward behavior.
 
-    ``vectorized`` pads and unpads with index ops instead of a per-rank loop.
+    ``vectorized`` assembles input segments and padding in one concatenation.
     """
     world_size = group.size()
     if input_tensor.ndim == 0:
@@ -129,16 +130,7 @@ def padded_all_to_all_single(
             f"expected {expected_shape}"
         )
 
-    if vectorized:
-        return _unpad_segments(padded_output, output_split_sizes, padded_split_size)
-    source_blocks = padded_output.split(padded_split_size, dim=0)
-    return torch.cat(
-        [
-            source_block[:output_size]
-            for source_block, output_size in zip(source_blocks, output_split_sizes)
-        ],
-        dim=0,
-    )
+    return _unpad_segments(padded_output, output_split_sizes, padded_split_size)
 
 
 def _global_padding_metadata(
