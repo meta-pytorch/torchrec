@@ -563,28 +563,30 @@ def _generate_vbe_row_output_offsets(
     num_features = B_offsets.shape[0] - 1
     num_ranks = B_offsets_rank_per_feature.shape[1] - 1
     chunk_counts = torch.diff(B_offsets_rank_per_feature, dim=1).flatten()
-    chunk_ids = torch.repeat_interleave(
-        torch.arange(
-            num_features * num_ranks,
-            dtype=B_offsets.dtype,
-            device=B_offsets.device,
-        ),
+    # Global bag boundaries are indexed by feature and rank, with shape [F, W + 1].
+    # e.g. F=2, W=2, [[0, 2, 5], [5, 6, 8]]: f0/rank0 uses [0, 2).
+    chunk_starts = (B_offsets[:-1, None] + B_offsets_rank_per_feature[:, :-1]).to(
+        output_offsets_feature_rank.dtype
+    )
+    # Output metadata is indexed in rank-major order.
+    output_starts = (
+        output_offsets_feature_rank[:-1]
+        .reshape(num_ranks, num_features)
+        .transpose(0, 1)
+    )
+    # Bag index within its feature/rank chunk is bag_id - chunk_start.
+    chunk_bias = output_starts - chunk_starts * emb_dim
+    bag_bias = torch.repeat_interleave(
+        chunk_bias.flatten(),
         chunk_counts,
         output_size=num_bags,
     )
-    features = chunk_ids // num_ranks
-    ranks = chunk_ids % num_ranks
-    bag_ids = torch.arange(num_bags, dtype=B_offsets.dtype, device=B_offsets.device)
-    # Global bag boundaries are indexed by feature and rank, with shape [F, W + 1].
-    # e.g. F=2, W=2, [[0, 2, 5], [5, 6, 8]]: f0/rank0 uses [0, 2).
-    chunk_starts = B_offsets[features] + B_offsets_rank_per_feature[features, ranks]
-    # Bag index within its feature/rank chunk.
-    bags_in_chunk = (bag_ids - chunk_starts).to(output_offsets_feature_rank.dtype)
-    # Output metadata is indexed in rank-major order.
-    return (
-        output_offsets_feature_rank[ranks * num_features + features]
-        + bags_in_chunk * emb_dim
+    bag_ids = torch.arange(
+        num_bags,
+        dtype=output_offsets_feature_rank.dtype,
+        device=B_offsets.device,
     )
+    return bag_ids * emb_dim + bag_bias
 
 
 def _setup_pooled_batched_offset_context(ctx, inputs, output) -> None:
