@@ -84,18 +84,18 @@ import torch.fx
 from torch import nn
 
 # @manual
-from torch.distributed._shard.sharded_tensor import (  # noqa
-    Shard,
-    ShardedTensor,
-    ShardedTensorMetadata,
-    TensorProperties,
+from torch.distributed._shard.sharded_tensor import (
+    Shard as Shard,
+    ShardedTensor as ShardedTensor,
+    ShardedTensorMetadata as ShardedTensorMetadata,
+    TensorProperties as TensorProperties,
 )
 
 # @manual
-from torch.distributed._shard.sharding_spec import (  # noqa
-    EnumerableShardingSpec,
-    ShardingSpec,
-    ShardMetadata,
+from torch.distributed._shard.sharding_spec import (
+    EnumerableShardingSpec as EnumerableShardingSpec,
+    ShardingSpec as ShardingSpec,
+    ShardMetadata as ShardMetadata,
 )
 from torchrec.streamable import Multistreamable
 

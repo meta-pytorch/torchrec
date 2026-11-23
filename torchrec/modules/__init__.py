@@ -23,14 +23,14 @@ These modules include:
       passed to provided interaction module.
 """
 
-from . import (  # noqa  # noqa  # noqa  # noqa  # noqa  # noqa  # noqa  # noqa  # noqa
-    activation,
-    crossnet,
-    deepfm,
-    embedding_configs,
-    embedding_modules,
-    embedding_tower,
-    feature_processor,
-    lazy_extension,
-    mlp,
+from . import (
+    activation as activation,
+    crossnet as crossnet,
+    deepfm as deepfm,
+    embedding_configs as embedding_configs,
+    embedding_modules as embedding_modules,
+    embedding_tower as embedding_tower,
+    feature_processor as feature_processor,
+    lazy_extension as lazy_extension,
+    mlp as mlp,
 )

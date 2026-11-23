@@ -26,7 +26,7 @@ except ImportError:
         "torchrec.modules.embedding_configs.import_failure.tbe_config_types"
     )
     from fbgemm_gpu.split_table_batched_embeddings_ops_common import PoolingMode
-from torchrec.types import DataType
+from torchrec.types import DataType as DataType
 
 
 @unique

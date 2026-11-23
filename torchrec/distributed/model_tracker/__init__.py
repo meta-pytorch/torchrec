@@ -20,16 +20,16 @@ Key features include:
 - Compaction of tracked data to reduce memory usage
 """
 
-from torchrec.distributed.model_tracker.delta_store import DeltaStore  # noqa
+from torchrec.distributed.model_tracker.delta_store import DeltaStore as DeltaStore
 from torchrec.distributed.model_tracker.model_delta_tracker import (
-    ModelDeltaTracker,  # noqa
-    SUPPORTED_MODULES,  # noqa
+    ModelDeltaTracker as ModelDeltaTracker,
+    SUPPORTED_MODULES as SUPPORTED_MODULES,
 )
 from torchrec.distributed.model_tracker.types import (
-    IndexedLookup,  # noqa
-    ModelTrackerConfigs,  # noqa
-    Trackers,  # noqa
-    TrackingMode,  # noqa
-    UniqueRows,  # noqa
-    UpdateMode,  # noqa
+    IndexedLookup as IndexedLookup,
+    ModelTrackerConfigs as ModelTrackerConfigs,
+    Trackers as Trackers,
+    TrackingMode as TrackingMode,
+    UniqueRows as UniqueRows,
+    UpdateMode as UpdateMode,
 )
