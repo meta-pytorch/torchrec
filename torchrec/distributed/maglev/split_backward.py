@@ -22,15 +22,16 @@ backward again -- every compiled dense half pays for its backward twice.
 
 :class:`SplitBackwardBackend` restores the split the way GraphPP does for LLM
 pipelines (torchtitan ``graph_trainer/graph_pp/split_di_dw.py``): export the
-joint graph, partition it with the min-cut partitioner Inductor uses, cut the
+joint graph, partition it with the partitioner Inductor uses, cut the
 backward graph into an input-gradient graph and a weight-gradient graph, and
 compile each separately. The graphs run behind one autograd node that asks the
 engine which of its inputs the current graph task needs, so the pipelining
 helpers drive it unchanged.
 """
 
+import copy
 from dataclasses import dataclass
-from typing import Any, Callable, cast, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, cast, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch._inductor
@@ -46,6 +47,27 @@ from torch.fx._lazy_graph_module import _make_graph_module
 
 # Compiles one extracted aten graph against example inputs.
 Compiler = Callable[[fx.GraphModule, Sequence[torch.Tensor]], Callable[..., Any]]
+
+# The name :func:`register_maglev_split_backend` registers by default.
+MAGLEV_SPLIT_BACKEND_NAME = "maglev_split_backward"
+
+
+def _partition(
+    joint: fx.GraphModule,
+    num_fwd_outputs: int,
+    static_lifetime_input_indices: List[int],
+) -> Tuple[fx.GraphModule, fx.GraphModule]:
+    """Partition the joint graph with the partitioner Inductor would use."""
+    custom = torch._inductor.config.custom_partitioner_fn
+    partitioner = min_cut_rematerialization_partition if custom is None else custom
+    # The export returns no joint inputs; the partitioners read the placeholders.
+    return partitioner(
+        joint,
+        (),
+        compiler="inductor",
+        num_fwd_outputs=num_fwd_outputs,
+        static_lifetime_input_indices=static_lifetime_input_indices,
+    )
 
 
 def inductor_compiler(
@@ -183,6 +205,58 @@ def _engine_visible(primal: torch.Tensor) -> torch.Tensor:
     return primal
 
 
+def _export_joint(
+    forward: Callable[..., Tuple[torch.Tensor, ...]],
+    primals: Tuple[torch.Tensor, ...],
+) -> fx.GraphModule:
+    """The joint graph of ``forward``, with its outputs copied if one aliases an input.
+
+    ``aot_export_joint_simple`` refuses an output that is a view of an input: a
+    region that hands an input on reshaped, or through a ``.to`` that is a no-op.
+    A copy carries the same value and the same gradient.
+    """
+    try:
+        return cast(
+            fx.GraphModule,
+            aot_export_joint_simple(forward, primals, trace_joint=True),
+        )
+    except RuntimeError as error:
+        if "outputs that alias inputs" not in str(error):
+            raise
+
+    def copied(*args: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        return tuple(output.clone() for output in forward(*args))
+
+    return cast(
+        fx.GraphModule, aot_export_joint_simple(copied, primals, trace_joint=True)
+    )
+
+
+def _differentiable_outputs(gm: fx.GraphModule) -> List[bool]:
+    """Per output of a dynamo graph, whether it requires grad; True when unknown."""
+    (output,) = gm.graph.find_nodes(op="output")
+    flags = []
+    for node in output.args[0]:
+        if not isinstance(node, fx.Node):
+            flags.append(False)
+            continue
+        value = node.meta.get("example_value", node.meta.get("val"))
+        flags.append(
+            value.requires_grad if isinstance(value, torch.Tensor) else value is None
+        )
+    return flags
+
+
+def _with_outputs(gm: fx.GraphModule, keep: Sequence[int]) -> fx.GraphModule:
+    """``gm`` returning only its outputs at ``keep``; its attributes are shared."""
+    graph = copy.deepcopy(gm.graph)
+    (output,) = graph.find_nodes(op="output")
+    outputs = output.args[0]
+    output.args = (tuple(outputs[i] for i in keep),)
+    graph.eliminate_dead_code()
+    return fx.GraphModule(gm, graph)
+
+
 class _SplitProgram:
     """One dynamo graph as forward, input-gradient and weight-gradient graphs."""
 
@@ -209,13 +283,8 @@ class _SplitProgram:
                 args[slot] = primal
             return tuple(gm(*args))
 
-        joint = cast(
-            fx.GraphModule,
-            aot_export_joint_simple(
-                forward,
-                tuple(example_inputs[slot] for slot in self.order),
-                trace_joint=True,
-            ),
+        joint = _export_joint(
+            forward, tuple(example_inputs[slot] for slot in self.order)
         )
         tangents = [
             node.name
@@ -227,9 +296,8 @@ class _SplitProgram:
                 "SplitBackwardBackend needs every output to be differentiable; "
                 f"{self.num_outputs - len(tangents)} of {self.num_outputs} are not"
             )
-        fw, bw = min_cut_rematerialization_partition(
+        fw, bw = _partition(
             joint,
-            None,
             num_fwd_outputs=self.num_outputs,
             static_lifetime_input_indices=list(range(len(weights))),
         )
@@ -267,6 +335,43 @@ class _SplitProgram:
     def __call__(self, *args: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         primals = [_engine_visible(args[slot]) for slot in self.order]
         return _SplitBackwardFunction.apply(self, *primals)
+
+
+class _MixedProgram:
+    """A dynamo graph with both differentiable and non-differentiable outputs.
+
+    The differentiable outputs go through a :class:`_SplitProgram`. The others
+    take no gradient, so they come from a second, inference-only graph over the
+    same inputs; it recomputes whatever they share with the first, which for the
+    outputs seen so far (index maps, ``empty_like`` buffers) is little.
+    """
+
+    def __init__(
+        self,
+        gm: fx.GraphModule,
+        example_inputs: Sequence[torch.Tensor],
+        differentiable: Sequence[bool],
+        compiler: Compiler,
+    ) -> None:
+        self.differentiable: Tuple[bool, ...] = tuple(differentiable)
+        keep = [i for i, flag in enumerate(differentiable) if flag]
+        rest = [i for i, flag in enumerate(differentiable) if not flag]
+        self.split_program = _SplitProgram(
+            _with_outputs(gm, keep), example_inputs, compiler
+        )
+        with torch.no_grad():
+            self.plain: Callable[..., Any] = compiler(
+                _with_outputs(gm, rest), example_inputs
+            )
+
+    def __call__(self, *args: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        split_outputs = iter(self.split_program(*args))
+        with torch.no_grad():
+            plain_outputs = iter(self.plain(*args))
+        return tuple(
+            next(split_outputs) if flag else next(plain_outputs)
+            for flag in self.differentiable
+        )
 
 
 def _scatter(
@@ -346,9 +451,16 @@ class SplitBackwardBackend:
     is what dynamo lifts a module's parameters to; every other differentiable
     input belongs to the input half.
 
-    Limitations: static shapes only, and the region must neither mutate its
-    inputs nor return a view of one -- the constraints of
-    ``aot_export_joint_simple``, which traces it.
+    An output that is a view of an input is returned as a copy, and outputs that
+    take no gradient come from a separate inference graph; a region with no
+    differentiable output is compiled as is.
+
+    The joint graph is partitioned with Inductor's ``custom_partitioner_fn``
+    when one is set, else with the min-cut partitioner, as Inductor does.
+
+    Limitations: static shapes only, and the region must not mutate its inputs
+    -- constraints of ``aot_export_joint_simple``, which traces it. Inductor's
+    joint-graph passes do not run on the region.
 
     Args:
         compiler (Callable): compiles each extracted aten graph against example
@@ -375,4 +487,54 @@ class SplitBackwardBackend:
             and any(value.requires_grad for value in example_inputs)
         ):
             return self._compiler(gm, example_inputs)
+        differentiable = _differentiable_outputs(gm)
+        if not any(differentiable):
+            return self._compiler(gm, example_inputs)
+        if not all(differentiable):
+            return _MixedProgram(gm, example_inputs, differentiable, self._compiler)
         return _SplitProgram(gm, example_inputs, self._compiler)
+
+
+def register_maglev_split_backend(
+    name: str = MAGLEV_SPLIT_BACKEND_NAME, compiler: Compiler = inductor_compiler
+) -> None:
+    """Register :class:`SplitBackwardBackend` as a named ``torch.compile`` backend.
+
+    A config that names its compile backend can then select the split backward.
+    ``torch.compile`` passes a named backend its ``options``, which are Inductor
+    config keys; the registered backend compiles each extracted graph under
+    them. A name that is already registered is left as is.
+
+    Args:
+        name (str): the backend name. Default: ``"maglev_split_backward"``
+        compiler (Callable): compiles each extracted aten graph against example
+            inputs. Default: :func:`inductor_compiler`
+
+    Example::
+
+        >>> register_maglev_split_backend()
+        >>> layer.dense = torch.compile(layer.dense, backend="maglev_split_backward")
+    """
+    if name in torch._dynamo.list_backends():
+        return
+
+    def split_backend(
+        gm: fx.GraphModule,
+        example_inputs: Sequence[Any],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Callable[..., Any]:
+        return SplitBackwardBackend(_with_inductor_options(compiler, options or {}))(
+            gm, example_inputs
+        )
+
+    torch._dynamo.register_backend(split_backend, name=name)
+
+
+def _with_inductor_options(compiler: Compiler, options: Dict[str, Any]) -> Compiler:
+    def compile_with_options(
+        gm: fx.GraphModule, example_inputs: Sequence[torch.Tensor]
+    ) -> Callable[..., Any]:
+        with torch._inductor.config.patch(options):
+            return compiler(gm, example_inputs)
+
+    return compile_with_options
