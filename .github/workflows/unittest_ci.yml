@@ -48,8 +48,6 @@ jobs:
         os:
           - mt-l-x86aavx2-45-167-a10g-4
         python:
-          - version: "3.10"
-            tag: "py310"
           - version: "3.11"
             tag: "py311"
           - version: "3.12"
@@ -108,10 +106,6 @@ jobs:
           - is_pr: true
             cuda-tag: "cu130"
             python:
-              version: "3.10"
-          - is_pr: true
-            cuda-tag: "cu130"
-            python:
               version: "3.11"
           - is_pr: true
             cuda-tag: "cu130"
@@ -150,10 +144,6 @@ jobs:
             python:
               version: "3.15"
               free_threaded: true
-          - is_main_push: true
-            cuda-tag: "cu130"
-            python:
-              version: "3.10"
           - is_main_push: true
             cuda-tag: "cu130"
             python:
@@ -200,14 +190,14 @@ jobs:
         fi
         echo "index_url: $index_url"
         conda run -n build_binary \
-          pip install torch --index-url $index_url
+          pip install torch==2.15.0 --index-url $index_url
         conda run -n build_binary \
           python -c "import torch; print(torch.__version__)"
         echo "torch succeeded"
         conda run -n build_binary \
           python -c "import torch.distributed"
         conda run -n build_binary \
-          pip install fbgemm-gpu --index-url $index_url
+          pip install fbgemm-gpu==1.10.0 --index-url $index_url
         conda run -n build_binary \
           python -c "import fbgemm_gpu; print(fbgemm_gpu.__version__)"
         echo "fbgemm_gpu succeeded"

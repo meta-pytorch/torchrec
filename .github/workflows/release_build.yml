@@ -24,10 +24,6 @@ jobs:
       matrix:
         include:
           - os: mt-l-x86iavx512-8-64
-            python-version: '3.10'
-            python-tag: "py310"
-            cuda-tag: "cu126"
-          - os: mt-l-x86iavx512-8-64
             python-version: '3.11'
             python-tag: "py311"
             cuda-tag: "cu126"
@@ -70,12 +66,12 @@ jobs:
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
-          conda run -n build_binary pip install torch
+          conda run -n build_binary pip install torch==2.15.0
       - name: Install fbgemm
         shell: bash
         run: |
           conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu
+          conda run -n build_binary pip install fbgemm-gpu==1.10.0
       - name: Install Dependencies
         shell: bash
         run: |
@@ -116,7 +112,6 @@ jobs:
         os:
           - mt-l-x86aavx2-11-41-a10g
         python-version:
-          - "3.10"
           - "3.11"
           - "3.12"
           - "3.13"
@@ -161,13 +156,13 @@ jobs:
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
-          conda run -n build_binary pip install torch
+          conda run -n build_binary pip install torch==2.15.0
       # download wheel from GHA
       - name: Install fbgemm
         shell: bash
         run: |
           conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu
+          conda run -n build_binary pip install fbgemm-gpu==1.10.0
       - name: Install torchmetrics
         shell: bash
         run: |
