@@ -2430,6 +2430,80 @@ class SplitsAllToAllOverflowDebugGatingTest(unittest.TestCase):
         self.assertEqual(self._count_reads(overflow_debug=True), 2)
 
 
+class SplitsAllToAllMismatchDiagnosticsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        dist.init_process_group(
+            backend="gloo",
+            store=dist.FileStore(os.path.join(tmpdir.name, "store"), 1),
+            rank=0,
+            world_size=1,
+        )
+        self.addCleanup(dist.destroy_process_group)
+        self.enterContext(patch.object(cu, "_USE_COLLECTIVE_VALIDATION", True))
+        # Prevent deliberately corrupted test metadata from emitting real events.
+        self.log_event = self.enterContext(
+            patch.object(dist_data.EventLoggingHandler, "log_event")
+        )
+        self.pg = none_throws(dist.group.WORLD)
+        self.awaitable = SplitsAllToAllAwaitable(
+            input_tensors=[torch.tensor([3], dtype=torch.int64)],
+            pg=self.pg,
+            collective_tag=42,
+            collective_tag_parts=("sequence_test",),
+        )
+        self.work = self.awaitable._splits_awaitable
+
+    def test_mismatch_reports_its_work_not_later_pg_sequence(self) -> None:
+        sequence = self.work._get_sequence_number()
+        later_work = none_throws(
+            dist.all_reduce(torch.ones(1), group=self.pg, async_op=True)
+        )
+        later_work.wait()
+        self.assertNotEqual(later_work._get_sequence_number(), sequence)
+        self.work.wait()
+        self.awaitable._output_tensor[-1] = 42 ^ 8192
+
+        with self.assertRaisesRegex(RuntimeError, "collective mismatch") as ctx:
+            self.awaitable.wait()
+
+        self.log_event.assert_called_once()
+        metadata = self.log_event.call_args.kwargs["metadata"]
+        self.assertEqual(metadata["collective_sequence_number"], str(sequence))
+        self.assertIn(f"sequence={sequence},", str(ctx.exception))
+        self.assertIn("does not distinguish these causes", str(ctx.exception))
+        self.assertNotIn("This indicates ranks are calling", str(ctx.exception))
+
+    def test_mismatch_survives_unavailable_work_sequence(self) -> None:
+        self.work.wait()
+        self.awaitable._output_tensor[-1] = 42 ^ 8192
+        for error_type in (AttributeError, RuntimeError):
+            with self.subTest(error_type=error_type):
+                self.log_event.reset_mock()
+                # Exercise backends/versions without sequence retrieval support.
+                with patch.object(
+                    dist.Work, "_get_sequence_number", side_effect=error_type()
+                ), self.assertRaisesRegex(
+                    RuntimeError, "collective mismatch.*sequence=unavailable"
+                ):
+                    self.awaitable.wait()
+                self.log_event.assert_called_once()
+                self.assertEqual(
+                    self.log_event.call_args.kwargs["metadata"][
+                        "collective_sequence_number"
+                    ],
+                    "unavailable",
+                )
+
+    def test_matching_tags_do_not_query_work_sequence(self) -> None:
+        with patch.object(dist.Work, "_get_sequence_number") as get_sequence:
+            self.assertEqual(self.awaitable.wait(), [[3]])
+            get_sequence.assert_not_called()
+        self.log_event.assert_not_called()
+
+
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
     def __init__(self, methodName: str = "runTest") -> None:
         # Force spawn: forkserver caches the env from when it was first

@@ -708,11 +708,21 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     async_op=not is_torchdynamo_compiling(),
                 )
 
+    def _get_work_sequence_number(self) -> str:
+        if not isinstance(self._splits_awaitable, dist.Work):
+            return "unavailable"
+        try:
+            # The PG counter may already include later collectives.
+            return str(self._splits_awaitable._get_sequence_number())
+        except (AttributeError, RuntimeError):
+            return "unavailable"
+
     def _log_mismatch_event(
         self,
         label: str,
         expected: int,
         tag_row: List[int],
+        sequence_number: str,
     ) -> None:
         if not _HAS_EVENT_LOGGER:
             return
@@ -742,6 +752,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     "mismatched_peer_global_ranks": str(mismatched_global),
                     "mismatched_peer_pg_ranks": str(mismatched_pg_local),
                     "pg_name": self._pg_name,
+                    "collective_sequence_number": sequence_number,
                     "pg_rank": str(self._pg_rank),
                     "global_rank": str(global_rank),
                     "world_size": str(self.num_workers),
@@ -796,21 +807,23 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                         if self._collective_tag_parts
                         else "unknown"
                     )
-                    self._log_mismatch_event(label, expected, tag_row)
+                    sequence_number = self._get_work_sequence_number()
+                    self._log_mismatch_event(label, expected, tag_row, sequence_number)
                     raise RuntimeError(
-                        f"All2All collective mismatch detected (collective={label!r}): "
+                        f"All2All collective mismatch detected "
+                        f"(pg={self._pg_name!r}, sequence={sequence_number}, "
+                        f"collective={label!r}): "
                         f"expected tag {expected} but received tags {tag_row} from "
-                        f"peers. This indicates ranks are calling different "
-                        f"collectives on the same process group.\n"
-                        f"To debug: identify the rank whose tag differs from this "
-                        f"one, then compare its collective inputs (e.g. "
-                        f"input.keys(), splits, sharding plan) against this rank's. "
-                        f"Common causes: (1) divergent feature lists across ranks, "
-                        f"(2) a rank skipping the collective via early return or "
-                        f"data exhaustion, (3) sharding plan inconsistency. Do NOT "
-                        f"disable the check via TORCHREC_VALIDATE_COLLECTIVES — "
-                        f"the underlying mismatch will still cause silent data "
-                        f"corruption or an NCCL hang downstream."
+                        f"peers. This can result from different collectives on "
+                        f"the same process group or corrupted metadata; the tag "
+                        f"check alone does not distinguish these causes.\n"
+                        f"To debug: correlate the Work sequence on the mismatched "
+                        f"peers, compare their collective inputs (e.g. "
+                        f"input.keys(), splits, sharding plan), and inspect "
+                        f"send, receive, and readback integrity. "
+                        f"Do NOT disable TORCHREC_VALIDATE_COLLECTIVES: "
+                        f"continuing with mismatched metadata can cause silent "
+                        f"data corruption or an NCCL hang downstream."
                     )
 
         # Check for int32 overflow in AllToAll input. If the input is already
