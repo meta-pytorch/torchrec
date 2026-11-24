@@ -2304,6 +2304,15 @@ class PlannerConfig:
     # existing digest. (Appended last to preserve positional construction of the
     # pre-existing fields.)
     grid_rowwise_shards: Optional[int] = None
+    # How ``DMPCollection`` lays sharding groups over global ranks. False (the
+    # default) strides them, so a host's ranks are split across parallel worlds;
+    # True gives each world contiguous ranks, i.e. whole hosts. Only the host
+    # layout differs, so this reaches the digest through the ``local_world_size``
+    # it produces rather than as a field of its own -- unlike num_parallel_worlds
+    # and grid_rowwise_shards, which can leave that value unchanged while still
+    # changing the plan. (Appended last to preserve positional construction of the
+    # pre-existing fields.)
+    use_inter_host_allreduce: bool = False
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
