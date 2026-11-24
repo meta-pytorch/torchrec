@@ -727,6 +727,8 @@ class KeyValueParams:
         ssd_rocksdb_write_buffer_size: Optional[int]: rocksdb write buffer size per tbe,
             relavant to rocksdb compaction frequency
         ssd_rocksdb_shards: Optional[int]: rocksdb shards number
+        ssd_rocksdb_stats_dump_period_sec (Optional[int]): Periodic RocksDB stats
+            dump interval in seconds; zero disables dumping, None preserves the backend default.
         gather_ssd_cache_stats: bool: whether enable ssd stats collection, std reporter and ods reporter
         stats_reporter_config
             report_interval: int: report interval in train iteration if gather_ssd_cache_stats is enabled
@@ -773,6 +775,7 @@ class KeyValueParams:
     ps_client_thread_num: Optional[int] = None
     ps_max_key_per_request: Optional[int] = None
     ps_max_local_index_length: Optional[int] = None
+    ssd_rocksdb_stats_dump_period_sec: Optional[int] = None
 
     def __hash__(self) -> int:
         return hash(
@@ -780,6 +783,7 @@ class KeyValueParams:
                 self.ssd_storage_directory,
                 self.ssd_rocksdb_write_buffer_size,
                 self.ssd_rocksdb_shards,
+                self.ssd_rocksdb_stats_dump_period_sec,
                 # Parameter Server (PS) Attributes
                 self.ps_hosts,
                 self.ps_client_thread_num,
