@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 # This test exercises DATA_PARALLEL replication and the DDP-wrap decision, which
 # are device-independent; run it CPU/gloo-only so it needs no GPU. CUDA is hidden
