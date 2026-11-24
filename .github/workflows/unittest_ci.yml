@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda-tag: ["cu130"]
+        cuda-tag: ["cu130", "cu132"]
         os:
           - mt-l-x86aavx2-45-167-a10g-4
         python:

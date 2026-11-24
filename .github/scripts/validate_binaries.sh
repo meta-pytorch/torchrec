@@ -105,6 +105,8 @@ if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
         export CUDA_VERSION="cu129"
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.0' ]]; then
         export CUDA_VERSION="cu130"
+    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.2' ]]; then
+        export CUDA_VERSION="cu132"
     else
         export CUDA_VERSION="cu130"
     fi
@@ -209,8 +211,8 @@ fi
 
 conda run -n "${CONDA_ENV}" python --version
 
-# we only have one cuda version for pypi build (fbgemm-gpu 1.10.0 ships CUDA 13.0 only)
-if [[ ${MATRIX_GPU_ARCH_VERSION} != '13.0' ]]; then
+# we only have one cuda version for pypi build: torch 2.15's PyPI wheels are CUDA 13.2
+if [[ ${MATRIX_GPU_ARCH_VERSION} != '13.2' ]]; then
     exit 0
 fi
 
