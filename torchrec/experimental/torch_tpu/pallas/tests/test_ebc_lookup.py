@@ -398,8 +398,8 @@ class EBCLookupTest(TestCase):
         with (
             patch.object(
                 ops,
-                "_generate_vbe_row_output_offsets",
-                wraps=ops._generate_vbe_row_output_offsets,
+                "generate_vbe_row_output_offsets",
+                wraps=ops.generate_vbe_row_output_offsets,
             ) as generate_offsets,
             patch.object(torch.ops.torchrec, op_name, return_value=pooled) as op,
         ):

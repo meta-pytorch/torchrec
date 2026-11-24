@@ -25,10 +25,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
+from fbgemm_gpu.split_table_batched_embeddings_ops_training_common import (
+    generate_vbe_metadata,
+)
 from torchrec.experimental.torch_tpu.modules.embedding_modules import (
     PallasTableBatchedEmbeddingBags,
 )
-from torchrec.experimental.torch_tpu.pallas import ops  # noqa: F401
+from torchrec.experimental.torch_tpu.pallas import ops
 
 NUM_ROWS = 1024
 EMB_DIM = 16  # must be a multiple of 16 (SparseCore vector-lane width)
@@ -40,13 +44,7 @@ def tpu_is_available() -> bool:
         import torch_tpu  # pyre-ignore[21]  # noqa: F401
     except ImportError:
         return False
-    tpu = getattr(torch, "tpu", None)
-    if tpu is None:
-        return False
-    is_available = getattr(tpu, "is_available", None)
-    if callable(is_available):
-        return bool(is_available())
-    return bool(getattr(tpu, "available", False))
+    return torch.accelerator.is_available()
 
 
 def _register_tpu_kernels() -> None:
@@ -125,7 +123,7 @@ class FusedAdagradCpuTest(unittest.TestCase):
                     ctx = Mock()
                     with patch.object(
                         ops,
-                        "_generate_vbe_row_output_offsets",
+                        "generate_vbe_row_output_offsets",
                         side_effect=AssertionError("VBE offsets must be reused"),
                     ):
                         setup_context(ctx, inputs, output=None)
@@ -317,6 +315,115 @@ class V2FwdBwdTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+    def test_batched_module_uses_generated_vbe_offsets(self) -> None:
+        from torchrec.experimental.torch_tpu.pallas import impl
+
+        dim = EMB_DIM
+        counts = [[2, 0, 1], [0, 2, 0], [1, 0, 1]]
+        indices = torch.tensor([1, 1, 2, 0, 3, 4, 1, 1, 2], dtype=torch.int32)
+        offsets = torch.tensor([0, 2, 2, 3, 5, 6, 6, 9], dtype=torch.int32)
+        row_offsets = torch.tensor([0, 0, 0, 7, 7, 0, 0], dtype=torch.int32)
+        for mode in (PoolingMode.SUM, PoolingMode.MEAN):
+            for fused in (False, True):
+                with self.subTest(mode=mode, fused=fused):
+                    module = PallasTableBatchedEmbeddingBags(
+                        embedding_specs=[(7, dim), (5, dim)],
+                        feature_table_map=[0, 1, 0],
+                        device=torch.device("tpu"),
+                        mode=mode,
+                        optimizer=(
+                            OptimType.EXACT_ROWWISE_ADAGRAD if fused else OptimType.NONE
+                        ),
+                        learning_rate=0.1,
+                        eps=0.01,
+                    )
+                    weights_cpu = (
+                        torch.arange(module.weights.numel(), dtype=torch.float32) * 0.01
+                    ).requires_grad_()
+                    with torch.no_grad():
+                        module.weights.copy_(weights_cpu.detach().to("tpu"))
+                    momentum_cpu = torch.zeros(module.total_hash_size)
+                    metadata = generate_vbe_metadata(
+                        offsets,
+                        counts,
+                        mode,
+                        torch.tensor([dim] * 3),
+                        torch.device("cpu"),
+                    )
+                    element_offsets = ops.generate_vbe_row_output_offsets(
+                        metadata.B_offsets,
+                        metadata.B_offsets_rank_per_feature,
+                        metadata.output_offsets_feature_rank,
+                        7,
+                        dim,
+                    )
+                    assert element_offsets is not None
+                    if fused:
+                        feature_major = torch.ops.torchrec.embedding_pooled_batched_lookup_offset_fused_adagrad(
+                            indices,
+                            offsets,
+                            weights_cpu,
+                            row_offsets,
+                            momentum_cpu,
+                            0.1,
+                            0.01,
+                            dim,
+                        )
+                    else:
+                        feature_major = (
+                            torch.ops.torchrec.embedding_pooled_batched_lookup_offset(
+                                indices,
+                                offsets,
+                                weights_cpu,
+                                row_offsets,
+                                dim,
+                            )
+                        )
+                    if mode == PoolingMode.MEAN:
+                        feature_major = (
+                            feature_major / torch.diff(offsets).clamp(min=1)[:, None]
+                        )
+                    expected = (
+                        torch.zeros_like(feature_major)
+                        .index_copy(0, (element_offsets // dim).long(), feature_major)
+                        .flatten()
+                    )
+                    with patch.object(
+                        impl,
+                        "_generate_vbe_metadata",
+                        wraps=impl._generate_vbe_metadata,
+                    ) as kernel:
+                        actual = module(
+                            indices.to("tpu"),
+                            offsets.to("tpu"),
+                            batch_size_per_feature_per_rank=counts,
+                        )
+                        torch.testing.assert_close(actual.cpu(), expected)
+                        gradient = torch.linspace(0.1, 1.0, actual.numel())
+                        expected.backward(gradient)
+                        actual.backward(gradient.to("tpu"))
+                        kernel.assert_called_once()
+                    if fused:
+                        self.assertIsNone(module.weights.grad)
+                        torch.testing.assert_close(
+                            module.weights.detach().cpu(),
+                            weights_cpu.detach(),
+                            rtol=1e-4,
+                            atol=1e-5,
+                        )
+                        assert module.momentum is not None
+                        torch.testing.assert_close(
+                            module.momentum.cpu(), momentum_cpu, rtol=1e-4, atol=1e-5
+                        )
+                    else:
+                        assert module.weights.grad is not None
+                        torch.testing.assert_close(
+                            module.weights.grad.cpu(),
+                            weights_cpu.grad,
+                            rtol=1e-4,
+                            atol=1e-5,
+                        )
 
     def test_vbe_int64_offsets_forward_backward_and_fused_update(self) -> None:
         dim = EMB_DIM

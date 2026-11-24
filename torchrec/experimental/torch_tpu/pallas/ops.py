@@ -5,11 +5,72 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Sequence
 
 import torch
 
 
+def _validate_vbe_metadata_shapes(
+    B_shape: Sequence[int],
+    B_rank_shape: Sequence[int],
+    output_shape: Sequence[int],
+) -> None:
+    assert len(B_shape) == 1, "B_offsets must be 1D"
+    assert len(B_rank_shape) == 2, "B_offsets_rank_per_feature must be 2D"
+    assert len(output_shape) == 1, "output_offsets_feature_rank must be 1D"
+    num_features = B_shape[0] - 1
+    num_ranks = B_rank_shape[1] - 1
+    assert num_features > 0, "VBE requires at least one feature"
+    assert num_ranks > 0, "VBE requires at least one rank"
+    assert B_rank_shape[0] == num_features, "VBE feature counts must match"
+    assert (
+        output_shape[0] == num_ranks * num_features + 1
+    ), "VBE output offsets must have num_ranks * num_features + 1 entries"
+
+
+def generate_vbe_row_output_offsets(
+    B_offsets: torch.Tensor | None,
+    B_offsets_rank_per_feature: torch.Tensor | None,
+    output_offsets_feature_rank: torch.Tensor | None,
+    num_bags: int,
+    emb_dim: int,
+    max_B_feature_rank: int | None = None,
+) -> torch.Tensor | None:
+    """Generate element offsets once for forward, backward and MEAN pooling."""
+    if B_offsets is None:
+        assert (
+            B_offsets_rank_per_feature is None and output_offsets_feature_rank is None
+        ), "VBE metadata must be all None or all provided"
+        return None
+    assert (
+        B_offsets_rank_per_feature is not None
+    ), "B_offsets_rank_per_feature is required for VBE"
+    assert (
+        output_offsets_feature_rank is not None
+    ), "output_offsets_feature_rank is required for VBE"
+    _validate_vbe_metadata_shapes(
+        B_offsets.shape,
+        B_offsets_rank_per_feature.shape,
+        output_offsets_feature_rank.shape,
+    )
+    return torch.ops.torchrec.generate_vbe_row_output_offsets(
+        B_offsets,
+        B_offsets_rank_per_feature,
+        output_offsets_feature_rank,
+        num_bags,
+        emb_dim,
+        num_bags if max_B_feature_rank is None else max_B_feature_rank,
+    )
+
+
 lib: torch.library.Library = torch.library.Library("torchrec", "FRAGMENT")
+
+lib.define(
+    "generate_vbe_row_output_offsets("
+    "Tensor B_offsets, Tensor B_offsets_rank_per_feature, "
+    "Tensor output_offsets_feature_rank, int num_bags, int emb_dim, "
+    "int max_B_feature_rank) -> Tensor"
+)
 
 lib.define("embedding_lookup(Tensor indices, Tensor weights, int emb_dim) -> Tensor")
 lib.define(
@@ -68,6 +129,18 @@ lib.define(
 ################
 # META KERNELS #
 ################
+@torch.library.register_fake("torchrec::generate_vbe_row_output_offsets")
+def _generate_vbe_row_output_offsets_meta(
+    B_offsets,
+    B_offsets_rank_per_feature,
+    output_offsets_feature_rank,
+    num_bags,
+    emb_dim,
+    max_B_feature_rank,
+):
+    return output_offsets_feature_rank.new_empty((num_bags,))
+
+
 @torch.library.register_fake("torchrec::embedding_lookup")
 def _embedding_lookup_meta(indices, weights, emb_dim):
     return weights.new_empty((indices.numel(), emb_dim))
@@ -189,6 +262,46 @@ def _permute_pooled_backward_fake(grad_out, offset_dim_list, permute_list):
 ###############
 # CPU KERNELS #
 ###############
+def generate_vbe_row_output_offsets_cpu(
+    B_offsets,
+    B_offsets_rank_per_feature,
+    output_offsets_feature_rank,
+    num_bags,
+    emb_dim,
+    max_B_feature_rank,
+):
+    num_features = B_offsets.shape[0] - 1
+    num_ranks = B_offsets_rank_per_feature.shape[1] - 1
+    chunk_counts = torch.diff(B_offsets_rank_per_feature, dim=1).flatten()
+    # Global bag boundaries are indexed by feature and rank, with shape [F, W + 1].
+    # e.g. F=2, W=2, [[0, 2, 5], [5, 6, 8]]: f0/rank0 uses [0, 2).
+    chunk_starts = (B_offsets[:-1, None] + B_offsets_rank_per_feature[:, :-1]).to(
+        output_offsets_feature_rank.dtype
+    )
+    # Output metadata is indexed in rank-major order.
+    output_starts = (
+        output_offsets_feature_rank[:-1]
+        .reshape(num_ranks, num_features)
+        .transpose(0, 1)
+    )
+    # Bag index within its feature/rank chunk is bag_id - chunk_start.
+    chunk_bias = output_starts - chunk_starts * emb_dim
+    bag_bias = torch.repeat_interleave(
+        chunk_bias.flatten(),
+        chunk_counts,
+        output_size=num_bags,
+    )
+    bag_ids = torch.arange(
+        num_bags,
+        dtype=output_offsets_feature_rank.dtype,
+        device=B_offsets.device,
+    )
+    return bag_ids * emb_dim + bag_bias
+
+
+lib.impl("generate_vbe_row_output_offsets", generate_vbe_row_output_offsets_cpu, "CPU")
+
+
 def embedding_lookup_cpu(
     indices: torch.Tensor, weights: torch.Tensor, emb_dim: int
 ) -> torch.Tensor:
@@ -504,89 +617,6 @@ def _pooled_offset_backward(ctx, grad_out: torch.Tensor):
         grad_out.contiguous(), indices, offsets, ctx.num_rows, ctx.emb_dim
     )
     return None, None, grad_weights, None
-
-
-def _validate_vbe_metadata(
-    B_offsets: torch.Tensor | None,
-    B_offsets_rank_per_feature: torch.Tensor | None,
-    output_offsets_feature_rank: torch.Tensor | None,
-) -> None:
-    if B_offsets is None:
-        assert (
-            B_offsets_rank_per_feature is None
-        ), "VBE metadata must be all None or all provided"
-        assert (
-            output_offsets_feature_rank is None
-        ), "VBE metadata must be all None or all provided"
-    else:
-        assert (
-            B_offsets_rank_per_feature is not None
-        ), "B_offsets_rank_per_feature is required for VBE"
-        assert (
-            output_offsets_feature_rank is not None
-        ), "output_offsets_feature_rank is required for VBE"
-        assert B_offsets.ndim == 1, "B_offsets must be 1D"
-        assert (
-            B_offsets_rank_per_feature.ndim == 2
-        ), "B_offsets_rank_per_feature must be 2D"
-        assert (
-            output_offsets_feature_rank.ndim == 1
-        ), "output_offsets_feature_rank must be 1D"
-        num_features = B_offsets.shape[0] - 1
-        num_ranks = B_offsets_rank_per_feature.shape[1] - 1
-        assert num_features > 0, "VBE requires at least one feature"
-        assert num_ranks > 0, "VBE requires at least one rank"
-        assert (
-            B_offsets_rank_per_feature.shape[0] == num_features
-        ), "VBE feature counts must match"
-        assert (
-            output_offsets_feature_rank.shape[0] == num_ranks * num_features + 1
-        ), "VBE output offsets must have num_ranks * num_features + 1 entries"
-
-
-def _generate_vbe_row_output_offsets(
-    B_offsets: torch.Tensor | None,
-    B_offsets_rank_per_feature: torch.Tensor | None,
-    output_offsets_feature_rank: torch.Tensor | None,
-    num_bags: int,
-    emb_dim: int,
-) -> torch.Tensor | None:
-    """Map input bags to element offsets in the rank-major output."""
-    # Follows fbgemm_gpu generate_vbe_metadata.cu
-    _validate_vbe_metadata(
-        B_offsets, B_offsets_rank_per_feature, output_offsets_feature_rank
-    )
-    if B_offsets is None:
-        return None
-    assert B_offsets_rank_per_feature is not None
-    assert output_offsets_feature_rank is not None
-    num_features = B_offsets.shape[0] - 1
-    num_ranks = B_offsets_rank_per_feature.shape[1] - 1
-    chunk_counts = torch.diff(B_offsets_rank_per_feature, dim=1).flatten()
-    # Global bag boundaries are indexed by feature and rank, with shape [F, W + 1].
-    # e.g. F=2, W=2, [[0, 2, 5], [5, 6, 8]]: f0/rank0 uses [0, 2).
-    chunk_starts = (B_offsets[:-1, None] + B_offsets_rank_per_feature[:, :-1]).to(
-        output_offsets_feature_rank.dtype
-    )
-    # Output metadata is indexed in rank-major order.
-    output_starts = (
-        output_offsets_feature_rank[:-1]
-        .reshape(num_ranks, num_features)
-        .transpose(0, 1)
-    )
-    # Bag index within its feature/rank chunk is bag_id - chunk_start.
-    chunk_bias = output_starts - chunk_starts * emb_dim
-    bag_bias = torch.repeat_interleave(
-        chunk_bias.flatten(),
-        chunk_counts,
-        output_size=num_bags,
-    )
-    bag_ids = torch.arange(
-        num_bags,
-        dtype=output_offsets_feature_rank.dtype,
-        device=B_offsets.device,
-    )
-    return bag_ids * emb_dim + bag_bias
 
 
 def _setup_pooled_batched_offset_context(ctx, inputs, output) -> None:

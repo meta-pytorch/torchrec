@@ -11,6 +11,7 @@ import torch
 from torch_tpu._internal import pallas  # pyrefly: ignore[missing-import]
 from torchrec.experimental.torch_tpu.pallas import (
     batch_index,
+    generate_vbe_metadata,
     lookup,
     ops,
     permute_embs,
@@ -73,6 +74,34 @@ _batch_index_select_sc_bwd = pallas.jax_op(
     "torchrec_pallas::batch_index_select_dim0_backward",
     batch_index.batch_index_select_bwd_sc,
 )
+_generate_vbe_metadata = pallas.jax_op(
+    "torchrec_pallas::generate_vbe_row_output_offsets",
+    generate_vbe_metadata.generate_vbe_metadata_sc,
+)
+
+
+def generate_vbe_row_output_offsets_tpu(
+    B_offsets,
+    B_offsets_rank_per_feature,
+    output_offsets_feature_rank,
+    num_bags,
+    emb_dim,
+    max_B_feature_rank,
+):
+    # TODO: Enable int64 once reaching model parity
+    if (num_bags - 1) * emb_dim > torch.iinfo(torch.int32).max:
+        raise ValueError("SparseCore VBE row output offsets must fit in int32")
+    output = _generate_vbe_metadata(
+        B_offsets=B_offsets.to(torch.int32),
+        B_offsets_rank_per_feature=B_offsets_rank_per_feature.to(torch.int32),
+        output_offsets_feature_rank=output_offsets_feature_rank.to(torch.int32),
+        num_bags=num_bags,
+        emb_dim=emb_dim,
+        max_B_feature_rank=max_B_feature_rank,
+    )
+    # TODO: Avoid the int32 -> int64 -> int32 round trip by using a consistent
+    # VBE offset dtype throughout metadata generation and lookup.
+    return output.to(output_offsets_feature_rank.dtype)
 
 
 def _batch_index_select_setup_context(ctx, inputs, output) -> None:
@@ -336,6 +365,7 @@ def batch_index_select_dim0_backward_tpu_impl(
 
 
 lib: torch.library.Library = torch.library.Library("torchrec", "IMPL")
+lib.impl("generate_vbe_row_output_offsets", generate_vbe_row_output_offsets_tpu, "TPU")
 lib.impl("embedding_lookup", embedding_lookup_tpu, "TPU")
 lib.impl("embedding_lookup_backward", embedding_lookup_backward_tpu, "TPU")
 lib.impl("embedding_pooled_lookup", embedding_pooled_lookup_tpu, "TPU")

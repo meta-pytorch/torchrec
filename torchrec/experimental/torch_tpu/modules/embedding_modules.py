@@ -569,12 +569,13 @@ class PallasTableBatchedEmbeddingBags(nn.Module):
             device=offsets.device,
         )
 
-        row_output_offsets = ops._generate_vbe_row_output_offsets(
+        row_output_offsets = ops.generate_vbe_row_output_offsets(
             vbe_metadata.B_offsets,
             vbe_metadata.B_offsets_rank_per_feature,
             vbe_metadata.output_offsets_feature_rank,
             num_bags=num_bags,
             emb_dim=self.max_D,
+            max_B_feature_rank=vbe_metadata.max_B_feature_rank,
         )
 
         if self.optimizer == OptimType.EXACT_ROWWISE_ADAGRAD:
