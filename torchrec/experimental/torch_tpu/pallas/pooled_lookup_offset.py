@@ -835,6 +835,35 @@ def embedding_pooled_batched_lookup_jax(
     )
 
 
+def _gradient_map(
+    indices: jax.Array,
+    offsets: jax.Array,
+    row_offsets: jax.Array,
+    bag_row_offsets: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    num_bags = offsets.shape[0] - 1
+    assert num_bags > 0
+    n = indices.shape[0]
+    bag_updates = (
+        jnp.ones((num_bags,), dtype=offsets.dtype)
+        if bag_row_offsets is None
+        else jnp.diff(bag_row_offsets, prepend=0)
+    )
+    updates = jnp.stack((bag_updates, jnp.diff(row_offsets, prepend=0)))
+    markers = jnp.zeros((2, n), dtype=updates.dtype)
+    prefixes = cast(
+        jax.Array, jnp.cumsum(markers.at[:, offsets[:-1]].add(updates), axis=1)
+    )
+    valid = jnp.arange(n, dtype=offsets.dtype) < offsets[-1]
+    bags = (
+        jnp.minimum(prefixes[0] - 1, num_bags - 1)
+        if bag_row_offsets is None
+        else jnp.where(valid, prefixes[0], 0)
+    )
+    rows = jnp.where(valid, indices + prefixes[1], 0)
+    return rows, bags, valid
+
+
 def embedding_pooled_batched_lookup_gradient_map_jax(
     indices: jax.Array,
     offsets: jax.Array,
@@ -846,6 +875,10 @@ def embedding_pooled_batched_lookup_gradient_map_jax(
     gradients from different bags, which the backward's scatter-add aggregates.
     Padded IDs are marked invalid.
     """
+    # Make sure they have the same dtype, since this impl combines both together
+    if offsets.dtype == row_offsets.dtype == jnp.int32:
+        return _gradient_map(indices, offsets, row_offsets)
+
     num_bags = offsets.shape[0] - 1
     assert num_bags > 0
 
@@ -915,10 +948,13 @@ def embedding_pooled_batched_lookup_row_runs_jax(
     offsets: jax.Array,
     row_offsets: jax.Array,
     num_rows: int,
+    bag_row_offsets: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Preprocessing for fused gradient for a stacked table-batched pooled lookup"""
-    rows, bags, valid = embedding_pooled_batched_lookup_gradient_map_jax(
-        indices, offsets, row_offsets
+    rows, bags, valid = (
+        embedding_pooled_batched_lookup_gradient_map_jax(indices, offsets, row_offsets)
+        if bag_row_offsets is None
+        else _gradient_map(indices, offsets, row_offsets, bag_row_offsets)
     )
 
     sorted_rows, sorted_bags = jax.lax.sort_key_val(
@@ -935,7 +971,7 @@ def embedding_pooled_batched_lookup_row_runs_jax(
         )
     )[:n]
     num_runs = jnp.sum(run_starts, dtype=offsets.dtype)
-    run_offsets = jnp.nonzero(run_starts, size=n, fill_value=n)[0]
+    run_offsets = jnp.nonzero(run_starts, size=min(n, num_rows), fill_value=n)[0]
     run_offsets = (
         jnp.concatenate((run_offsets, jnp.array([n], dtype=run_offsets.dtype)))
         .at[num_runs]
