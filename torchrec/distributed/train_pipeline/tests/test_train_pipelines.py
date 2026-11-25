@@ -34,7 +34,11 @@ from torch import nn, optim
 from torch._dynamo.testing import reduce_to_scalar_loss
 from torch._dynamo.utils import counters
 from torch.autograd import DeviceType
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import (
+    FSDPModule,
+    fully_shard,
+    FullyShardedDataParallel as FSDP,
+)
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import ProfilerActivity
@@ -89,6 +93,7 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
 )
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     _FsdpThenDdpWrapper,
+    split_dtensor_params,
     TrainPipelineSparseDistTestBase,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import (
@@ -1145,7 +1150,9 @@ def async_optimizer_parity_test_runner(
     data: List[Tuple[ModelInput, List[ModelInput]]],
     backend: str = "nccl",
     local_size: Optional[int] = None,
+    fsdp2_children: Optional[List[str]] = None,
 ) -> None:
+    """With ``fsdp2_children``, those children of the model are FSDP2 units."""
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         pg = ctx.pg
         assert pg is not None
@@ -1171,13 +1178,23 @@ def async_optimizer_parity_test_runner(
                 env=ShardingEnv.from_process_group(pg),
                 device=ctx.device,
                 sharders=[sharder],
+                init_data_parallel=False,
+                data_parallel_wrapper=(
+                    _FsdpThenDdpWrapper(fsdp2_children, _fsdp2)
+                    if fsdp2_children
+                    else None
+                ),
             )
+            # Copy before data parallelism wraps the model: an FSDP's state dict
+            # does not write back to its parameters.
             copy_state_dict(sharded_model.state_dict(), model.state_dict())
+            sharded_model.init_data_parallel()
+            dense_param_groups = split_dtensor_params(
+                dict(in_backward_optimizer_filter(sharded_model.named_parameters()))
+            )
             # Citrine C2: use the multi-tensor optimizer implementation.
             optimizer = optim.Adam(
-                dict(
-                    in_backward_optimizer_filter(sharded_model.named_parameters())
-                ).values(),
+                [{"params": list(group.values())} for group in dense_param_groups],
                 lr=0.01,
                 foreach=True,
             )
@@ -1198,6 +1215,9 @@ def async_optimizer_parity_test_runner(
             )
 
         assert len(async_pipeline._async_optimizer_ddp_modules) > 0
+        assert len(async_pipeline._async_optimizer_fsdp2_roots) == len(
+            fsdp2_children or []
+        )
         async_params = dict(async_pipeline._model.named_parameters())
         for name, param in sync_pipeline._model.named_parameters():
             torch.testing.assert_close(async_params[name], param)
@@ -1278,6 +1298,22 @@ class TrainPipelineGPUTest(MultiProcessTestBase):
             tables=self.tables,
             weighted_tables=self.weighted_tables,
             data=self._generate_data(num_batches=10, batch_size=32),
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_async_optimizer_fsdp2_matches_sync_two_ranks(self) -> None:
+        # With two ranks, FSDP2 actually reduce-scatters the dense arch's
+        # gradients, which the side stream must wait for.
+        self._run_multi_process_test(
+            callable=async_optimizer_parity_test_runner,
+            world_size=2,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            data=self._generate_data(num_batches=10, batch_size=32),
+            fsdp2_children=["dense"],
         )
 
 
@@ -3971,6 +4007,29 @@ def _nested_fsdp1(module: nn.Module) -> nn.Module:
     )
 
 
+def _fsdp2(module: nn.Module) -> nn.Module:
+    return cast(nn.Module, fully_shard(module))
+
+
+def _nested_fsdp2(module: nn.Module) -> nn.Module:
+    # Each nn.Linear becomes its own FSDP2 unit inside the outer one.
+    for linear in [m for m in module.modules() if isinstance(m, nn.Linear)]:
+        fully_shard(linear)
+    return _fsdp2(module)
+
+
+class _RecordingHandle:
+    """Wraps an FSDP2 gradient reduction handle to record the stream it waits on."""
+
+    def __init__(self, handle: Any, wait_streams: List[torch.Stream]) -> None:
+        self._handle = handle
+        self._wait_streams = wait_streams
+
+    def wait(self) -> None:
+        self._wait_streams.append(torch.cuda.current_stream())
+        self._handle.wait()
+
+
 @unittest.skipIf(
     not torch.cuda.is_available(),
     "Not enough GPUs, this test requires at least one GPU",
@@ -4297,8 +4356,12 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
 
         self._assert_no_ddp_armed(pipeline, model)
 
-    def _run_fsdp1_parity(
-        self, wrapper: _FsdpThenDdpWrapper, num_batches: int = 10
+    def _run_wrapped_parity(
+        self,
+        wrapper: Optional[_FsdpThenDdpWrapper],
+        expect_caller_wait: bool,
+        num_batches: int = 10,
+        **pipeline_kwargs: Any,
     ) -> TrainPipelineSparseDist:
         _, async_pipeline = self._run_async_optimizer_parity(
             TrainPipelineSparseDist,
@@ -4306,21 +4369,42 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
             EmbeddingComputeKernel.FUSED.value,
             num_batches=num_batches,
             data_parallel_wrapper=wrapper,
+            **pipeline_kwargs,
         )
-        self.assertTrue(async_pipeline._async_wait_for_caller_stream)
+        self.assertEqual(
+            async_pipeline._async_wait_for_caller_stream, expect_caller_wait
+        )
         return async_pipeline
 
+    def _wrapped_async_pipeline(
+        self, wrapper: _FsdpThenDdpWrapper
+    ) -> Tuple[DistributedModelParallel, TrainPipelineSparseDist]:
+        model, optimizer = self._init_data_parallel_and_optimizer(
+            self._shard_model(
+                self._setup_model(),
+                ShardingType.TABLE_WISE.value,
+                EmbeddingComputeKernel.FUSED.value,
+                wrapper,
+            )
+        )
+        return model, self._async_pipeline(model, optimizer)
+
     def test_fsdp1_matches_sync(self) -> None:
-        pipeline = self._run_fsdp1_parity(_FsdpThenDdpWrapper(["dense"], _fsdp1))
+        pipeline = self._run_wrapped_parity(
+            _FsdpThenDdpWrapper(["dense"], _fsdp1), expect_caller_wait=True
+        )
         self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
 
     def test_nested_fsdp1_matches_sync(self) -> None:
-        pipeline = self._run_fsdp1_parity(_FsdpThenDdpWrapper(["over"], _nested_fsdp1))
+        pipeline = self._run_wrapped_parity(
+            _FsdpThenDdpWrapper(["over"], _nested_fsdp1), expect_caller_wait=True
+        )
         self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
 
     def test_fsdp1_without_ddp_arms(self) -> None:
-        pipeline = self._run_fsdp1_parity(
-            _FsdpThenDdpWrapper(["dense", "over"], _fsdp1, ddp=False)
+        pipeline = self._run_wrapped_parity(
+            _FsdpThenDdpWrapper(["dense", "over"], _fsdp1, ddp=False),
+            expect_caller_wait=True,
         )
         self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
 
@@ -4336,12 +4420,8 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
                     autospec=True,
                     side_effect=torch.cuda.Stream.wait_stream,
                 ) as wait_stream:
-                    _, pipeline = self._run_async_optimizer_parity(
-                        TrainPipelineSparseDist,
-                        ShardingType.TABLE_WISE.value,
-                        EmbeddingComputeKernel.FUSED.value,
-                        num_batches=3,
-                        data_parallel_wrapper=wrapper,
+                    pipeline = self._run_wrapped_parity(
+                        wrapper, expect_caller_wait=wrapper is not None, num_batches=3
                     )
 
                 side_stream_waits = [
@@ -4354,15 +4434,9 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
                 self.assertEqual(side_stream_waits, expected)
 
     def test_detach_clears_fsdp1_wait_and_attach_rearms(self) -> None:
-        model, optimizer = self._init_data_parallel_and_optimizer(
-            self._shard_model(
-                self._setup_model(),
-                ShardingType.TABLE_WISE.value,
-                EmbeddingComputeKernel.FUSED.value,
-                _FsdpThenDdpWrapper(["dense"], _fsdp1),
-            )
+        model, pipeline = self._wrapped_async_pipeline(
+            _FsdpThenDdpWrapper(["dense"], _fsdp1)
         )
-        pipeline = self._async_pipeline(model, optimizer)
         data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
         pipeline.progress(data_iter)
         self.assertTrue(pipeline._async_wait_for_caller_stream)
@@ -4374,6 +4448,83 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         pipeline.attach(model)
         self.assertTrue(pipeline._async_optimizer_armed)
         self.assertTrue(pipeline._async_wait_for_caller_stream)
+        pipeline.progress(data_iter)
+
+    def test_fsdp2_matches_sync(self) -> None:
+        # dense gets float features, which need no grad, so FSDP2 defers its
+        # post-backward (the reduce-scatter) into finalize_backward().
+        for steps in (1, 0):
+            with self.subTest(async_num_opt_steps_on_main_stream=steps):
+                pipeline = self._run_wrapped_parity(
+                    _FsdpThenDdpWrapper(["dense"], _fsdp2),
+                    expect_caller_wait=False,
+                    async_num_opt_steps_on_main_stream=steps,
+                )
+                self.assertEqual(len(pipeline._async_optimizer_fsdp2_roots), 1)
+                self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+
+    def test_sibling_and_nested_fsdp2_without_ddp_match_sync(self) -> None:
+        pipeline = self._run_wrapped_parity(
+            _FsdpThenDdpWrapper(["dense", "over"], _nested_fsdp2, ddp=False),
+            expect_caller_wait=False,
+        )
+        # The nested nn.Linear units are finalized through their two roots.
+        self.assertEqual(len(pipeline._async_optimizer_fsdp2_roots), 2)
+        self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
+
+    def test_fsdp2_finalizes_on_caller_and_waits_on_side_stream(self) -> None:
+        finalize_streams: List[torch.Stream] = []
+        wait_streams: List[torch.Stream] = []
+        finalize_backward = FSDPModule.finalize_backward
+
+        def recording_finalize_backward(
+            root: FSDPModule, *, async_op: bool = False
+        ) -> Any:
+            finalize_streams.append(torch.cuda.current_stream())
+            handle = finalize_backward(root, async_op=async_op)
+            return handle if handle is None else _RecordingHandle(handle, wait_streams)
+
+        with patch.object(FSDPModule, "finalize_backward", recording_finalize_backward):
+            pipeline = self._run_wrapped_parity(
+                _FsdpThenDdpWrapper(["dense"], _fsdp2),
+                expect_caller_wait=False,
+                num_batches=3,
+            )
+
+        # The first step runs on the main stream; the next two wait on the side
+        # stream for the reductions finalized on the main stream.
+        self.assertEqual(finalize_streams, [torch.cuda.current_stream()] * 3)
+        self.assertEqual(wait_streams, [pipeline._async_stream] * 2)
+
+    def test_fsdp2_without_manual_finalization_waits_for_caller_stream(self) -> None:
+        with patch(
+            "torchrec.distributed.train_pipeline.train_pipelines."
+            "fsdp2_supports_manual_finalization",
+            return_value=False,
+        ):
+            pipeline = self._run_wrapped_parity(
+                _FsdpThenDdpWrapper(["dense"], _fsdp2), expect_caller_wait=True
+            )
+
+        self.assertEqual(pipeline._async_optimizer_fsdp2_roots, [])
+
+    def test_detach_disarms_fsdp2_and_attach_rearms(self) -> None:
+        model, pipeline = self._wrapped_async_pipeline(
+            _FsdpThenDdpWrapper(["dense"], _fsdp2)
+        )
+        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
+        pipeline.progress(data_iter)
+        roots = list(pipeline._async_optimizer_fsdp2_roots)
+        self.assertEqual(len(roots), 1)
+        state_ctx = roots[0]._get_fsdp_state()._state_ctx
+
+        pipeline.detach()
+
+        self.assertEqual(pipeline._async_optimizer_fsdp2_roots, [])
+        self.assertFalse(state_ctx.manual_backward_finalization)
+        pipeline.attach(model)
+        self.assertEqual(pipeline._async_optimizer_fsdp2_roots, roots)
+        self.assertTrue(state_ctx.manual_backward_finalization)
         pipeline.progress(data_iter)
 
 

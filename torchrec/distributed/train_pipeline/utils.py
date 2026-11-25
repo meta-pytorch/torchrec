@@ -35,7 +35,7 @@ from typing import (
 )
 
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel
+from torch.distributed.fsdp import FSDPModule, FullyShardedDataParallel
 from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten
@@ -143,7 +143,8 @@ def is_deferred_dp_supported(
     )
 
 
-_ModuleT = TypeVar("_ModuleT", bound=torch.nn.Module)
+# Unbound: FSDPModule is a mixin that is not an nn.Module subclass.
+_ModuleT = TypeVar("_ModuleT")
 
 
 # Keep this implementation self-contained: model re-packaging can combine current
@@ -193,6 +194,41 @@ def fsdp1_managed_param_ids(
         for param in fsdp.parameters()
         if param.requires_grad
     }
+
+
+def fsdp2_roots(module: torch.nn.Module) -> List[FSDPModule]:
+    """
+    Returns the FSDP2 modules in a module tree that are not inside another one:
+    the roots after FSDP2's lazy init, which finalize their nested units.
+    """
+    fsdp_modules = find_modules_of_type(module, FSDPModule)
+    nested = {
+        id(nested_module)
+        for fsdp in fsdp_modules
+        for nested_module in cast(torch.nn.Module, fsdp).modules()
+        if nested_module is not fsdp
+    }
+    return [fsdp for fsdp in fsdp_modules if id(fsdp) not in nested]
+
+
+def fsdp2_managed_param_ids(roots: Iterable[FSDPModule]) -> Set[int]:
+    """
+    Returns the ids of the sharded params that FSDP2 reduces in ``roots`` and
+    their nested units, leaving out the params FSDP2 ignores.
+    """
+    return {
+        id(fsdp_param.sharded_param)
+        for root in roots
+        for module in cast(torch.nn.Module, root).modules()
+        if isinstance(module, FSDPModule)
+        for group in module._get_fsdp_state()._fsdp_param_groups
+        for fsdp_param in group.fsdp_params
+    }
+
+
+def fsdp2_supports_manual_finalization() -> bool:
+    """Whether this PyTorch's FSDP2 has manual backward finalization."""
+    return hasattr(FSDPModule, "set_manual_backward_finalization")
 
 
 def ddp_managed_param_ids(ddp_modules: Iterable[DistributedDataParallel]) -> Set[int]:
@@ -260,11 +296,11 @@ def async_optimizer_unsupported_reason(
     or ``None`` if it can.
 
     ``reduced_param_ids`` holds the params whose gradients the side stream waits
-    for: those DDP reduces (through ``finalize_backward()``) and those of FSDP1
-    modules (the side stream then waits for the main stream). Every param stepped
-    from a gradient must be in it. ``FusedOptimizer`` children are skipped: their
-    update already ran in backward, and their ``step()`` only sets a CPU learning
-    rate.
+    for: those DDP or FSDP2 reduces (through their manual backward finalization)
+    and those of FSDP1 modules (the side stream then waits for the main stream).
+    Every param stepped from a gradient must be in it. ``FusedOptimizer``
+    children are skipped: their update already ran in backward, and their
+    ``step()`` only sets a CPU learning rate.
     ``CombinedOptimizer`` children and the optimizer inside an ``OptimizerWrapper``
     are checked recursively. Step hooks on any optimizer in the tree are refused,
     since they may touch tensors the side stream does not wait for. An optimizer
@@ -289,7 +325,7 @@ def async_optimizer_unsupported_reason(
         )
         if id(grad_source) not in reduced_param_ids:
             return (
-                f"{name} is not reduced by a DDP or FSDP1, so the side stream would "
+                f"{name} is not reduced by a DDP or FSDP, so the side stream would "
                 "not wait for its gradient"
             )
     return None

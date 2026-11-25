@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from torch._dynamo import is_dynamo_supported
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
@@ -84,6 +85,8 @@ from torchrec.distributed.train_pipeline.utils import (
     ddp_managed_param_ids,
     find_ddp_modules,
     find_modules_of_type,
+    fsdp2_managed_param_ids,
+    fsdp2_roots,
     start_embedding_lookup_post_prefetch,
     use_context_for_postprocs,
 )
@@ -1433,6 +1436,44 @@ class FindModulesOfTypeTest(unittest.TestCase):
         found = find_modules_of_type(_ModuleWithLookups(child, hidden), torch.nn.Linear)
 
         self.assertCountEqual(found, [child, hidden])
+
+
+class _Fsdp2TestModel(torch.nn.Module):
+    def __init__(self, device: torch.device) -> None:
+        super().__init__()
+        self.inner = torch.nn.Linear(2, 2, device=device)
+        self.outer = torch.nn.Linear(2, 2, device=device)
+        self.ignored = torch.nn.Parameter(torch.zeros(2, device=device))
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available(),
+    "Not enough GPUs, this test requires at least one GPU",
+)
+class Fsdp2UtilsTest(TrainPipelineSparseDistTestBase):
+    def _sharded_model(self) -> _Fsdp2TestModel:
+        # inner is a unit nested inside the model's unit, which ignores one param.
+        model = _Fsdp2TestModel(self.device)
+        fully_shard(model.inner)
+        fully_shard(model, ignored_params={model.ignored})
+        return model
+
+    def test_roots_skip_nested_units(self) -> None:
+        model = self._sharded_model()
+
+        self.assertEqual(fsdp2_roots(torch.nn.Sequential(model)), [model])
+
+    def test_managed_params_skip_ignored_params(self) -> None:
+        model = self._sharded_model()
+
+        self.assertEqual(
+            fsdp2_managed_param_ids([cast(FSDPModule, model)]),
+            {
+                id(param)
+                for name, param in model.named_parameters()
+                if name != "ignored"
+            },
+        )
 
 
 class DDPManagedParamIdsTest(TrainPipelineSparseDistTestBase):

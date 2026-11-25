@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.model_parallel import (
@@ -34,6 +35,20 @@ from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.test_utils import init_distributed_single_host
+
+
+def split_dtensor_params(
+    params: Dict[str, torch.Tensor],
+) -> List[Dict[str, torch.Tensor]]:
+    """
+    Splits ``params`` into plain tensors and FSDP2's DTensors, dropping an empty
+    part, since a foreach optimizer kernel can't mix the two.
+    """
+    parts: List[Dict[str, torch.Tensor]] = [
+        {name: p for name, p in params.items() if not isinstance(p, DTensor)},
+        {name: p for name, p in params.items() if isinstance(p, DTensor)},
+    ]
+    return [part for part in parts if part]
 
 
 class _FsdpThenDdpWrapper(DataParallelWrapper):
@@ -64,10 +79,11 @@ class _FsdpThenDdpWrapper(DataParallelWrapper):
             setattr(module, name, self._wrap_fn(getattr(module, name)))
         if not self._ddp:
             return
+        # FSDP1 flat params, and FSDP2's sharded DTensor params.
         fsdp_param_names = [
             name
-            for name, _ in module.named_parameters()
-            if name.endswith("_flat_param")
+            for name, param in module.named_parameters()
+            if name.endswith("_flat_param") or isinstance(param, DTensor)
         ]
         DefaultDataParallelWrapper(params_to_ignore=fsdp_param_names).wrap(
             dmp, env, device
@@ -274,21 +290,26 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
         # _shard_model skips data parallelism, and async_optimizer refuses dense
         # params that nothing reduces.
         sharded_model.init_data_parallel()
-        dense_params = dict(
-            in_backward_optimizer_filter(sharded_model.named_parameters())
+        dense_param_groups = split_dtensor_params(
+            dict(in_backward_optimizer_filter(sharded_model.named_parameters()))
         )
         if not combined_optimizer:
             # Citrine C2: use the multi-tensor optimizer implementation.
             return sharded_model, optim.Adam(
-                dense_params.values(), lr=0.01, foreach=True
+                [{"params": list(group.values())} for group in dense_param_groups],
+                lr=0.01,
+                foreach=True,
             )
-        dense_optimizer = KeyedOptimizerWrapper(
-            dense_params,
-            # Citrine C2: use the multi-tensor optimizer implementation.
-            lambda params: optim.Adam(params, lr=0.01, foreach=True),
-        )
+        dense_optimizers = [
+            KeyedOptimizerWrapper(
+                group,
+                # Citrine C2: use the multi-tensor optimizer implementation.
+                lambda params: optim.Adam(params, lr=0.01, foreach=True),
+            )
+            for group in dense_param_groups
+        ]
         return sharded_model, CombinedOptimizer(
-            [sharded_model.fused_optimizer, dense_optimizer]
+            [sharded_model.fused_optimizer, *dense_optimizers]
         )
 
     def _run_async_optimizer_parity(
