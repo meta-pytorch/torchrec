@@ -66,7 +66,6 @@ from torchrec.distributed.types import (
     EmbeddingModuleShardingPlan,
     EnumerableShardingSpec,
     KeyValueParams,
-    ModuleSharder,
     ShardingPlan,
     ShardingType,
     StorageUsageType,
