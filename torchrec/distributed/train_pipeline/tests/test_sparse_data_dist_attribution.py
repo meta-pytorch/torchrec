@@ -503,6 +503,7 @@ class SparseDataDistAttributionTest(unittest.TestCase):
                 ):
                     pipeline.progress(dataloader)
 
+                self.assertEqual(0, pipeline.get_current_batch_index())
                 self.assertIs(error, raised.exception)
                 self._assert_attribution(error, operation, metadata, 1)
 
@@ -567,6 +568,7 @@ class SparseDataDistAttributionTest(unittest.TestCase):
 
                 self.assertIs(error, raised.exception)
                 self._assert_attribution(error, operation, metadata, 1)
+                self.assertEqual(1, pipeline.get_current_batch_index())
 
     def test_staged_without_context_clears_attribution(self) -> None:
         for fail_on in ("start", "wait"):
