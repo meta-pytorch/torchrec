@@ -67,6 +67,14 @@ inline bool CachelineIDTransformer<
         tcb::span<int64_t> cache_ids,
         Update update,
         Fetch fetch) {
+  // The table marks occupied slots by the sign bit of ~global_id, so a
+  // negative id cannot be stored. Check all ids before mutating any state.
+  for (const int64_t global_id : global_ids) {
+    TORCH_CHECK(
+        global_id >= 0,
+        "CachelineIDTransformer only supports non-negative global ids, got ",
+        global_id);
+  }
   for (size_t i = 0; i < global_ids.size(); ++i) {
     int64_t global_id = global_ids[i];
     auto [group_id, intra_id] = FindGroupIndex(global_id);
@@ -124,6 +132,10 @@ inline void CachelineIDTransformer<
     BitMap,
     Hash>::Evict(tcb::span<const int64_t> global_ids) {
   for (const int64_t global_id : global_ids) {
+    // Transform rejects negative ids, so none can be in the table.
+    if (global_id < 0) {
+      continue;
+    }
     auto [group_id, intra_id] = FindGroupIndex(global_id);
 
     int64_t global_id_not = ~global_id;

@@ -97,6 +97,7 @@ class CachelineIDTransformer {
    * @param update update lambda. See `Update` doc.
    * @param fetch fetch lambda. See `Fetch` doc.
    * @return true if all transformed, otherwise need eviction.
+   * @throws c10::Error if any global id is negative.
    */
   template <
       typename Update = decltype(transform_default::NoUpdate<LXURecord>),
@@ -120,8 +121,10 @@ class CachelineIDTransformer {
   static_assert(std::is_trivially_destructible_v<CacheValue>);
   static_assert(std::is_trivially_constructible_v<CacheValue>);
   [[nodiscard]] std::tuple<int64_t, int64_t> FindGroupIndex(int64_t val) const {
-    int64_t hash = hasher_(val);
-    return {hash / group_size_ % num_groups_, hash % group_size_};
+    uint64_t hash = hasher_(val);
+    return {
+        static_cast<int64_t>(hash / group_size_ % num_groups_),
+        static_cast<int64_t>(hash % group_size_)};
   }
 
   static constexpr int64_t group_size_ =
