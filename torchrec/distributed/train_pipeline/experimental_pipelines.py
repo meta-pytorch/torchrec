@@ -400,6 +400,16 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
             ThreadPoolExecutor(max_workers=1) if multi_thread else None
         )
         self._sparse_future: Optional[Future[In]] = None
+        self._current_progress_batch_index: Optional[int] = None
+
+    def get_current_batch_index(self) -> Optional[int]:
+        if self._current_progress_batch_index is not None:
+            return self._current_progress_batch_index
+        return super().get_current_batch_index()
+
+    def reset(self) -> None:
+        super().reset()
+        self._current_progress_batch_index = None
 
     # pyrefly: ignore[bad-override]
     def _pipeline_model(
@@ -697,12 +707,18 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         while preparing the next batch through Stages 1+2 (CPU sparse forward
         + async copy). This overlaps CPU sparse work with GPU dense compute.
         """
+        self._current_progress_batch_index = (
+            self.contexts[0].index if self.contexts else None
+        )
         self.fill_pipeline(dataloader_iter)
         if not self.batches:
+            self._current_progress_batch_index = None
             one_time_rank0_logger.info(
                 f"training stopped at {self._batch_count} batches"
             )
             raise StopIteration
+
+        self._current_progress_batch_index = self.contexts[0].index
 
         # Wait for any pending sparse forward from previous iteration
         if self._sparse_future is not None:

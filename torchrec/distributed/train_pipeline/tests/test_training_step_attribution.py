@@ -62,6 +62,14 @@ class _CopyableBatch(_Batch):
         pass
 
 
+class _FailingCopyBatch(_Batch):
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def to(self, device: torch.device, non_blocking: bool) -> _FailingCopyBatch:
+        raise self._error
+
+
 class _FakeStream:
     def __init__(self, device: torch.device) -> None:
         self.device = device
@@ -795,13 +803,13 @@ class TrainingStepAttributionTest(unittest.TestCase):
     def test_base_pt2_and_sparse_optimizer_failure_uses_new_context_after_success(
         self,
     ) -> None:
-        for pipeline_type, second_metadata in product(
+        for pipeline_type, third_metadata in product(
             (TrainPipelineBase, TrainPipelinePT2, TrainPipelineSparseDist),
             (None, object()),
         ):
             with self.subTest(
                 pipeline_type=pipeline_type.__name__,
-                attributed=second_metadata is not None,
+                attributed=third_metadata is not None,
             ):
                 model = _TrainingModel()
                 optimizer = self._make_sgd(model)
@@ -816,13 +824,20 @@ class TrainingStepAttributionTest(unittest.TestCase):
                 )
                 first_batch = _CopyableBatch()
                 second_batch = _CopyableBatch()
-                second_input = self._wrap_batch(second_batch, second_metadata)
+                third_batch = _CopyableBatch()
+                first_metadata = object()
+                second_metadata = object()
+                third_input = self._wrap_batch(third_batch, third_metadata)
                 batches: list[Pipelineable] = [
                     cast(
                         Pipelineable,
-                        AttributedBatch(first_batch, object()),
+                        AttributedBatch(first_batch, first_metadata),
                     ),
-                    second_input,
+                    cast(
+                        Pipelineable,
+                        AttributedBatch(second_batch, second_metadata),
+                    ),
+                    third_input,
                 ]
                 if pipeline_type is TrainPipelineSparseDist:
                     batches.append(
@@ -833,19 +848,73 @@ class TrainingStepAttributionTest(unittest.TestCase):
                     )
                 dataloader_iter = iter(batches)
 
+                self.assertIsNone(pipeline.get_last_processed_batch_metadata())
                 self.assertIs(model.output, pipeline.progress(dataloader_iter))
+                self.assertIs(
+                    first_metadata,
+                    pipeline.get_last_processed_batch_metadata(),
+                )
+                self.assertIs(model.output, pipeline.progress(dataloader_iter))
+                self.assertIs(
+                    second_metadata,
+                    pipeline.get_last_processed_batch_metadata(),
+                )
                 self._assert_optimizer_failure(
                     pipeline,
                     optimizer,
                     dataloader_iter,
+                    third_metadata,
+                    batch_index=2,
+                )
+                self.assertEqual(2, pipeline.get_current_batch_index())
+                self.assertIs(
                     second_metadata,
-                    batch_index=1,
+                    pipeline.get_last_processed_batch_metadata(),
                 )
 
                 self.assertEqual(
-                    [first_batch, second_batch],
+                    [first_batch, second_batch, third_batch],
                     model.received_batches,
                 )
+
+                pipeline.reset()
+                self.assertIsNone(pipeline.get_last_processed_batch_metadata())
+                self.assertIsNone(pipeline.get_current_batch_index())
+
+    def test_sparse_progress_keeps_current_index_on_lookahead_copy_failure(
+        self,
+    ) -> None:
+        model = _TrainingModel()
+        pipeline = self._make_sparse_pipeline(model)
+        error = RuntimeError("copy failed")
+        current_metadata = object()
+        failed_metadata = object()
+        dataloader_iter = iter(
+            (
+                cast(
+                    Pipelineable,
+                    AttributedBatch(_CopyableBatch(), current_metadata),
+                ),
+                _CopyableBatch(),
+                cast(
+                    Pipelineable,
+                    AttributedBatch(_FailingCopyBatch(error), failed_metadata),
+                ),
+            )
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            pipeline.progress(dataloader_iter)
+
+        self.assertIs(error, raised.exception)
+        self._assert_attribution(
+            error,
+            failed_metadata,
+            operation="copy_to_device",
+            batch_index=2,
+        )
+        self.assertEqual(0, pipeline.get_current_batch_index())
+        self.assertIsNone(pipeline.get_last_processed_batch_metadata())
 
     def test_optimizer_failure_uses_current_context(self) -> None:
         def make_compiled_autograd(

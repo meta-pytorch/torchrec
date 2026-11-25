@@ -209,6 +209,8 @@ def _attributed_model_forward(
 
 
 class TrainPipeline(abc.ABC, Generic[In, Out]):
+    _last_processed_batch_metadata: object | None = None
+
     @abc.abstractmethod
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         pass
@@ -216,18 +218,41 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def __init__(self) -> None:
         # pipeline state such as in foward, in backward etc, used in training recover scenarios
         self._state: PipelineState = PipelineState.IDLE
+        self._last_processed_batch_metadata = None
 
         logger.info(f"TrainPipeline class: {type(self)}")
         one_time_rank0_logger.info(f"TrainPipeline class: {type(self)}")
 
     @property
     def supports_batch_attribution(self) -> bool:
+        """Whether this pipeline implements the batch-attribution contract.
+
+        Existing subclasses remain compatible by defaulting to unsupported. A
+        pipeline that changes batch ownership in ``progress`` must either expose
+        matching attribution accessors or remain unsupported.
+        """
         return False
 
     def _get_optimizer_context(
         self,
     ) -> TrainPipelineContextLite | TrainPipelineContext | None:
         """Return the batch context owning the current optimizer operation."""
+        return None
+
+    def get_last_processed_batch_metadata(self) -> object | None:
+        """Return metadata for the latest successfully processed batch.
+
+        The value must not advance when processing fails and is ``None`` when
+        no batch has completed or attribution is unsupported.
+        """
+        return self._last_processed_batch_metadata
+
+    def get_current_batch_index(self) -> Optional[int]:
+        """Return the pipeline-relative index owning the in-flight operation.
+
+        The value is ``None`` when no batch is active or attribution is
+        unsupported.
+        """
         return None
 
     def sync_embeddings(
@@ -349,6 +374,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._cur_batch: Optional[In] = None
         self._cur_context: TrainPipelineContextLite | None = None
         self._prev_context: TrainPipelineContextLite | None = None
+        self._current_progress_batch_index: Optional[int] = None
         self._dataloader_iter: Optional[Iterator[In]] = None
         # Temporary metadata handoff preserving raw `_next_batch()` returns.
         # `_next_batch_with_metadata()` clears it before fetching and in `finally`.
@@ -364,6 +390,8 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._cur_context = None
         self._next_batch_metadata = None
         self._prev_context = None
+        self._current_progress_batch_index = None
+        self._last_processed_batch_metadata = None
 
     def _reset_data_iter_if_needed(self, dataloader_iter: Iterator[In]) -> None:
         if dataloader_iter is not self._dataloader_iter:
@@ -386,6 +414,9 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             )
             if not self._data_iter_stopped
             else None
+        )
+        self._current_progress_batch_index = (
+            self._cur_context.index if self._cur_context is not None else None
         )
         if cur_batch is not None:
             self._copy_batch_to_gpu(cur_batch)
@@ -432,6 +463,9 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
     def _get_optimizer_context(self) -> TrainPipelineContextLite | None:
         return self._prev_context
 
+    def get_current_batch_index(self) -> Optional[int]:
+        return self._current_progress_batch_index
+
     @attributed_logger("optimizer", owner=lambda self: self._get_optimizer_context())
     def _optimizer_step(self) -> None:
         self._optimizer.step()
@@ -474,6 +508,9 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                 f"training stopped at {self._batch_count} batches"
             )
             raise StopIteration()
+        self._current_progress_batch_index = (
+            self._cur_context.index if self._cur_context is not None else None
+        )
         self._batch_count += 1
 
         # get the current batch from previous operation
@@ -526,6 +563,12 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             if self._model.training:
                 with record_function("## optimizer ##"):
                     self._optimizer_step()
+
+            self._last_processed_batch_metadata = (
+                self._prev_context.batch_metadata
+                if self._prev_context is not None
+                else None
+            )
         finally:
             self._prev_context = None
 
@@ -598,6 +641,9 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
 
     def _get_optimizer_context(self) -> TrainPipelineContextLite | None:
         return self._cur_context
+
+    def get_current_batch_index(self) -> Optional[int]:
+        return self._cur_context.index if self._cur_context is not None else None
 
     @attributed_logger("optimizer", owner=lambda self: self._get_optimizer_context())
     def _optimizer_step(self) -> None:
@@ -677,7 +723,11 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
             with record_function("## optimizer ##"):
                 self._optimizer_step()
 
+        self._last_processed_batch_metadata = context.batch_metadata
         return output
+
+    def reset(self) -> None:
+        super().reset()
 
 
 class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In]):
@@ -982,7 +1032,8 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         remove a processed batch from the batch queue, also set the module context if applicable
         """
         self.batches.popleft()
-        self.contexts.popleft()
+        context = self.contexts.popleft()
+        self._last_processed_batch_metadata = getattr(context, "batch_metadata", None)
 
         # update PipelinedForward context to match next forward pass
         if len(self.batches) >= 1:
@@ -1147,6 +1198,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
     def _get_optimizer_context(self) -> Optional[TrainPipelineContext]:
         return self.contexts[0] if self.contexts else None
 
+    def get_current_batch_index(self) -> Optional[int]:
+        return self.contexts[0].index if self.contexts else None
+
     @attributed_logger("optimizer", owner=lambda self: self._get_optimizer_context())
     def _optimizer_step(self) -> None:
         self._optimizer.step()
@@ -1197,6 +1251,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
     def reset(self) -> None:
         self.contexts.clear()
         self.batches.clear()
+        self._last_processed_batch_metadata = None
         self._dataloader_exhausted = False
         self._next_batch_metadata = None
         self._next_index = 0
@@ -3217,6 +3272,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         # Temporary metadata handoff preserving raw `_next_batch()` returns.
         # `_next_batch_with_metadata()` clears it before fetching and in `finally`.
         self._next_batch_metadata: Optional[object] = None
+        self._current_progress_batch_index: Optional[int] = None
         self._compute_stream: torch.Stream = (
             compute_stream
             or torch.get_device_module(
@@ -3241,6 +3297,24 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         context = TrainPipelineContext(index=self._next_index, version=1)
         self._next_index += 1
         return context
+
+    def get_current_batch_index(self) -> Optional[int]:
+        if self._current_progress_batch_index is not None:
+            return self._current_progress_batch_index
+
+        first_context = self._stage_contexts[0] if self._stage_contexts else None
+        return first_context.index if first_context is not None else None
+
+    @property
+    def last_output_context(self) -> Optional[TrainPipelineContext]:
+        return self._last_output_context
+
+    def mark_batch_processed(self) -> None:
+        """Publish metadata after the latest Staged output completes training."""
+        if self._last_output_context is not None:
+            self._last_processed_batch_metadata = (
+                self._last_output_context.batch_metadata
+            )
 
     def _advance(self) -> Optional[StageOutputWithEvent]:
         # left shifts all batch results.
@@ -3460,7 +3534,9 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         self._dataloader_iter = None
         self._dataloader_exhausted = False
         self._next_batch_metadata = None
+        self._current_progress_batch_index = None
         self._flushing = False
+        self._last_processed_batch_metadata = None
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -3484,10 +3560,18 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             Optional[StageOut]: Output of the final stage. `None` signifies that the
                 dataloader iterator is depleted.
         """
+        first_context = self._stage_contexts[0] if self._stage_contexts else None
+        self._current_progress_batch_index = (
+            first_context.index if first_context is not None else None
+        )
         if not self._initialized:
             self._fill_pipeline(dataloader_iter)
 
         output_with_event = self._advance()
+        output_context = self._last_output_context
+        self._current_progress_batch_index = (
+            output_context.index if output_context is not None else None
+        )
 
         if output_with_event is None:
             # All data consumed, exit early
@@ -3516,7 +3600,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
                 self._record_stream(
                     out,
                     self._compute_stream,
-                    context=self._last_output_context,
+                    context=output_context,
                 )
 
         if out is None and self._flushing:
