@@ -2044,7 +2044,11 @@ class EvalPipelinePrefetchSparseDist(TrainPipelineSparseDist[In, Out]):
             # batch i's prefetch was issued on the prefetch stream; the forward
             # below reads its output on the current stream.
             with record_function(f"## wait_for_batch {self.contexts[0].index} ##"):
-                _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+                _wait_for_batch(
+                    cast(In, self.batches[0]),
+                    self._prefetch_stream,
+                    context=self.contexts[0],
+                )
 
             if not self._enqueue_batch_after_forward:
                 # batch i+3: load data and copy to gpu, the dataloader iter will
@@ -2319,7 +2323,11 @@ class PrefetchTrainPipelineFusedSparseDist(PrefetchTrainPipelineSparseDist[In, O
                 self._optimizer.zero_grad()
 
         with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
+            _wait_for_batch(
+                cast(In, self.batches[0]),
+                self._prefetch_stream,
+                context=context,
+            )
 
         # batch i+2: load data and copy to gpu
         self.enqueue_batch(dataloader_iter)
