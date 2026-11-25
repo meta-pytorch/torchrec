@@ -1749,6 +1749,10 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         defer_pipeline_stream_fences (bool): defer whole-stream waits by recording
             per-module lookup completion events and keeping produced tensors alive
             on their consuming streams.
+        async_optimizer (bool): see `TrainPipelineSparseDist`. With
+            DATA_PARALLEL tables, use ``defer_dp_lookup=True`` so their lookups
+            run in the forward, after the optimizer step; without it, the
+            pipeline uses the regular optimizer step.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -1776,6 +1780,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         embedding_lookup_before_optimizer: bool = False,
         defer_dp_lookup: bool = False,
         defer_pipeline_stream_fences: bool = False,
+        async_optimizer: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1790,6 +1795,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             free_features_storage_early=free_features_storage_early,
             clear_data_dist_inputs=clear_data_dist_inputs,
+            async_optimizer=async_optimizer,
         )
 
         self._embedding_lookup_phase = _resolve_embedding_lookup_phase(
@@ -1837,6 +1843,27 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             self._emb_lookup_stream = self._data_dist_stream
         else:
             raise RuntimeError(f"Unknown emb_lookup_stream {emb_lookup_stream}")
+
+    def _arm_async_optimizer_ddps(self) -> None:
+        """
+        Falls back to the regular optimizer step when the model has DATA_PARALLEL
+        tables and ``defer_dp_lookup`` is off. Their weights are updated by the
+        optimizer step, and a lookup issued outside the forward is not ordered
+        after the side stream.
+        """
+        # Sharded modules wrap each DATA_PARALLEL lookup in a DDP.
+        if (
+            self._async_optimizer
+            and not self._defer_dp_lookup
+            and any(find_ddp_modules(module) for module in self._pipelined_modules)
+        ):
+            logger.warning(
+                "async_optimizer: DATA_PARALLEL tables need defer_dp_lookup=True. "
+                "Using the regular optimizer step."
+            )
+            self._async_optimizer = False
+            return
+        super()._arm_async_optimizer_ddps()
 
     def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
         super().fill_pipeline(dataloader_iter)
