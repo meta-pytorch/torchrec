@@ -83,6 +83,9 @@ from torchrec.distributed.model_parallel import (
     get_module,
     ShardedModule,
 )
+from torchrec.distributed.train_pipeline.batch_attribution import (
+    unwrap_attributed_batch,
+)
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
     In,
@@ -819,6 +822,7 @@ class DataLoadingThread(Thread, Generic[In]):
         self._device = device
         self._to_device_non_blocking = to_device_non_blocking
         self._buffered: Optional[In] = None
+        self._buffered_batch_metadata: object | None = None
         self._exception: Optional[Exception] = None
         self._buffer_empty_event.set()
         one_time_rank0_logger.info(
@@ -844,7 +848,9 @@ class DataLoadingThread(Thread, Generic[In]):
                 return
             with record_function("## load_batch ##"):
                 try:
-                    batch = next(self._dataloader_iter)
+                    batch, batch_metadata = unwrap_attributed_batch(
+                        next(self._dataloader_iter)
+                    )
                 except StopIteration:
                     self._stop = True
                     self._buffer_filled_event.set()
@@ -866,13 +872,23 @@ class DataLoadingThread(Thread, Generic[In]):
                     self._buffer_filled_event.set()
                     return
             with record_function("## copy_batch_to_gpu ##"):
-                with torch.get_device_module(self._device).stream(self._memcpy_stream):
-                    self._buffered = cast(
-                        In,
-                        batch.to(
-                            self._device, non_blocking=self._to_device_non_blocking
-                        ),
-                    )
+                try:
+                    with torch.get_device_module(self._device).stream(
+                        self._memcpy_stream
+                    ):
+                        self._buffered = cast(
+                            In,
+                            batch.to(
+                                self._device,
+                                non_blocking=self._to_device_non_blocking,
+                            ),
+                        )
+                        self._buffered_batch_metadata = batch_metadata
+                except Exception as e:
+                    self._exception = e
+                    self._stop = True
+                    self._buffer_filled_event.set()
+                    return
                 self._buffer_empty_event.clear()
                 self._buffer_filled_event.set()
 
@@ -885,9 +901,20 @@ class DataLoadingThread(Thread, Generic[In]):
         logger.info(f"{self.__class__.__name__}: Data loading thread stopped.")
 
     def get_next_batch(self, none_throws: bool = False) -> Optional[In]:
+        """Return the next raw batch without its attribution metadata.
+
+        Call ``get_next_batch_with_metadata`` when attribution metadata must
+        remain paired with the batch.
         """
-        Get the next batch from the buffer if threading is enabled, otherwise
-        call load_next_batch directly.
+        batch, _ = self.get_next_batch_with_metadata(none_throws)
+        return batch
+
+    def get_next_batch_with_metadata(
+        self,
+        none_throws: bool = False,
+    ) -> Tuple[Optional[In], object | None]:
+        """
+        Get the next raw batch and its attribution metadata from the buffer.
 
         This function is not thread safe. We assume this is only invoked from
         the main thread in the training loop.
@@ -901,11 +928,13 @@ class DataLoadingThread(Thread, Generic[In]):
         if batch is None:
             if none_throws:
                 raise StopIteration
-            return None
+            return None, None
+        batch_metadata = self._buffered_batch_metadata
         self._buffered = None
+        self._buffered_batch_metadata = None
         self._buffer_filled_event.clear()
         self._buffer_empty_event.set()
-        return batch
+        return batch, batch_metadata
 
 
 def prefetch_embeddings(
