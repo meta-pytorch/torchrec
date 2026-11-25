@@ -26,7 +26,10 @@ Out = TypeVar("Out")
 @dataclass
 class TrainPipelineContext:
     """
-    Context information for a `TrainPipelineSparseDist` instance.
+    Per-batch context for a training pipeline.
+
+    Pipelines may use only the batch identity fields or populate the sparse
+    distribution state below as the batch advances through additional stages.
 
     Attributes:
         input_dist_splits_requests (Dict[str, Awaitable[Any]]): Stores input dist
@@ -48,6 +51,8 @@ class TrainPipelineContext:
         delayed_backward_tensors: Output-dist tensors whose upstream backward is
             delayed until a later pipeline stage.
         delay_backward: Whether output-dist backward is delayed for this batch.
+        batch_metadata: Opaque attribution metadata paired with this batch, or
+            ``None`` when the batch is unattributed.
     """
 
     input_dist_splits_requests: Dict[str, Awaitable[Any]] = field(default_factory=dict)
@@ -71,6 +76,7 @@ class TrainPipelineContext:
     )
     delayed_backward_tensors: List[DelayedBackwardTensor] = field(default_factory=list)
     delay_backward: bool = True
+    batch_metadata: object | None = field(default=None, kw_only=True)
 
 
 @dataclass
