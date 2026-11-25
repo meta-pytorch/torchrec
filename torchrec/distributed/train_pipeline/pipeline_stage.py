@@ -7,7 +7,7 @@
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
@@ -87,6 +87,8 @@ class PipelineStage:
             runnable during filling the pipeline
         data_exhausted_callback (Optional[Callable[[], None]])) - optional callback to run
             when data is exhausted
+        pass_batch_context (bool): Whether to pass the context paired with the input
+            batch to the runnable as the keyword-only ``context`` argument.
     """
 
     name: str
@@ -94,6 +96,7 @@ class PipelineStage:
     stream: torch.Stream
     fill_callback: Optional[Callable[[], None]] = None
     data_exhausted_callback: Optional[Callable[[], None]] = None
+    pass_batch_context: bool = field(default=False, kw_only=True)
 
 
 class SparseDataDistUtil(Generic[In]):
