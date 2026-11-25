@@ -164,9 +164,9 @@ def wrap(
         data_info: dict keyed by int index of module path. For example, if the dataloader produces
             `label, kjt1, kjt2` each iteration and `kjt1` and `kjt2` are inputs to modules of path
             `emb1` and `emb2` respectively, then `data_info` should be `{ 1: "emb1", 2: "emb2" }`.
-        eviction_config: configuration for eviction policy. Default is `{"type": "mixed_lru_lfu"}`
+        eviction_config: configuration for eviction policy. Default is `{"type": "mixed_lru_lfu", "ratio": 0.5}`
         transform_config: configuration for the transformer. Default is `{"type": "naive"}`
-        transform_config: configuration for the ps. Default is `{"chunk_size": 8 * 1024 * 1024}
+        ps_config: configuration for the ps. Default is `{"chunk_size": 8 * 1024 * 1024}
         parallel: Whether the IDTransformerCollections will run paralell. When set to True,
             IDTransformerGroup will start a thread for each IDTransformerCollection.
         num_prefetch: number of samples to prefetch.
