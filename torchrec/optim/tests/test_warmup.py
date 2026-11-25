@@ -9,11 +9,17 @@
 
 import unittest
 from collections import defaultdict
+from copy import deepcopy
 from typing import Any
+from unittest.mock import patch
 
 import torch
 from torch.autograd import Variable
-from torchrec.optim.keyed import KeyedOptimizer
+from torchrec.optim.keyed import (
+    CombinedOptimizer,
+    KeyedOptimizer,
+    KeyedOptimizerWrapper,
+)
 from torchrec.optim.warmup import WarmupOptimizer, WarmupPolicy, WarmupStage
 
 
@@ -27,6 +33,53 @@ class DummyKeyedOptimizer(KeyedOptimizer):
 
 
 class TestWarmupOptimizer(unittest.TestCase):
+    def test_legacy_nested_checkpoint_resume(self) -> None:
+        def make(
+            optimizer_type: type[torch.optim.SGD] | type[torch.optim.AdamW],
+        ) -> tuple[torch.Tensor, CombinedOptimizer, KeyedOptimizerWrapper]:
+            p = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+            kwargs = {"lr": 0.03, "weight_decay": 0.2}
+            if optimizer_type is torch.optim.SGD:
+                kwargs["momentum"] = 0.9
+            keyed = KeyedOptimizerWrapper(
+                {"weight": p}, lambda ps: optimizer_type(ps, **kwargs)
+            )
+            warmup = WarmupOptimizer(
+                keyed,
+                [WarmupStage(WarmupPolicy.LINEAR, max_iters=6, value=0.1)],
+                lr=0.03,
+            )
+            return p, CombinedOptimizer([warmup]), keyed
+
+        for optimizer_type in (torch.optim.SGD, torch.optim.AdamW):
+            with self.subTest(optimizer=optimizer_type):
+                p, source, _ = make(optimizer_type)
+                for step in range(4):
+                    p.grad = torch.tensor([0.2 * (step + 1), -0.3])
+                    source.step()
+                saved = deepcopy(source.state_dict())
+                self.assertEqual(set(saved), {"state"})
+                q, target, keyed = make(optimizer_type)
+                target.init_state()
+                with torch.no_grad():
+                    q.copy_(p)
+                with patch.object(keyed, "post_load_state_dict") as child_hook:
+                    target.load_state_dict(saved)
+                    child_hook.assert_not_called()
+                for step in range(4, 9):
+                    p.grad = torch.tensor([0.2 * (step + 1), -0.3])
+                    q.grad = p.grad.clone()
+                    source.step()
+                    target.step()
+                    torch.testing.assert_close(q, p, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        target.state_dict(), source.state_dict(), rtol=0, atol=0
+                    )
+                    self.assertEqual(
+                        [group["lr"] for group in target.param_groups],
+                        [group["lr"] for group in source.param_groups],
+                    )
+
     def test_load_state_dict(self) -> None:
         def get_optimizer() -> WarmupOptimizer:
             param_1_t = torch.tensor([1.0, 2.0])
