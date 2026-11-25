@@ -227,6 +227,12 @@ class EmbeddingShardingPerfEvaluator(ABC):
         """
         return ctx.device_bw
 
+    def _get_lookup_bw(
+        self, ctx: ShardPerfContext, config: HardwarePerfConfig
+    ) -> float:
+        """Get the bandwidth used for embedding-row reads."""
+        return ctx.lookup_bw if ctx.lookup_bw is not None else ctx.device_bw
+
     def _get_hbm_to_ddr_mem_bw(
         self, ctx: ShardPerfContext, config: HardwarePerfConfig
     ) -> float:
@@ -377,11 +383,11 @@ class EmbeddingShardingPerfEvaluator(ABC):
         Default forward using coefficient-based formula.
 
         Formula:
-            fwd_compute = (input_read_size * input_read_size_multiplier
+            fwd_compute = ((input_read_size * input_read_size_multiplier
+                           + fwd_output_write_size * embedding_output_multiplier
+                           + hash_size * hash_size_multiplier) / device_bw
                           + embedding_lookup_size * lookup_size_multiplier
-                          + fwd_output_write_size * embedding_output_multiplier
-                          + hash_size * hash_size_multiplier)
-                          * block_usage_penalty / device_bw
+                            / lookup_bw) * block_usage_penalty
 
         Args:
             ctx: Shard performance context
@@ -391,6 +397,9 @@ class EmbeddingShardingPerfEvaluator(ABC):
             Forward compute time in seconds
         """
         device_bw = self._get_device_bw(ctx, config)
+        lookup_bw = self._get_lookup_bw(ctx, config)
+        assert device_bw > 0, f"Invalid device bw: {device_bw}"
+        assert lookup_bw > 0, f"Invalid lookup bw: {lookup_bw}"
 
         # Get coefficients for this sharding type
         coefficients = config.get_coefficients_for_sharding(
@@ -420,16 +429,20 @@ class EmbeddingShardingPerfEvaluator(ABC):
             )
 
         # Apply coefficients
-        compute_size = (
-            fwd_coeff.input_read_size_multiplier * input_read_size
-            + fwd_coeff.lookup_size_multiplier * embedding_lookup_size
-            + fwd_coeff.embedding_output_multiplier * fwd_output_write_size
-            + fwd_coeff.hash_size_multiplier * ctx.hash_size
-        )
+        input_size = fwd_coeff.input_read_size_multiplier * input_read_size
+        lookup_size = fwd_coeff.lookup_size_multiplier * embedding_lookup_size
+        output_size = fwd_coeff.embedding_output_multiplier * fwd_output_write_size
+        hash_size = fwd_coeff.hash_size_multiplier * ctx.hash_size
 
-        fwd_compute = compute_size * block_penalty / device_bw
+        # A single bandwidth keeps the original summation order, so estimates
+        # for kernels without a separate lookup bandwidth are unchanged.
+        if lookup_bw == device_bw:
+            compute_size = input_size + lookup_size + output_size + hash_size
+            return compute_size * block_penalty / device_bw
 
-        return fwd_compute
+        return (
+            (input_size + output_size + hash_size) / device_bw + lookup_size / lookup_bw
+        ) * block_penalty
 
     def use_min_dim_for_lookup(self, config: HardwarePerfConfig) -> bool:
         """
@@ -518,13 +531,21 @@ class EmbeddingShardingPerfEvaluator(ABC):
         if bwd_coeff is not None:
             # Use bwd_coeff based approach if backward coefficients are defined
             device_bw = self._get_device_bw(ctx=ctx, config=config)
-            compute_size = (
-                bwd_coeff.input_read_size_multiplier * input_read_size
-                + bwd_coeff.lookup_size_multiplier * embedding_lookup_size
-                + bwd_coeff.embedding_output_multiplier * output_write_size
-                + bwd_coeff.hash_size_multiplier * ctx.hash_size
-            )
-            bwd_compute = compute_size / device_bw
+            lookup_bw = self._get_lookup_bw(ctx=ctx, config=config)
+            assert device_bw > 0, f"Invalid device bw: {device_bw}"
+            assert lookup_bw > 0, f"Invalid lookup bw: {lookup_bw}"
+            input_size = bwd_coeff.input_read_size_multiplier * input_read_size
+            lookup_size = bwd_coeff.lookup_size_multiplier * embedding_lookup_size
+            output_size = bwd_coeff.embedding_output_multiplier * output_write_size
+            hash_size = bwd_coeff.hash_size_multiplier * ctx.hash_size
+            if lookup_bw == device_bw:
+                bwd_compute = (
+                    input_size + lookup_size + output_size + hash_size
+                ) / device_bw
+            else:
+                bwd_compute = (
+                    input_size + output_size + hash_size
+                ) / device_bw + lookup_size / lookup_bw
         else:
             # Use default approach if backward coefficients are not defined
             # Priority: config override -> ctx (from topology)
