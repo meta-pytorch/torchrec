@@ -67,7 +67,10 @@ from torchrec.distributed.test_utils.test_sharding import (
 from torchrec.distributed.tests.test_fp_embeddingbag_utils import (
     create_module_and_freeze,
 )
-from torchrec.distributed.train_pipeline.batch_attribution import AttributedBatch
+from torchrec.distributed.train_pipeline.batch_attribution import (
+    AttributedBatch,
+    get_exception_attribution,
+)
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
     EvalPipelineCPUSparse,
     PrefetchTrainPipelineFusedSparseDist,
@@ -156,6 +159,38 @@ class _ContextualStageOutput(Pipelineable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         self.batch.record_stream(stream)
+
+
+class _FailingBatch(Pipelineable):
+    def __init__(self, error: RuntimeError) -> None:
+        self.error = error
+
+    def to(
+        self,
+        device: torch.device,
+        non_blocking: bool,
+        data_copy_stream: Optional[torch.Stream] = None,
+        dense_only: bool = False,
+    ) -> "_FailingBatch":
+        raise self.error
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        pass
+
+
+def _assert_exception_attribution(
+    test_case: unittest.TestCase,
+    error: RuntimeError,
+    operation: str,
+    metadata: object,
+    batch_index: int,
+) -> None:
+    attribution = get_exception_attribution(error)
+    test_case.assertIsNotNone(attribution)
+    assert attribution is not None
+    test_case.assertEqual(operation, attribution.operation)
+    test_case.assertIs(metadata, attribution.metadata)
+    test_case.assertEqual(batch_index, attribution.batch_index)
 
 
 class TestModule(nn.Module):
@@ -350,6 +385,41 @@ class TrainPipelineBaseTest(unittest.TestCase):
         )
         self.assertIsNot(first_context, pipeline.copied_contexts[-1][1])
 
+    def test_copy_failure_uses_batch_context(self) -> None:
+        device = torch.device("cpu")
+        metadata = object()
+        valid_batch = ModelInputSimple(
+            float_features=torch.zeros(10),
+            label=torch.zeros(1),
+        )
+
+        for copy_path, preceding_batches, batch_index in (
+            ("connect", [], 0),
+            ("progress", [valid_batch], 1),
+        ):
+            with self.subTest(copy_path=copy_path):
+                model = TestModule().to(device)
+                model.eval()
+                optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+                pipeline = TrainPipelineBase(model, optimizer, device)
+                error = RuntimeError("copy failed")
+                failing_batch = cast(
+                    ModelInputSimple,
+                    AttributedBatch(_FailingBatch(error), metadata),
+                )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    pipeline.progress(iter([*preceding_batches, failing_batch]))
+
+                self.assertIs(error, raised.exception)
+                _assert_exception_attribution(
+                    self,
+                    error,
+                    "copy_to_device",
+                    metadata,
+                    batch_index,
+                )
+
     def test_none_batch_has_context_but_exhaustion_does_not(self) -> None:
         device = torch.device("cpu")
         model = TestModule().to(device)
@@ -464,6 +534,64 @@ class TrainPipelinePT2Test(unittest.TestCase):
             cast(TrainPipelineContextLite, pipeline._cur_context).index,
             0,
         )
+
+    def test_preprocessing_failure_uses_batch_context(self) -> None:
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        error = RuntimeError("preprocessing failed")
+        received: list[object] = []
+
+        def fail_preprocessing(batch: ModelInputSimple) -> ModelInputSimple:
+            received.append(batch)
+            raise error
+
+        pipeline = TrainPipelinePT2(
+            model,
+            optimizer,
+            device,
+            compile_configs=TorchCompileConfig(compile_on_iter=100),
+            input_transformer=fail_preprocessing,
+        )
+        batch = ModelInputSimple(
+            float_features=torch.zeros(10),
+            label=torch.zeros(1),
+        )
+        metadata = object()
+
+        with self.assertRaises(RuntimeError) as raised:
+            pipeline.progress(
+                iter([cast(ModelInputSimple, AttributedBatch(batch, metadata))])
+            )
+
+        self.assertIs(error, raised.exception)
+        self.assertEqual(1, len(received))
+        self.assertIsInstance(received[0], ModelInputSimple)
+        _assert_exception_attribution(self, error, "preprocessing", metadata, 0)
+
+    def test_copy_failure_uses_batch_attribution(self) -> None:
+        device = torch.device("cpu")
+        model = TestModule().to(device)
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelinePT2(model, optimizer, device)
+        error = RuntimeError("copy failed")
+        batch = _FailingBatch(error)
+        metadata = object()
+
+        with self.assertRaises(RuntimeError) as raised:
+            pipeline.progress(
+                iter(
+                    [
+                        cast(
+                            ModelInputSimple,
+                            AttributedBatch(batch, metadata),
+                        )
+                    ]
+                )
+            )
+
+        self.assertIs(error, raised.exception)
+        _assert_exception_attribution(self, error, "copy_to_device", metadata, 0)
 
     def test_attributed_batch_is_unwrapped_into_context(self) -> None:
         device = torch.device("cpu")
@@ -830,6 +958,183 @@ class TrainPipelineSparseDistBatchContextTest(unittest.TestCase):
         context = pipeline.contexts[0]
         self.assertIsInstance(context, CPUEmbeddingTrainPipelineContext)
         self.assertIs(metadata, context.batch_metadata)
+
+    def test_cpu_embedding_copy_failure_uses_batch_attribution(self) -> None:
+        for enable_inplace_copy_batch in (False, True):
+            with self.subTest(enable_inplace_copy_batch=enable_inplace_copy_batch):
+                model = TestModule()
+                optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+                pipeline = EvalPipelineCPUSparse(
+                    model,
+                    optimizer,
+                    device=torch.device("cpu"),
+                    enable_inplace_copy_batch=enable_inplace_copy_batch,
+                )
+                error = RuntimeError("copy failed")
+                metadata = object()
+                context = CPUEmbeddingTrainPipelineContext(index=7, version=1)
+                context.batch_metadata = metadata
+
+                with self.assertRaises(RuntimeError) as raised:
+                    pipeline.copy_data_to_gpu(_FailingBatch(error), context)
+
+                self.assertIs(error, raised.exception)
+                _assert_exception_attribution(
+                    self, error, "copy_to_device", metadata, 7
+                )
+
+    def test_copy_failure_uses_batch_attribution(self) -> None:
+        for enable_inplace_copy_batch in (False, True):
+            with self.subTest(enable_inplace_copy_batch=enable_inplace_copy_batch):
+                model = TestModule()
+                optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+                pipeline = TrainPipelineSparseDist(
+                    model,
+                    optimizer,
+                    device=torch.device("cpu"),
+                    enable_inplace_copy_batch=enable_inplace_copy_batch,
+                )
+                error = RuntimeError("copy failed")
+                metadata = object()
+                dataloader = iter(
+                    [
+                        cast(
+                            _FailingBatch,
+                            AttributedBatch(_FailingBatch(error), metadata),
+                        )
+                    ]
+                )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    if enable_inplace_copy_batch:
+                        pipeline.inplace_copy_batch_to_gpu(dataloader)
+                    else:
+                        pipeline.copy_batch_to_gpu(dataloader)
+
+                self.assertIs(error, raised.exception)
+                _assert_exception_attribution(
+                    self, error, "copy_to_device", metadata, 0
+                )
+
+    def test_raw_copy_failure_is_unchanged(self) -> None:
+        model = TestModule()
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelineSparseDist(
+            model,
+            optimizer,
+            device=torch.device("cpu"),
+        )
+        error = RuntimeError("copy failed")
+
+        with self.assertRaises(RuntimeError) as raised:
+            pipeline.copy_batch_to_gpu(iter([_FailingBatch(error)]))
+
+        self.assertIs(error, raised.exception)
+        self.assertIsNone(get_exception_attribution(error))
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_inplace_copy_failure_uses_batch_attribution(self) -> None:
+        model = TestModule()
+        optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = TrainPipelineSparseDist(
+            model,
+            optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            enable_inplace_copy_batch=True,
+            async_inplace_copy=True,
+        )
+        self.addCleanup(pipeline._shutdown_async_inplace_copy)
+        error = RuntimeError("copy failed")
+        metadata = object()
+        future_batch, _ = pipeline.inplace_copy_batch_to_gpu(
+            iter(
+                [
+                    cast(
+                        _FailingBatch,
+                        AttributedBatch(_FailingBatch(error), metadata),
+                    )
+                ]
+            )
+        )
+        self.assertIsNotNone(future_batch)
+        copy_future = cast(Future[_FailingBatch], future_batch)
+
+        with self.assertRaises(RuntimeError) as raised:
+            copy_future.result()
+
+        self.assertIs(error, raised.exception)
+        _assert_exception_attribution(self, error, "copy_to_device", metadata, 0)
+
+    def test_executor_copy_failure_uses_batch_attribution(self) -> None:
+        for enable_inplace_copy_batch in (False, True):
+            with self.subTest(enable_inplace_copy_batch=enable_inplace_copy_batch):
+                model = TestModule()
+                optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+                pipeline = TrainPipelineSparseDistT(
+                    model,
+                    optimizer,
+                    device=torch.device("cpu"),
+                    enable_inplace_copy_batch=enable_inplace_copy_batch,
+                )
+                self.addCleanup(pipeline._copy_executor.shutdown)
+                error = RuntimeError("copy failed")
+                metadata = object()
+                dataloader = iter(
+                    [
+                        cast(
+                            _FailingBatch,
+                            AttributedBatch(_FailingBatch(error), metadata),
+                        )
+                    ]
+                )
+                if enable_inplace_copy_batch:
+                    future_batch, _ = pipeline.inplace_copy_batch_to_gpu(dataloader)
+                else:
+                    future_batch, _ = pipeline.copy_batch_to_gpu(dataloader)
+                self.assertIsNotNone(future_batch)
+                copy_future = cast(Future[_FailingBatch], future_batch)
+
+                with self.assertRaises(RuntimeError) as raised:
+                    copy_future.result()
+
+                self.assertIs(error, raised.exception)
+                _assert_exception_attribution(
+                    self, error, "copy_to_device", metadata, 0
+                )
+
+    def test_pipeline_variant_copy_failure_uses_batch_attribution(self) -> None:
+        for pipeline_type in (TrainEvalHybridPipelineBase, TrainPipelineSemiSync):
+            with self.subTest(pipeline_type=pipeline_type.__name__):
+                model = TestModule()
+                optimizer = optim.SGD(model.parameters(), lr=0.01, foreach=True)
+                pipeline = pipeline_type(
+                    model,
+                    optimizer,
+                    device=torch.device("cpu"),
+                )
+                error = RuntimeError("copy failed")
+                metadata = object()
+                pipeline._state = PipelineState.UNKNOWN
+
+                with self.assertRaises(RuntimeError) as raised:
+                    pipeline.copy_batch_to_gpu(
+                        iter(
+                            [
+                                cast(
+                                    _FailingBatch,
+                                    AttributedBatch(_FailingBatch(error), metadata),
+                                )
+                            ]
+                        )
+                    )
+
+                self.assertIs(error, raised.exception)
+                _assert_exception_attribution(
+                    self, error, "copy_to_device", metadata, 0
+                )
 
 
 class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
@@ -1661,14 +1966,18 @@ def fp_ebc_jk_disabled_pipelined_test_runner(
 
         # Test pipelined path with JK disabled
         # Both modify_input_for_feature_processor locations should NOT be called
-        with patch(
-            "torch._utils_internal.justknobs_check",
-            return_value=False,
-        ), patch(
-            "torchrec.distributed.fp_embeddingbag.modify_input_for_feature_processor"
-        ) as mock_modify_fp_ebc, patch(
-            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
-            return_value=False,
+        with (
+            patch(
+                "torch._utils_internal.justknobs_check",
+                return_value=False,
+            ),
+            patch(
+                "torchrec.distributed.fp_embeddingbag.modify_input_for_feature_processor"
+            ) as mock_modify_fp_ebc,
+            patch(
+                "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+                return_value=False,
+            ),
         ):
             sharded_model_pipeline = DistributedModelParallel(
                 module=copy.deepcopy(sparse_arch),
@@ -3469,6 +3778,74 @@ class DataLoadingThreadTest(unittest.TestCase):
         self.assertTrue(torch.equal(batch, copied_batch))
         self.assertIs(metadata, copied_metadata)
         data_loader.stop()
+
+    def test_copy_failure_uses_batch_attribution(self) -> None:
+        error = RuntimeError("copy failed")
+        metadata = object()
+
+        data_loader = DataLoadingThread(
+            torch.device("cpu"),
+            iter(
+                [
+                    cast(
+                        _FailingBatch,
+                        AttributedBatch(_FailingBatch(error), metadata),
+                    )
+                ]
+            ),
+            True,
+        )
+        data_loader.start()
+        self.addCleanup(data_loader.stop)
+
+        with self.assertRaises(RuntimeError) as raised:
+            data_loader.get_next_batch()
+
+        self.assertIs(error, raised.exception)
+        _assert_exception_attribution(self, error, "copy_to_device", metadata, 0)
+
+    def test_second_copy_failure_uses_next_batch_index(self) -> None:
+        error = RuntimeError("copy failed")
+        metadata = object()
+
+        class SecondCopyFails(Pipelineable):
+            copies = 0
+
+            def to(
+                self,
+                device: torch.device,
+                non_blocking: bool,
+            ) -> "SecondCopyFails":
+                type(self).copies += 1
+                if type(self).copies == 2:
+                    raise error
+                return self
+
+            def record_stream(self, stream: torch.Stream) -> None:
+                pass
+
+        data_loader = DataLoadingThread(
+            torch.device("cpu"),
+            iter(
+                [
+                    SecondCopyFails(),
+                    cast(
+                        SecondCopyFails,
+                        AttributedBatch(SecondCopyFails(), metadata),
+                    ),
+                ]
+            ),
+            True,
+        )
+        data_loader.start()
+        self.addCleanup(data_loader.stop)
+
+        self.assertIsNotNone(data_loader.get_next_batch())
+        with self.assertRaises(RuntimeError) as raised:
+            data_loader.get_next_batch()
+
+        self.assertIs(error, raised.exception)
+        _assert_exception_attribution(self, error, "copy_to_device", metadata, 1)
 
 
 class EvalPipelineSparseDistTest(unittest.TestCase):
