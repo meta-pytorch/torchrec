@@ -56,6 +56,13 @@ from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _is_cuda_triton_uvm(compute_device: str, compute_kernel: str) -> bool:
+    return (
+        compute_device.lower() == "cuda"
+        and compute_kernel.lower() == EmbeddingComputeKernel.TRITON_UVM.value
+    )
+
+
 # =============================================================================
 # Coefficient Dataclasses
 # =============================================================================
@@ -264,6 +271,7 @@ class HardwarePerfConfig:
     inter_host_bw: Optional[float] = None
 
     kernel_device_bandwidths: Dict[Tuple[str, str], float] = {}
+    kernel_lookup_bandwidths: Dict[Tuple[str, str], float] = {}
 
     # Supported sharding types (None = all supported, set via @supported_sharding_types)
     _supported_sharding_types: Optional[FrozenSet[str]] = None
@@ -431,7 +439,10 @@ class HardwarePerfConfig:
         Priority order:
         1. kernel_device_bandwidths (specific device+kernel overrides)
         2. device_bw (general device bandwidth override)
-        3. kernel_bw_lookup() (computed from memory bandwidth)
+        3. For Triton UVM on CUDA: the fused-kernel override if present, else
+           hbm_mem_bw. Only its embedding-row reads cross PCIe; those use
+           get_lookup_bw().
+        4. kernel_bw_lookup() (computed from memory bandwidth)
 
         Args:
             compute_device: The compute device (e.g., "cuda", "cpu", "mtia")
@@ -464,7 +475,20 @@ class HardwarePerfConfig:
         if self.device_bw is not None:
             return self.device_bw
 
-        # Priority 3: Use kernel_bw_lookup (returns None for invalid kernels)
+        # Priority 3: Triton UVM performs input processing and output writes on
+        # the GPU while only the embedding lookup traverses PCIe. Reuse the
+        # fused-kernel device bandwidth for that non-lookup work when a hardware
+        # override exists.
+        if _is_cuda_triton_uvm(compute_device, compute_kernel):
+            fused_key = (
+                compute_device.lower(),
+                EmbeddingComputeKernel.FUSED.value,
+            )
+            if fused_key in self.kernel_device_bandwidths:
+                return self.kernel_device_bandwidths[fused_key]
+            return hbm_mem_bw
+
+        # Priority 4: Use kernel_bw_lookup (returns None for invalid kernels)
         bw = kernel_bw_lookup(
             compute_device=compute_device,
             compute_kernel=compute_kernel,
@@ -480,6 +504,50 @@ class HardwarePerfConfig:
                 f"Unrecognized or unsupported compute kernel: {compute_kernel} for hardware aware perf estimators."
             )
         return bw
+
+    def get_lookup_bw(
+        self,
+        compute_device: str,
+        compute_kernel: str,
+        device_bw: float,
+        hbm_mem_bw: float,
+        ddr_mem_bw: float,
+        hbm_to_ddr_mem_bw: float,
+    ) -> float:
+        """Get the bandwidth used for embedding-row reads.
+
+        Priority order:
+        1. kernel_lookup_bandwidths (specific device+kernel overrides)
+        2. For Triton UVM on CUDA: a kernel_device_bandwidths override for
+           Triton UVM, which then covers all of its bytes; otherwise
+           kernel_bw_lookup(), i.e. the effective host-to-device lookup
+           throughput (honoring a hbm_to_ddr_mem_bw override). Charging the
+           raw link bandwidth makes UVM work look artificially cheap and
+           produces an imbalanced placement.
+        3. device_bw, so other kernels keep the single-bandwidth model.
+        """
+        key = (compute_device.lower(), compute_kernel.lower())
+        if key in self.kernel_lookup_bandwidths:
+            return self.kernel_lookup_bandwidths[key]
+
+        if _is_cuda_triton_uvm(compute_device, compute_kernel):
+            if key in self.kernel_device_bandwidths:
+                return self.kernel_device_bandwidths[key]
+            bw = kernel_bw_lookup(
+                compute_device=compute_device,
+                compute_kernel=compute_kernel,
+                hbm_mem_bw=hbm_mem_bw,
+                ddr_mem_bw=ddr_mem_bw,
+                hbm_to_ddr_mem_bw=(
+                    self.hbm_to_ddr_mem_bw
+                    if self.hbm_to_ddr_mem_bw is not None
+                    else hbm_to_ddr_mem_bw
+                ),
+            )
+            assert bw is not None, "kernel_bw_lookup has no Triton UVM entry"
+            return bw
+
+        return device_bw
 
 
 # =============================================================================
@@ -528,6 +596,7 @@ class ShardPerfContext:
 
     # Bandwidth values
     device_bw: float = HBM_MEM_BW
+    lookup_bw: Optional[float] = None
     hbm_to_ddr_mem_bw: float = HBM_MEM_BW
     intra_host_bw: float = 0.0
     inter_host_bw: float = 0.0
@@ -761,6 +830,15 @@ class ShardPerfContext:
                     f"{topology.intra_group_size}, got {len(shard_sizes)}."
                 )
 
+        lookup_bw = config.get_lookup_bw(
+            compute_device=topology.compute_device,
+            compute_kernel=sharding_option.compute_kernel,
+            device_bw=device_bw,
+            hbm_mem_bw=topology.hbm_mem_bw,
+            ddr_mem_bw=topology.ddr_mem_bw,
+            hbm_to_ddr_mem_bw=topology.hbm_to_ddr_mem_bw,
+        )
+
         # Build contexts
         contexts: List["ShardPerfContext"] = []
         for hash_size, emb_dim in shard_sizes:
@@ -784,6 +862,7 @@ class ShardPerfContext:
                 fwd_sr_comm_data_type_size=fwd_sr_comm_data_type_size,
                 bwd_sr_comm_data_type_size=bwd_sr_comm_data_type_size,
                 device_bw=device_bw,
+                lookup_bw=lookup_bw,
                 hbm_to_ddr_mem_bw=topology.hbm_to_ddr_mem_bw,
                 comms_bandwidths=topology.comms_bandwidths,
                 is_inference=is_inference,

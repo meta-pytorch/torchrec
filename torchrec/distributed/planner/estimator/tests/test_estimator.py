@@ -84,6 +84,7 @@ def create_test_context(
     intra_group_size: Optional[int] = None,
     table_num_twrw_groups: int = 1,
     device_bw: float = HBM_MEM_BW,
+    lookup_bw: Optional[float] = None,
     is_pooled: bool = True,
     is_weighted: bool = False,
     comms_bw: float = 1000.0,
@@ -91,6 +92,8 @@ def create_test_context(
     """Helper to create a ShardPerfContext for testing."""
     if intra_group_size is None:
         intra_group_size = local_world_size
+    if lookup_bw is None:
+        lookup_bw = device_bw
     return ShardPerfContext(
         sharding_type=sharding_type,
         compute_kernel=compute_kernel,
@@ -104,6 +107,7 @@ def create_test_context(
         intra_group_size=intra_group_size,
         table_num_twrw_groups=table_num_twrw_groups,
         device_bw=device_bw,
+        lookup_bw=lookup_bw,
         hbm_to_ddr_mem_bw=device_bw,
         is_pooled=is_pooled,
         is_weighted=is_weighted,
@@ -216,11 +220,61 @@ class TableWiseEvaluatorTest(unittest.TestCase):
         fwd_compute = self.evaluator.compute_fwd_comp(ctx, self.config)
         self.assertGreater(fwd_compute, 0.0)
 
+    def test_fwd_compute_uses_lookup_bandwidth_for_lookup_bytes(self) -> None:
+        """Test that lookup bytes and other GPU work use separate bandwidths."""
+        ctx = create_test_context(
+            hash_size=0,
+            emb_dim=128,
+            batch_sizes=[1],
+            num_poolings=[1.0],
+            input_lengths=[1.0],
+            world_size=1,
+            local_world_size=1,
+            device_bw=1000.0,
+            lookup_bw=100.0,
+        )
+
+        fwd_compute = self.evaluator.compute_fwd_comp(ctx, self.config)
+
+        input_read_size = 8.0
+        lookup_size = 128 * 4.0
+        output_write_size = 128 * 4.0
+        expected = (input_read_size + output_write_size) / 1000.0 + lookup_size / 100.0
+        self.assertAlmostEqual(fwd_compute, expected)
+
     def test_bwd_compute_is_positive(self) -> None:
         """Test that backward compute time is positive."""
         ctx = create_test_context(sharding_type=ShardingType.TABLE_WISE.value)
         bwd_compute = self.evaluator.compute_bwd_comp(ctx, self.config)
         self.assertGreater(bwd_compute, 0.0)
+
+    def test_explicit_bwd_coeff_uses_lookup_bandwidth(self) -> None:
+        """Test explicit backward lookup bytes use lookup bandwidth."""
+
+        class ExplicitBackwardConfig(HardwarePerfConfig):
+            @bwd_coefficient(sharding_type=ShardingType.TABLE_WISE.value)
+            def table_wise_bwd(self) -> PerfCoefficient:
+                return PerfCoefficient()
+
+        ctx = create_test_context(
+            hash_size=0,
+            emb_dim=128,
+            batch_sizes=[1],
+            num_poolings=[1.0],
+            input_lengths=[1.0],
+            world_size=1,
+            local_world_size=1,
+            device_bw=1000.0,
+            lookup_bw=100.0,
+        )
+
+        bwd_compute = self.evaluator.compute_bwd_comp(ctx, ExplicitBackwardConfig())
+
+        input_read_size = 8.0
+        lookup_size = 128 * 4.0
+        output_write_size = 128 * 4.0
+        expected = (input_read_size + output_write_size) / 1000.0 + lookup_size / 100.0
+        self.assertAlmostEqual(bwd_compute, expected)
 
 
 class RowWiseEvaluatorTest(unittest.TestCase):

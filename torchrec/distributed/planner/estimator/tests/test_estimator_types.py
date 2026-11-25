@@ -352,6 +352,83 @@ class HardwarePerfConfigTest(unittest.TestCase):
         )
         self.assertEqual(bw, 900.0)
 
+    def test_get_device_bw_triton_uvm_uses_fused_kernel_bandwidth(self) -> None:
+        """Test Triton UVM non-lookup work uses the fused GPU bandwidth."""
+
+        class ConfigWithFusedBW(HardwarePerfConfig):
+            kernel_device_bandwidths = {("cuda", "fused"): 1000.0}
+
+        config = ConfigWithFusedBW()
+        bw = config.get_device_bw(
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.TRITON_UVM.value,
+            hbm_mem_bw=900.0,
+            ddr_mem_bw=100.0,
+            ssd_mem_bw=50.0,
+            hbm_to_ddr_mem_bw=200.0,
+        )
+        self.assertEqual(bw, 1000.0)
+
+    def test_get_lookup_bw_triton_uvm_uses_effective_lookup_bandwidth(self) -> None:
+        """Test Triton UVM retains its effective lookup-throughput factor."""
+        config = HardwarePerfConfig()
+        bw = config.get_lookup_bw(
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.TRITON_UVM.value,
+            device_bw=900.0,
+            hbm_mem_bw=900.0,
+            ddr_mem_bw=100.0,
+            hbm_to_ddr_mem_bw=200.0,
+        )
+        self.assertEqual(bw, 20.0)
+
+    def test_get_lookup_bw_non_triton_uses_device_bandwidth(self) -> None:
+        """Test other kernels retain the single-bandwidth model."""
+        config = HardwarePerfConfig()
+        bw = config.get_lookup_bw(
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            device_bw=900.0,
+            hbm_mem_bw=900.0,
+            ddr_mem_bw=100.0,
+            hbm_to_ddr_mem_bw=200.0,
+        )
+        self.assertEqual(bw, 900.0)
+
+    def test_get_lookup_bw_uses_kernel_override(self) -> None:
+        """Test a hardware-specific lookup bandwidth has highest priority."""
+
+        class ConfigWithLookupBW(HardwarePerfConfig):
+            kernel_lookup_bandwidths = {("cuda", "triton_uvm"): 300.0}
+
+        config = ConfigWithLookupBW()
+        bw = config.get_lookup_bw(
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.TRITON_UVM.value,
+            device_bw=900.0,
+            hbm_mem_bw=900.0,
+            ddr_mem_bw=100.0,
+            hbm_to_ddr_mem_bw=200.0,
+        )
+        self.assertEqual(bw, 300.0)
+
+    def test_get_lookup_bw_triton_uvm_uses_device_kernel_override(self) -> None:
+        """Test a Triton UVM device-bandwidth override also covers lookups."""
+
+        class ConfigWithTritonDeviceBW(HardwarePerfConfig):
+            kernel_device_bandwidths = {("cuda", "triton_uvm"): 400.0}
+
+        config = ConfigWithTritonDeviceBW()
+        bw = config.get_lookup_bw(
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.TRITON_UVM.value,
+            device_bw=400.0,
+            hbm_mem_bw=900.0,
+            ddr_mem_bw=100.0,
+            hbm_to_ddr_mem_bw=200.0,
+        )
+        self.assertEqual(bw, 400.0)
+
     def test_get_device_bw_invalid_kernel_raises(self) -> None:
         """Test get_device_bw raises for invalid compute kernel."""
         config = HardwarePerfConfig()

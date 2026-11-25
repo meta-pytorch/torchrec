@@ -13,12 +13,17 @@ from unittest.mock import MagicMock
 from pyre_extensions import none_throws
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.planner.constants import BATCH_SIZE
+from torchrec.distributed.planner.constants import BATCH_SIZE, DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
+from torchrec.distributed.planner.estimator import (
+    EmbeddingPerfEstimatorFactory,
+    HardwarePerfConfig,
+)
 from torchrec.distributed.planner.partitioners import (
     GreedyPerfPartitioner,
     MemoryBalancedPartitioner,
     OrderedDeviceHardware,
+    SortBy,
 )
 from torchrec.distributed.planner.types import (
     DeviceHardware,
@@ -55,6 +60,16 @@ class TWSharder(EmbeddingBagCollectionSharder):
         self, sharding_type: str, compute_device_type: str
     ) -> List[str]:
         return [EmbeddingComputeKernel.DENSE.value]
+
+
+class TritonUvmTWSharder(EmbeddingBagCollectionSharder):
+    def sharding_types(self, compute_device_type: str) -> List[str]:
+        return [ShardingType.TABLE_WISE.value]
+
+    def compute_kernels(
+        self, sharding_type: str, compute_device_type: str
+    ) -> List[str]:
+        return [EmbeddingComputeKernel.TRITON_UVM.value]
 
 
 class TWRWSharder(EmbeddingBagCollectionSharder):
@@ -171,6 +186,132 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
             devices_allocation[1].storage,
             Storage(2000, 2000),
         )
+
+    def test_triton_uvm_lookup_time_is_balanced_across_devices(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name=f"table_{index}",
+                feature_names=[f"feature_{index}"],
+            )
+            for index in range(4)
+        ]
+        constraints = {
+            f"table_{index}": ParameterConstraints(
+                compute_kernels=[EmbeddingComputeKernel.TRITON_UVM.value],
+                pooling_factors=[pooling_factor],
+            )
+            for index, pooling_factor in enumerate((8.0, 8.0, 1.0, 1.0))
+        }
+        estimator = EmbeddingPerfEstimatorFactory.create(
+            DEFAULT_PERF_ESTIMATOR,
+            topology=self.topology,
+            constraints=constraints,
+            is_inference=True,
+        )
+        enumerator = EmbeddingEnumerator(
+            topology=self.topology,
+            batch_size=BATCH_SIZE,
+            constraints=constraints,
+            estimator=estimator,
+        )
+        sharding_options = enumerator.enumerate(
+            module=TestSparseNN(tables=tables, weighted_tables=[]),
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[TritonUvmTWSharder()],
+        )
+        for option in sharding_options:
+            option.shards[0].storage = Storage(hbm=0, ddr=1000)
+
+        sharding_plan = GreedyPerfPartitioner(sort_by=SortBy.PERF).partition(
+            proposal=sharding_options,
+            storage_constraint=self.topology,
+        )
+        devices_allocation = self.get_devices_allocation(sharding_plan)
+
+        self.assertAlmostEqual(
+            devices_allocation[0].perf.total,
+            devices_allocation[1].perf.total,
+        )
+        hot_table_ranks = {
+            none_throws(option.shards[0].rank)
+            for option in sharding_plan
+            if option.name in ("table_0", "table_1")
+        }
+        self.assertEqual(hot_table_ranks, {0, 1})
+
+    def test_triton_uvm_lookup_bandwidth_balances_uvm_reads(self) -> None:
+        """Splitting lookup bandwidth balances per-rank UVM row reads.
+
+        The single-bandwidth model charges a Triton UVM table's input reads and
+        pooled output writes at the host-to-device rate, so it overprices
+        low-pooling-factor tables relative to the rows they actually read over
+        PCIe. One hot table and eight cold tables on two ranks show the effect:
+        the single-bandwidth plan leaves one rank reading more rows, while the
+        split model places the same row-read volume on both ranks.
+        """
+        pooling_factors = [8.0] + [1.0] * 8
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name=f"table_{index}",
+                feature_names=[f"feature_{index}"],
+            )
+            for index in range(len(pooling_factors))
+        ]
+        constraints = {
+            f"table_{index}": ParameterConstraints(
+                compute_kernels=[EmbeddingComputeKernel.TRITON_UVM.value],
+                pooling_factors=[pooling_factor],
+            )
+            for index, pooling_factor in enumerate(pooling_factors)
+        }
+        uvm_key = ("cuda", EmbeddingComputeKernel.TRITON_UVM.value)
+        single_bw = self.topology.hbm_to_ddr_mem_bw / 10
+
+        class SingleBandwidthConfig(HardwarePerfConfig):
+            kernel_device_bandwidths = {uvm_key: single_bw}
+            kernel_lookup_bandwidths = {uvm_key: single_bw}
+
+        def rank_row_reads(config: HardwarePerfConfig) -> List[float]:
+            estimator = EmbeddingPerfEstimatorFactory.create_with_config(
+                config,
+                is_inference=True,
+                topology=self.topology,
+                constraints=constraints,
+            )
+            enumerator = EmbeddingEnumerator(
+                topology=self.topology,
+                batch_size=BATCH_SIZE,
+                constraints=constraints,
+                estimator=estimator,
+            )
+            sharding_options = enumerator.enumerate(
+                module=TestSparseNN(tables=tables, weighted_tables=[]),
+                # pyrefly: ignore[bad-argument-type]
+                sharders=[TritonUvmTWSharder()],
+            )
+            for option in sharding_options:
+                option.shards[0].storage = Storage(hbm=0, ddr=1000)
+            plan = GreedyPerfPartitioner(sort_by=SortBy.PERF).partition(
+                proposal=sharding_options,
+                storage_constraint=self.topology,
+            )
+            reads = [0.0] * self.topology.world_size
+            for option in plan:
+                index = int(option.name.split("_")[1])
+                reads[none_throws(option.shards[0].rank)] += (
+                    pooling_factors[index] * tables[index].embedding_dim
+                )
+            return reads
+
+        single_bw_reads = rank_row_reads(SingleBandwidthConfig())
+        split_bw_reads = rank_row_reads(HardwarePerfConfig())
+
+        self.assertLess(max(split_bw_reads), max(single_bw_reads))
+        self.assertAlmostEqual(max(split_bw_reads), min(split_bw_reads))
 
     def test_device_partition_heap_invariant(self) -> None:
         """Validate that _device_partition maintains the minheap invariant."""
