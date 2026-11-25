@@ -334,6 +334,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         )
         self._cur_batch: Optional[In] = None
         self._cur_context: TrainPipelineContextLite | None = None
+        self._prev_context: TrainPipelineContextLite | None = None
         self._dataloader_iter: Optional[Iterator[In]] = None
         # Temporary metadata handoff preserving raw `_next_batch()` returns.
         # `_next_batch_with_metadata()` clears it before fetching and in `finally`.
@@ -348,6 +349,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._cur_batch = None
         self._cur_context = None
         self._next_batch_metadata = None
+        self._prev_context = None
 
     def _reset_data_iter_if_needed(self, dataloader_iter: Iterator[In]) -> None:
         if dataloader_iter is not self._dataloader_iter:
@@ -408,6 +410,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                 context=self._cur_context,
             )
 
+    @attributed_logger("backward", owner=lambda self: self._prev_context)
     def _backward(self, losses: torch.Tensor) -> None:
         with record_function("## backward ##"):
             torch.sum(losses, dim=0).backward()
@@ -484,21 +487,26 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         with record_function("## forward ##"):
             (losses, output) = self._model_fwd(cur_batch)
 
-            # clear the current batch after forward pass (so current batch can be freed)
+            # The batch and `_cur_context` advance immediately after forward.
+            # Retain the previous context for backward and optimizer attribution.
+            self._prev_context = self._cur_context
             self._cur_batch = cur_batch = next_batch
             self._cur_context = next_context
 
-        if self._model.training:
-            self._backward(losses)
+        try:
+            if self._model.training:
+                self._backward(losses)
 
-        # Copy the next batch to GPU
-        if cur_batch is not None:
-            self._copy_batch_to_gpu(cur_batch)
+            # Copy the next batch to GPU
+            if cur_batch is not None:
+                self._copy_batch_to_gpu(cur_batch)
 
-        # Update
-        if self._model.training:
-            with record_function("## optimizer ##"):
-                self._optimizer.step()
+            # Update
+            if self._model.training:
+                with record_function("## optimizer ##"):
+                    self._optimizer.step()
+        finally:
+            self._prev_context = None
 
         return output
 
@@ -556,6 +564,12 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
     @attributed_logger("preprocessing", owner=lambda self: self._cur_context)
     def _apply_input_transformer(self, batch: In) -> In:
         return self._input_transformer(batch)
+
+    @attributed_logger("backward", owner=lambda self: self._cur_context)
+    def _backward(self, losses: torch.Tensor) -> None:
+        with record_function("## backward ##"):
+            self._state = PipelineState.CALL_BWD
+            torch.sum(losses).backward()
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -626,9 +640,7 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
             self._iter += 1
 
         if self._model.training:
-            with record_function("## backward ##"):
-                self._state = PipelineState.CALL_BWD
-                torch.sum(losses).backward()
+            self._backward(losses)
 
             with record_function("## optimizer ##"):
                 self._optimizer.step()
@@ -1005,6 +1017,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
                 context=self.contexts[0] if self.contexts else None,
             )
 
+    @attributed_logger(
+        "backward",
+        owner=lambda self: self.contexts[0] if self.contexts else None,
+    )
     def _backward(self, losses: torch.Tensor) -> None:
         batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
         with record_function(f"## backward {batch_id} ##"):
@@ -2670,7 +2686,6 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self._prefetch(cast(PrefetchTrainPipelineContext, self.contexts[1]))
 
         if self._model.training:
-            # backward
             self._backward(losses)
 
             # update
@@ -3581,12 +3596,8 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
         if self._model.training:
             # backward
             ctx = self.get_compiled_autograd_ctx()
-            with (
-                ctx,
-                torchrec_use_sync_collectives(),
-                record_function("## backward ##"),
-            ):
-                torch.sum(losses, dim=0).backward()
+            with ctx, torchrec_use_sync_collectives():
+                self._backward(losses)
 
             # update
             with record_function("## optimizer ##"):
