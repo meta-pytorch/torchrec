@@ -322,9 +322,21 @@ def embedding_pooled_batched_lookup_fused_adagrad_bwd_jax(
     emb_dim: int,
     row_output_offsets: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    num_rows = emb_tables.size // emb_dim
+    bag_grad_rows = None
+    # VBE bags must map from input order to gradient-output order.
+    if (
+        row_output_offsets is not None
+        and offsets.dtype == row_offsets.dtype == jnp.int32
+    ):
+        # TODO: optimize VBE preprocessing for int64 metadata.
+        bag_grad_rows = (row_output_offsets // emb_dim).astype(jnp.int32)
+        # Preprocessing will return gradient-row IDs, skip the later remapping.
+        row_output_offsets = None
+
     sorted_rows, bag_ids, run_offsets, num_runs = (
         pooled_lookup_offset.embedding_pooled_batched_lookup_row_runs_jax(
-            indices, offsets, row_offsets, emb_tables.size // emb_dim
+            indices, offsets, row_offsets, num_rows, bag_grad_rows
         )
     )
     # Reshaping is required since XLA compiler converts the layouts of the
