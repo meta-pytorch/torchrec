@@ -260,7 +260,6 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
             valid_input.lengths().reshape(len(self._keys), -1).max(dim=1)
         )
 
-        # pyrefly: ignore[no-matching-overload]
         assert torch.all(
             max_elements <= self._feature_max_lengths_t
         ).item(), "input KJT has a feature that exceeds specified max lengths"

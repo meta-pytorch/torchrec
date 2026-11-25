@@ -97,7 +97,6 @@ class KeyedOptimizer(optim.Optimizer):
             if isinstance(v, dict):
                 result[k] = KeyedOptimizer._extract_state_dict_content(v)
             elif hasattr(v, "state_dict") and callable(v.state_dict):
-                # pyrefly: ignore[unsupported-operation]
                 result[k] = v.state_dict()
             else:
                 result[k] = v

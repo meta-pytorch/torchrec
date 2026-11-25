@@ -521,7 +521,6 @@ class TestJaggedTensor(unittest.TestCase):
             torch.tensor([0.5]),
             torch.tensor([0.6, 0.7, 0.8]),
         ]
-        # pyrefly: ignore[no-matching-overload]
         for t0, expected_t0 in zip(weights_list, expected_weights_list):
             torch.testing.assert_close(t0, expected_t0, rtol=0, atol=0)
 
@@ -628,7 +627,6 @@ class TestJaggedTensor(unittest.TestCase):
         ]
 
         expected_t0_weights = torch.tensor(expected_t0_weights)
-        # pyrefly: ignore[bad-argument-type]
         torch.testing.assert_close(t0_weights, expected_t0_weights, rtol=0, atol=0)
 
         t1_weights = jt.to_padded_dense_weights(desired_length=2, padding_value=1.0)
@@ -641,7 +639,6 @@ class TestJaggedTensor(unittest.TestCase):
             [0.6, 0.7],
         ]
         expected_t1_weights = torch.tensor(expected_t1_weights)
-        # pyrefly: ignore[bad-argument-type]
         torch.testing.assert_close(t1_weights, expected_t1_weights, rtol=0, atol=0)
 
         values = torch.Tensor(
@@ -689,7 +686,6 @@ class TestJaggedTensor(unittest.TestCase):
             ],
         ]
         expected_t2_weights = torch.tensor(expected_t2_weights)
-        # pyrefly: ignore[bad-argument-type]
         torch.testing.assert_close(t2_weights, expected_t2_weights, rtol=0, atol=0)
 
         jt = JaggedTensor(

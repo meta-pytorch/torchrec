@@ -214,7 +214,7 @@ class _BatchedFusedEmbeddingLookups(nn.Module, FusedOptimizerModule):
     def fused_optimizer(self) -> FusedOptimizer:
         return self._optim
 
-    # pyrefly: ignore [bad-override, bad-param-name-override]
+    # pyrefly: ignore [bad-override]
     def parameters(
         self, prefix: str = "", recurse: bool = True
     ) -> Iterator[nn.Parameter]:
@@ -244,7 +244,7 @@ class _BatchedFusedEmbeddingLookups(nn.Module, FusedOptimizerModule):
             key = f"{prefix}.{name}" if (prefix and name) else (prefix + name)
             yield key, param
 
-    # pyrefly: ignore [bad-override, bad-param-name-override]
+    # pyrefly: ignore [bad-override]
     def buffers(self, prefix: str = "", recurse: bool = True) -> Iterator[torch.Tensor]:
         yield from self.split_embedding_weights()
 

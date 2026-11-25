@@ -72,7 +72,6 @@ class ExperimentalDecoratorTest(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            # pyrefly: ignore [not-callable]
             wrapped()
 
             self.assertEqual(len(w), 1)
@@ -88,7 +87,6 @@ class ExperimentalDecoratorTest(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            # pyrefly: ignore [not-callable]
             wrapped()
 
             self.assertEqual(len(w), 1)
@@ -106,7 +104,6 @@ class ExperimentalDecoratorTest(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            # pyrefly: ignore [not-callable]
             wrapped()
 
             self.assertEqual(len(w), 1)
@@ -176,7 +173,6 @@ class ExperimentalDecoratorTest(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            # pyrefly: ignore [not-callable]
             WrappedClass()
 
             self.assertEqual(len(w), 1)
@@ -261,7 +257,6 @@ class ExperimentalDecoratorTest(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            # pyrefly: ignore [not-callable]
             wrapped()
 
             self.assertEqual(len(w), 1)

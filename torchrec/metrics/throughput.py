@@ -236,23 +236,17 @@ class ThroughputMetric(nn.Module):
         if self._batch_size_stages is not None:
             self._num_batch += 1
         batch_examples = self._batch_examples()
-        # pyrefly: ignore [bad-argument-type, unsupported-operation]
         self.total_examples += batch_examples
-        # pyrefly: ignore [bad-argument-type, unsupported-operation]
         self.attempt_examples += batch_examples
 
         if self._steps <= self._warmup_steps:
-            # pyrefly: ignore [bad-argument-type, unsupported-operation]
             self.warmup_examples += batch_examples
-            # pyrefly: ignore [bad-argument-type, unsupported-operation]
             self.attempt_warmup_examples += batch_examples
             if self._steps == self._warmup_steps:
                 self._previous_ts = timestamp
         else:
             time_lapse = timestamp - self._previous_ts
-            # pyrefly: ignore [bad-argument-type, unsupported-operation]
             self.time_lapse_after_warmup += time_lapse
-            # pyrefly: ignore [bad-argument-type, unsupported-operation]
             self.attempt_time_lapse_after_warmup += time_lapse
             # Subtract before the deque's implicit evict, mirroring
             # WindowBuffer._aggregate_state_impl. append() on a full deque(maxlen=...)
@@ -291,20 +285,13 @@ class ThroughputMetric(nn.Module):
             self._attempt_time_lapse_after_warmup_key: self.attempt_time_lapse_after_warmup,
         }
         if self._steps > self._warmup_steps and (
-            # pyrefly: ignore[not-callable]
             not math.isclose(self.time_lapse_after_warmup.item(), 0)
         ):
-            # pyrefly: ignore[unsupported-operation]
             lifetime_throughput = (
-                # pyrefly: ignore[unsupported-operation]
-                self.total_examples
-                - self.warmup_examples
+                self.total_examples - self.warmup_examples
             ) / self.time_lapse_after_warmup
-            # pyrefly: ignore[unsupported-operation]
             attempt_throughput = (
-                # pyrefly: ignore[unsupported-operation]
-                self.attempt_examples
-                - self.attempt_warmup_examples
+                self.attempt_examples - self.attempt_warmup_examples
             ) / self.attempt_time_lapse_after_warmup
             if not math.isclose(self._window_time_lapse, 0):
                 window_throughput = (
@@ -340,7 +327,6 @@ class ThroughputMetric(nn.Module):
                 }
             )
 
-        # pyrefly: ignore[bad-return]
         return ret
 
     @staticmethod

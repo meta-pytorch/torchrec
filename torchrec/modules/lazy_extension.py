@@ -186,25 +186,19 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
 
     # fmt: off
     def _call_impl(self, *input, **kwargs):  # noqa: C901
-        # pyrefly: ignore[missing-attribute]
         forward_call = (self._slow_forward if torch._C._get_tracing_state() else self.forward)
         # If we don't have any hooks, we want to skip the rest of the logic in
         # this function, and just call forward.
-        # pyrefly: ignore[missing-attribute]
         if not (self._backward_hooks or self._forward_hooks or self._forward_pre_hooks or _global_backward_hooks
                 or _global_forward_hooks or _global_forward_pre_hooks):
             return forward_call(*input, **kwargs)
         # Do not call functions when jit is used
         full_backward_hooks, non_full_backward_hooks = [], []
-        # pyrefly: ignore[missing-attribute]
         if self._backward_hooks or _global_backward_hooks:
-            # pyrefly: ignore[missing-attribute]
             full_backward_hooks, non_full_backward_hooks = self._get_backward_hooks()
-        # pyrefly: ignore[missing-attribute]
         if _global_forward_pre_hooks or self._forward_pre_hooks:
             #  tuples: `*torch.nn.modules.module._global_forward_pre_hooks.values(),
             #  *self._forward_pre_hooks.values()`.
-            # pyrefly: ignore[missing-attribute]
             for hook in (*_global_forward_pre_hooks.values(), *self._forward_pre_hooks.values()):
                 if len(inspect.signature(hook).parameters) == 3:
                     result = hook(self, input, kwargs)
@@ -217,16 +211,13 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
 
         bw_hook = None
         if full_backward_hooks:
-            # pyrefly: ignore[missing-argument]
             bw_hook = hooks.BackwardHook(self, full_backward_hooks)
             input = bw_hook.setup_input_hook(input)
 
         result = forward_call(*input, **kwargs)
-        # pyrefly: ignore[missing-attribute]
         if _global_forward_hooks or self._forward_hooks:
             #  tuples: `*torch.nn.modules.module._global_forward_hooks.values(),
             #  *self._forward_hooks.values()`.
-            # pyrefly: ignore[missing-attribute]
             for hook in (*_global_forward_hooks.values(), *self._forward_hooks.values()):
                 hook_result = hook(self, input, result)
                 if hook_result is not None:
@@ -249,7 +240,6 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
                     wrapper = functools.partial(hook, self)
                     functools.update_wrapper(wrapper, hook)
                     grad_fn.register_hook(wrapper)
-                # pyrefly: ignore[missing-attribute]
                 self._maybe_warn_non_full_backward_hook(input, result, grad_fn)
 
         return result

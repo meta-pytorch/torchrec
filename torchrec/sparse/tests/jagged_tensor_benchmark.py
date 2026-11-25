@@ -270,7 +270,6 @@ def main(
     """
     run_option.set_log_level()
     if run_option.debug_mode:
-        # pyrefly: ignore[missing-module-attribute]
         from fbvscode import attach_debugger
 
         attach_debugger()

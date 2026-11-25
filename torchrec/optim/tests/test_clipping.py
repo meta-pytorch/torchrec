@@ -738,7 +738,6 @@ class TestClipGradNorm(unittest.TestCase):
 
         expected_norm = (3.0**2 + 4.0**2) ** 0.5
         torch.testing.assert_close(
-            # pyrefly: ignore[bad-argument-type]
             total_norm,
             torch.tensor(expected_norm),
             rtol=1e-05,
