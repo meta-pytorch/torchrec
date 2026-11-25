@@ -27,6 +27,7 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
+from torchrec.distributed.attributed_logging import attributed_logger
 from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.logging_utils import OptimizationTechnique
 from torchrec.distributed.memory_stashing import (
@@ -148,7 +149,12 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
                 )
 
                 if batch is not None:
-                    batch = _to_device(batch, self._device, non_blocking=True)
+                    batch = _to_device(
+                        batch,
+                        self._device,
+                        non_blocking=True,
+                        context=context,
+                    )
                 elif not self._execute_all_batches:
                     raise StopIteration
                 return batch, context
@@ -581,6 +587,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
                     context.gpu_embedding_outputs[name] = gpu_embeddings
         return batch
 
+    @attributed_logger("copy_to_device", owner_kwarg="context")
     def copy_data_to_gpu(
         self, batch: In, context: CPUEmbeddingTrainPipelineContext
     ) -> In:
@@ -783,7 +790,12 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
                 def _copy_work() -> In:
                     # pyrefly: ignore [bad-argument-type]
                     with self._stream_context(self._memcpy_stream):
-                        return _to_device(batch, self._device, True)
+                        return _to_device(
+                            batch,
+                            self._device,
+                            True,
+                            context=context,
+                        )
 
                 future_batch = self._copy_executor.submit(_copy_work)
                 return cast(In, future_batch), context
@@ -819,6 +831,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
                     self._device,
                     True,
                     self._memcpy_stream,
+                    context=context,
                 )
                 # Return the CPU batch as placeholder; _resolve_copy_future
                 # will replace it in self.batches before consumption.
