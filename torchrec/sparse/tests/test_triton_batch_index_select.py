@@ -63,6 +63,93 @@ class TritonBatchIndexSelectTest(unittest.TestCase):
         indices = torch.cat(index_parts)
         return inputs, indices, batch_size, input_rows, input_columns
 
+    def test_invalid_inputs(self) -> None:
+        valid_inputs = torch.randn(4, device="cuda")
+        valid_indices = torch.zeros(1, device="cuda", dtype=torch.int64)
+        cases = (
+            (
+                "metadata_lengths",
+                valid_inputs,
+                valid_indices,
+                1,
+                (2,),
+                (2, 2),
+                "input_rows and input_columns must have equal length",
+            ),
+            (
+                "device",
+                valid_inputs,
+                torch.zeros(1, dtype=torch.int64),
+                1,
+                (2,),
+                (2,),
+                "inputs and indices must be CUDA tensors on the same device",
+            ),
+            (
+                "contiguity",
+                torch.randn(2, 2, device="cuda").T,
+                valid_indices,
+                1,
+                (2,),
+                (2,),
+                "inputs and indices must be contiguous",
+            ),
+            (
+                "input_size",
+                torch.randn(3, device="cuda"),
+                valid_indices,
+                1,
+                (2,),
+                (2,),
+                "inputs size does not match input_rows and input_columns",
+            ),
+            (
+                "indices_size",
+                valid_inputs,
+                torch.zeros(2, device="cuda", dtype=torch.int64),
+                1,
+                (2,),
+                (2,),
+                "indices size does not match batch_size and input_columns",
+            ),
+            (
+                "row_count",
+                torch.empty(0, device="cuda"),
+                valid_indices,
+                1,
+                (0,),
+                (1,),
+                "all input row counts must be positive",
+            ),
+            (
+                "column_count",
+                torch.empty(0, device="cuda"),
+                valid_indices,
+                1,
+                (1,),
+                (0,),
+                "all input column counts must be positive",
+            ),
+        )
+        for (
+            name,
+            inputs,
+            indices,
+            batch_size,
+            input_rows,
+            input_columns,
+            expected_error,
+        ) in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    triton_batch_index_select_module._validate_inputs(
+                        inputs,
+                        indices,
+                        batch_size,
+                        input_rows,
+                        input_columns,
+                    )
+
     def test_forward_and_backward(self) -> None:
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
