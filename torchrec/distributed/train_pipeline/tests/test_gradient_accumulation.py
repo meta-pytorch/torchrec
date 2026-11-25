@@ -146,6 +146,38 @@ class GradientAccumulationConfigTest(unittest.TestCase):
         self.assertEqual(config.num_warmup_steps, 1)
 
 
+class GradientAccumulationUsageLoggingTest(unittest.TestCase):
+    _LOGGER: str = (
+        "torchrec.distributed.train_pipeline.gradient_accumulation.static_logger"
+    )
+
+    def _wrap(self, config: GradientAccumulationConfig) -> None:
+        model = _MockModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        GradientAccumulationWrapper(
+            _MockPipeline(num_batches=1), optimizer, model, config
+        )
+
+    def test_logs_once_when_enabled(self) -> None:
+        with patch(self._LOGGER) as logger:
+            self._wrap(GradientAccumulationConfig(num_steps=4, num_warmup_steps=2))
+        logger.info.assert_called_once_with(
+            str(
+                {
+                    "message": "gradient_accumulation_enabled",
+                    "ga_num_steps": 4,
+                    "ga_num_warmup_steps": 2,
+                    "ga_pipeline": "_MockPipeline",
+                }
+            )
+        )
+
+    def test_does_not_log_when_disabled(self) -> None:
+        with patch(self._LOGGER) as logger:
+            self._wrap(GradientAccumulationConfig())
+        logger.info.assert_not_called()
+
+
 class GAOptimizerWrapperTest(unittest.TestCase):
     def _make_wrapper(
         self, num_steps: int = 4, num_warmup_steps: int = 1
