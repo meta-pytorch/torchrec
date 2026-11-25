@@ -83,6 +83,7 @@ from torchrec.distributed.train_pipeline.utils import (
     DataLoadingThread,
     ddp_managed_param_ids,
     find_ddp_modules,
+    find_modules_of_type,
     start_embedding_lookup_post_prefetch,
     use_context_for_postprocs,
 )
@@ -1414,6 +1415,24 @@ class _DDPManagedParamIdsTestModel(torch.nn.Module):
         self.frozen = torch.nn.Parameter(
             torch.zeros(2, device=device), requires_grad=False
         )
+
+
+class _ModuleWithLookups(torch.nn.Module):
+    def __init__(self, child: torch.nn.Module, hidden: torch.nn.Module) -> None:
+        super().__init__()
+        self.child = child
+        # Sharded embedding modules keep lookups in a plain list, which
+        # nn.Module.modules() does not visit.
+        self._lookups: List[torch.nn.Module] = [hidden, child]
+
+
+class FindModulesOfTypeTest(unittest.TestCase):
+    def test_finds_hidden_lookups_once(self) -> None:
+        child, hidden = torch.nn.Linear(1, 1), torch.nn.Linear(1, 1)
+
+        found = find_modules_of_type(_ModuleWithLookups(child, hidden), torch.nn.Linear)
+
+        self.assertCountEqual(found, [child, hidden])
 
 
 class DDPManagedParamIdsTest(TrainPipelineSparseDistTestBase):
