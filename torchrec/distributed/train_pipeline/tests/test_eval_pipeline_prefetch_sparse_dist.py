@@ -28,6 +28,9 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.distributed.test_utils.test_sharding import copy_state_dict
+from torchrec.distributed.train_pipeline.batch_attribution import (
+    get_exception_attribution,
+)
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
     EvalPipelinePrefetchSparseDist,
     EvalPipelineStage,
@@ -141,6 +144,31 @@ class EvalPipelinePrefetchTest(EvalPipelinePrefetchTestBase):
         self.assertEqual(len(pipeline.contexts), 2)
         self.assertIsInstance(pipeline.contexts[0], PrefetchTrainPipelineContext)
         self.assertIsInstance(pipeline.contexts[1], PrefetchTrainPipelineContext)
+
+    def test_wait_failure_uses_current_batch_context(self) -> None:
+        pipeline, dataloader, _, _ = self._create_pipeline()
+        pipeline.fill_pipeline(dataloader)
+        context = pipeline.contexts[0]
+        metadata = object()
+        context.batch_metadata = metadata
+        batch = pipeline.batches[0]
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        error = RuntimeError("record_stream failed")
+
+        with (
+            patch.object(type(batch), "record_stream", side_effect=error),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            pipeline.progress(dataloader)
+
+        self.assertIs(error, raised.exception)
+        attribution = get_exception_attribution(error)
+        self.assertIsNotNone(attribution)
+        assert attribution is not None
+        self.assertEqual("wait_for_batch", attribution.operation)
+        self.assertIs(metadata, attribution.metadata)
+        self.assertEqual(context.index, attribution.batch_index)
 
     @unittest.skipIf(
         not torch.cuda.is_available(),
