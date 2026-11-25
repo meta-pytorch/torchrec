@@ -93,7 +93,7 @@ def compute_false_neg_sum(
     fn_sum = torch.zeros(THRESHOLD_GRANULARITY, dtype=torch.double)
     thresholds = torch.linspace(0, 1, steps=THRESHOLD_GRANULARITY)
     for i, threshold in enumerate(thresholds):
-        fn_sum[i] = torch.sum(weights * ((predictions <= threshold) * labels), -1)
+        fn_sum[i] = torch.sum(weights * ((predictions < threshold) * labels), -1)
     return fn_sum
 
 
