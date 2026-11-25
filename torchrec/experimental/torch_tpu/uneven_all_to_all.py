@@ -82,7 +82,7 @@ def padded_all_to_all_single(
     padded_split_size: int,
     *,
     even_all_to_all: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
-    vectorized: bool = True,
+    vectorized: bool = False,
 ) -> torch.Tensor:
     """Implement uneven dim-0 all-to-all using an even padded collective.
 
@@ -239,7 +239,7 @@ def maybe_all2all_pooled_uneven_tpu(
         output_split_sizes,
         max(1, padded_split_size),
         even_all_to_all=even_all_to_all,
-        vectorized=True,
+        vectorized=False,
     )
     outputs_by_rank = sharded_output.split(output_split_sizes)
     return torch.cat(
