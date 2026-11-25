@@ -14,6 +14,7 @@ from torchrec.distributed.train_pipeline.pipeline_context import (  # noqa
     In,
     Out,
     TrainPipelineContext,
+    TrainPipelineContextLite,
 )
 from torchrec.distributed.train_pipeline.pipeline_stage import (  # noqa
     SparseDataDistUtil,  # noqa
