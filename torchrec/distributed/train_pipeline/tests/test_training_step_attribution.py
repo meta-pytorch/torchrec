@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 import unittest
-from contextlib import ExitStack
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, ExitStack
+from functools import partial
 from itertools import product
-from typing import Callable, cast
+from typing import cast
 from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch.utils.hooks import RemovableHandle
 from torchrec.distributed.train_pipeline.batch_attribution import (
     AttributedBatch,
     get_exception_attribution,
@@ -22,10 +25,13 @@ from torchrec.distributed.train_pipeline.batch_attribution import (
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
 from torchrec.distributed.train_pipeline.train_pipelines import (
     EvalPipelineSparseDist,
+    PrefetchTrainPipelineSparseDist,
     TorchCompileConfig,
+    TrainPipeline,
     TrainPipelineBase,
     TrainPipelinePT2,
     TrainPipelineSparseDist,
+    TrainPipelineSparseDistCompAutograd,
 )
 from torchrec.streamable import Pipelineable
 
@@ -66,6 +72,23 @@ class _TrainingModel(nn.Module):
         self.custom_batches.append(batch)
         loss, _ = self(batch)
         return loss * 2, self.custom_output
+
+
+class _ObservedContext:
+    def __init__(self) -> None:
+        self.active = False
+        self.observations: list[bool] = []
+
+    @contextmanager
+    def enter(self) -> Iterator[None]:
+        self.active = True
+        try:
+            yield
+        finally:
+            self.active = False
+
+    def record(self) -> None:
+        self.observations.append(self.active)
 
 
 class TrainingStepAttributionTest(unittest.TestCase):
@@ -160,11 +183,42 @@ class TrainingStepAttributionTest(unittest.TestCase):
         self._patches.enter_context(patch.object(pipeline, "_init_pipelined_modules"))
         return pipeline
 
+    def _make_comp_autograd_pipeline(
+        self,
+        model: _TrainingModel,
+    ) -> TrainPipelineSparseDistCompAutograd[Pipelineable, torch.Tensor]:
+        # Citrine C2: foreach=True for multi-tensor optimizer execution.
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        pipeline = TrainPipelineSparseDistCompAutograd[Pipelineable, torch.Tensor](
+            model,
+            optimizer,
+            torch.device("cpu"),
+        )
+        self._patches.enter_context(patch.object(pipeline, "_init_pipelined_modules"))
+        return pipeline
+
+    def _make_prefetch_pipeline(
+        self,
+        model: _TrainingModel,
+    ) -> PrefetchTrainPipelineSparseDist[Pipelineable, torch.Tensor]:
+        # Citrine C2: foreach=True for multi-tensor optimizer execution.
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        pipeline = PrefetchTrainPipelineSparseDist[Pipelineable, torch.Tensor](
+            model,
+            optimizer,
+            torch.device("cpu"),
+        )
+        self._patches.enter_context(patch.object(pipeline, "_init_pipelined_modules"))
+        self._patches.enter_context(patch.object(pipeline, "_prefetch"))
+        return pipeline
+
     def _assert_attribution(
         self,
         error: Exception,
         metadata: object | None,
-        expected_batch_index: int,
+        batch_index: int = 0,
+        *,
+        operation: str = "forward",
     ) -> None:
         attribution = get_exception_attribution(error)
         if metadata is None:
@@ -172,9 +226,9 @@ class TrainingStepAttributionTest(unittest.TestCase):
             return
         self.assertIsNotNone(attribution)
         assert attribution is not None
-        self.assertEqual("forward", attribution.operation)
+        self.assertEqual(operation, attribution.operation)
         self.assertIs(metadata, attribution.metadata)
-        self.assertEqual(expected_batch_index, attribution.batch_index)
+        self.assertEqual(batch_index, attribution.batch_index)
 
     def _assert_forward_preserved(
         self,
@@ -198,6 +252,40 @@ class TrainingStepAttributionTest(unittest.TestCase):
             model.weight.detach(),
             torch.tensor([expected_weight]),
         )
+
+    def _assert_backward_failure(
+        self,
+        pipeline: TrainPipeline[Pipelineable, torch.Tensor],
+        model: _TrainingModel,
+        dataloader_iter: Iterator[Pipelineable],
+        metadata: object | None,
+        *,
+        batch_index: int = 0,
+        on_backward: Callable[[], None] | None = None,
+    ) -> RemovableHandle:
+        error = ValueError("backward failed")
+
+        def fail(_gradient: torch.Tensor) -> torch.Tensor:
+            if on_backward is not None:
+                on_backward()
+            raise error
+
+        hook = model.weight.register_hook(fail)
+        self.addCleanup(hook.remove)
+        weight_before = model.weight.detach().clone()
+
+        with self.assertRaises(ValueError) as raised:
+            pipeline.progress(dataloader_iter)
+
+        self.assertIs(error, raised.exception)
+        torch.testing.assert_close(model.weight.detach(), weight_before)
+        self._assert_attribution(
+            error,
+            metadata,
+            operation="backward",
+            batch_index=batch_index,
+        )
+        return hook
 
     def test_sparse_progress_preserves_hooks_custom_forward_and_runtime_types(
         self,
@@ -365,6 +453,157 @@ class TrainingStepAttributionTest(unittest.TestCase):
                     model.output,
                     0.8,
                 )
+
+    def test_sparse_pipeline_backward_failure_uses_current_context(self) -> None:
+        pipeline_factories = (
+            ("sparse", self._make_sparse_pipeline),
+            ("prefetch", self._make_prefetch_pipeline),
+        )
+        for (pipeline_name, make_pipeline), metadata in product(
+            pipeline_factories,
+            (None, object()),
+        ):
+            with self.subTest(
+                pipeline=pipeline_name,
+                attributed=metadata is not None,
+            ):
+                model = _TrainingModel()
+                raw_batch = _CopyableBatch()
+                pipeline = make_pipeline(model)
+                batch = self._wrap_batch(raw_batch, metadata)
+                lookahead_batch = self._wrap_batch(_CopyableBatch(), object())
+
+                self._assert_backward_failure(
+                    pipeline,
+                    model,
+                    iter((batch, lookahead_batch)),
+                    metadata,
+                )
+
+                self.assertEqual([raw_batch], model.received_batches)
+
+    def test_compiled_autograd_backward_failure_uses_current_context(self) -> None:
+        for metadata in (None, object()):
+            with self.subTest(attributed=metadata is not None):
+                model = _TrainingModel()
+                raw_batch = _CopyableBatch()
+                pipeline = self._make_comp_autograd_pipeline(model)
+                compiled_autograd_context = _ObservedContext()
+                self._patches.enter_context(
+                    patch.object(
+                        pipeline,
+                        "get_compiled_autograd_ctx",
+                        side_effect=compiled_autograd_context.enter,
+                    )
+                )
+                batch = self._wrap_batch(raw_batch, metadata)
+                lookahead_batch = self._wrap_batch(_CopyableBatch(), object())
+
+                self._assert_backward_failure(
+                    pipeline,
+                    model,
+                    iter((batch, lookahead_batch)),
+                    metadata,
+                    on_backward=compiled_autograd_context.record,
+                )
+
+                self.assertEqual([raw_batch], model.received_batches)
+                self.assertEqual([True], compiled_autograd_context.observations)
+
+    def test_base_and_pt2_backward_failure_uses_current_context(self) -> None:
+        for pipeline_type, metadata in product(
+            (TrainPipelineBase, TrainPipelinePT2),
+            (None, object()),
+        ):
+            with self.subTest(
+                pipeline_type=pipeline_type.__name__,
+                attributed=metadata is not None,
+            ):
+                model = _TrainingModel()
+                pipeline = self._make_pipeline(pipeline_type, model)
+                raw_batch = _CopyableBatch()
+                batch = self._wrap_batch(raw_batch, metadata)
+                next_batch = self._wrap_batch(_CopyableBatch(), object())
+
+                self._assert_backward_failure(
+                    pipeline,
+                    model,
+                    iter((batch, next_batch)),
+                    metadata,
+                )
+
+                self.assertEqual([raw_batch], model.received_batches)
+
+    def test_backward_after_successful_step_uses_second_batch_context(
+        self,
+    ) -> None:
+        pipeline_factories = (
+            ("base", partial(self._make_pipeline, TrainPipelineBase)),
+            ("pt2", partial(self._make_pipeline, TrainPipelinePT2)),
+            ("sparse", self._make_sparse_pipeline),
+            ("prefetch", self._make_prefetch_pipeline),
+        )
+        for pipeline_name, make_pipeline in pipeline_factories:
+            with self.subTest(pipeline=pipeline_name):
+                model = _TrainingModel()
+                pipeline = make_pipeline(model)
+                first_batch = _CopyableBatch()
+                second_batch = _CopyableBatch()
+                second_metadata = object()
+                # Keep the deeper prefetch queue filled during both steps.
+                dataloader_iter = iter(
+                    (
+                        self._wrap_batch(first_batch, object()),
+                        self._wrap_batch(second_batch, second_metadata),
+                        *(
+                            self._wrap_batch(_CopyableBatch(), object())
+                            for _ in range(4)
+                        ),
+                    )
+                )
+
+                self.assertIs(model.output, pipeline.progress(dataloader_iter))
+                self._assert_backward_failure(
+                    pipeline,
+                    model,
+                    dataloader_iter,
+                    second_metadata,
+                    batch_index=1,
+                )
+
+                self.assertEqual([first_batch, second_batch], model.received_batches)
+
+    def test_base_failed_step_clears_backward_context(self) -> None:
+        model = _TrainingModel()
+        pipeline = self._make_pipeline(TrainPipelineBase, model)
+        raw_batch = _CopyableBatch()
+        metadata = object()
+        backward_hook = self._assert_backward_failure(
+            pipeline,
+            model,
+            iter((self._wrap_batch(raw_batch, metadata),)),
+            metadata,
+        )
+        backward_hook.remove()
+        unattributed_error = ValueError("backward without progress failed")
+
+        def fail_without_owner(
+            _gradient: torch.Tensor,
+            error: ValueError = unattributed_error,
+        ) -> torch.Tensor:
+            raise error
+
+        unattributed_hook = model.weight.register_hook(fail_without_owner)
+        try:
+            # Direct call exposes stale context because progress() installs a new owner.
+            with self.assertRaises(ValueError) as raised:
+                pipeline._backward(model.weight)
+        finally:
+            unattributed_hook.remove()
+
+        self.assertIs(unattributed_error, raised.exception)
+        self.assertIsNone(get_exception_attribution(unattributed_error))
+        self.assertEqual([raw_batch], model.received_batches)
 
     def test_base_and_pt2_forward_failure_uses_current_context(self) -> None:
         for pipeline_type, metadata in product(
