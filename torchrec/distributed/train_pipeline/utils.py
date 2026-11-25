@@ -22,6 +22,7 @@ from typing import (
     Dict,
     Generator,
     Generic,
+    Iterable,
     Iterator,
     List,
     Optional,
@@ -29,10 +30,12 @@ from typing import (
     Tuple,
     Type,
     TypeGuard,
+    TypeVar,
     Union,
 )
 
 import torch
+from torch.distributed.fsdp import FSDPModule, FullyShardedDataParallel
 from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten
@@ -78,6 +81,9 @@ except Exception:
     )
 
     one_time_rank0_logger = logging.getLogger(__name__)
+from torchrec.distributed.composable.table_batched_embedding_slice import (
+    TableBatchedEmbeddingSlice,
+)
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
     get_module,
@@ -114,6 +120,13 @@ from torchrec.distributed.train_pipeline.types import (  # noqa
     PipeliningDiagnosticReason,
 )
 from torchrec.distributed.types import Awaitable
+from torchrec.optim.fused import FusedOptimizer
+from torchrec.optim.keyed import (
+    CombinedOptimizer,
+    KeyedOptimizer,
+    KeyedOptimizerWrapper,
+    OptimizerWrapper,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
 
@@ -130,17 +143,26 @@ def is_deferred_dp_supported(
     )
 
 
+# Unbound: FSDPModule is a mixin that is not an nn.Module subclass.
+_ModuleT = TypeVar("_ModuleT")
+
+
 # Keep this implementation self-contained: model re-packaging can combine current
 # train-pipeline code with an archived model_parallel module that lacks this symbol.
-def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
-    """Returns all DDP instances in a module tree, including hidden lookups."""
-    ddp_modules: List[DistributedDataParallel] = []
+def find_modules_of_type(
+    module: torch.nn.Module, module_type: Type[_ModuleT]
+) -> List[_ModuleT]:
+    """
+    Returns every ``module_type`` instance in a module tree, including hidden
+    lookups.
+    """
+    found: List[_ModuleT] = []
     seen: Set[int] = set()
 
     def collect(candidate: torch.nn.Module) -> None:
-        if isinstance(candidate, DistributedDataParallel) and id(candidate) not in seen:
+        if isinstance(candidate, module_type) and id(candidate) not in seen:
             seen.add(id(candidate))
-            ddp_modules.append(candidate)
+            found.append(candidate)
 
     for submodule in get_module(module).modules():
         collect(submodule)
@@ -150,7 +172,163 @@ def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
         for lookup in getattr(submodule, "_lookups", ()):
             collect(lookup)
 
-    return ddp_modules
+    return found
+
+
+def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
+    """Returns all DDP instances in a module tree, including hidden lookups."""
+    return find_modules_of_type(module, DistributedDataParallel)
+
+
+def fsdp1_managed_param_ids(
+    fsdp_modules: Iterable[FullyShardedDataParallel],
+) -> Set[int]:
+    """
+    Returns the ids of the params in ``fsdp_modules``, including nested FSDP
+    units'. It also counts params FSDP ignores, which is safe only because the
+    async optimizer step waits for the main stream whenever FSDP1 is present.
+    """
+    return {
+        id(param)
+        for fsdp in fsdp_modules
+        for param in fsdp.parameters()
+        if param.requires_grad
+    }
+
+
+def fsdp2_roots(module: torch.nn.Module) -> List[FSDPModule]:
+    """
+    Returns the FSDP2 modules in a module tree that are not inside another one:
+    the roots after FSDP2's lazy init, which finalize their nested units.
+    """
+    fsdp_modules = find_modules_of_type(module, FSDPModule)
+    nested = {
+        id(nested_module)
+        for fsdp in fsdp_modules
+        for nested_module in cast(torch.nn.Module, fsdp).modules()
+        if nested_module is not fsdp
+    }
+    return [fsdp for fsdp in fsdp_modules if id(fsdp) not in nested]
+
+
+def fsdp2_managed_param_ids(roots: Iterable[FSDPModule]) -> Set[int]:
+    """
+    Returns the ids of the sharded params that FSDP2 reduces in ``roots`` and
+    their nested units, leaving out the params FSDP2 ignores.
+    """
+    return {
+        id(fsdp_param.sharded_param)
+        for root in roots
+        for module in cast(torch.nn.Module, root).modules()
+        if isinstance(module, FSDPModule)
+        for group in module._get_fsdp_state()._fsdp_param_groups
+        for fsdp_param in group.fsdp_params
+    }
+
+
+def fsdp2_supports_manual_finalization() -> bool:
+    """Whether this PyTorch's FSDP2 has manual backward finalization."""
+    return hasattr(FSDPModule, "set_manual_backward_finalization")
+
+
+def ddp_managed_param_ids(ddp_modules: Iterable[DistributedDataParallel]) -> Set[int]:
+    """
+    Returns the ids of the params whose gradients ``ddp_modules`` all-reduce, using
+    the same rule as DDP's reducer (``_build_params_for_reducer``).
+    """
+    return {
+        id(param)
+        for ddp in ddp_modules
+        for module_name, module in ddp.module.named_modules()
+        for param_name, param in module.named_parameters(recurse=False)
+        if param.requires_grad
+        and f"{module_name}.{param_name}" not in ddp.parameters_to_ignore
+    }
+
+
+def _params_stepped_from_grads(
+    optimizer: torch.optim.Optimizer, prefix: str = ""
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Yields ``(name, param)`` for every param of a non-fused optimizer in ``optimizer``."""
+    if isinstance(optimizer, FusedOptimizer):
+        return
+    if isinstance(optimizer, CombinedOptimizer):
+        for key, child in optimizer.optimizers:
+            yield from _params_stepped_from_grads(
+                child, f"{prefix}{key}." if key else prefix
+            )
+    elif isinstance(optimizer, OptimizerWrapper):
+        yield from _params_stepped_from_grads(optimizer._optimizer, prefix)
+    else:
+        # A KeyedOptimizer's params only name what step() updates: they can also
+        # hold params it never steps, such as WarmupOptimizer's placeholder.
+        names = (
+            {id(param): name for name, param in optimizer.params.items()}
+            if isinstance(optimizer, KeyedOptimizer)
+            else {}
+        )
+        for i, group in enumerate(optimizer.param_groups):
+            for j, param in enumerate(group["params"]):
+                yield prefix + names.get(id(param), f"param_groups[{i}][{j}]"), param
+
+
+def has_step_hooks(optimizer: torch.optim.Optimizer) -> bool:
+    """
+    Whether ``optimizer``, or any optimizer its ``step()`` steps, has step hooks.
+    ``OptimizerWrapper`` never creates the hook dicts, so it has none of its own.
+    """
+    if getattr(optimizer, "_optimizer_step_pre_hooks", None) or getattr(
+        optimizer, "_optimizer_step_post_hooks", None
+    ):
+        return True
+    if isinstance(optimizer, CombinedOptimizer):
+        return any(has_step_hooks(child) for _, child in optimizer.optimizers)
+    if isinstance(optimizer, (OptimizerWrapper, KeyedOptimizerWrapper)):
+        return has_step_hooks(optimizer._optimizer)
+    return False
+
+
+def async_optimizer_unsupported_reason(
+    optimizer: object, reduced_param_ids: Set[int]
+) -> Optional[str]:
+    """
+    Returns why ``optimizer`` can't step on ``async_optimizer``'s side stream,
+    or ``None`` if it can.
+
+    ``reduced_param_ids`` holds the params whose gradients the side stream waits
+    for: those DDP or FSDP2 reduces (through their manual backward finalization)
+    and those of FSDP1 modules (the side stream then waits for the main stream).
+    Every param stepped from a gradient must be in it. ``FusedOptimizer``
+    children are skipped: their update already ran in backward, and their
+    ``step()`` only sets a CPU learning rate.
+    ``CombinedOptimizer`` children and the optimizer inside an ``OptimizerWrapper``
+    are checked recursively. Step hooks on any optimizer in the tree are refused,
+    since they may touch tensors the side stream does not wait for. An optimizer
+    with only fused children is supported: its side-stream step does no device work.
+    """
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        return f"{type(optimizer).__name__} is not a torch.optim.Optimizer"
+    if has_step_hooks(optimizer):
+        return (
+            "the optimizer, or an optimizer it steps, has step hooks, which may "
+            "touch tensors the side stream does not wait for"
+        )
+    for name, param in _params_stepped_from_grads(optimizer):
+        if not param.requires_grad:
+            continue
+        # A per-table view of a batched embedding weight gets its .grad from that
+        # weight, which is what DDP reduces.
+        grad_source = (
+            param._original_tensor
+            if isinstance(param, TableBatchedEmbeddingSlice)
+            else param
+        )
+        if id(grad_source) not in reduced_param_ids:
+            return (
+                f"{name} is not reduced by a DDP or FSDP, so the side stream would "
+                "not wait for its gradient"
+            )
+    return None
 
 
 def _batch_tensor_size(batch: Any) -> int:
