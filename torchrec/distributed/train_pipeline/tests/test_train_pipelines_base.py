@@ -232,15 +232,14 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
         num_batches: int = 10,
         combined_optimizer: bool = True,
         optimizer_factory: Optional[Callable[[CombinedOptimizer], Optimizer]] = None,
-        expect_async: bool = True,
         **pipeline_kwargs: Any,
     ) -> Tuple[TrainPipelineSparseDist, TrainPipelineSparseDist]:
         """
         Trains the same model with and without ``async_optimizer`` and checks
-        that every step's output and the final parameters match. With
-        ``optimizer_factory``, both pipelines get the optimizer it builds from the
-        combined optimizer. With ``expect_async=False``, checks that the async
-        pipeline fell back to the regular step. Returns the sync and async pipelines.
+        that every step's output and the final parameters match, and that the
+        async pipeline armed. With ``optimizer_factory``, both pipelines get the
+        optimizer it builds from the combined optimizer. Returns the sync and
+        async pipelines.
         """
         model = self._setup_model()
         data = self._generate_data(num_batches=num_batches, batch_size=32)
@@ -276,10 +275,7 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
                 async_pipeline.progress(async_iter), sync_pipeline.progress(sync_iter)
             )
 
-        if expect_async:
-            self.assertGreater(len(async_pipeline._async_optimizer_ddp_modules), 0)
-        else:
-            self.assertEqual(async_pipeline._async_optimizer_ddp_modules, [])
+        self.assertGreater(len(async_pipeline._async_optimizer_ddp_modules), 0)
         self.assertEqual(sync_pipeline._async_optimizer_ddp_modules, [])
         async_params = dict(async_model.named_parameters())
         for name, param in sync_model.named_parameters():

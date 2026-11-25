@@ -184,13 +184,13 @@ class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    def test_async_optimizer_falls_back_without_defer_dp_lookup(self) -> None:
-        self._run_async_optimizer_parity(
-            TrainPipelineFusedSparseDist,
-            ShardingType.DATA_PARALLEL.value,
-            EmbeddingComputeKernel.DENSE.value,
-            expect_async=False,
-        )
+    def test_async_optimizer_without_defer_dp_lookup_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "defer_dp_lookup=True"):
+            self._run_async_optimizer_parity(
+                TrainPipelineFusedSparseDist,
+                ShardingType.DATA_PARALLEL.value,
+                EmbeddingComputeKernel.DENSE.value,
+            )
 
     def _create_dp_sharded_ec(self) -> ShardedEmbeddingCollection:
         module = EmbeddingCollection(
