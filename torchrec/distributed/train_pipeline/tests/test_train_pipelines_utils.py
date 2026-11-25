@@ -1574,10 +1574,8 @@ class AsyncOptimizerUnsupportedReasonTest(unittest.TestCase):
         assert reason is not None
         self.assertIn("_GAOptimizerWrapper", reason)
 
-    def test_only_fused_is_unsupported(self) -> None:
+    def test_only_fused_children_supported(self) -> None:
+        # Stepping only fused optimizers on the side stream does no device work.
         optimizer = CombinedOptimizer([("sparse", EmptyFusedOptimizer())])
 
-        reason = async_optimizer_unsupported_reason(optimizer, set())
-
-        assert reason is not None
-        self.assertIn("nothing", reason)
+        self.assertIsNone(async_optimizer_unsupported_reason(optimizer, set()))

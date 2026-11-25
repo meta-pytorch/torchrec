@@ -595,9 +595,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
             of backward. Fused optimizers already updated their weights in
             backward, so their ``step()`` does no device work. Every other param
             the optimizer steps must be reduced by a DDP, because the side stream
-            does not wait for the main stream. Falls back to the regular optimizer
-            step on devices without streams, if the model has no DDP, or if
-            ``async_optimizer_unsupported_reason`` gives a reason. The first
+            does not wait for the main stream. Raises ``ValueError`` when the
+            optimizer can't step on the side stream: when
+            ``async_optimizer_unsupported_reason`` gives a reason (for example
+            step hooks, or a param no DDP reduces) when the pipeline arms, or when
+            step hooks are added later. Falls back to the regular optimizer step
+            on devices without streams. The first
             ``async_num_opt_steps_on_main_stream`` steps run on the main stream
             instead, so optimizer state they create lazily (e.g.
             ``torch.optim.Adam``'s) lands in the main stream's memory pool rather
@@ -1055,18 +1058,19 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
         # getattr: some callers build a pipeline with __new__ alone, skipping
         # __init__, to call this method.
         if getattr(self, "_async_optimizer_ddp_modules", None):
-            # Step hooks added after the pipeline armed were never checked, so a
-            # step that has them runs on the main stream.
-            if self._async_main_stream_steps_left == 0 and not has_step_hooks(
-                self._optimizer
-            ):
-                self._async_optimizer_step()
-            else:
+            # The pipeline refused step hooks when it armed; refuse ones added since.
+            if has_step_hooks(self._optimizer):
+                raise ValueError(
+                    "async_optimizer: step hooks were added to the optimizer after "
+                    "the pipeline armed, and they may touch tensors the side stream "
+                    "does not wait for. Remove them, or turn off async_optimizer to "
+                    "use the regular optimizer step."
+                )
+            if self._async_main_stream_steps_left > 0:
                 self._caller_stream_optimizer_step()
-                # Every main-stream step counts, including hook-forced ones, so
-                # the first N steps always run on the main stream.
-                if self._async_main_stream_steps_left > 0:
-                    self._async_main_stream_steps_left -= 1
+                self._async_main_stream_steps_left -= 1
+            else:
+                self._async_optimizer_step()
             return
         with record_function(f"## optimizer {self.contexts[0].index} ##"):
             self._optimizer.step()
@@ -1149,32 +1153,26 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
 
     def _arm_async_optimizer_ddps(self) -> None:
         """
-        Checks that the optimizer can step on the side stream and makes every DDP
-        in the model wait for an explicit ``finalize_backward()``, which
-        ``_async_optimizer_step`` issues on the side stream. Runs after each
-        model rewrite, so ``attach()`` re-arms it.
+        Checks that the optimizer can step on the side stream, raising
+        ``ValueError`` if it can't, and makes every DDP in the model wait for an
+        explicit ``finalize_backward()``, which ``_async_optimizer_step`` issues on
+        the side stream. Runs after each model rewrite, so ``attach()`` re-arms
+        it. With no DDP and only fused optimizers, nothing is armed and the
+        regular step runs, which does the same work.
         """
         if not self._async_optimizer or self._async_optimizer_ddp_modules:
             return
 
         ddp_modules = find_ddp_modules(self._model)
-        if not ddp_modules:
-            logger.warning(
-                "async_optimizer: no DDP found, using the regular optimizer step"
-            )
-            self._async_optimizer = False
-            return
-
-        # Check before arming any DDP, so falling back leaves DDP in automatic mode.
+        # Check before arming any DDP, so raising leaves DDP in automatic mode.
         reason = async_optimizer_unsupported_reason(
             self._optimizer, ddp_managed_param_ids(ddp_modules)
         )
         if reason is not None:
-            logger.warning(
-                f"async_optimizer: {reason}. Using the regular optimizer step."
+            raise ValueError(
+                f"async_optimizer: {reason}. Turn off async_optimizer to use the "
+                "regular optimizer step."
             )
-            self._async_optimizer = False
-            return
         for ddp in ddp_modules:
             try:
                 self._set_manual_ddp_finalization(ddp, required=True)
@@ -1794,7 +1792,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         async_optimizer (bool): see `TrainPipelineSparseDist`. With
             DATA_PARALLEL tables, use ``defer_dp_lookup=True`` so their lookups
             run in the forward, after the optimizer step; without it, the
-            pipeline uses the regular optimizer step.
+            pipeline raises ``ValueError``.
         async_num_opt_steps_on_main_stream (int): see `TrainPipelineSparseDist`.
     """
 
@@ -1891,10 +1889,10 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
     def _arm_async_optimizer_ddps(self) -> None:
         """
-        Falls back to the regular optimizer step when the model has DATA_PARALLEL
-        tables and ``defer_dp_lookup`` is off. Their weights are updated by the
-        optimizer step, and a lookup issued outside the forward is not ordered
-        after the side stream.
+        Raises ``ValueError`` when the model has DATA_PARALLEL tables and
+        ``defer_dp_lookup`` is off. Their weights are updated by the optimizer
+        step, and a lookup issued outside the forward is not ordered after the
+        side stream.
         """
         # Sharded modules wrap each DATA_PARALLEL lookup in a DDP.
         if (
@@ -1902,12 +1900,13 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             and not self._defer_dp_lookup
             and any(find_ddp_modules(module) for module in self._pipelined_modules)
         ):
-            logger.warning(
-                "async_optimizer: DATA_PARALLEL tables need defer_dp_lookup=True. "
-                "Using the regular optimizer step."
+            raise ValueError(
+                "async_optimizer: DATA_PARALLEL tables need defer_dp_lookup=True, "
+                "because their lookups otherwise start on another stream before "
+                "the side-stream optimizer step updates them. Set "
+                "defer_dp_lookup=True, or turn off async_optimizer to use the "
+                "regular optimizer step."
             )
-            self._async_optimizer = False
-            return
         super()._arm_async_optimizer_ddps()
 
     def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:

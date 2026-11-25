@@ -4032,21 +4032,70 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
             [[pipeline._async_stream] * 2 for _ in optimizer.optimizers],
         )
 
-    def test_hooks_added_after_arming_run_on_caller_stream(self) -> None:
+    def test_hooks_added_after_arming_raise(self) -> None:
         _, pipeline = self._setup_async_pipeline()
         data_iter = iter(self._generate_data(num_batches=3, batch_size=32))
         # The first step arms DDP and checks the optimizer, before the hook exists.
         pipeline.progress(data_iter)
-        streams: List[torch.Stream] = []
-        pipeline._optimizer.register_step_pre_hook(
-            lambda *_: streams.append(torch.cuda.current_stream())
+        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+        pipeline._optimizer.register_step_pre_hook(lambda *_: None)
+
+        with self.assertRaisesRegex(ValueError, "step hooks"):
+            pipeline.progress(data_iter)
+
+    def test_step_hooks_at_arm_raise(self) -> None:
+        model, pipeline = self._setup_async_pipeline()
+        pipeline._optimizer.register_step_pre_hook(lambda *_: None)
+
+        with self.assertRaisesRegex(ValueError, "step hooks"):
+            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+
+        self._assert_no_ddp_armed(model, pipeline)
+
+    def _assert_no_ddp_armed(
+        self, model: nn.Module, pipeline: TrainPipelineSparseDist
+    ) -> None:
+        self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
+        for ddp in find_ddp_modules(model):
+            self.assertFalse(ddp.require_manual_backward_finalization)
+
+    def _no_ddp_pipeline(self, with_hook: bool) -> TrainPipelineSparseDist:
+        # Skips init_data_parallel(), so no DDP reduces the dense params, like
+        # MVAI's SimpleDDP, whose step pre-hook finalizes the gradients instead.
+        model, optimizer = self._generate_sharded_model_and_optimizer(
+            self._setup_model(),
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+        )
+        if with_hook:
+            optimizer.register_step_pre_hook(lambda *_: None)
+        return TrainPipelineSparseDist(
+            model=model, optimizer=optimizer, device=self.device, async_optimizer=True
         )
 
-        pipeline.progress(data_iter)
-        pipeline.progress(data_iter)
+    def test_step_hooks_without_ddp_raise(self) -> None:
+        pipeline = self._no_ddp_pipeline(with_hook=True)
 
-        self.assertEqual(streams, [torch.cuda.current_stream()] * 2)
-        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+        with self.assertRaisesRegex(ValueError, "step hooks"):
+            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+
+    def test_dense_params_without_ddp_raise(self) -> None:
+        pipeline = self._no_ddp_pipeline(with_hook=False)
+
+        with self.assertRaisesRegex(ValueError, "not reduced by a DDP"):
+            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+
+    def test_only_fused_optimizer_runs_async(self) -> None:
+        # The side stream finalizes DDP and steps only the fused optimizer, whose
+        # step() does no device work.
+        self._run_async_optimizer_parity(
+            TrainPipelineSparseDist,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            optimizer_factory=lambda optimizer: CombinedOptimizer(
+                [optimizer.optimizers[0]]
+            ),
+        )
 
     def test_top_level_optimizer_wrapper_matches_sync(self) -> None:
         # OptimizerWrapper never creates the step hook dicts.
@@ -4109,27 +4158,6 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         with self.assertRaisesRegex(ValueError, "async_num_opt_steps_on_main_stream"):
             self._setup_async_pipeline(async_num_opt_steps_on_main_stream=-1)
 
-    def test_hook_forced_step_counts_as_main_stream_step(self) -> None:
-        _, pipeline = self._setup_async_pipeline(async_num_opt_steps_on_main_stream=2)
-        optimizer = cast(CombinedOptimizer, pipeline._optimizer)
-        streams = _record_step_streams(optimizer)
-        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
-        # The first step arms the pipeline, which refuses hooks that exist then.
-        pipeline.progress(data_iter)
-        hook = optimizer.register_step_pre_hook(lambda *_: None)
-        pipeline.progress(data_iter)
-        hook.remove()
-
-        pipeline.progress(data_iter)
-        pipeline.progress(data_iter)
-
-        main_stream = torch.cuda.current_stream()
-        async_stream = pipeline._async_stream
-        # Step 2 has a hook and is also the second main-stream step.
-        self.assertEqual(
-            streams, [main_stream, main_stream, async_stream, async_stream]
-        )
-
     def test_combined_optimizer_subclass_steps_whole(self) -> None:
         class _StepCountingOptimizer(CombinedOptimizer):
             step_count: int = 0
@@ -4148,14 +4176,23 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         )
         self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
 
-    def test_param_outside_ddp_falls_back(self) -> None:
-        self._run_async_optimizer_parity(
-            TrainPipelineSparseDist,
+    def test_param_outside_ddp_raises(self) -> None:
+        model, optimizer = self._setup_ddp_model_and_optimizer(
+            self._setup_model(),
             ShardingType.TABLE_WISE.value,
             EmbeddingComputeKernel.FUSED.value,
-            optimizer_factory=_add_param_outside_ddp,
-            expect_async=False,
         )
+        pipeline = TrainPipelineSparseDist(
+            model=model,
+            optimizer=_add_param_outside_ddp(cast(CombinedOptimizer, optimizer)),
+            device=self.device,
+            async_optimizer=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside is not reduced by a DDP"):
+            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+
+        self._assert_no_ddp_armed(model, pipeline)
 
     def test_warmup_wrapped_optimizers_match_sync(self) -> None:
         # MVAI's RecOptimizer wraps each group that has an LR warmup schedule, fused
@@ -4218,14 +4255,14 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
             EmbeddingComputeKernel.FUSED.value,
         )
 
-        pipeline.attach(new_model)
-        pipeline.progress(data_iter)
+        # The pipeline's optimizer steps the old model's params, which no DDP of the
+        # new model reduces, so arming the new model raises.
+        with self.assertRaisesRegex(ValueError, "not reduced by a DDP"):
+            pipeline.attach(new_model)
 
         for ddp in find_ddp_modules(old_model):
             self.assertFalse(ddp.require_manual_backward_finalization)
-        # The pipeline's optimizer steps the old model's params, which no DDP of the
-        # new model reduces, so the new model falls back to the regular step.
-        self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
+        self._assert_no_ddp_armed(new_model, pipeline)
 
     def test_ddp_refusing_manual_finalization_leaves_none_armed(self) -> None:
         model, pipeline = self._setup_async_pipeline()

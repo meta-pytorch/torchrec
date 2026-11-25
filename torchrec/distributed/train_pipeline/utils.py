@@ -234,7 +234,8 @@ def async_optimizer_unsupported_reason(
     ran in backward, and their ``step()`` only sets a CPU learning rate.
     ``CombinedOptimizer`` children and the optimizer inside an ``OptimizerWrapper``
     are checked recursively. Step hooks on any optimizer in the tree are refused,
-    since they may touch tensors the side stream does not wait for.
+    since they may touch tensors the side stream does not wait for. An optimizer
+    with only fused children is supported: its side-stream step does no device work.
     """
     if not isinstance(optimizer, torch.optim.Optimizer):
         return f"{type(optimizer).__name__} is not a torch.optim.Optimizer"
@@ -243,14 +244,9 @@ def async_optimizer_unsupported_reason(
             "the optimizer, or an optimizer it steps, has step hooks, which may "
             "touch tensors the side stream does not wait for"
         )
-    named_params = [
-        (name, param)
-        for name, param in _params_stepped_from_grads(optimizer)
-        if param.requires_grad
-    ]
-    if not named_params:
-        return "there is nothing to step outside fused optimizers"
-    for name, param in named_params:
+    for name, param in _params_stepped_from_grads(optimizer):
+        if not param.requires_grad:
+            continue
         # A per-table view of a batched embedding weight gets its .grad from that
         # weight, which is what DDP reduces.
         grad_source = (
