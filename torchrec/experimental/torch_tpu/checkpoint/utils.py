@@ -63,20 +63,21 @@ def mod_shard(
 def reverse_mod_shard(
     sharded_weight: torch.Tensor,
     vocab_size: int,
-    embedding_dim: int,
+    embedding_dim: Optional[int],
     num_shards: int,
 ) -> torch.Tensor:
     """Un-MOD-shards a sharded tensor back to sequential layout.
 
     Args:
-      sharded_weight: Consolidated sharded tensor of shape [padded_vocab_size,
-        dim]
+      sharded_weight: Consolidated sharded tensor of shape [padded_vocab_size]
+        or [padded_vocab_size, dim]
       vocab_size: Original (unpadded) vocabulary size.
-      embedding_dim: Embedding dimension.
+      embedding_dim: Embedding dimension (unused for 1D tensors).
       num_shards: Number of shards (ranks * SCs per rank)
 
     Returns:
-      Sequential unpadded tensor of shape [vocab_size, embedding_dim].
+      Sequential unpadded tensor of shape [vocab_size] or
+      [vocab_size, embedding_dim].
     """
     padded_vocab_size = sharded_weight.size(0)
     if padded_vocab_size % num_shards != 0:
@@ -96,6 +97,8 @@ def reverse_mod_shard(
     unsharded_weight = t.view(-1, *extra_shape)
 
     # Slice to remove padding if vocab_size is smaller than padded shape
+    if unsharded_weight.ndim == 1:
+        return unsharded_weight[:vocab_size]
     return unsharded_weight[:vocab_size, :embedding_dim]
 
 
@@ -124,24 +127,25 @@ def unstack_and_unshard_global_tensor(
     stack_config: Union[StackedSparseCoreEmbeddingConfig, Dict[str, Any]],
     num_shards: int,
 ) -> Dict[str, torch.Tensor]:
-    """Unstacks and un-MOD-shards a full global stacked tensor into individual table weights.
+    """Unstacks and un-MOD-shards a full global stacked tensor into individual table tensors.
 
     Args:
-      sharded_weight: Consolidated sharded tensor of shape [stack_num_embeddings,
-        stack_embedding_dim]
+      sharded_weight: Consolidated sharded tensor of shape [stack_num_embeddings]
+        (1D row-wise slot) or [stack_num_embeddings, stack_embedding_dim] (2D).
       stack_config: StackedSparseCoreEmbeddingConfig or serialized dict metadata.
       num_shards: Total number of shards (world_size * num_sc_per_device) used
         when saving.
 
     Returns:
-      Dict mapping table name to sequential unpadded tensor [vocab_size,
-      embedding_dim].
+      Dict mapping table name to sequential unpadded tensor [vocab_size] or
+      [vocab_size, embedding_dim].
     """
     if isinstance(stack_config, dict):
         stack_config = StackedSparseCoreEmbeddingConfig.from_dict(stack_config)
 
+    is_1d = sharded_weight.ndim == 1
     stack_num_embeddings = sharded_weight.size(0)
-    stack_embedding_dim = sharded_weight.size(1)
+    extra_shape = [] if is_1d else [sharded_weight.size(1)]
 
     if stack_num_embeddings % num_shards != 0:
         raise ValueError(
@@ -149,7 +153,7 @@ def unstack_and_unshard_global_tensor(
             f" num_shards {num_shards}"
         )
 
-    global_3d = sharded_weight.view(num_shards, -1, stack_embedding_dim)
+    global_sharded = sharded_weight.view(num_shards, -1, *extra_shape)
     table_weights = {}
 
     for table in stack_config.tables:
@@ -161,19 +165,23 @@ def unstack_and_unshard_global_tensor(
         rotation = stack_config.shard_rotations[table_name]
 
         chunk_size = padded_vocab_size // num_shards
-        w_slice = global_3d[:, row_offset : row_offset + chunk_size, :]
+        w_slice = global_sharded[:, row_offset : row_offset + chunk_size]
 
         rot = rotation % num_shards
         if rot != 0:
             w_slice = torch.roll(w_slice, shifts=-rot, dims=0)
 
         unsharded_padded = reverse_mod_shard(
-            w_slice.reshape(-1, stack_embedding_dim),
+            w_slice.reshape(-1, *extra_shape),
             vocab_size=padded_vocab_size,
-            embedding_dim=stack_embedding_dim,
+            embedding_dim=None if is_1d else extra_shape[0],
             num_shards=num_shards,
         )
-        table_weights[table_name] = unsharded_padded[:vocab_size, :embedding_dim]
+        table_weights[table_name] = (
+            unsharded_padded[:vocab_size]
+            if is_1d
+            else unsharded_padded[:vocab_size, :embedding_dim]
+        )
 
     return table_weights
 
@@ -183,17 +191,17 @@ def stack_and_shard_global_tensor(
     stack_config: Union[StackedSparseCoreEmbeddingConfig, Dict[str, Any]],
     num_shards: int,
 ) -> torch.Tensor:
-    """Stacks and MOD-shards individual table weights into a full global stacked tensor.
+    """Stacks and MOD-shards individual table tensors into a full global stacked tensor.
 
     Args:
-      table_weights: Dict mapping table name to sequential tensor [vocab_size,
-        embedding_dim]
+      table_weights: Dict mapping table name to sequential tensor [vocab_size]
+        (1D row-wise slot) or [vocab_size, embedding_dim] (2D).
       stack_config: StackedSparseCoreEmbeddingConfig or serialized dict metadata.
       num_shards: Total number of target shards (world_size * num_sc_per_device).
 
     Returns:
-      Stacked and MOD-sharded tensor of shape [stack_num_embeddings,
-      stack_embedding_dim].
+      Stacked and MOD-sharded tensor of shape [stack_num_embeddings] or
+      [stack_num_embeddings, stack_embedding_dim].
     """
     if isinstance(stack_config, dict):
         stack_config = StackedSparseCoreEmbeddingConfig.from_dict(stack_config)
@@ -207,11 +215,13 @@ def stack_and_shard_global_tensor(
             f" target num_shards {num_shards}"
         )
 
+    first_tensor = next(iter(table_weights.values()))
+    is_1d = first_tensor.ndim == 1
+    extra_shape = [] if is_1d else [stack_embedding_dim]
     total_rows_per_shard = stack_num_embeddings // num_shards
-    dtype = next(iter(table_weights.values())).dtype
-    global_3d = torch.zeros(
-        (num_shards, total_rows_per_shard, stack_embedding_dim),
-        dtype=dtype,
+    global_sharded = torch.zeros(
+        (num_shards, total_rows_per_shard, *extra_shape),
+        dtype=first_tensor.dtype,
     )
 
     for table in stack_config.tables:
@@ -222,20 +232,23 @@ def stack_and_shard_global_tensor(
         rotation = stack_config.shard_rotations[table_name]
 
         pad_rows = padded_vocab_size - w.size(0)
-        pad_cols = stack_embedding_dim - w.size(1)
-        if pad_rows > 0 or pad_cols > 0:
-            w_padded = F.pad(w, (0, pad_cols, 0, pad_rows), value=0.0)
+        if is_1d:
+            w_padded = F.pad(w, (0, pad_rows), value=0.0) if pad_rows > 0 else w
         else:
-            w_padded = w
+            pad_cols = stack_embedding_dim - w.size(1)
+            if pad_rows > 0 or pad_cols > 0:
+                w_padded = F.pad(w, (0, pad_cols, 0, pad_rows), value=0.0)
+            else:
+                w_padded = w
 
         sharded = mod_shard(w_padded, num_shards=num_shards)
         chunk_size = padded_vocab_size // num_shards
-        t = sharded.view(num_shards, chunk_size, stack_embedding_dim)
+        t = sharded.view(num_shards, chunk_size, *extra_shape)
 
         rot = rotation % num_shards
         if rot != 0:
             t = torch.roll(t, shifts=rot, dims=0)
 
-        global_3d[:, row_offset : row_offset + chunk_size, :] = t
+        global_sharded[:, row_offset : row_offset + chunk_size] = t
 
-    return global_3d.view(-1, stack_embedding_dim)
+    return global_sharded.view(-1, *extra_shape)

@@ -76,7 +76,7 @@ from torchrec.experimental.torch_tpu.modules.fused_embedding_modules import Spar
 
 embedding_layer = SparseCoreFusedEmbeddingBagCollection(
     tables=[sc_table_config],
-    optimizer_type=torch.optim.SGD,     # Supported: torch.optim.SGD, Adagrad, Adam
+    optimizer_type=torch.optim.SGD,     # Supported: torch.optim.SGD, Adagrad, torchrec.optim.RowWiseAdagrad, Adam
     optimizer_kwargs={"lr": 0.05},      # Learning rate & optimizer hyperparameters
     batch_size=local_batch_size,        # Process-local batch size
     global_device_count=world_size,     # Total TPU chips across hosts
@@ -88,6 +88,7 @@ embedding_layer = SparseCoreFusedEmbeddingBagCollection(
 `torchrec.experimental.torch_tpu` supports standard PyTorch optimizer parameter names:
 * **SGD**: `{"lr": 0.05}`
 * **Adagrad**: `{"lr": 0.1, "initial_accumulator_value": 0.1, "eps": 1e-10}`
+* **RowWiseAdagrad** (`torchrec.optim.RowWiseAdagrad`): `{"lr": 0.1, "initial_accumulator_value": 0.1, "eps": 1e-10}`
 * **Adam**: `{"lr": 0.001, "betas": (0.9, 0.999), "eps": 1e-8}`
 
 *(Note: Legacy argument names `learning_rate`, `beta1`, `beta2`, and `epsilon` are also seamlessly accepted).*

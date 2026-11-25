@@ -35,12 +35,13 @@ from torchrec.experimental.torch_tpu.modules.embedding_configs import (
     StackedSparseCoreEmbeddingConfig,
 )
 from torchrec.modules import embedding_configs
-from torchrec.optim import fused, keyed
+from torchrec.optim import fused, keyed, rowwise_adagrad
 from torchrec.sparse import jagged_tensor
 
 KeyedOptimizer = keyed.KeyedOptimizer
 FusedOptimizer = fused.FusedOptimizer
 FusedOptimizerModule = fused.FusedOptimizerModule
+RowWiseAdagrad = rowwise_adagrad.RowWiseAdagrad
 
 KeyedSparseCorePreprocessedInput = input_preprocessing.KeyedSparseCorePreprocessedInput
 EmbeddingConfig = embedding_configs.EmbeddingConfig
@@ -48,16 +49,20 @@ KeyedTensor = jagged_tensor.KeyedTensor
 JaggedTensor = jagged_tensor.JaggedTensor
 EmbeddingBagConfig = embedding_configs.EmbeddingBagConfig
 
+_ADAGRAD_OPTIMIZERS = (torch.optim.Adagrad, RowWiseAdagrad)
+
 _DISPATCH_TABLE = {
     None: custom_ops.sparse_dense_matmul_sgd_fwd,
     torch.optim.SGD: custom_ops.sparse_dense_matmul_sgd_fwd,
     torch.optim.Adagrad: custom_ops.sparse_dense_matmul_adagrad_fwd,
+    RowWiseAdagrad: custom_ops.sparse_dense_matmul_adagrad_fwd,
     torch.optim.Adam: custom_ops.sparse_dense_matmul_adam_fwd,
 }
 
 _DISPATCH_TABLE_BWD = {
     torch.optim.SGD: custom_ops.sparse_dense_matmul_sgd_bwd,
     torch.optim.Adagrad: custom_ops.sparse_dense_matmul_adagrad_bwd,
+    RowWiseAdagrad: custom_ops.sparse_dense_matmul_adagrad_bwd,
     torch.optim.Adam: custom_ops.sparse_dense_matmul_adam_bwd,
 }
 
@@ -152,9 +157,9 @@ def run_sparse_dense_matmul(
       batch_size: Device batch size.
       max_ids_per_partition: Static partition size for IDs.
       max_unique_ids_per_partition: Static partition size for unique IDs.
-      optimizer_type: Optimizer class (SGD, Adagrad, Adam).
+      optimizer_type: Optimizer class (SGD, Adagrad, RowWiseAdagrad, Adam).
       table_name: Name of the table / stack for debugging and custom op naming.
-      accumulator: Optional Adagrad accumulator tensor.
+      accumulator: Optional Adagrad / RowWiseAdagrad accumulator tensor.
       momentum: Optional Adam momentum tensor.
       velocity: Optional Adam velocity tensor.
       epsilon: Numerical stability constant for Adagrad / Adam.
@@ -171,8 +176,8 @@ def run_sparse_dense_matmul(
     """
     if optimizer_type not in _DISPATCH_TABLE:
         raise ValueError(
-            f"Unsupported optimizer: {optimizer_type}. Only 'sgd', 'adagrad', and"
-            " 'adam' are supported."
+            f"Unsupported optimizer: {optimizer_type}. Only 'sgd', 'adagrad',"
+            " 'rowwise_adagrad', and 'adam' are supported."
         )
     op = _DISPATCH_TABLE[optimizer_type]
     if optimizer_type is None or optimizer_type == torch.optim.SGD:
@@ -193,7 +198,7 @@ def run_sparse_dense_matmul(
             table_name,
             enable_minibatching,
         )
-    elif optimizer_type == torch.optim.Adagrad:
+    elif optimizer_type in _ADAGRAD_OPTIMIZERS:
         if accumulator is None:
             raise ValueError("accumulator must be provided for Adagrad")
         return op(
@@ -260,8 +265,8 @@ def run_sparse_dense_matmul_bwd(
     """Runs SparseCore backward pass and in-place optimizer update."""
     if optimizer_type not in _DISPATCH_TABLE_BWD:
         raise ValueError(
-            f"Unsupported optimizer: {optimizer_type}. Only 'sgd', 'adagrad', and"
-            " 'adam' are supported."
+            f"Unsupported optimizer: {optimizer_type}. Only 'sgd', 'adagrad',"
+            " 'rowwise_adagrad', and 'adam' are supported."
         )
     op = _DISPATCH_TABLE_BWD[optimizer_type]
     if optimizer_type == torch.optim.SGD:
@@ -279,7 +284,7 @@ def run_sparse_dense_matmul_bwd(
             table_name,
             enable_minibatching,
         )
-    elif optimizer_type == torch.optim.Adagrad:
+    elif optimizer_type in _ADAGRAD_OPTIMIZERS:
         if accumulator is None:
             raise ValueError("accumulator must be provided for Adagrad")
         op(
@@ -526,9 +531,25 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
 
             if self._optimizer_type is None or self._optimizer_type == torch.optim.SGD:
                 pass
-            elif self._optimizer_type == torch.optim.Adagrad:
+            elif self._optimizer_type in _ADAGRAD_OPTIMIZERS:
+                if self._optimizer_type == RowWiseAdagrad:
+                    for config in stack_config.tables:
+                        if config.embedding_dim != stack_config.stack_embedding_dim:
+                            raise ValueError(
+                                "RowWiseAdagrad requires table embedding_dim"
+                                f" ({config.embedding_dim}) for table '{config.name}'"
+                                " to equal stack_embedding_dim"
+                                f" ({stack_config.stack_embedding_dim}) for stack"
+                                f" '{stack_config.stack_name}'; width padding dilutes"
+                                " the row-wise mean squared gradient."
+                            )
+                acc_shape = (
+                    (stack_shape[0],)
+                    if self._optimizer_type == RowWiseAdagrad
+                    else stack_shape
+                )
                 accumulator = torch.full(
-                    stack_shape,
+                    acc_shape,
                     self._optimizer_kwargs.get("initial_accumulator_value", 0.0),
                     dtype=torch.float32,
                 )
@@ -576,7 +597,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
             else:
                 raise ValueError(
                     f"Unsupported optimizer: {self._optimizer_type}. Only 'sgd',"
-                    " 'adagrad', and 'adam' are supported."
+                    " 'adagrad', 'rowwise_adagrad', and 'adam' are supported."
                 )
 
         # Synchronize TPU devices to ensure all tables are initialized
@@ -1034,12 +1055,15 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                     computation_name=f"sgd_{stack_name}",
                     enable_minibatching=table_inputs.enable_minibatching,
                 )
-            elif self._optimizer_type == torch.optim.Adagrad:
+            elif self._optimizer_type in _ADAGRAD_OPTIMIZERS:
                 if local_accumulator is None:
                     raise RuntimeError(
                         f"local_accumulator for stack {stack_name} is None."
                     )
                 eps = self._optimizer_kwargs.get("eps", 1e-10)
+                opt_prefix = (
+                    "rowwise_adagrad" if local_accumulator.ndim == 1 else "adagrad"
+                )
                 new_table, new_accumulator = (
                     torch.tpu.ops.sparse_dense_matmul_grad_with_adagrad(
                         table_inputs.row_pointers,
@@ -1054,7 +1078,7 @@ class _SparseCoreFusedEmbeddingBase(FusedOptimizerModule):
                         device_batch_size=total_batch_size,
                         max_ids_per_partition=max_ids,
                         max_unique_ids_per_partition=max_unique_ids,
-                        computation_name=f"adagrad_{stack_name}",
+                        computation_name=f"{opt_prefix}_{stack_name}",
                         enable_minibatching=table_inputs.enable_minibatching,
                     )
                 )

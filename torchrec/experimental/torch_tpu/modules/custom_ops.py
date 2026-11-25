@@ -250,6 +250,7 @@ def sparse_dense_matmul_adagrad_bwd(
     enable_minibatching: bool = False,
 ) -> None:
     """Executes the backward pass and inplace Adagrad weight and accumulator update."""
+    opt_prefix = "rowwise_adagrad" if accumulator.ndim == 1 else "adagrad"
     updated_table, updated_accumulator = (
         torch.tpu.ops.sparse_dense_matmul_grad_with_adagrad(
             row_pointers,
@@ -264,7 +265,7 @@ def sparse_dense_matmul_adagrad_bwd(
             device_batch_size=batch_size,
             max_ids_per_partition=max_ids_per_partition,
             max_unique_ids_per_partition=max_unique_ids_per_partition,
-            computation_name=f"adagrad_{table_name}",
+            computation_name=f"{opt_prefix}_{table_name}",
             enable_minibatching=enable_minibatching,
         )
     )
