@@ -30,10 +30,12 @@ from typing import (
     Tuple,
     Type,
     TypeGuard,
+    TypeVar,
     Union,
 )
 
 import torch
+from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten
@@ -141,17 +143,25 @@ def is_deferred_dp_supported(
     )
 
 
+_ModuleT = TypeVar("_ModuleT", bound=torch.nn.Module)
+
+
 # Keep this implementation self-contained: model re-packaging can combine current
 # train-pipeline code with an archived model_parallel module that lacks this symbol.
-def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
-    """Returns all DDP instances in a module tree, including hidden lookups."""
-    ddp_modules: List[DistributedDataParallel] = []
+def find_modules_of_type(
+    module: torch.nn.Module, module_type: Type[_ModuleT]
+) -> List[_ModuleT]:
+    """
+    Returns every ``module_type`` instance in a module tree, including hidden
+    lookups.
+    """
+    found: List[_ModuleT] = []
     seen: Set[int] = set()
 
     def collect(candidate: torch.nn.Module) -> None:
-        if isinstance(candidate, DistributedDataParallel) and id(candidate) not in seen:
+        if isinstance(candidate, module_type) and id(candidate) not in seen:
             seen.add(id(candidate))
-            ddp_modules.append(candidate)
+            found.append(candidate)
 
     for submodule in get_module(module).modules():
         collect(submodule)
@@ -161,7 +171,28 @@ def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
         for lookup in getattr(submodule, "_lookups", ()):
             collect(lookup)
 
-    return ddp_modules
+    return found
+
+
+def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
+    """Returns all DDP instances in a module tree, including hidden lookups."""
+    return find_modules_of_type(module, DistributedDataParallel)
+
+
+def fsdp1_managed_param_ids(
+    fsdp_modules: Iterable[FullyShardedDataParallel],
+) -> Set[int]:
+    """
+    Returns the ids of the params in ``fsdp_modules``, including nested FSDP
+    units'. It also counts params FSDP ignores, which is safe only because the
+    async optimizer step waits for the main stream whenever FSDP1 is present.
+    """
+    return {
+        id(param)
+        for fsdp in fsdp_modules
+        for param in fsdp.parameters()
+        if param.requires_grad
+    }
 
 
 def ddp_managed_param_ids(ddp_modules: Iterable[DistributedDataParallel]) -> Set[int]:
@@ -222,16 +253,18 @@ def has_step_hooks(optimizer: torch.optim.Optimizer) -> bool:
 
 
 def async_optimizer_unsupported_reason(
-    optimizer: object, ddp_param_ids: Set[int]
+    optimizer: object, reduced_param_ids: Set[int]
 ) -> Optional[str]:
     """
     Returns why ``optimizer`` can't step on ``async_optimizer``'s side stream,
     or ``None`` if it can.
 
-    The side stream waits only for the DDP all-reduces (through
-    ``finalize_backward()``), so every param stepped from a gradient must be in
-    ``ddp_param_ids``. ``FusedOptimizer`` children are skipped: their update already
-    ran in backward, and their ``step()`` only sets a CPU learning rate.
+    ``reduced_param_ids`` holds the params whose gradients the side stream waits
+    for: those DDP reduces (through ``finalize_backward()``) and those of FSDP1
+    modules (the side stream then waits for the main stream). Every param stepped
+    from a gradient must be in it. ``FusedOptimizer`` children are skipped: their
+    update already ran in backward, and their ``step()`` only sets a CPU learning
+    rate.
     ``CombinedOptimizer`` children and the optimizer inside an ``OptimizerWrapper``
     are checked recursively. Step hooks on any optimizer in the tree are refused,
     since they may touch tensors the side stream does not wait for. An optimizer
@@ -254,10 +287,10 @@ def async_optimizer_unsupported_reason(
             if isinstance(param, TableBatchedEmbeddingSlice)
             else param
         )
-        if id(grad_source) not in ddp_param_ids:
+        if id(grad_source) not in reduced_param_ids:
             return (
-                f"{name} is not reduced by a DDP, so the side stream would not wait "
-                "for its gradient"
+                f"{name} is not reduced by a DDP or FSDP1, so the side stream would "
+                "not wait for its gradient"
             )
     return None
 

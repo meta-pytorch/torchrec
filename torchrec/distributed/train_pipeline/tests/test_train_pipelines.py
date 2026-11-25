@@ -34,6 +34,8 @@ from torch import nn, optim
 from torch._dynamo.testing import reduce_to_scalar_loss
 from torch._dynamo.utils import counters
 from torch.autograd import DeviceType
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import ProfilerActivity
 from torchrec.distributed import DistributedModelParallel
@@ -86,6 +88,7 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
     PipelinedForward,
 )
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
+    _FsdpThenDdpWrapper,
     TrainPipelineSparseDistTestBase,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import (
@@ -3957,6 +3960,17 @@ def _allocator_stream(tensor: torch.Tensor) -> int:
     raise AssertionError(f"No allocator segment holds address {ptr:#x}")
 
 
+def _fsdp1(module: nn.Module) -> nn.Module:
+    return FSDP(module, use_orig_params=False)
+
+
+def _nested_fsdp1(module: nn.Module) -> nn.Module:
+    # Each nn.Linear becomes its own FSDP unit inside the outer one.
+    return FSDP(
+        module, auto_wrap_policy=ModuleWrapPolicy({nn.Linear}), use_orig_params=False
+    )
+
+
 @unittest.skipIf(
     not torch.cuda.is_available(),
     "Not enough GPUs, this test requires at least one GPU",
@@ -3973,14 +3987,32 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
             EmbeddingComputeKernel.FUSED.value,
         )
         assert isinstance(optimizer, CombinedOptimizer)
-        pipeline = TrainPipelineSparseDist(
+        pipeline = self._async_pipeline(
+            model, optimizer_class([*optimizer.optimizers]), **pipeline_kwargs
+        )
+        return model, pipeline
+
+    def _async_pipeline(
+        self, model: nn.Module, optimizer: optim.Optimizer, **pipeline_kwargs: Any
+    ) -> TrainPipelineSparseDist:
+        return TrainPipelineSparseDist(
             model=model,
-            optimizer=optimizer_class([*optimizer.optimizers]),
+            optimizer=optimizer,
             device=self.device,
             async_optimizer=True,
             **pipeline_kwargs,
         )
-        return model, pipeline
+
+    def _progress_once(self, pipeline: TrainPipelineSparseDist) -> None:
+        pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+
+    def _assert_no_ddp_armed(
+        self, pipeline: TrainPipelineSparseDist, *models: nn.Module
+    ) -> None:
+        self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
+        for model in models:
+            for ddp in find_ddp_modules(model):
+                self.assertFalse(ddp.require_manual_backward_finalization)
 
     def _train_twice_then_eval(
         self, grad_enabled: bool
@@ -4048,16 +4080,9 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         pipeline._optimizer.register_step_pre_hook(lambda *_: None)
 
         with self.assertRaisesRegex(ValueError, "step hooks"):
-            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+            self._progress_once(pipeline)
 
-        self._assert_no_ddp_armed(model, pipeline)
-
-    def _assert_no_ddp_armed(
-        self, model: nn.Module, pipeline: TrainPipelineSparseDist
-    ) -> None:
-        self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
-        for ddp in find_ddp_modules(model):
-            self.assertFalse(ddp.require_manual_backward_finalization)
+        self._assert_no_ddp_armed(pipeline, model)
 
     def _no_ddp_pipeline(self, with_hook: bool) -> TrainPipelineSparseDist:
         # Skips init_data_parallel(), so no DDP reduces the dense params, like
@@ -4069,21 +4094,19 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         )
         if with_hook:
             optimizer.register_step_pre_hook(lambda *_: None)
-        return TrainPipelineSparseDist(
-            model=model, optimizer=optimizer, device=self.device, async_optimizer=True
-        )
+        return self._async_pipeline(model, optimizer)
 
     def test_step_hooks_without_ddp_raise(self) -> None:
         pipeline = self._no_ddp_pipeline(with_hook=True)
 
         with self.assertRaisesRegex(ValueError, "step hooks"):
-            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+            self._progress_once(pipeline)
 
     def test_dense_params_without_ddp_raise(self) -> None:
         pipeline = self._no_ddp_pipeline(with_hook=False)
 
         with self.assertRaisesRegex(ValueError, "not reduced by a DDP"):
-            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+            self._progress_once(pipeline)
 
     def test_only_fused_optimizer_runs_async(self) -> None:
         # The side stream finalizes DDP and steps only the fused optimizer, whose
@@ -4182,17 +4205,14 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
             ShardingType.TABLE_WISE.value,
             EmbeddingComputeKernel.FUSED.value,
         )
-        pipeline = TrainPipelineSparseDist(
-            model=model,
-            optimizer=_add_param_outside_ddp(cast(CombinedOptimizer, optimizer)),
-            device=self.device,
-            async_optimizer=True,
+        pipeline = self._async_pipeline(
+            model, _add_param_outside_ddp(cast(CombinedOptimizer, optimizer))
         )
 
         with self.assertRaisesRegex(ValueError, "outside is not reduced by a DDP"):
-            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+            self._progress_once(pipeline)
 
-        self._assert_no_ddp_armed(model, pipeline)
+        self._assert_no_ddp_armed(pipeline, model)
 
     def test_warmup_wrapped_optimizers_match_sync(self) -> None:
         # MVAI's RecOptimizer wraps each group that has an LR warmup schedule, fused
@@ -4260,13 +4280,10 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         with self.assertRaisesRegex(ValueError, "not reduced by a DDP"):
             pipeline.attach(new_model)
 
-        for ddp in find_ddp_modules(old_model):
-            self.assertFalse(ddp.require_manual_backward_finalization)
-        self._assert_no_ddp_armed(new_model, pipeline)
+        self._assert_no_ddp_armed(pipeline, old_model, new_model)
 
     def test_ddp_refusing_manual_finalization_leaves_none_armed(self) -> None:
         model, pipeline = self._setup_async_pipeline()
-        ddp_modules = find_ddp_modules(model)
         refusing_ddp = DistributedDataParallel(
             nn.Linear(2, 2, device=self.device), process_group=self.pg
         )
@@ -4276,11 +4293,88 @@ class TrainPipelineAsyncOptimizerTest(TrainPipelineSparseDistTestBase):
         model.module.add_module("refusing_ddp", refusing_ddp)
 
         with self.assertRaisesRegex(RuntimeError, "DDP refused"):
-            pipeline.progress(iter(self._generate_data(num_batches=2, batch_size=32)))
+            self._progress_once(pipeline)
 
-        for ddp in ddp_modules:
-            self.assertFalse(ddp.require_manual_backward_finalization)
+        self._assert_no_ddp_armed(pipeline, model)
+
+    def _run_fsdp1_parity(
+        self, wrapper: _FsdpThenDdpWrapper, num_batches: int = 10
+    ) -> TrainPipelineSparseDist:
+        _, async_pipeline = self._run_async_optimizer_parity(
+            TrainPipelineSparseDist,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            num_batches=num_batches,
+            data_parallel_wrapper=wrapper,
+        )
+        self.assertTrue(async_pipeline._async_wait_for_caller_stream)
+        return async_pipeline
+
+    def test_fsdp1_matches_sync(self) -> None:
+        pipeline = self._run_fsdp1_parity(_FsdpThenDdpWrapper(["dense"], _fsdp1))
+        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+
+    def test_nested_fsdp1_matches_sync(self) -> None:
+        pipeline = self._run_fsdp1_parity(_FsdpThenDdpWrapper(["over"], _nested_fsdp1))
+        self.assertGreater(len(pipeline._async_optimizer_ddp_modules), 0)
+
+    def test_fsdp1_without_ddp_arms(self) -> None:
+        pipeline = self._run_fsdp1_parity(
+            _FsdpThenDdpWrapper(["dense", "over"], _fsdp1, ddp=False)
+        )
         self.assertEqual(pipeline._async_optimizer_ddp_modules, [])
+
+    def test_side_stream_waits_for_caller_stream_only_with_fsdp1(self) -> None:
+        for name, wrapper in [
+            ("fsdp1", _FsdpThenDdpWrapper(["dense"], _fsdp1)),
+            ("ddp", None),
+        ]:
+            with self.subTest(name):
+                with patch.object(
+                    torch.cuda.Stream,
+                    "wait_stream",
+                    autospec=True,
+                    side_effect=torch.cuda.Stream.wait_stream,
+                ) as wait_stream:
+                    _, pipeline = self._run_async_optimizer_parity(
+                        TrainPipelineSparseDist,
+                        ShardingType.TABLE_WISE.value,
+                        EmbeddingComputeKernel.FUSED.value,
+                        num_batches=3,
+                        data_parallel_wrapper=wrapper,
+                    )
+
+                side_stream_waits = [
+                    call.args[1]
+                    for call in wait_stream.call_args_list
+                    if call.args[0] == pipeline._async_stream
+                ]
+                # The first of the three steps runs on the main stream.
+                expected = [torch.cuda.current_stream()] * 2 if wrapper else []
+                self.assertEqual(side_stream_waits, expected)
+
+    def test_detach_clears_fsdp1_wait_and_attach_rearms(self) -> None:
+        model, optimizer = self._init_data_parallel_and_optimizer(
+            self._shard_model(
+                self._setup_model(),
+                ShardingType.TABLE_WISE.value,
+                EmbeddingComputeKernel.FUSED.value,
+                _FsdpThenDdpWrapper(["dense"], _fsdp1),
+            )
+        )
+        pipeline = self._async_pipeline(model, optimizer)
+        data_iter = iter(self._generate_data(num_batches=4, batch_size=32))
+        pipeline.progress(data_iter)
+        self.assertTrue(pipeline._async_wait_for_caller_stream)
+
+        pipeline.detach()
+
+        self.assertFalse(pipeline._async_optimizer_armed)
+        self.assertFalse(pipeline._async_wait_for_caller_stream)
+        pipeline.attach(model)
+        self.assertTrue(pipeline._async_optimizer_armed)
+        self.assertTrue(pipeline._async_wait_for_caller_stream)
+        pipeline.progress(data_iter)
 
 
 class TrainPipelineSparseDistWithoutInitTest(unittest.TestCase):
