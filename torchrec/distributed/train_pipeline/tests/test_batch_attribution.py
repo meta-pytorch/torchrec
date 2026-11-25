@@ -13,7 +13,7 @@ from io import BytesIO
 
 import torch
 from torch.package import PackageExporter, PackageImporter
-from torchrec.distributed.train_pipeline.batch_attribution import (
+from torchrec.distributed.batch_attribution import (
     attach_exception_attribution,
     AttributedBatch,
     ExceptionAttribution,
@@ -255,7 +255,7 @@ class BatchAttributionTest(unittest.TestCase):
     def test_torch_package_preserves_and_recognizes_carrier(self) -> None:
         buffer = BytesIO()
         with PackageExporter(buffer) as exporter:
-            exporter.intern("torchrec.distributed.train_pipeline.batch_attribution")
+            exporter.intern("torchrec.distributed.batch_attribution")
             exporter.extern("*")
             exporter.save_pickle(
                 "work",
@@ -280,7 +280,7 @@ class BatchAttributionTest(unittest.TestCase):
         )
         buffer = BytesIO()
         with PackageExporter(buffer) as exporter:
-            exporter.intern("torchrec.distributed.train_pipeline.batch_attribution")
+            exporter.intern("torchrec.distributed.batch_attribution")
             exporter.extern("*")
             exporter.save_pickle("work", "error.pkl", error)
         buffer.seek(0)
