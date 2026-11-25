@@ -61,6 +61,17 @@ def _extract_key_and_prefix(fqn: str) -> tuple[str, str]:
     return fqn, ""
 
 
+def _copy_into_prefix(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copies the overlapping prefix of `src` into `dst` for 1D or 2D tensors."""
+    if dst.ndim == 1:
+        rows = min(dst.size(0), src.size(0))
+        dst[:rows].copy_(src[:rows])
+    else:
+        rows = min(dst.size(0), src.size(0))
+        cols = min(dst.size(1), src.size(1))
+        dst[:rows, :cols].copy_(src[:rows, :cols])
+
+
 def _is_embedding_param(fqn: str) -> bool:
     """Checks if a parameter name corresponds to an embedding table or optimizer state."""
     _, prefix = _extract_key_and_prefix(fqn)
@@ -408,7 +419,8 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
         assert fqn in self._metadata.state_dict_metadata
         md = self._metadata.state_dict_metadata[fqn]
         vocab_size = md.size[0]
-        embedding_dim = md.size[1]
+        is_1d = len(md.size) == 1
+        embedding_dim = None if is_1d else md.size[1]
 
         key, _ = _extract_key_and_prefix(fqn)
         old_stacked_configs = (
@@ -452,8 +464,9 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                 if fqn in self._target_table_mapping:
                     for t_name, _, target_tensor in self._target_table_mapping[fqn]:
                         if t_name in unstacked_dict:
-                            t_w = unstacked_dict[t_name]
-                            target_tensor.data[: t_w.size(0), : t_w.size(1)].copy_(t_w)
+                            _copy_into_prefix(
+                                target_tensor.data, unstacked_dict[t_name]
+                            )
                 else:
                     # Target is stacked on CPU: re-pack as 1-shard sequential stacked tensor
                     cpu_stacked = utils.stack_and_shard_global_tensor(
@@ -461,9 +474,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                         stack_config,
                         num_shards=1,
                     )
-                    dest.data[: cpu_stacked.size(0), : cpu_stacked.size(1)].copy_(
-                        cpu_stacked
-                    )
+                    _copy_into_prefix(dest.data, cpu_stacked)
             elif key in table_to_stack_name:
                 s_name = table_to_stack_name[key]
                 stack_config = old_stacked_configs[s_name]
@@ -473,8 +484,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                     num_shards=old_num_shards,
                 )
                 if key in unstacked_dict:
-                    t_w = unstacked_dict[key]
-                    dest.data[: t_w.size(0), : t_w.size(1)].copy_(t_w)
+                    _copy_into_prefix(dest.data, unstacked_dict[key])
             else:
                 unsharded = utils.reverse_mod_shard(
                     target,
@@ -482,9 +492,7 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                     embedding_dim=embedding_dim,
                     num_shards=old_num_shards,
                 )
-                rows = min(dest.size(0), unsharded.size(0))
-                cols = min(dest.size(1), unsharded.size(1))
-                dest.data[:rows, :cols].copy_(unsharded[:rows, :cols])
+                _copy_into_prefix(dest.data, unsharded)
 
             if fqn in self._cpu_buffers:
                 del self._cpu_buffers[fqn]
@@ -546,11 +554,12 @@ class SparseCoreLoadPlanner(default_planner.DefaultLoadPlanner):
                 else target_param.size(0) * curr_world_size
             )
             t_w = unstacked_tables[key]
+            extra_shape = list(t_w.shape[1:])
             target_padded_cpu = torch.zeros(
-                (target_padded_vocab, t_w.size(1)), dtype=full_cpu_tensor.dtype
+                (target_padded_vocab, *extra_shape), dtype=full_cpu_tensor.dtype
             )
             copy_limit = min(t_w.size(0), target_padded_vocab)
-            target_padded_cpu[:copy_limit, :] = t_w[:copy_limit, :]
+            target_padded_cpu[:copy_limit] = t_w[:copy_limit]
             target_sharded_cpu = utils.mod_shard(
                 target_padded_cpu,
                 num_shards=curr_num_shards,

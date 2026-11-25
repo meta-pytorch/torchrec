@@ -145,22 +145,24 @@ def to_device_in_sparsecore_layout(
 ) -> torch.Tensor:
     """Copies a host tensor to `device`, in the SparseCore layout if it's a TPU.
 
-    SparseCore kernels read and write tables row-major in 8-element tiles, the
-    {1,0:T(8)} layout. Allocating tables and optimizer slots in it avoids a
-    full-table relayout around SparseCore kernels, since XLA's default layout for
-    narrow tables is {0,1:T(8,128)}.
+    SparseCore kernels read and write 2D tables row-major in 8-element tiles
+    ({1,0:T(8)}) and 1D row-wise slots in 8-element tiles ({0:T(8)}). Allocating
+    tables and optimizer slots in this layout avoids a full-tensor relayout
+    around SparseCore kernels, since XLA's default layouts are {0,1:T(8,128)}
+    (2D) and {0:T(1024)} (1D).
 
     Args:
       t: The tensor to copy, on the host.
       device: The device to copy `t` to.
 
     Returns:
-      A copy of `t` on `device`, in the SparseCore layout if `device` is a TPU and
-      in the default layout otherwise.
+      A copy of `t` on `device`, in the SparseCore layout if `device` is a TPU
+      and `t.ndim > 0`, and in the default layout otherwise.
     """
-    if device.type != "tpu":
+    if device.type != "tpu" or t.ndim == 0:
         return t.to(device)
+    minor_to_major = list(reversed(range(t.ndim)))
     with torch.tpu.LayoutContext(
-        torch.tpu.TpuLayout(minor_to_major=[1, 0], tiles=[[8]])
+        torch.tpu.TpuLayout(minor_to_major=minor_to_major, tiles=[[8]])
     ):
         return t.to(device)
