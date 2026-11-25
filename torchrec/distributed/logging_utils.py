@@ -22,6 +22,25 @@ class EventType(Enum):
     INFO = "INFO"
 
 
+def mark_secondary_failure(error: BaseException) -> None:
+    """Mark an error as caused by another component's failure, such as a peer
+    process exiting. Event logging records it as INFO instead of FAILURE. The
+    error keeps its type and message, so existing handlers still match it."""
+    setattr(error, "_torchrec_secondary_failure", True)  # noqa: B010
+
+
+def is_secondary_failure(error: BaseException) -> bool:
+    return getattr(error, "_torchrec_secondary_failure", False)
+
+
+def is_peer_exit_error(error: BaseException) -> bool:
+    """Whether a Gloo error reports that the remote process has already exited."""
+    message = str(error)
+    return (
+        "Connection closed by peer" in message or "Connection reset by peer" in message
+    )
+
+
 @unique
 class StackLayer(Enum):
     """Layer in the training stack where the event originates."""

@@ -63,7 +63,12 @@ except Exception:
                 pass
 
 
-from torchrec.distributed.logging_utils import EventType
+from torchrec.distributed.logging_utils import (
+    EventType,
+    is_peer_exit_error,
+    is_secondary_failure,
+    mark_secondary_failure,
+)
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.deferrable_metrics import (
     DeferrableMetrics,
@@ -952,7 +957,9 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
         # is_alive() checks above pass for already-dead threads.
         if self._captured_exception_event.is_set():
             assert self._captured_exception is not None
-            raise self._captured_exception
+            if not is_secondary_failure(self._captured_exception):
+                raise self._captured_exception
+            return
 
         self._log_event("shutdown", EventType.SUCCESS, correctness_metadata)
         logger.info(
@@ -1110,9 +1117,18 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
                     self.cpu_process_group = cast(
                         dist.ProcessGroup, dist.new_group(backend="gloo")
                     )
-                aggregated_states = self.comms_module.get_pre_compute_states(
-                    self.cpu_process_group
-                )
+                try:
+                    aggregated_states = self.comms_module.get_pre_compute_states(
+                        self.cpu_process_group
+                    )
+                except RuntimeError as e:
+                    # Gloo reports a peer process exiting before NCCL's watchdog
+                    # does; the root cause is on that peer.
+                    if is_peer_exit_error(e) and torch._utils_internal.justknobs_check(
+                        "pytorch/torchrec:zorm_peer_exit_as_secondary", default=False
+                    ):
+                        mark_secondary_failure(e)
+                    raise
                 self.all_gather_time_logger.add(
                     (time.time() - all_gather_start_ms) * 1000
                 )
@@ -1181,7 +1197,7 @@ class CPUOffloadedRecMetricModule(OffloadedRecMetricModule):
                 logger.exception(f"Exception in compute loop: {e}")
                 self._log_event(
                     "compute_loop",
-                    EventType.FAILURE,
+                    EventType.INFO if is_secondary_failure(e) else EventType.FAILURE,
                     {
                         "compute_queue_size": str(self.compute_queue.qsize()),
                         "total_computes_processed": str(self._total_computes_processed),

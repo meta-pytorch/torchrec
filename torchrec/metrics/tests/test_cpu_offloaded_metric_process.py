@@ -17,11 +17,16 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Any, Optional, TypeVar
+from typing import Any, Mapping, Optional, TypeVar
 from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
+from torchrec.distributed.logging_utils import (
+    EventType,
+    is_secondary_failure,
+    mark_secondary_failure,
+)
 from torchrec.metrics.cpu_offloaded_metric_ipc import (
     build_slot_layout,
     SharedUpdateRing,
@@ -178,6 +183,14 @@ class _SlowFailingUpdateModule(CPUOffloadedRecMetricModule):
     def _process_metric_update_job(self, metric_update_job: MetricUpdateJob) -> None:
         time.sleep(1.0)
         raise RuntimeError("injected update failure")
+
+
+class _PeerExitUpdateModule(CPUOffloadedRecMetricModule):
+    def _process_metric_update_job(self, metric_update_job: MetricUpdateJob) -> None:
+        time.sleep(1.0)
+        error = RuntimeError("Connection closed by peer [::1]:1234")
+        mark_secondary_failure(error)
+        raise error
 
 
 def _spawn_module_and_exit(conn: Any) -> None:
@@ -552,6 +565,45 @@ class ProcessIsolatedCPUOffloadedRecMetricModuleTest(unittest.TestCase):
             isolated.update(_batch(step))
         with self.assertRaises(RecMetricException):
             isolated.async_compute().resolve()
+
+    def _fail_worker_then_shutdown(
+        self, metric_class: type[CPUOffloadedRecMetricModule]
+    ) -> tuple[RecMetricException, Mapping[str, Any]]:
+        isolated = self._track(
+            _process_module(_metrics_config(), metric_class=metric_class)
+        )
+        for step in range(12):
+            isolated.update(_batch(step))
+        with self.assertRaises(RecMetricException) as compute_error:
+            isolated.async_compute().resolve()
+        deadline = time.monotonic() + 60
+        while isolated._captured_exception is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertIsNotNone(isolated._captured_exception)
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_process.EventLoggingHandler.log_event"
+        ) as log_event:
+            isolated.shutdown()
+        (shutdown,) = [
+            call.kwargs
+            for call in log_event.call_args_list
+            if call.kwargs["event_name"].endswith(".shutdown")
+        ]
+        return compute_error.exception, shutdown
+
+    def test_secondary_worker_failure_is_info_at_shutdown(self) -> None:
+        compute_error, shutdown = self._fail_worker_then_shutdown(_PeerExitUpdateModule)
+        self.assertTrue(is_secondary_failure(compute_error))
+        self.assertEqual(shutdown["event_type"], EventType.INFO)
+        self.assertIn("Connection closed by peer", shutdown["error_message"])
+
+    def test_worker_failure_is_failure_at_shutdown(self) -> None:
+        compute_error, shutdown = self._fail_worker_then_shutdown(
+            _SlowFailingUpdateModule
+        )
+        self.assertFalse(is_secondary_failure(compute_error))
+        self.assertEqual(shutdown["event_type"], EventType.FAILURE)
+        self.assertIn("injected update failure", shutdown["error_message"])
 
     def test_shutdown_is_idempotent_and_stops_worker(self) -> None:
         isolated = _process_module(_metrics_config())

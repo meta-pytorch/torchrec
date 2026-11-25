@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
-from torchrec.distributed.logging_utils import EventType
+from torchrec.distributed.logging_utils import EventType, is_secondary_failure
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.metrics.cpu_offloaded_metric_module import (
     _COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC,
@@ -1574,6 +1574,30 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "compute failed"):
                 deferrable.resolve()
+
+    def test_only_peer_exits_are_marked_secondary_with_knob_on(self) -> None:
+        cases = [
+            ("Connection closed by peer [::1]:1234", True, True),
+            ("Connection reset by peer [::1]:1234", True, True),
+            ("Connection closed by peer [::1]:1234", False, False),
+            ("Timed out waiting 1800000ms for recv operation", True, False),
+        ]
+        for message, knob, expected in cases:
+            with self.subTest(message=message, knob=knob):
+                module = self._make_module()
+                with patch.object(
+                    module.comms_module,
+                    "get_pre_compute_states",
+                    side_effect=RuntimeError(message),
+                ), patch("torch._utils_internal.justknobs_check", return_value=knob):
+                    module.async_compute()
+                    self.assertTrue(module._captured_exception_event.wait(5.0))
+                error = module._captured_exception
+                assert error is not None
+                self.assertEqual(str(error), message)
+                self.assertEqual(is_secondary_failure(error), expected)
+                with contextlib.suppress(RuntimeError):
+                    module.shutdown()
 
     def test_sync_marker_failure_propagates_to_future(self) -> None:
         """SynchronizationMarker.future is the same future returned via
