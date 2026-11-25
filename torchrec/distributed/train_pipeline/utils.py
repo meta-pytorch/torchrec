@@ -309,6 +309,7 @@ def _clear_input_dist_tensors(context: TrainPipelineContext) -> None:
         log_clear_input_dist_tensors(size)
 
 
+@attributed_logger("input_dist_start", owner_kwarg="context")
 def _start_data_dist(
     pipelined_modules: List[ShardedModule],
     batch: Pipelineable,
@@ -356,6 +357,13 @@ def _start_data_dist(
     _clear_releasable_inputs(context)
 
     _fuse_input_dist_splits(context)
+
+
+@attributed_logger("input_dist_wait", owner_kwarg="context")
+def _wait_data_dist(*, context: TrainPipelineContext) -> None:
+    for names, awaitable in context.fused_splits_awaitables:
+        for name, request in zip(names, awaitable.wait()):
+            context.input_dist_tensors_requests[name] = request
 
 
 def _start_embedding_lookup_legacy(
