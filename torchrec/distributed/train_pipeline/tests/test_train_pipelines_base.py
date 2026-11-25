@@ -10,7 +10,7 @@
 import copy
 import os
 import unittest
-from typing import Any, cast, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -18,16 +18,60 @@ from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
-from torchrec.distributed.model_parallel import DataParallelWrapper
+from torchrec.distributed.model_parallel import (
+    DataParallelWrapper,
+    DefaultDataParallelWrapper,
+)
 from torchrec.distributed.test_utils.emb_sharder import (
     TestEBCSharder,
     TestEBCSharderMCH,
 )
 from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNN
+from torchrec.distributed.test_utils.test_sharding import copy_state_dict
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.types import ModuleSharder, ShardingEnv
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
+from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
+from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.test_utils import init_distributed_single_host
+
+
+class _FsdpThenDdpWrapper(DataParallelWrapper):
+    """
+    Replaces the named children of the model with ``wrap_fn(child)`` (an FSDP
+    wrapping), then, with ``ddp``, wraps the model in a DDP that ignores the
+    FSDP-managed params, the way MVAI combines FSDP and DDP.
+    """
+
+    def __init__(
+        self,
+        fsdp_children: List[str],
+        wrap_fn: Callable[[nn.Module], nn.Module],
+        ddp: bool = True,
+    ) -> None:
+        self._fsdp_children = fsdp_children
+        self._wrap_fn = wrap_fn
+        self._ddp = ddp
+
+    def wrap(
+        self,
+        dmp: DistributedModelParallel,
+        env: ShardingEnv,
+        device: torch.device,
+    ) -> None:
+        module = dmp._dmp_wrapped_module
+        for name in self._fsdp_children:
+            setattr(module, name, self._wrap_fn(getattr(module, name)))
+        if not self._ddp:
+            return
+        fsdp_param_names = [
+            name
+            for name, _ in module.named_parameters()
+            if name.endswith("_flat_param")
+        ]
+        DefaultDataParallelWrapper(params_to_ignore=fsdp_param_names).wrap(
+            dmp, env, device
+        )
 
 
 class TrainPipelineSparseDistTestBase(unittest.TestCase):
@@ -185,3 +229,132 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
             lr=0.1,
         )
         return sharded_model, optimizer
+
+    def _shard_model(
+        self,
+        model: nn.Module,
+        sharding_type: str,
+        kernel_type: str,
+        data_parallel_wrapper: Optional[DataParallelWrapper] = None,
+    ) -> DistributedModelParallel:
+        """Shards ``model`` without initializing data parallelism yet."""
+        sharded_model, _ = self._generate_sharded_model_and_optimizer(
+            model,
+            sharding_type,
+            kernel_type,
+            data_parallel_wrapper=data_parallel_wrapper,
+        )
+        return cast(DistributedModelParallel, sharded_model)
+
+    def _setup_ddp_model_and_optimizer(
+        self,
+        model: nn.Module,
+        sharding_type: str,
+        kernel_type: str,
+        combined_optimizer: bool = True,
+    ) -> Tuple[DistributedModelParallel, Optimizer]:
+        """
+        Shards ``model`` with DDP enabled and returns it with an Adam optimizer over
+        the remaining (dense) parameters. With ``combined_optimizer``, the Adam
+        optimizer is combined with the model's fused optimizer.
+        """
+        return self._init_data_parallel_and_optimizer(
+            self._shard_model(model, sharding_type, kernel_type), combined_optimizer
+        )
+
+    def _init_data_parallel_and_optimizer(
+        self, sharded_model: DistributedModelParallel, combined_optimizer: bool = True
+    ) -> Tuple[DistributedModelParallel, Optimizer]:
+        """
+        Initializes the model's data parallelism (DDP unless its
+        ``data_parallel_wrapper`` does otherwise) and returns it with an Adam
+        optimizer over the dense parameters, combined with the fused optimizer
+        when ``combined_optimizer``.
+        """
+        # _shard_model skips data parallelism, and async_optimizer refuses dense
+        # params that nothing reduces.
+        sharded_model.init_data_parallel()
+        dense_params = dict(
+            in_backward_optimizer_filter(sharded_model.named_parameters())
+        )
+        if not combined_optimizer:
+            # Citrine C2: use the multi-tensor optimizer implementation.
+            return sharded_model, optim.Adam(
+                dense_params.values(), lr=0.01, foreach=True
+            )
+        dense_optimizer = KeyedOptimizerWrapper(
+            dense_params,
+            # Citrine C2: use the multi-tensor optimizer implementation.
+            lambda params: optim.Adam(params, lr=0.01, foreach=True),
+        )
+        return sharded_model, CombinedOptimizer(
+            [sharded_model.fused_optimizer, dense_optimizer]
+        )
+
+    def _run_async_optimizer_parity(
+        self,
+        pipeline_class: Type[TrainPipelineSparseDist],
+        sharding_type: str,
+        kernel_type: str,
+        num_batches: int = 10,
+        combined_optimizer: bool = True,
+        optimizer_factory: Optional[Callable[[CombinedOptimizer], Optimizer]] = None,
+        data_parallel_wrapper: Optional[DataParallelWrapper] = None,
+        **pipeline_kwargs: Any,
+    ) -> Tuple[TrainPipelineSparseDist, TrainPipelineSparseDist]:
+        """
+        Trains the same model with and without ``async_optimizer`` and checks
+        that every step's output and the final parameters match, and that the
+        async pipeline armed. With ``optimizer_factory``, both pipelines get the
+        optimizer it builds from the combined optimizer. ``data_parallel_wrapper``
+        replaces the default DDP wrapping of both models. Returns the sync and
+        async pipelines.
+        """
+        model = self._setup_model()
+        data = self._generate_data(num_batches=num_batches, batch_size=32)
+        sync_model = self._shard_model(
+            model, sharding_type, kernel_type, data_parallel_wrapper
+        )
+        async_model = self._shard_model(
+            model, sharding_type, kernel_type, data_parallel_wrapper
+        )
+        # Copy before data parallelism wraps the models: an FSDP's state dict does
+        # not write back to its parameters.
+        copy_state_dict(async_model.state_dict(), sync_model.state_dict())
+        sync_model, sync_optimizer = self._init_data_parallel_and_optimizer(
+            sync_model, combined_optimizer
+        )
+        async_model, async_optimizer = self._init_data_parallel_and_optimizer(
+            async_model, combined_optimizer
+        )
+        if optimizer_factory is not None:
+            sync_optimizer = optimizer_factory(cast(CombinedOptimizer, sync_optimizer))
+            async_optimizer = optimizer_factory(
+                cast(CombinedOptimizer, async_optimizer)
+            )
+
+        sync_pipeline = pipeline_class(
+            model=sync_model,
+            optimizer=sync_optimizer,
+            device=self.device,
+            **pipeline_kwargs,
+        )
+        async_pipeline = pipeline_class(
+            model=async_model,
+            optimizer=async_optimizer,
+            device=self.device,
+            async_optimizer=True,
+            **pipeline_kwargs,
+        )
+        sync_iter, async_iter = iter(data), iter(data)
+        for _ in range(num_batches):
+            torch.testing.assert_close(
+                async_pipeline.progress(async_iter), sync_pipeline.progress(sync_iter)
+            )
+
+        self.assertTrue(async_pipeline._async_optimizer_armed)
+        self.assertFalse(sync_pipeline._async_optimizer_armed)
+        async_params = dict(async_model.named_parameters())
+        for name, param in sync_model.named_parameters():
+            torch.testing.assert_close(async_params[name], param)
+        return sync_pipeline, async_pipeline
