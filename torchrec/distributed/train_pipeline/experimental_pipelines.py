@@ -74,6 +74,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _rewrite_model,
     _start_data_dist,
     _to_device,
+    _wait_data_dist,
     _wait_for_batch,
     FutureDeque,
     prefetch_embeddings,
@@ -426,11 +427,13 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=self._pipeline_postproc,
         )
         # Bootstrap: run input_dist once to initialize KJT dist state
-        _start_data_dist(self._pipelined_modules, batch, context)
+        _start_data_dist(
+            self._pipelined_modules,
+            batch,
+            context=context,
+        )
         # Wait for splits → tensor awaitables
-        for names, awaitable in context.fused_splits_awaitables:
-            for name, request in zip(names, awaitable.wait()):
-                context.input_dist_tensors_requests[name] = request
+        _wait_data_dist(context=context)
         context.fused_splits_awaitables.clear()
         # Override KJT dist forwards with fused versions (requires initialized dists)
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
@@ -484,11 +487,13 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         with record_function(f"## sparse_forward {context.index} on CPU ##"):
             # input_dist
             with use_context_for_postprocs(self._pipelined_postprocs, context):
-                _start_data_dist(self._pipelined_modules, batch, context)
+                _start_data_dist(
+                    self._pipelined_modules,
+                    batch,
+                    context=context,
+                )
             # wait splits → tensor awaitables
-            for names, awaitable in context.fused_splits_awaitables:
-                for name, request in zip(names, awaitable.wait()):
-                    context.input_dist_tensors_requests[name] = request
+            _wait_data_dist(context=context)
             context.fused_splits_awaitables.clear()
             # compute + output_dist + pin
             self._embedding_lookup_and_pin(context)
