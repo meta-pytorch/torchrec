@@ -811,7 +811,7 @@ class DataLoadingThread(Thread, Generic[In]):
         if memcpy_stream is None:
             self._memcpy_stream: Optional[torch.Stream] = (
                 torch.get_device_module(device).Stream(priority=memcpy_stream_priority)
-                if device.type in ["cuda", "mtia"]
+                if device.type in ["cuda", "mtia", "xpu"]
                 else None
             )
         else:
@@ -835,6 +835,9 @@ class DataLoadingThread(Thread, Generic[In]):
         elif self._device.type == "mtia" and torch.mtia.is_available():
             # set the current device the same as the one used in the main thread
             torch.mtia.set_device(self._device)
+        elif self._device.type == "xpu" and torch.xpu.is_available():
+            # set the current device the same as the one used in the main thread
+            torch.xpu.set_device(self._device)
 
         while not self._stop:
             self._buffer_empty_event.wait()
@@ -1097,6 +1100,8 @@ def _init_inplace_copy_worker(device: torch.device) -> None:
         device_module.set_device(device)
     elif device.type == "mtia" and torch.mtia.is_available():
         device_module.set_device(device)
+    elif device.type == "xpu" and torch.xpu.is_available():
+        device_module.set_device(device)
 
 
 class AsyncInplaceCopyMixin(Generic[In]):
@@ -1136,7 +1141,7 @@ class AsyncInplaceCopyMixin(Generic[In]):
         self, enabled: bool, device: torch.device, async_next_batch: bool = False
     ) -> None:
         requested = enabled
-        if enabled and device.type not in ("cuda", "mtia"):
+        if enabled and device.type not in ("cuda", "mtia", "xpu"):
             logger.warning(
                 "async_inplace_copy requested on non-accelerator device %s; disabling.",
                 device.type,
