@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torchrec.distributed.logging_utils import EventType, is_secondary_failure
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.rec_metric import RecMetricList
@@ -31,6 +32,96 @@ class CPUOffloadedMetricModuleProcessGroupTest(MultiProcessTestBase):
             callable=_construct_with_divergent_process_group_counters,
             world_size=2,
         )
+
+    def test_peer_exit_during_metric_sync_is_secondary(self) -> None:
+        self._run_multi_process_test_per_rank(
+            callable=_peer_exits_during_metric_sync,
+            world_size=2,
+            kwargs_per_rank=[{"peer_exit_as_secondary": True}] * 2,
+        )
+
+    def test_peer_exit_during_metric_sync_knob_off_is_failure(self) -> None:
+        self._run_multi_process_test_per_rank(
+            callable=_peer_exits_during_metric_sync,
+            world_size=2,
+            kwargs_per_rank=[{"peer_exit_as_secondary": False}] * 2,
+        )
+
+
+def _peer_exits_during_metric_sync(
+    rank: int,
+    world_size: int,
+    peer_exit_as_secondary: bool,
+) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(
+        backend="gloo",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    tasks = gen_test_tasks(["task1"])
+    module = CPUOffloadedRecMetricModule(
+        model_out_device=torch.device("cpu"),
+        batch_size=1,
+        world_size=world_size,
+        rec_tasks=tasks,
+        rec_metrics=RecMetricList(
+            [
+                MockRecMetric(
+                    world_size=world_size,
+                    my_rank=rank,
+                    batch_size=1,
+                    tasks=tasks,
+                    initial_states=create_tensor_states(["cross_entropy_sum"]),
+                )
+            ]
+        ),
+        update_batch_size=1,
+        cpu_process_group=dist.group.WORLD,
+    )
+    model_out = {
+        "task1-prediction": torch.tensor([0.5]),
+        "task1-label": torch.tensor([1.0]),
+        "task1-weight": torch.tensor([1.0]),
+    }
+    module.update(model_out)
+    module.async_compute().resolve()
+    if rank == 1:
+        os._exit(0)
+
+    with patch(
+        "torch._utils_internal.justknobs_check", return_value=peer_exit_as_secondary
+    ), patch.object(module, "_log_event") as log_event:
+        module.update(model_out)
+        module.async_compute()
+        assert module._captured_exception_event.wait(timeout=60)
+    error = module._captured_exception
+    assert isinstance(error, RuntimeError)
+    assert "by peer" in str(error), repr(error)
+    (event_name, event_type, _), _ = log_event.call_args
+
+    assert event_name == "compute_loop"
+    if peer_exit_as_secondary:
+        assert is_secondary_failure(error)
+        assert event_type == EventType.INFO
+        try:
+            module.update(model_out)
+            raise AssertionError("update() must still fail fast")
+        except RuntimeError as update_error:
+            assert update_error is error
+        with patch.object(module, "_log_event") as shutdown_log_event:
+            module.shutdown()
+        shutdown_log_event.assert_not_called()
+    else:
+        assert not is_secondary_failure(error)
+        assert event_type == EventType.FAILURE
+        try:
+            module.shutdown()
+            raise AssertionError("shutdown() must re-raise the raw error")
+        except RuntimeError as shutdown_error:
+            assert shutdown_error is error
 
 
 def _construct_with_divergent_process_group_counters(

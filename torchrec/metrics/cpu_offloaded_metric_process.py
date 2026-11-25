@@ -35,7 +35,11 @@ import torch
 import torch.distributed as dist
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.profiler import record_function
-from torchrec.distributed.logging_utils import EventType
+from torchrec.distributed.logging_utils import (
+    EventType,
+    is_secondary_failure,
+    mark_secondary_failure,
+)
 from torchrec.metrics.cpu_offloaded_metric_ipc import (
     align,
     build_slot_layout,
@@ -64,6 +68,7 @@ from torchrec.metrics.cpu_offloaded_metric_worker import (
     WindowStat,
     worker_main,
     WorkerArgs,
+    WorkerError,
     WorkerFactory,
     WorkerLauncher,
 )
@@ -624,7 +629,7 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
         self.compute_interval_steps = int(message.payload)
 
     def _on_fatal(self, message: ReplyMessage) -> None:
-        self._fail(RecMetricException(f"metric worker crashed:\n{message.payload}"))
+        self._fail(_worker_exception(message.payload, "metric worker crashed:\n"))
 
     def _on_health(self, message: ReplyMessage) -> None:
         health = {
@@ -646,19 +651,21 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
             with _annotate("## ZORM-MP:resolve ##"):
                 future.set_result(message.payload)
         else:
-            future.set_exception(RecMetricException(message.payload))
+            future.set_exception(_worker_exception(message.payload))
 
     def _log_event(
         self,
         name: str,
         metadata: Mapping[str, Any],
         event_type: EventType = EventType.INFO,
+        error_message: Optional[str] = None,
     ) -> None:
         EventLoggingHandler.log_event(
             component=TorchrecComponent.REC_METRICS.value,
             event_name=f"ProcessIsolatedCPUOffloadedRecMetricModule.{name}",
             event_type=event_type,
             metadata={key: str(value) for key, value in metadata.items()},
+            error_message=error_message,
         )
 
     def _fail(self, error: Exception) -> None:
@@ -951,10 +958,13 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
             f"{time.monotonic() - start:.1f}s: trainer_updates={self._seq}, "
             f"worker={counters}"
         )
+        error = self._captured_exception
+        failed = error is not None and not is_secondary_failure(error)
         self._log_event(
             "shutdown",
             {"trainer_updates": self._seq, **(counters or {})},
-            EventType.FAILURE if self._captured_exception else EventType.INFO,
+            EventType.FAILURE if failed else EventType.INFO,
+            error_message=str(error) if error is not None else None,
         )
         # Best-effort like threaded ZORM: raising here would mask the training error.
         if self._captured_exception is not None:
@@ -975,6 +985,13 @@ class ProcessIsolatedCPUOffloadedRecMetricModule(OffloadedRecMetricModule):
         self._listener.join(timeout=5.0)
         self._result_conn.close()
         self._fail_pending(RecMetricException("metric worker is shut down."))
+
+
+def _worker_exception(payload: WorkerError, prefix: str = "") -> RecMetricException:
+    error = RecMetricException(prefix + payload.traceback)
+    if payload.secondary:
+        mark_secondary_failure(error)
+    return error
 
 
 @contextlib.contextmanager

@@ -35,6 +35,7 @@ from typing import Any, Callable, Mapping, NamedTuple, Optional, TypeVar
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
+from torchrec.distributed.logging_utils import is_secondary_failure
 from torchrec.metrics.cpu_offloaded_metric_ipc import (
     load_counter,
     read_header,
@@ -137,6 +138,14 @@ class ReplyMessage(NamedTuple):
     kind: Reply
     req_id: int = -1
     payload: Any = None
+
+
+class WorkerError(NamedTuple):
+    """Payload of an ERROR or FATAL reply."""
+
+    traceback: str
+    # `is_secondary_failure` of the worker's error; the traceback text loses it.
+    secondary: bool
 
 
 def require_handlers(handlers: Mapping[_Kind, object], kinds: type[_Kind]) -> None:
@@ -422,7 +431,7 @@ class _MetricWorker:
             if message.req_id < 0:
                 raise
             logger.exception(f"metric worker failed handling {message.kind.name}")
-            self.reply(Reply.ERROR, message.req_id, _format_error(error))
+            self.reply(Reply.ERROR, message.req_id, _error_payload(error))
             if message.kind is Control.SHUTDOWN:
                 self._running = False
 
@@ -503,7 +512,7 @@ class _MetricWorker:
             try:
                 payload = future.result()
             except Exception as error:
-                self.reply(Reply.ERROR, req_id, _format_error(error))
+                self.reply(Reply.ERROR, req_id, _error_payload(error))
                 return
             self._report_compute_interval()
             self.reply(Reply.RESULT, req_id, payload)
@@ -604,8 +613,11 @@ def _shm_usage() -> str:
     )
 
 
-def _format_error(error: BaseException) -> str:
-    return "".join(traceback.format_exception(type(error), error, error.__traceback__))
+def _error_payload(error: BaseException) -> WorkerError:
+    return WorkerError(
+        "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+        is_secondary_failure(error),
+    )
 
 
 def _configure_logging(rank: int) -> None:
@@ -650,11 +662,11 @@ def worker_main(args: WorkerArgs) -> None:
         try:
             # Compute callbacks may still be replying on other threads.
             if worker is not None:
-                worker.reply(Reply.FATAL, payload=_format_error(error))
+                worker.reply(Reply.FATAL, payload=_error_payload(error))
             else:
                 send(
                     args.result_conn,
-                    ReplyMessage(Reply.FATAL, -1, _format_error(error)),
+                    ReplyMessage(Reply.FATAL, -1, _error_payload(error)),
                 )
             args.result_conn.close()
         except (OSError, EOFError):
