@@ -56,6 +56,9 @@ _T = TypeVar("_T")
 _MAX_WEIGHT_CHUNKS: int = 16
 _DDP_BROADCAST_BUCKET_SIZE: int = 250 * 1024 * 1024
 _TWRW_MULTI_GROUP_JK: str = "pytorch/torchrec:enable_twrw_multi_group"
+_PLANNER_PER_SHARD_INPUT_DIST_ESTIMATE_JK: str = (
+    "pytorch/torchrec:enable_planner_per_shard_input_dist_estimate"
+)
 _GRID_SHARD_PLAN_ROW_ROUTING_JK: str = (
     "pytorch/torchrec:enable_grid_shard_plan_row_routing"
 )
@@ -90,6 +93,12 @@ def init_data_parallel_state(
 
 def is_twrw_multi_group_enabled() -> bool:
     return torch._utils_internal.justknobs_check(_TWRW_MULTI_GROUP_JK)
+
+
+def is_planner_per_shard_input_dist_estimate_enabled() -> bool:
+    return torch._utils_internal.justknobs_check(
+        _PLANNER_PER_SHARD_INPUT_DIST_ESTIMATE_JK
+    )
 
 
 def is_grid_shard_plan_row_routing_enabled() -> bool:

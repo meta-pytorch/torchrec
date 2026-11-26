@@ -20,6 +20,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type
 
+from torchrec.distributed import utils as distributed_utils
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import (
@@ -1029,16 +1030,32 @@ class EmbeddingShardingPerfEvaluator(ABC):
         """
         Default input distribution communication formula.
 
-        This is the same for TABLE_WISE, ROW_WISE, and TABLE_ROW_WISE sharding.
-        Only DATA_PARALLEL overrides this to return 0.0.
+        Formula, over the global batch:
+            input_read_size = (batch_inputs / divisor + batch_lengths)
+                              * world_size * input_data_type_size
+            return input_read_size / ALL_TO_ALL comms_bw
+        where:
+        - divisor = `get_batch_inputs_divisor`, the number of ranks the table's
+          rows are split over, since a shard receives only the ids in its rows:
+          1 for TABLE_WISE, COLUMN_WISE and TABLE_COLUMN_WISE, world_size for
+          ROW_WISE, intra_group_size * table_num_twrw_groups for
+          TABLE_ROW_WISE, and intra_group_size for GRID_SHARD (each group
+          holds a slice of the columns, split by rows over its ranks, and
+          receives every id);
+        - lengths are not divided: a shard needs every sample's length to tell
+          which ids belong to which sample, and it sums its rows for every
+          sample of the global batch, so it receives one length per sample per
+          feature and pooling, 0 where none of the sample's ids fall in its
+          rows. They are priced at the id size, which overstates int32
+          lengths;
+        - weights of weighted features are not counted.
 
-        Formula from OSS _input_dist_expected_latency:
-        - input_read_size = batch_inputs * world_size * input_data_type_size
-        - Return input_read_size / comms_bw (using ALL_TO_ALL collective)
+        DATA_PARALLEL overrides this to return 0.0. `Perf.total` leaves this
+        term out, so it affects only consumers of `input_dist_comms`.
 
-        Note: OSS has the is_weighted logic in the function but callers DON'T
-        pass is_weighted, so it defaults to False. We match this behavior by
-        NOT applying the weighted multiplier here.
+        Rolled out behind `is_planner_per_shard_input_dist_estimate_enabled`.
+        With it off, every shard is charged all of the table's ids in the
+        global batch and no lengths, as before.
 
         Args:
             ctx: Shard performance context
@@ -1048,15 +1065,18 @@ class EmbeddingShardingPerfEvaluator(ABC):
             Input distribution communication time in seconds
         """
 
-        # Calculate input_read_size WITHOUT the weighted multiplier
-        # (matches OLD estimator _input_dist_expected_latency which is called
-        # without is_weighted parameter, so it defaults to False)
-        #
         # NOTE: input_dist_comms always uses BYTES since it's about actual data
         # transfer over the network. The use_bytes_for_input_read_size annotation
         # only affects compute formulas (fwd_compute, bwd_compute).
+        if distributed_utils.is_planner_per_shard_input_dist_estimate_enabled():
+            elements = (
+                ctx.batch_inputs / self.get_batch_inputs_divisor(ctx)
+                + ctx.batch_lengths
+            )
+        else:
+            elements = ctx.batch_inputs
         input_read_size = math.ceil(
-            ctx.batch_inputs * ctx.world_size * ctx.input_data_type_size
+            elements * ctx.world_size * ctx.input_data_type_size
         )
 
         assert ctx.comms_bandwidths is not None
