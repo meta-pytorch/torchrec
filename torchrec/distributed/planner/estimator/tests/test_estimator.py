@@ -287,7 +287,7 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
         )
         self.assertEqual(self.evaluator.get_prefetch_divisor(ctx), 8)
 
-    def test_multi_group_changes_compute_and_communication_costs(self) -> None:
+    def test_multi_group_keeps_per_shard_comms_and_cuts_compute(self) -> None:
         single_group = self.evaluator.compute_perf(
             create_test_context(
                 sharding_type=ShardingType.TABLE_ROW_WISE.value,
@@ -304,8 +304,16 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
         )
 
         self.assertLess(two_groups.fwd_compute, single_group.fwd_compute)
-        self.assertGreater(two_groups.fwd_comms, single_group.fwd_comms)
-        self.assertGreater(two_groups.bwd_comms, single_group.bwd_comms)
+        # Per shard: the reduce-scatter of the global batch (64 * 8 samples)
+        # plus its 1/R share of the all-to-all (64 * 8 / 4 = 64 * 2 samples);
+        # D = 128 at 4 bytes over the mock's 1000 bytes/s.
+        self.assertAlmostEqual(
+            single_group.fwd_comms, (64 * 8 + 64 * 2) * 128 * 4 / 1000
+        )
+        # Each shard sends only its own group's partial; the extra partials come
+        # from the doubled shard count, not from a larger per-shard volume.
+        self.assertAlmostEqual(two_groups.fwd_comms, single_group.fwd_comms)
+        self.assertAlmostEqual(two_groups.bwd_comms, single_group.bwd_comms)
 
     def test_compute_perf_returns_perf_object(self) -> None:
         """Test that compute_perf returns a Perf object."""
