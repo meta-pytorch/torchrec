@@ -1686,8 +1686,80 @@ class ParameterConstraints:
             full-precision weights are charged to DDR and the weights at this dtype
             are charged to HBM. When unset, the full-precision weights stay charged
             to HBM as well. Must be a float dtype no wider than the table's dtype.
-        num_twrw_groups (Optional[int]): TABLE_ROW_WISE group span. `None` and
-            1 preserve the single-group placement.
+        num_twrw_groups (Optional[int]): number of TWRW groups N to spread this
+            TABLE_ROW_WISE table over: `None` or 1 is one group, N > 1 is TWRW
+            multi-group. A TWRW group is `intra_group_size` (R) ranks joined by
+            fast links. The rows are split over N * R ranks. Each rank sums,
+            per sample, the selected rows it holds; each group's reduce-scatter
+            adds these sums into the group's partial, and an all-to-all sends
+            each partial to the rank that trains the sample, which adds the N
+            partials. Pooled tables (EmbeddingBagCollection) only; not
+            supported with 2D parallelism; ignored while
+            `is_twrw_multi_group_enabled()` is off.
+
+            What decides between one group, TWRW multi-group and GRID_SHARD
+            (GRID), with D the embedding dimension and P the pooling factor
+            (ids per sample per feature, `pooling_factors`):
+
+            - Communication: TWRW multi-group sends each pooled output as N
+              partials (D values forward, D gradient values backward). GRID
+              splits the D columns over the N groups: each pooled output
+              arrives once, as N slices of D/N values, but each id must reach
+              every group, so it is sent N times (with its weight, if
+              weighted). TWRW multi-group sends less when
+              P * id bytes > D * (forward + backward bytes per value), e.g.
+              P > 256 for D = 256, 8-byte ids and 4-byte values.
+            - Every rank: in input distribution, GRID copies each id N times
+              before sending; TWRW multi-group adds bucketization work for each
+              additional unique N in the module. In output distribution, TWRW
+              multi-group adds the N partials of each sample and fans the
+              gradients out to them; GRID at most reorders the slices. All of
+              this is small next to communication and does not change the
+              choice.
+            - Shared pipeline: in an EmbeddingBagCollection, the tables of one
+              sharding type share input distribution, batched lookups and
+              output distribution. A TWRW multi-group table joins the TWRW
+              tables'; GRID tables get their own, so the first one adds a whole
+              pipeline to every step, whatever its size.
+            - Per placement rank (a rank holding a shard of the table): TWRW
+              multi-group gives it 1/N of the rows at full width, GRID as many
+              rows as with one group at width D/N; both hold, look up and
+              update 1/N of the embedding values. Work per id and per row
+              (finding rows, row-wise optimizer updates and state) drops to 1/N
+              only in TWRW multi-group; work per output value (the rank's
+              pooled outputs and buffers) drops to 1/N only in GRID. So many
+              ids per sample favor TWRW multi-group and wide outputs favor
+              GRID.
+            - Training: a row-wise optimizer keeps one state value per row,
+              computed over all of the row's columns. TWRW multi-group keeps
+              rows whole, so each row keeps its one value; GRID splits each
+              row's columns over the N groups, each keeping its own value from
+              its D/N columns, so the row's updates change and the model trains
+              differently.
+            - Planner gaps: TWRW multi-group's extra cost, N copies of each
+              output, depends only on N, D and the batch size, which the
+              planner always knows, and counts in `Perf.total`, the cost
+              planners balance. GRID's, N copies of each id, depends on P,
+              which is 1 when `pooling_factors` is unset, and goes to
+              `Perf.input_dist_comms`, which `Perf.total` leaves out although
+              input distribution is not always hidden behind compute. GRID's
+              own pipeline and the training change are not priced either. So a
+              plan can rank GRID cheaper than it is.
+
+            Rule of thumb: spread a TWRW table when, on one group, its lookups
+            hold back the step or it does not fit in memory. Many ids per
+            sample favor TWRW multi-group and wide outputs GRID, in both
+            traffic and per-rank work; for traffic, TWRW multi-group sends less
+            when P * id bytes > D * (forward + backward bytes per value).
+            Adding a TWRW multi-group table to a module with TWRW tables is
+            cheaper than adding a GRID table: it joins their input
+            distribution, lookups and output distribution, while the first GRID
+            table adds its own. GRID is rarely used, so most modules have none,
+            and a new GRID table usually adds a whole pipeline. With a row-wise
+            optimizer, GRID changes training, so check model quality. Do not
+            take the planner's choice between the two at face value: it does
+            not count GRID's id traffic in `Perf.total` and, without
+            `pooling_factors`, assumes P = 1.
     """
 
     sharding_types: Optional[List[str]] = None
