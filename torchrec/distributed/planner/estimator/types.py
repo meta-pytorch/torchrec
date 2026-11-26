@@ -828,6 +828,23 @@ class ShardPerfContext:
         )
 
     @property
+    def batch_lengths(self) -> float:
+        """
+        Number of lengths in one rank's batch, over the table's features.
+
+        Input distribution sends each feature's ids with their lengths: how
+        many ids each sample has, one length per sample, or one per pooling
+        when a feature is pooled several times per sample. For feature i,
+        `batch_sizes[i]` is the samples per rank and `num_poolings[i]` the
+        poolings per sample (usually 1). Unlike `batch_inputs`, this does not
+        depend on the ids per pooling (`input_lengths`).
+        """
+        return sum(
+            poolings * samples
+            for poolings, samples in zip(self.num_poolings, self.batch_sizes)
+        )
+
+    @property
     def batch_outputs(self) -> float:
         """
         Raw batch outputs.
