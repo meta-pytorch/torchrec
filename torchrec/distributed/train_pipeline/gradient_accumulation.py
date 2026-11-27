@@ -130,9 +130,9 @@ class GradientAccumulationConfig:
     is_enabled: bool = False
     num_steps: int = 1
     num_warmup_steps: int = 1
-    # Preserve DDP bucket aliases by zeroing eligible dense gradients in place. An unused
-    # parameter retains a zero gradient instead of None, which can affect optimizers that
-    # distinguish those states.
+    # Preserve DDP bucket aliases across windows of more than one micro-batch by zeroing
+    # eligible dense gradients in place. An unused parameter retains a zero gradient
+    # instead of None, which can affect optimizers that distinguish those states.
     accumulate_into_buckets: bool = False
 
     def __post_init__(self) -> None:
@@ -234,13 +234,19 @@ class _GAOptimizerWrapper:
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear gradients once at the start of each accumulation window.
 
-        Bucket-view gradients are zeroed in place when ``accumulate_into_buckets`` is
-        enabled. Metadata is cleared only after actual zeroing succeeds;
-        skipped calls leave both gradients and metadata unchanged.
+        With ``accumulate_into_buckets``, a window of more than one micro-batch zeroes
+        bucket-view gradients in place. A one-micro-batch window clears them like the
+        wrapped optimizer, so a K = 1 job runs as it would without accumulation.
+        Metadata is cleared only after actual zeroing succeeds; skipped calls leave
+        both gradients and metadata unchanged.
         """
         if not self._needs_zero_grad:
             return
-        if self._config.accumulate_into_buckets and self._ga_wrapper is not None:
+        if (
+            self._config.accumulate_into_buckets
+            and self._k > 1
+            and self._ga_wrapper is not None
+        ):
             self._ga_wrapper._window_start_zero_grad()
         else:
             self._optimizer.zero_grad(set_to_none=set_to_none)

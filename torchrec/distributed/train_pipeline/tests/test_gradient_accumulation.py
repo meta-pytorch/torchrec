@@ -13,12 +13,16 @@
 # @lint-ignore-every CITRINECI missing_for_each_optimizer
 
 import contextlib
+import tempfile
 import unittest
-from typing import Any, cast, Iterator, List, Optional
+from typing import Any, cast, Iterator, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.distributed as dist
 from torch import nn, optim
+from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.distributed.train_pipeline.gradient_accumulation import (
     _GAOptimizerWrapper,
     GradientAccumulationConfig,
@@ -2829,4 +2833,177 @@ class SetNumMicroBatchesPerStepTest(unittest.TestCase):
         )
         self.assertEqual(
             observed[-1], 6, f"micros were lost or double-counted: {observed}"
+        )
+
+
+_GradSnapshot = List[Optional[Tuple[int, torch.Tensor]]]
+
+
+class _GradSnapshotPipeline(TrainPipeline[Any, torch.Tensor]):
+    """Pipeline that records each gradient's storage and value after zero_grad and backward."""
+
+    def __init__(self, model: nn.Module, optimizer: optim.Optimizer) -> None:
+        super().__init__()  # pyrefly: ignore[missing-argument]
+        self._model = model
+        self._optimizer = optimizer
+        self.after_zero_grad: List[_GradSnapshot] = []
+        self.after_backward: List[_GradSnapshot] = []
+
+    def _snapshot(self) -> _GradSnapshot:
+        return [
+            (
+                None
+                if p.grad is None
+                else (p.grad.untyped_storage().data_ptr(), p.grad.detach().clone())
+            )
+            for p in self._model.parameters()
+        ]
+
+    def progress(self, dataloader_iter: Iterator[torch.Tensor]) -> torch.Tensor:
+        batch = next(dataloader_iter)
+        self._optimizer.zero_grad()
+        self.after_zero_grad.append(self._snapshot())
+        loss = self._model(batch).sum()
+        loss.backward()
+        self.after_backward.append(self._snapshot())
+        self._optimizer.step()
+        return loss
+
+
+class OneMicroBatchWindowZeroingTest(unittest.TestCase):
+    """Tests window-start zeroing of one-micro-batch windows under accumulate_into_buckets."""
+
+    def test_one_micro_batch_window_clears_like_the_wrapped_optimizer(self) -> None:
+        """A K = 1 window sets gradients to None and skips the bucket-view path."""
+        model = nn.Linear(4, 2, bias=False)
+        optimizer = optim.SGD(model.parameters(), lr=0.0)
+        wrapper = GradientAccumulationWrapper(
+            _RealForwardPipeline(model, optimizer),
+            optimizer,
+            model,
+            GradientAccumulationConfig(
+                is_enabled=True, num_steps=2, accumulate_into_buckets=True
+            ),
+        )
+        wrapper.set_num_micro_batches_per_step(1)
+        model(torch.ones(1, 4)).sum().backward()
+        wrapper._bucket_views_ready = True
+        wrapper.optimizer_wrapper._needs_zero_grad = True
+
+        with patch.object(wrapper, "_window_start_zero_grad") as mock_window_zero:
+            wrapper.optimizer_wrapper.zero_grad()
+
+        mock_window_zero.assert_not_called()
+        self.assertIsNone(model.weight.grad)
+
+    def test_bucket_aliases_follow_the_window_length_through_a_ramp(self) -> None:
+        """K = 1 windows clear to None; a K = 2 window accumulates in the reducer's bucket."""
+        store_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(store_dir.cleanup)
+        dist.init_process_group(
+            "gloo", init_method=f"file://{store_dir.name}/store", rank=0, world_size=1
+        )
+        self.addCleanup(dist.destroy_process_group)
+        torch.manual_seed(0)
+        ddp_model = DistributedDataParallel(
+            nn.Linear(4, 2, bias=False), gradient_as_bucket_view=True
+        )
+        optimizer = optim.SGD(ddp_model.parameters(), lr=0.0)
+        pipeline = _GradSnapshotPipeline(ddp_model, optimizer)
+        wrapper = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            ddp_model,
+            GradientAccumulationConfig(
+                is_enabled=True, num_steps=2, accumulate_into_buckets=True
+            ),
+        )
+        x1 = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        x2 = torch.tensor([[5.0, 6.0, 7.0, 8.0]])
+
+        wrapper.set_num_micro_batches_per_step(1)
+        for x in (torch.ones(1, 4), torch.full((1, 4), 2.0)):
+            wrapper.progress(iter([x]))
+        for snapshot in pipeline.after_zero_grad:
+            self.assertEqual(snapshot, [None])
+        # A synchronized backward leaves each gradient as a view of its reducer bucket.
+        bucket_ptr = cast(Tuple[int, torch.Tensor], pipeline.after_backward[-1][0])[0]
+
+        wrapper.set_num_micro_batches_per_step(2)
+        wrapper.progress(iter([x1]))
+        # A no_sync backward keeps the bucket alias only if zero_grad kept it.
+        for snapshot in (pipeline.after_zero_grad[-1], pipeline.after_backward[-1]):
+            entry = snapshot[0]
+            self.assertIsNotNone(entry)
+            self.assertEqual(cast(Tuple[int, torch.Tensor], entry)[0], bucket_ptr)
+        torch.testing.assert_close(
+            cast(Tuple[int, torch.Tensor], pipeline.after_zero_grad[-1][0])[1],
+            torch.zeros(2, 4),
+            rtol=0,
+            atol=0,
+        )
+        wrapper.progress(iter([x2]))
+        expected = (x1 + x2).expand(2, 4)
+        torch.testing.assert_close(
+            ddp_model.module.weight.grad, expected, rtol=0, atol=0
+        )
+
+        wrapper.set_num_micro_batches_per_step(1)
+        wrapper.progress(iter([x1]))
+        self.assertEqual(pipeline.after_zero_grad[-1], [None])
+
+
+def _one_micro_batch_window_grads(
+    rank: int, world_size: int, accumulate: bool
+) -> list[torch.Tensor]:
+    """Return each step's synchronized gradient on this rank, with or without the wrapper."""
+    torch.manual_seed(0)
+    model = DistributedDataParallel(
+        nn.Linear(16, 8, bias=False), gradient_as_bucket_view=True
+    )
+    optimizer = optim.SGD(model.parameters(), lr=0.0)
+    pipeline = _GradSnapshotPipeline(model, optimizer)
+    wrapper = GradientAccumulationWrapper(
+        pipeline,
+        optimizer,
+        model,
+        GradientAccumulationConfig(
+            is_enabled=True, num_steps=2, accumulate_into_buckets=True
+        ),
+    )
+    wrapper.set_num_micro_batches_per_step(1)
+    inputs = torch.randn(
+        3, 4, 16, generator=torch.Generator().manual_seed(1 + rank)
+    ).unbind()
+    for x in inputs:
+        if accumulate:
+            wrapper.progress(iter([x]))
+        else:
+            pipeline.progress(iter([x]))
+    return [cast(Tuple[int, torch.Tensor], s[0])[1] for s in pipeline.after_backward]
+
+
+def _run_one_micro_batch_window_matches_no_accumulation(
+    rank: int, world_size: int
+) -> None:
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        expected = _one_micro_batch_window_grads(rank, world_size, accumulate=False)
+        actual = _one_micro_batch_window_grads(rank, world_size, accumulate=True)
+        for step, (got, want) in enumerate(zip(actual, expected)):
+            torch.testing.assert_close(
+                got, want, rtol=0, atol=0, msg=lambda m, step=step: f"step {step}: {m}"
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+class OneMicroBatchWindowMultiRankTest(MultiProcessTestBase):
+    def test_one_micro_batch_windows_match_no_accumulation_at_three_ranks(
+        self,
+    ) -> None:
+        """At W = 3, where DDP's two ways of averaging round differently, K = 1 is bitwise a plain step."""
+        self._run_multi_process_test(
+            callable=_run_one_micro_batch_window_matches_no_accumulation,
+            world_size=3,
         )
