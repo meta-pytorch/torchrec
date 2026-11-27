@@ -305,7 +305,26 @@ class KeyedOptimizer(optim.Optimizer):
                 ):
                     t = t.to_sparse()
                 param.grad = torch.autograd.Variable(t)
+
+        # Snapshot state for params that already carry state (e.g. restored
+        # from a checkpoint): the dummy step below must not consume a logical
+        # optimizer step or decay their moments, since they will be overwritten
+        # by the checkpoint load anyway.
+        prev_state: Dict[torch.Tensor, Dict[str, Any]] = {}
+        for param, state in self.state.items():
+            if isinstance(state, dict):
+                prev_state[param] = deepcopy(state)
+
         self.step(closure=None)
+
+        # Restore checkpointed state exactly, and make freshly initialized
+        # params start at step 0 so the first real update still uses t=1.
+        for param, state in self.state.items():
+            if param in prev_state:
+                state.clear()
+                state.update(prev_state[param])
+            elif isinstance(state, dict) and "step" in state:
+                state["step"].fill_(0)
 
     def save_param_groups(self, save: bool) -> None:
         self.defaults["_save_param_groups"] = save
