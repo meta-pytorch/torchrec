@@ -68,6 +68,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
         self._step_num = 0
         self._track_grad_norm = track_grad_norm
         self._last_total_grad_norm: Optional[torch.Tensor] = None
+        self._step_grad_scale: float = 1.0
 
         # Group parameters by model parallelism process group if global clipping is enabled.
         # Otherwise, all parameters are treated as replicated and will be clipped locally.
@@ -104,7 +105,33 @@ class GradientClippingOptimizer(OptimizerWrapper):
                     "clip_grad_value_ for sharded parameters is not supported yet"
                 )
 
+    def set_step_grad_scale(self, scale: float) -> None:
+        """Scale the gradients by ``scale`` in the next ``step()``, inside the clip multiply.
+
+        The norm is computed on the unscaled gradients, and the clip decision and the
+        logged norm use ``scale`` times it. The scale applies to that one step.
+        """
+        self._step_grad_scale = scale
+
+    @property
+    def can_fold_step_grad_scale(self) -> bool:
+        """Whether ``set_step_grad_scale`` scales every gradient this optimizer clips."""
+        if self._clipping != GradientClipping.NORM:
+            return False
+        # The replicate-only path clips DTensor parameters through their local tensors,
+        # which do not hold gradients stored on the DTensor.
+        return len(self._sharded_params) > 0 or not any(
+            isinstance(p, DTensor) for p in self._replicate_params
+        )
+
     def step(self, closure: Any = None) -> None:
+        scale = self._step_grad_scale
+        self._step_grad_scale = 1.0
+        if scale != 1.0 and not self.can_fold_step_grad_scale:
+            raise ValueError(
+                f"set_step_grad_scale({scale}) needs NORM clipping on gradients this "
+                f"optimizer can scale; clipping is {self._clipping.value}"
+            )
         if self._check_meta:
             # skip gradient clipping and early return
             if any(t.device.type == "meta" for t in self._replicate_params):
@@ -136,7 +163,11 @@ class GradientClippingOptimizer(OptimizerWrapper):
                     for p in replicate_params
                     if p.grad is not None and p.grad.numel() > 0
                 ]
-                if replicate_params:
+                if replicate_params and scale != 1.0:
+                    self._last_total_grad_norm = self._clip_and_scale_replicate(
+                        replicate_params, scale
+                    )
+                elif replicate_params:
                     self._last_total_grad_norm = torch.nn.utils.clip_grad_norm_(
                         parameters=replicate_params,
                         max_norm=self._max_gradient,
@@ -145,7 +176,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
                 else:
                     self._last_total_grad_norm = None
             else:
-                result = self.clip_grad_norm_()
+                result = self.clip_grad_norm_(scale=scale)
                 self._last_total_grad_norm = (
                     torch.tensor(result) if isinstance(result, float) else result
                 )
@@ -224,14 +255,43 @@ class GradientClippingOptimizer(OptimizerWrapper):
         )
         return total_norm, all_grads
 
-    def clip_grad_norm_(self) -> Optional[Union[float, torch.Tensor]]:
-        """Clip the gradient norm of all parameters."""
+    def _clip_and_scale_replicate(
+        self, params: List[torch.Tensor], scale: float
+    ) -> torch.Tensor:
+        """Clip ``scale`` times the gradients of ``params`` in one multiply.
+
+        Returns the norm of the scaled gradients.
+        """
+        grads = [cast(torch.Tensor, p.grad) for p in params]
+        norm = torch.nn.utils.get_total_norm(grads, norm_type=self._norm_type)
+        scaled_norm = norm * scale
+        clip_coef = torch.clamp(self._max_gradient / (scaled_norm + 1e-6), max=1.0)
+        coef = clip_coef * scale
+        grouped = torch.utils._foreach_utils._group_tensors_by_device_and_dtype(
+            [grads]  # pyrefly: ignore[bad-argument-type]
+        )
+        for (device, _), ([device_grads], _) in grouped.items():
+            torch._foreach_mul_(cast(List[torch.Tensor], device_grads), coef.to(device))
+        return scaled_norm
+
+    def clip_grad_norm_(
+        self, scale: float = 1.0
+    ) -> Optional[Union[float, torch.Tensor]]:
+        """Clip the gradient norm of all parameters.
+
+        A ``scale`` other than 1 also multiplies the gradients by it, in the same
+        multiply, and the clip and the returned norm apply to the scaled gradients.
+        """
 
         total_grad_norm, all_grads = self.compute_total_grad_norm()
+        if scale != 1.0:
+            total_grad_norm = total_grad_norm * scale
 
         # pyrefly: ignore[redundant-cast]
         clip_coef = cast(torch.Tensor, self._max_gradient / (total_grad_norm + 1e-6))
         clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+        if scale != 1.0:
+            clip_coef_clamped = clip_coef_clamped * scale
         torch._foreach_mul_(all_grads, clip_coef_clamped)
         return total_grad_norm
 
