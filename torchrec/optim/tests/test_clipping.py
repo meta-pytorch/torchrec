@@ -8,10 +8,12 @@
 # pyre-strict
 
 import unittest
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import torch
 from torch.autograd import Variable
+from torch.distributed._tensor.api import DTensor
 from torchrec.optim.clipping import (
     _batch_cal_norm,
     _compute_total_norm,
@@ -839,3 +841,154 @@ class TestClipGradNorm(unittest.TestCase):
         self.assertIsNotNone(total_norm)
         # pyrefly: ignore[missing-attribute]
         self.assertGreater(total_norm.item(), 0)
+
+
+def _clipper(
+    params: list[torch.Tensor],
+    clipping: GradientClipping = GradientClipping.NORM,
+    max_gradient: float = 1.0,
+    norm_type: float | str = 2.0,
+) -> GradientClippingOptimizer:
+    keyed_optimizer = DummyKeyedOptimizer(
+        {f"param_{i}": p for i, p in enumerate(params)}, {}, [{"params": params}]
+    )
+    return GradientClippingOptimizer(
+        optimizer=keyed_optimizer,
+        clipping=clipping,
+        max_gradient=max_gradient,
+        norm_type=norm_type,
+    )
+
+
+class StepGradScaleFoldTest(unittest.TestCase):
+    """Tests the gradient scale a NORM clipper applies inside its clip multiply."""
+
+    def _grads(self, seed: int = 0) -> list[torch.Tensor]:
+        generator = torch.Generator().manual_seed(seed)
+        return [
+            torch.randn(5, generator=generator) * 3,
+            torch.randn(3, 2, generator=generator) * 3,
+        ]
+
+    def _run(
+        self,
+        scale: float,
+        fold: bool,
+        max_gradient: float,
+        norm_type: float | str,
+        sharded: bool,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        grads = self._grads()
+        params: list[torch.Tensor] = [
+            Variable(torch.zeros_like(g), requires_grad=True) for g in grads
+        ]
+        clipper = _clipper(params, max_gradient=max_gradient, norm_type=norm_type)
+        if sharded:
+            clipper._sharded_params = {(MagicMock(),): [params[0]]}
+            clipper._replicate_params = [params[1]]
+        for param, grad in zip(params, grads):
+            param.grad = grad.clone()
+        if fold:
+            clipper.set_step_grad_scale(scale)
+        else:
+            torch._foreach_mul_([cast(torch.Tensor, p.grad) for p in params], scale)
+        with patch("torch.distributed.all_reduce"):
+            clipper.step()
+        norm = clipper.last_total_grad_norm
+        assert norm is not None
+        return [cast(torch.Tensor, p.grad) for p in params], norm
+
+    def test_power_of_two_scale_folded_equals_separate_multiply_bitwise(self) -> None:
+        """A power-of-two scale folded into the clip matches a separate multiply bitwise."""
+        for scale in (0.5, 0.25):
+            for norm_type in (2.0, "inf"):
+                for max_gradient in (0.1, 1e6):
+                    for sharded in (False, True):
+                        with self.subTest(
+                            scale=scale,
+                            norm_type=norm_type,
+                            max_gradient=max_gradient,
+                            sharded=sharded,
+                        ):
+                            folded, folded_norm = self._run(
+                                scale, True, max_gradient, norm_type, sharded
+                            )
+                            separate, separate_norm = self._run(
+                                scale, False, max_gradient, norm_type, sharded
+                            )
+                            for got, want in zip(folded, separate):
+                                self.assertTrue(torch.equal(got, want))
+                            self.assertTrue(torch.equal(folded_norm, separate_norm))
+
+    def test_other_scale_folded_matches_separate_multiply(self) -> None:
+        """A scale that is not a power of two matches a separate multiply to rounding."""
+        for norm_type in (2.0, "inf"):
+            for sharded in (False, True):
+                with self.subTest(norm_type=norm_type, sharded=sharded):
+                    folded, folded_norm = self._run(
+                        1 / 3, True, 0.1, norm_type, sharded
+                    )
+                    separate, separate_norm = self._run(
+                        1 / 3, False, 0.1, norm_type, sharded
+                    )
+                    for got, want in zip(folded, separate):
+                        torch.testing.assert_close(got, want)
+                    torch.testing.assert_close(folded_norm, separate_norm)
+
+    def test_scale_of_one_is_a_plain_step(self) -> None:
+        """A scale of 1 leaves the step bitwise unchanged."""
+        for sharded in (False, True):
+            with self.subTest(sharded=sharded):
+                with_scale, with_scale_norm = self._run(1.0, True, 0.1, 2.0, sharded)
+                plain, plain_norm = self._run(1.0, False, 0.1, 2.0, sharded)
+                for got, want in zip(with_scale, plain):
+                    self.assertTrue(torch.equal(got, want))
+                self.assertTrue(torch.equal(with_scale_norm, plain_norm))
+
+    def test_scale_applies_to_one_step(self) -> None:
+        """The scale is used by the next step only, and a new scale replaces it."""
+        param = Variable(torch.zeros(2), requires_grad=True)
+        clipper = _clipper([param], max_gradient=1e6)
+        clipper.set_step_grad_scale(0.5)
+        param.grad = torch.tensor([2.0, 4.0])
+        clipper.step()
+        torch.testing.assert_close(param.grad, torch.tensor([1.0, 2.0]), rtol=0, atol=0)
+        param.grad = torch.tensor([2.0, 4.0])
+        clipper.step()
+        torch.testing.assert_close(param.grad, torch.tensor([2.0, 4.0]), rtol=0, atol=0)
+        clipper.set_step_grad_scale(0.25)
+        clipper.step()
+        torch.testing.assert_close(param.grad, torch.tensor([0.5, 1.0]), rtol=0, atol=0)
+
+    def test_logged_norm_is_the_scaled_norm(self) -> None:
+        """The logged norm is the norm of the scaled gradients."""
+        param = Variable(torch.zeros(2), requires_grad=True)
+        clipper = _clipper([param], max_gradient=1e6)
+        clipper.set_step_grad_scale(0.5)
+        param.grad = torch.tensor([3.0, 4.0])
+        clipper.step()
+        torch.testing.assert_close(
+            clipper.last_total_grad_norm, torch.tensor(2.5), rtol=0, atol=0
+        )
+
+    def test_only_norm_clipping_takes_a_scale(self) -> None:
+        """Only NORM clipping folds a scale; VALUE and NONE reject one."""
+        param = Variable(torch.zeros(2), requires_grad=True)
+        self.assertTrue(_clipper([param]).can_fold_step_grad_scale)
+        for mode in (GradientClipping.VALUE, GradientClipping.NONE):
+            with self.subTest(clipping=mode):
+                clipper = _clipper([param], clipping=mode)
+                self.assertFalse(clipper.can_fold_step_grad_scale)
+                clipper.set_step_grad_scale(0.5)
+                param.grad = torch.ones(2)
+                with self.assertRaisesRegex(ValueError, "needs NORM clipping"):
+                    clipper.step()
+
+    def test_dtensor_params_on_the_replicate_path_do_not_fold(self) -> None:
+        """The replicate-only path cannot scale DTensor gradients, so it does not fold."""
+        param = Variable(torch.zeros(2), requires_grad=True)
+        clipper = _clipper([param])
+        clipper._replicate_params = [MagicMock(spec=DTensor)]
+        self.assertFalse(clipper.can_fold_step_grad_scale)
+        clipper._sharded_params = {(MagicMock(),): [param]}
+        self.assertTrue(clipper.can_fold_step_grad_scale)

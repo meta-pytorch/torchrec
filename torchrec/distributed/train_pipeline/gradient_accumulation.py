@@ -15,21 +15,25 @@ Use ``DISCARD`` or ``RAISE`` when every optimizer step must be observable.
 
 import contextlib
 import logging
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
     Any,
+    Callable,
     cast,
     ContextManager,
     Generic,
     Iterator,
     Optional,
     Protocol,
+    runtime_checkable,
     TYPE_CHECKING,
 )
 
 import torch
+from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.attributed_logging import attributed_logger
@@ -51,6 +55,134 @@ class GAWindowObserver(Protocol):
     """
 
     def __call__(self, *, should_step: bool, at_window_start: bool) -> None: ...
+
+
+@runtime_checkable
+class _FoldableGradClipper(Protocol):
+    """A gradient-clipping optimizer that can apply a step's gradient scale in its clip."""
+
+    @property
+    def can_fold_step_grad_scale(self) -> bool: ...
+
+    def set_step_grad_scale(self, scale: float) -> None: ...
+
+
+def _child_optimizers(opt: torch.optim.Optimizer) -> list[torch.optim.Optimizer]:
+    children = getattr(opt, "optimizers", None)
+    if isinstance(children, list):
+        return [child for _, child in children]
+    inner = getattr(opt, "_optimizer", None)
+    return [inner] if isinstance(inner, torch.optim.Optimizer) else []
+
+
+def _is_grad_clipper(opt: torch.optim.Optimizer) -> bool:
+    return isinstance(opt, torch.optim.Optimizer) and isinstance(
+        opt, _FoldableGradClipper
+    )
+
+
+def _fold_targets(
+    roots: list[torch.optim.Optimizer],
+) -> Optional[tuple[list[_FoldableGradClipper], set[int]]]:
+    """Return the clippers that can take a step's gradient scale, and the parameters they clip.
+
+    Walks down from the optimizers that are stepped. Returns ``None`` when a clipper cannot
+    fold or a parameter would be clipped twice, so the caller multiplies every gradient.
+    """
+    clippers: list[_FoldableGradClipper] = []
+    seen: set[int] = set()
+    stack = list(roots)
+    while stack:
+        opt = stack.pop()
+        if not _is_grad_clipper(opt):
+            stack.extend(_child_optimizers(opt))
+            continue
+        clipper = cast(_FoldableGradClipper, opt)
+        if not clipper.can_fold_step_grad_scale:
+            return None
+        # A clipper below a clipper clips twice.
+        below = _child_optimizers(opt)
+        while below:
+            inner = below.pop()
+            if _is_grad_clipper(inner):
+                return None
+            below.extend(_child_optimizers(inner))
+        for group in opt.param_groups:
+            for param in group["params"]:
+                if id(param) in seen:
+                    return None
+                seen.add(id(param))
+        clippers.append(clipper)
+    return clippers, seen
+
+
+def _topology_key(optimizers: list[torch.optim.Optimizer]) -> tuple[int, ...]:
+    key: list[int] = []
+    for opt in optimizers:
+        groups = opt.param_groups
+        key += [id(opt), len(groups)]
+        key += [len(group["params"]) for group in groups]
+    return tuple(key)
+
+
+@dataclass(frozen=True)
+class _FoldPlan:
+    """Where a step's gradient scale is applied, kept until the optimizers change."""
+
+    key: tuple[int, ...]
+    clippers: list[_FoldableGradClipper]
+    multiplied: list[torch.Tensor]
+
+
+def _plan_folds(
+    key: tuple[int, ...],
+    optimizer: torch.optim.Optimizer,
+    roots: list[torch.optim.Optimizer],
+) -> _FoldPlan:
+    params: list[torch.Tensor] = []
+    listed: set[int] = set()
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            # ShardedTensors cannot hold a gradient, and their .grad reads are slow.
+            if not isinstance(param, ShardedTensor) and id(param) not in listed:
+                listed.add(id(param))
+                params.append(param)
+    targets = _fold_targets(roots)
+    if targets is None:
+        logger.info(
+            "Gradient accumulation multiplies all %d gradients by each step's scale: "
+            "a gradient clipper cannot take it, or would clip a parameter twice.",
+            len(params),
+        )
+        return _FoldPlan(key, [], params)
+    clippers, clipped = targets
+    multiplied = [param for param in params if id(param) not in clipped]
+    logger.info(
+        "Gradient accumulation: %d gradient clippers apply each step's scale in their "
+        "clip; %d parameters are multiplied directly.",
+        len(clippers),
+        len(multiplied),
+    )
+    return _FoldPlan(key, clippers, multiplied)
+
+
+@runtime_checkable
+class GAStepGradScale(Protocol):
+    """The optimizer a ``GradientAccumulationWrapper`` installs as the pipeline's optimizer.
+
+    Pipeline operations that step optimizers directly call ``apply_step_grad_scale()``
+    once the gradients of the step that the current micro-batch completes are reduced,
+    before anything reads them.
+    """
+
+    @property
+    def step_grad_scale(self) -> float: ...
+
+    def set_stepped_optimizers(
+        self, optimizers: list[torch.optim.Optimizer]
+    ) -> None: ...
+
+    def apply_step_grad_scale(self) -> None: ...
 
 
 class _GAPipelineHooks(Protocol):
@@ -160,9 +292,14 @@ class _GAOptimizerWrapper:
         self,
         optimizer: torch.optim.Optimizer,
         config: GradientAccumulationConfig,
+        grad_scale_fn: Optional[Callable[[int], float]] = None,
     ) -> None:
         self._optimizer = optimizer
         self._config = config
+        self._grad_scale_fn = grad_scale_fn
+        # Micro-batch index whose gradients carry this step's factor, so a repeated
+        # step() in one micro-batch does not apply it twice.
+        self._scaled_at_step: Optional[int] = None
         # Use one stored window size for every boundary calculation.
         self._k: int = config.num_steps
         self._current_step: int = 0
@@ -173,6 +310,12 @@ class _GAOptimizerWrapper:
         self._force_step: bool = False
         # The owning wrapper provides model topology for bucket-view zeroing.
         self._ga_wrapper: Optional["GradientAccumulationWrapper[Any, Any]"] = None
+        # Optimizers a pipeline steps directly, instead of this wrapper's step().
+        self._stepped_optimizers: Optional[list[torch.optim.Optimizer]] = None
+        # Clippers that took the last step's scale. A clipper consumes the scale in its own
+        # step(), so one whose step never ran must not keep it for a later step.
+        self._armed_clippers: list[_FoldableGradClipper] = []
+        self._fold_plan: Optional[_FoldPlan] = None
         # Track processed micro-batches because set_step() can change the window position.
         self._micro_batches_counted: int = 0
         # A window that starts on a boundary must contain exactly _k micro-batches.
@@ -231,6 +374,69 @@ class _GAOptimizerWrapper:
         """Return whether the next optimizer step should run."""
         return (self.micro_batches_into_window + 1) % self._k == 0
 
+    def grad_scale(self, num_micro_batches: int) -> float:
+        """Return the gradient factor for a step that accumulated ``num_micro_batches``."""
+        if self._grad_scale_fn is None:
+            return 1.0
+        return self._grad_scale_fn(num_micro_batches)
+
+    @property
+    def step_grad_scale(self) -> float:
+        """Gradient factor for the optimizer step that the current micro-batch completes."""
+        return self.grad_scale(self._micro_batches_counted + 1)
+
+    def apply_step_grad_scale(self) -> None:
+        """Apply ``step_grad_scale`` to the accumulated gradients, once per step."""
+        self.scale_grads(self.step_grad_scale)
+
+    def set_stepped_optimizers(self, optimizers: list[torch.optim.Optimizer]) -> None:
+        """Register the optimizers a pipeline steps directly instead of this wrapper.
+
+        Only gradient clippers below them can take the step's gradient scale in their
+        clip multiply.
+        """
+        self._stepped_optimizers = list(optimizers)
+        self._fold_plan = None
+
+    def scale_grads(self, scale: float) -> None:
+        """Scale the accumulated gradients by ``scale``, once per optimizer step.
+
+        NORM clippers on the stepped path apply the scale in their clip multiply to the
+        parameters they clip; every other gradient is multiplied here. The plan is rebuilt
+        when the stepped optimizers or the param groups change. A clipper that took an
+        earlier step's scale but never ran its step drops that scale here.
+        """
+        if self._scaled_at_step == self._current_step:
+            return
+        for clipper in self._armed_clippers:
+            clipper.set_step_grad_scale(1.0)
+        self._armed_clippers = []
+        if scale == 1.0:
+            return
+        plan = self._current_fold_plan()
+        for clipper in plan.clippers:
+            clipper.set_step_grad_scale(scale)
+        self._armed_clippers = list(plan.clippers)
+        # Foreach ops reject a list that mixes DTensor and plain tensor gradients.
+        grads_by_type: defaultdict[type, list[torch.Tensor]] = defaultdict(list)
+        for param in plan.multiplied:
+            if param.grad is not None:
+                grads_by_type[type(param.grad)].append(param.grad)
+        for same_type in grads_by_type.values():
+            torch._foreach_mul_(same_type, scale)
+        self._scaled_at_step = self._current_step
+
+    def _current_fold_plan(self) -> _FoldPlan:
+        roots = (
+            [self._optimizer]
+            if self._stepped_optimizers is None
+            else self._stepped_optimizers
+        )
+        key = _topology_key([self._optimizer, *roots])
+        if self._fold_plan is None or self._fold_plan.key != key:
+            self._fold_plan = _plan_folds(key, self._optimizer, roots)
+        return self._fold_plan
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear gradients once at the start of each accumulation window.
 
@@ -260,12 +466,22 @@ class _GAOptimizerWrapper:
             self._apply_gradients(*args, **kwargs)
 
     @attributed_logger("optimizer", owner=lambda wrapper: wrapper)
-    def _apply_gradients(self, *args: Any, **kwargs: Any) -> None:
+    def _apply_gradients(
+        self, *args: Any, grad_scale: Optional[float] = None, **kwargs: Any
+    ) -> None:
+        """Scale the gradients once, then step.
+
+        Without ``grad_scale``, the scale is ``step_grad_scale``.
+        """
         ga = self._ga_wrapper
         if ga is not None:
             # Deferred resharding may leave parameters unsharded between microbatches.
             # Optimizers must read sharded parameters.
             ga._fsdp_sync_suppression.ensure_sharded(ga._get_fsdp_targets())
+        if grad_scale is None:
+            self.apply_step_grad_scale()
+        else:
+            self.scale_grads(grad_scale)
         self._optimizer.step(*args, **kwargs)
         self._needs_zero_grad = True
         self._clear_optimizer_contributors()
@@ -320,12 +536,14 @@ class _GAOptimizerWrapper:
         self._window_base = 0
         self._needs_zero_grad = True
         self._force_step = False
+        self._scaled_at_step = None
         self._clear_optimizer_contributors()
         self._start_counted_window()
 
     def realign_window(self) -> None:
         """Start a new window without resetting the global micro-batch counter."""
         self._window_base = self._current_step
+        self._scaled_at_step = None
         self._start_counted_window()
 
     def set_step(self, step: int) -> None:
@@ -337,6 +555,7 @@ class _GAOptimizerWrapper:
         self._current_step = step
         self._window_base = 0
         self._micro_batches_counted = 0
+        self._scaled_at_step = None
         # An incomplete first window created by set_step() produces a warning.
         self._window_started_aligned = (step % self._k) == 0
 
@@ -349,7 +568,11 @@ class GradientAccumulationWrapper(Generic[In, Out]):
     """Add gradient accumulation to a ``TrainPipeline``.
 
     The wrapper controls optimizer boundaries and suppresses distributed gradient
-    synchronization between those boundaries.
+    synchronization between those boundaries. ``set_grad_scale_fn`` installs a function
+    that, given the number of micro-batches an optimizer step accumulated, returns a
+    factor applied once to the gradients before that step. Pipeline operations that step
+    optimizers directly apply it through ``GAStepGradScale``, which the optimizer
+    installed as the pipeline's ``_optimizer`` implements.
 
     Batch attribution snapshots metadata and indexes observed by the wrapped optimizer.
     Split optimizers that bypass it need integration at their update boundaries.
@@ -581,10 +804,15 @@ class GradientAccumulationWrapper(Generic[In, Out]):
                 )
                 self._fsdp_sync_suppression.clear_partial(targets)
             self._fsdp_sync_suppression.restore(targets)
+            optimizer_wrapper = self._optimizer_wrapper
             # Each processed micro-batch recorded its context in step(); exhaustion
             # does not contribute another batch to this partial window.
-            self._optimizer_wrapper._apply_gradients()
-            self._optimizer_wrapper.zero_grad(set_to_none=True)
+            optimizer_wrapper._apply_gradients(
+                grad_scale=optimizer_wrapper.grad_scale(
+                    optimizer_wrapper._micro_batches_counted
+                )
+            )
+            optimizer_wrapper.zero_grad(set_to_none=True)
             return True
         return False
 
@@ -777,6 +1005,17 @@ class GradientAccumulationWrapper(Generic[In, Out]):
     def num_micro_batches_per_step(self) -> int:
         """Number of micro-batches accumulated per optimizer step."""
         return self._optimizer_wrapper._k
+
+    def set_grad_scale_fn(
+        self, grad_scale_fn: Optional[Callable[[int], float]]
+    ) -> None:
+        """Install the per-step gradient factor, or remove it with None.
+
+        Args:
+            grad_scale_fn: Called with the micro-batches an optimizer step accumulated;
+                returns the factor that multiplies the gradients once before the step.
+        """
+        self._optimizer_wrapper._grad_scale_fn = grad_scale_fn
 
     def set_num_micro_batches_per_step(
         self, k: int, *, allow_open_window: bool = False

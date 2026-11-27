@@ -15,21 +15,33 @@
 import contextlib
 import tempfile
 import unittest
-from typing import Any, cast, Iterator, List, Optional, Tuple
+from typing import Any, Callable, cast, Iterator, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
 from torch import nn, optim
+from torch.distributed._shard import sharded_tensor
+from torch.distributed._shard.sharding_spec import ChunkShardingSpec
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.distributed.train_pipeline.gradient_accumulation import (
+    _fold_targets,
     _GAOptimizerWrapper,
+    GAStepGradScale,
     GradientAccumulationConfig,
     GradientAccumulationWrapper,
     PartialWindowPolicy,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipeline
+from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer
+from torchrec.optim.keyed import (
+    CombinedOptimizer,
+    KeyedOptimizer,
+    KeyedOptimizerWrapper,
+)
 
 
 class _MockPipeline(TrainPipeline[Any, float]):
@@ -2834,6 +2846,455 @@ class SetNumMicroBatchesPerStepTest(unittest.TestCase):
         self.assertEqual(
             observed[-1], 6, f"micros were lost or double-counted: {observed}"
         )
+
+
+class GradScaleTest(unittest.TestCase):
+    """Tests the per-step gradient factor on every path that takes an optimizer step.
+
+    Each micro-batch contributes a gradient of exactly 1, and the factor ``10 + q`` names
+    the micro-batch count ``q`` it was computed for.
+    """
+
+    def _run(
+        self,
+        num_steps: int,
+        num_micros: int,
+        bypass_wrapper_step: bool = False,
+        mark_last: bool = False,
+        grad_scale_fn: Optional[Callable[[int], float]] = lambda q: 10.0 + q,
+    ) -> tuple[_SplitOrDefaultModePipeline, list[float]]:
+        model = nn.Linear(1, 1, bias=False)
+        optimizer = optim.SGD(model.parameters(), lr=0.0)
+        pipeline = _SplitOrDefaultModePipeline(model, optimizer, bypass_wrapper_step)
+        stepped_grads: list[float] = []
+
+        def record_step(*args: Any, **kwargs: Any) -> None:
+            if bypass_wrapper_step:
+                # The installed optimizer is the wrapper's; the child is stepped directly.
+                installed = pipeline._optimizer
+                assert isinstance(installed, GAStepGradScale)
+                installed.apply_step_grad_scale()
+            stepped_grads.append(cast(torch.Tensor, model.weight.grad).item())
+
+        optimizer.step = record_step  # pyrefly: ignore[bad-assignment]
+        wrapper = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            GradientAccumulationConfig(is_enabled=True, num_steps=num_steps),
+            window_observer=pipeline.set_ga_window_state,
+        )
+        wrapper.set_grad_scale_fn(grad_scale_fn)
+        data = iter([torch.ones(1, 1) for _ in range(num_micros)])
+        for i in range(num_micros):
+            wrapper.progress(data, is_last_batch=mark_last and i == num_micros - 1)
+        return pipeline, stepped_grads
+
+    def test_scheduled_steps_scale_by_the_full_window(self) -> None:
+        _, stepped = self._run(num_steps=2, num_micros=4)
+        self.assertEqual(stepped, [2.0 * 12.0, 2.0 * 12.0])
+
+    def test_forced_final_step_scales_by_its_partial_count(self) -> None:
+        _, stepped = self._run(num_steps=4, num_micros=3, mark_last=True)
+        self.assertEqual(stepped, [3.0 * 13.0])
+
+    def test_partial_window_flush_scales_by_its_partial_count(self) -> None:
+        model = nn.Linear(1, 1, bias=False)
+        optimizer = optim.SGD(model.parameters(), lr=0.0)
+        pipeline = _SplitOrDefaultModePipeline(model, optimizer, False)
+        stepped: list[float] = []
+        optimizer.step = (
+            lambda *a, **k: stepped.append(  # pyrefly: ignore[bad-assignment]
+                cast(torch.Tensor, model.weight.grad).item()
+            )
+        )
+        wrapper = GradientAccumulationWrapper(
+            pipeline,
+            optimizer,
+            model,
+            GradientAccumulationConfig(is_enabled=True, num_steps=4),
+        )
+        wrapper.set_grad_scale_fn(lambda q: 10.0 + q)
+        data = iter([torch.ones(1, 1) for _ in range(3)])
+        for _ in range(3):
+            wrapper.progress(data)
+        with self.assertRaises(StopIteration):
+            wrapper.progress(data)
+        self.assertEqual(stepped, [3.0 * 13.0])
+
+    def test_pipeline_stepping_directly_reads_the_same_factor(self) -> None:
+        pipeline, stepped = self._run(
+            num_steps=2, num_micros=4, bypass_wrapper_step=True
+        )
+        self.assertEqual(pipeline.child_step_count, 2)
+        self.assertEqual(stepped, [2.0 * 12.0, 2.0 * 12.0])
+
+    def test_no_scale_fn_leaves_gradients_unchanged(self) -> None:
+        _, stepped = self._run(num_steps=2, num_micros=4, grad_scale_fn=None)
+        self.assertEqual(stepped, [2.0, 2.0])
+
+    def test_repeated_boundary_steps_scale_once(self) -> None:
+        param = nn.Parameter(torch.zeros(1))
+        optimizer = optim.SGD([param], lr=0.0)
+        wrapper = _GAOptimizerWrapper(
+            optimizer,
+            GradientAccumulationConfig(is_enabled=True, num_steps=2),
+            grad_scale_fn=lambda q: 1.0 / q,
+        )
+        param.grad = torch.ones(1)
+        wrapper._current_step = 1
+        wrapper._micro_batches_counted = 1
+        wrapper.step()
+        wrapper.step()
+        self.assertEqual(cast(torch.Tensor, param.grad).item(), 0.5)
+        # The next window is scaled again even when gradients are cleared elsewhere.
+        param.grad = torch.ones(1)
+        wrapper._current_step = 3
+        wrapper.step()
+        self.assertEqual(cast(torch.Tensor, param.grad).item(), 0.5)
+
+    def test_rewinding_the_step_counter_rescales_the_next_window(self) -> None:
+        param = nn.Parameter(torch.zeros(1))
+        wrapper = _GAOptimizerWrapper(
+            optim.SGD([param], lr=0.0),
+            GradientAccumulationConfig(is_enabled=True, num_steps=2),
+            grad_scale_fn=lambda q: 1.0 / q,
+        )
+        for restart in (wrapper.set_step, lambda _: wrapper.realign_window()):
+            param.grad = torch.ones(1)
+            wrapper.scale_grads(0.5)
+            restart(wrapper._current_step)
+            param.grad = torch.ones(1)
+            wrapper.scale_grads(0.5)
+            self.assertEqual(cast(torch.Tensor, param.grad).item(), 0.5)
+
+
+def _sgd(params: dict[str, nn.Parameter]) -> KeyedOptimizerWrapper:
+    return KeyedOptimizerWrapper(params, lambda ps: optim.SGD(ps, lr=0.0))
+
+
+def _norm_clipper(inner: KeyedOptimizer) -> GradientClippingOptimizer:
+    return GradientClippingOptimizer(
+        optimizer=inner, clipping=GradientClipping.NORM, max_gradient=1e6
+    )
+
+
+_GA_MODULE = "torchrec.distributed.train_pipeline.gradient_accumulation"
+
+
+class StepGradScaleFoldTest(unittest.TestCase):
+    """Tests where the per-step gradient scale is applied."""
+
+    def setUp(self) -> None:
+        self.w1 = nn.Parameter(torch.zeros(2))
+        self.w2 = nn.Parameter(torch.zeros(3))
+
+    def _wrapper(self, optimizer: torch.optim.Optimizer) -> _GAOptimizerWrapper:
+        return _GAOptimizerWrapper(
+            optimizer, GradientAccumulationConfig(is_enabled=True, num_steps=2)
+        )
+
+    def _set_grads(self) -> None:
+        self.w1.grad = torch.tensor([2.0, 4.0])
+        self.w2.grad = torch.tensor([8.0, 16.0, 32.0])
+
+    def _assert_grads(self, factor: float) -> None:
+        torch.testing.assert_close(
+            self.w1.grad, factor * torch.tensor([2.0, 4.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            self.w2.grad, factor * torch.tensor([8.0, 16.0, 32.0]), rtol=0, atol=0
+        )
+
+    def test_norm_clippers_covering_every_gradient_take_the_scale(self) -> None:
+        """NORM clippers that cover every gradient once apply the scale in their step."""
+        combined = CombinedOptimizer(
+            [
+                ("a", _norm_clipper(_sgd({"w1": self.w1}))),
+                ("b", _norm_clipper(_sgd({"w2": self.w2}))),
+            ]
+        )
+        wrapper = self._wrapper(combined)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        self._assert_grads(1.0)
+        combined.step()
+        self._assert_grads(0.5)
+
+    def test_gradients_outside_every_clipper_are_multiplied_and_the_rest_folded(
+        self,
+    ) -> None:
+        """A gradient outside every clipper is multiplied; the clipper's take the scale once."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1}))
+        combined = CombinedOptimizer([("a", clipper), ("b", _sgd({"w2": self.w2}))])
+        wrapper = self._wrapper(combined)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        torch.testing.assert_close(
+            self.w1.grad, torch.tensor([2.0, 4.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            self.w2.grad, torch.tensor([4.0, 8.0, 16.0]), rtol=0, atol=0
+        )
+        combined.step()
+        self._assert_grads(0.5)
+
+    def test_fold_plan_is_computed_once_across_steps(self) -> None:
+        """Later steps reuse the plan instead of walking the optimizers again."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w2": self.w2}))
+        wrapper = self._wrapper(clipper)
+        with patch(f"{_GA_MODULE}._fold_targets", wraps=_fold_targets) as walk:
+            for _ in range(3):
+                self._set_grads()
+                wrapper.scale_grads(0.5)
+                clipper.step()
+                self._assert_grads(0.5)
+                wrapper.advance_step()
+        self.assertEqual(walk.call_count, 1)
+
+    def test_registering_stepped_optimizers_recomputes_the_plan(self) -> None:
+        """A plan made for the wrapped optimizer is not reused for registered ones."""
+        inner_a, inner_b = _sgd({"w1": self.w1}), _sgd({"w2": self.w2})
+        across = _norm_clipper(CombinedOptimizer([("a", inner_a), ("b", inner_b)]))
+        wrapper = self._wrapper(across)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        self._assert_grads(1.0)
+        wrapper.advance_step()
+        wrapper.set_stepped_optimizers([inner_a, inner_b])
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        self._assert_grads(0.5)
+
+    def test_adding_a_param_group_recomputes_the_plan(self) -> None:
+        """A parameter group added after the first step is scaled too."""
+        optimizer = optim.SGD([self.w1], lr=0.0)
+        wrapper = self._wrapper(optimizer)
+        self.w1.grad = torch.tensor([2.0, 4.0])
+        wrapper.scale_grads(0.5)
+        wrapper.advance_step()
+        optimizer.add_param_group({"params": [self.w2]})
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        self._assert_grads(0.5)
+
+    def test_parameter_without_a_gradient_at_plan_time_is_still_scaled(self) -> None:
+        """The plan covers every parameter, not only those with a gradient when made."""
+        w3 = nn.Parameter(torch.zeros(1))
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w3": w3}))
+        combined = CombinedOptimizer([("a", clipper), ("b", _sgd({"w2": self.w2}))])
+        wrapper = self._wrapper(combined)
+        self.w1.grad = torch.tensor([2.0, 4.0])
+        wrapper.scale_grads(0.5)
+        combined.step()
+        wrapper.advance_step()
+        self._set_grads()
+        w3.grad = torch.tensor([8.0])
+        wrapper.scale_grads(0.5)
+        combined.step()
+        self._assert_grads(0.5)
+        torch.testing.assert_close(w3.grad, torch.tensor([4.0]), rtol=0, atol=0)
+
+    def test_failed_plan_is_kept_and_every_step_multiplies(self) -> None:
+        """A plan that cannot fold is kept, and each step multiplies every gradient once."""
+        optimizer = _norm_clipper(_norm_clipper(_sgd({"w1": self.w1, "w2": self.w2})))
+        wrapper = self._wrapper(optimizer)
+        with patch(f"{_GA_MODULE}._fold_targets", wraps=_fold_targets) as walk:
+            for _ in range(2):
+                self._set_grads()
+                wrapper.scale_grads(0.5)
+                self._assert_grads(0.5)
+                optimizer.step()
+                self._assert_grads(0.5)
+                wrapper.advance_step()
+        self.assertEqual(walk.call_count, 1)
+
+    def test_nested_or_non_norm_clippers_are_multiplied_once(self) -> None:
+        """Nested clippers and non-NORM clippers make the wrapper multiply."""
+        params = {"w1": self.w1, "w2": self.w2}
+        cases = {
+            "nested": _norm_clipper(_norm_clipper(_sgd(params))),
+            "value": GradientClippingOptimizer(
+                optimizer=_sgd(params),
+                clipping=GradientClipping.VALUE,
+                max_gradient=1e6,
+            ),
+        }
+        for name, optimizer in cases.items():
+            with self.subTest(case=name):
+                wrapper = self._wrapper(optimizer)
+                self._set_grads()
+                wrapper.scale_grads(0.5)
+                self._assert_grads(0.5)
+                optimizer.step()
+                self._assert_grads(0.5)
+
+    def test_parameter_listed_by_two_optimizers_is_scaled_once(self) -> None:
+        """A parameter that two optimizers list, as semi-sync DiLoCo does, is scaled once."""
+        combined = CombinedOptimizer(
+            [("local", _sgd({"w1": self.w1})), ("global", _sgd({"w1": self.w1}))]
+        )
+        wrapper = self._wrapper(combined)
+        self.w1.grad = torch.tensor([2.0, 4.0])
+        wrapper.scale_grads(0.5)
+        torch.testing.assert_close(
+            self.w1.grad, torch.tensor([1.0, 2.0]), rtol=0, atol=0
+        )
+
+    def test_clipper_above_the_stepped_optimizers_does_not_take_the_scale(self) -> None:
+        """A clipper above the optimizers a pipeline steps directly never runs its clip."""
+        inner_a, inner_b = _sgd({"w1": self.w1}), _sgd({"w2": self.w2})
+        across = _norm_clipper(CombinedOptimizer([("a", inner_a), ("b", inner_b)]))
+        wrapper = self._wrapper(across)
+        wrapper.set_stepped_optimizers([inner_a, inner_b])
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        self._assert_grads(0.5)
+        inner_a.step()
+        inner_b.step()
+        self._assert_grads(0.5)
+
+    def test_no_registered_stepped_optimizers_multiply(self) -> None:
+        """A pipeline that registers no stepped optimizers gets the multiply."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w2": self.w2}))
+        wrapper = self._wrapper(clipper)
+        wrapper.set_stepped_optimizers([])
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        self._assert_grads(0.5)
+
+    def test_scale_is_applied_once_per_step_through_the_clippers(self) -> None:
+        """A second scale call in the same step does not scale the gradients again."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w2": self.w2}))
+        wrapper = self._wrapper(clipper)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        wrapper.scale_grads(0.5)
+        clipper.step()
+        self._assert_grads(0.5)
+
+    def test_scale_of_a_step_whose_clipper_never_ran_is_dropped(self) -> None:
+        """A step that an outer optimizer skips does not pass its scale to the next step."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w2": self.w2}))
+        wrapper = self._wrapper(clipper)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        # The clipper's step does not run, as when NanGradientSkipOptimizer skips it.
+        wrapper.advance_step()
+        wrapper.scale_grads(1.0)
+        clipper.step()
+        self._assert_grads(1.0)
+
+    def test_dropped_scale_is_not_applied_on_top_of_a_multiply(self) -> None:
+        """A dropped scale is not applied again when the next step multiplies instead."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w2": self.w2}))
+        wrapper = self._wrapper(clipper)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        wrapper.advance_step()
+        wrapper.set_stepped_optimizers([])
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        clipper.step()
+        self._assert_grads(0.5)
+
+    def test_reset_keeps_dropping_the_scale_of_a_clipper_that_never_ran(self) -> None:
+        """After reset(), a scale whose clipper never ran is still dropped."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w2": self.w2}))
+        wrapper = self._wrapper(clipper)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        wrapper.advance_step()
+        wrapper.reset()
+        self._set_grads()
+        wrapper.scale_grads(1.0)
+        clipper.step()
+        self._assert_grads(1.0)
+
+    def test_reset_then_multiply_does_not_apply_a_dropped_scale(self) -> None:
+        """After reset(), multiplying does not also apply the dropped scale."""
+        clipper = _norm_clipper(_sgd({"w1": self.w1, "w2": self.w2}))
+        wrapper = self._wrapper(clipper)
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        wrapper.advance_step()
+        wrapper.reset()
+        wrapper.set_stepped_optimizers([])
+        self._set_grads()
+        wrapper.scale_grads(0.5)
+        clipper.step()
+        self._assert_grads(0.5)
+
+
+class ShardedTensorStepGradScaleTest(unittest.TestCase):
+    def test_sharded_tensors_are_skipped_without_a_dispatch(self) -> None:
+        """ShardedTensors are skipped unread; dense gradients are still scaled once."""
+        store_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(store_dir.cleanup)
+        dist.init_process_group(
+            "gloo", init_method=f"file://{store_dir.name}/store", rank=0, world_size=1
+        )
+        self.addCleanup(dist.destroy_process_group)
+        table = sharded_tensor.empty(
+            ChunkShardingSpec(dim=0, placements=["rank:0/cpu"]), 4, 2
+        )
+        w = nn.Parameter(torch.zeros(2))
+        cases: dict[str, KeyedOptimizer] = {
+            "multiply": _sgd({"w": w}),
+            "fold": _norm_clipper(_sgd({"w": w})),
+        }
+        for name, dense in cases.items():
+            with self.subTest(case=name):
+                sparse = KeyedOptimizer({"table": table}, {}, [{"params": [table]}])
+                wrapper = _GAOptimizerWrapper(
+                    CombinedOptimizer([("dense", dense), ("sparse", sparse)]),
+                    GradientAccumulationConfig(is_enabled=True, num_steps=2),
+                )
+                w.grad = torch.tensor([2.0, 4.0])
+                with patch.object(
+                    sharded_tensor.ShardedTensor,
+                    "__torch_function__",
+                    side_effect=AssertionError("ShardedTensor was dispatched"),
+                ):
+                    wrapper.scale_grads(0.5)
+                dense.step()
+                torch.testing.assert_close(
+                    w.grad, torch.tensor([1.0, 2.0]), rtol=0, atol=0
+                )
+
+
+class DTensorStepGradScaleTest(unittest.TestCase):
+    def test_plain_and_dtensor_gradients_on_two_meshes_are_each_scaled_once(
+        self,
+    ) -> None:
+        """One step scales plain gradients and DTensor gradients on two meshes once."""
+        store_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(store_dir.cleanup)
+        dist.init_process_group(
+            "gloo", init_method=f"file://{store_dir.name}/store", rank=0, world_size=1
+        )
+        self.addCleanup(dist.destroy_process_group)
+        mesh_a = init_device_mesh("cpu", (1,), mesh_dim_names=("a",))
+        mesh_b = init_device_mesh("cpu", (1,), mesh_dim_names=("b",))
+        plain = nn.Parameter(torch.ones(2))
+        on_a = nn.Parameter(distribute_tensor(torch.ones(3), mesh_a, [Replicate()]))
+        on_b = nn.Parameter(distribute_tensor(torch.ones(4), mesh_b, [Shard(0)]))
+        plain.grad = torch.full((2,), 2.0)
+        on_a.grad = distribute_tensor(torch.full((3,), 4.0), mesh_a, [Replicate()])
+        on_b.grad = distribute_tensor(torch.full((4,), 8.0), mesh_b, [Shard(0)])
+        wrapper = _GAOptimizerWrapper(
+            optim.SGD([plain, on_a, on_b], lr=0.0),
+            GradientAccumulationConfig(is_enabled=True, num_steps=2),
+        )
+        wrapper.scale_grads(0.5)
+        wrapper.scale_grads(0.5)
+        torch.testing.assert_close(plain.grad, torch.full((2,), 1.0), rtol=0, atol=0)
+        for param, value in ((on_a, 2.0), (on_b, 4.0)):
+            grad = cast(DTensor, param.grad)
+            self.assertIsInstance(grad, DTensor)
+            torch.testing.assert_close(
+                grad.full_tensor(), torch.full(grad.shape, value), rtol=0, atol=0
+            )
 
 
 _GradSnapshot = List[Optional[Tuple[int, torch.Tensor]]]
