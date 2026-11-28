@@ -44,6 +44,7 @@ from torchrec.distributed.types import (
     KeyValueParams,
     PipelineType,
     ShardingType,
+    StorageUsageType,
 )
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
 
@@ -241,8 +242,13 @@ class EmbeddingStorageEstimator(ShardEstimator):
             weight_init_on_cpu: bool = bool(
                 sharder_data.fused_params.get("weight_init_on_cpu", False)
             )
+            # A QUANT_UVM option carries the dtype the enumerator validated, so the
+            # price follows the option even when this estimator was built without the
+            # enumerator's constraints.
             quantized_weight_dtype: Optional[DataType] = (
-                constraints.quantized_weight_dtype if constraints else None
+                sharding_option.quantized_weight_dtype
+                if sharding_option.quantized_weight_dtype is not None
+                else (constraints.quantized_weight_dtype if constraints else None)
             )
             if (
                 weight_init_on_cpu
@@ -538,6 +544,19 @@ def _calculate_shard_storages_and_cache_sizes(
         use_virtual_table=use_virtual_table,
         quantized_weight_dtype=quantized_weight_dtype,
     )
+    training_quant_uvm: bool = (
+        compute_kernel == EmbeddingComputeKernel.QUANT_UVM.value
+        and sharder_data.storage_usage_type == StorageUsageType.BASE
+    )
+    if training_quant_uvm:
+        # A training sharder's QUANT_UVM table is an inference TBE: IntNBit rows in
+        # host memory, with no optimizer or cache state.
+        hbm_specific_sizes = [0] * len(shard_sizes)
+        ddr_specific_sizes = _calculate_intnbit_weight_sizes(
+            shard_sizes=shard_sizes,
+            quantized_weight_dtype=quantized_weight_dtype,
+            compute_device=compute_device,
+        )
 
     ssd_specific_sizes: List[int] = [
         hbm_specific_size + ddr_specific_size
@@ -571,7 +590,7 @@ def _calculate_shard_storages_and_cache_sizes(
             EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
         }
         or use_virtual_table
-    ):
+    ) and not training_quant_uvm:  # its IntNBit rows are not a key-value cache
         hbm_specific_sizes = _calculate_key_value_l1_cache_sizes(
             tensor=tensor,
             num_shards=len(hbm_specific_sizes),
@@ -1080,6 +1099,46 @@ def _calculate_quantized_weight_bytes(
             f"wider than the table's weight dtype {tensor.dtype}."
         )
     return math.ceil(tensor.numel() * num_bits / 8)
+
+
+_INTNBIT_SCALE_BIAS_BYTES: int = 4  # an FP16 scale and an FP16 shift per row
+_INTNBIT_TABLE_ALIGNMENT_BYTES: int = 128  # FBGEMM's cache line
+
+
+def _calculate_intnbit_weight_sizes(
+    shard_sizes: List[List[int]],
+    quantized_weight_dtype: Optional[DataType],
+    compute_device: str,
+) -> List[int]:
+    """Bytes each shard occupies in an IntNBit inference TBE.
+
+    A row is the packed payload plus its FP16 scale and shift, padded to the TBE's row
+    alignment: 16 bytes on CUDA, 1 elsewhere, as `QuantBatchedEmbeddingBag` builds it.
+    Each shard is one table of that TBE, and its rows together are padded to a 128-byte
+    cache line, as `nbit_construct_split_state` does with its default
+    `cacheline_alignment`. This is FBGEMM's arithmetic, kept here so the planner takes
+    no FBGEMM dependency. Splitting the scale and bias out of the state dict views does
+    not change this storage.
+    """
+    # The same set as enumerators.TRAINING_QUANT_UVM_WEIGHT_DTYPES, which the enumerator
+    # validates first; importing it here would make the two modules import each other.
+    if quantized_weight_dtype not in {DataType.INT8, DataType.INT4}:
+        raise ValueError(
+            "[TorchRec Planner] A training sharder's quant_uvm table needs "
+            f"quantized_weight_dtype INT8 or INT4, got {quantized_weight_dtype}."
+        )
+    num_bits = DATA_TYPE_NUM_BITS[quantized_weight_dtype]
+    row_alignment = 16 if compute_device == "cuda" else 1
+    sizes: List[int] = []
+    for rows, cols in shard_sizes:
+        unpadded = cols * num_bits // 8 + _INTNBIT_SCALE_BIAS_BYTES
+        row_bytes = -(-unpadded // row_alignment) * row_alignment
+        table_bytes = rows * row_bytes
+        sizes.append(
+            -(-table_bytes // _INTNBIT_TABLE_ALIGNMENT_BYTES)
+            * _INTNBIT_TABLE_ALIGNMENT_BYTES
+        )
+    return sizes
 
 
 def _maybe_charge_weights_to_ddr(
