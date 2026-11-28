@@ -23,6 +23,7 @@ from torch.autograd.profiler import record_function
 from torchrec.distributed.types import Awaitable, NoWait, QuantizedCommCodecs
 from torchrec.distributed.utils import none_throws
 from torchrec.pt2.checks import is_torchdynamo_compiling
+from torchrec.streamable import Multistreamable
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
@@ -228,7 +229,7 @@ class Comm(ABC):
         ...
 
 
-class Request(Awaitable[W]):
+class Request(Awaitable[W], Multistreamable):
     """
     Defines a collective operation request for a process group on a tensor.
 
@@ -261,6 +262,11 @@ class Request(Awaitable[W]):
                 device=device,
             )
         )
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        tensor = self.tensor
+        if isinstance(tensor, torch.Tensor) and tensor.device.type in ("cuda", "mtia"):
+            tensor.record_stream(stream)
 
     def _wait_impl(self) -> W:
         """

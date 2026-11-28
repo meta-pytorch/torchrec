@@ -432,7 +432,7 @@ def construct_output_kt(
 
 
 class VariableBatchEmbeddingBagCollectionAwaitable(
-    LazyGetItemMixin[str, torch.Tensor], LazyAwaitable[KeyedTensor]
+    LazyGetItemMixin[str, torch.Tensor], LazyAwaitable[KeyedTensor], Multistreamable
 ):
     def __init__(
         self,
@@ -460,6 +460,28 @@ class VariableBatchEmbeddingBagCollectionAwaitable(
         self._module_fqn = module_fqn
         self._sharding_types = sharding_types
         self._resize_awaitables = resize_awaitables
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        if self._result is not None:
+            values = self._result.values()
+            if values.device.type in ("cuda", "mtia"):
+                values.record_stream(stream)
+            return
+        for awaitable in self._awaitables:
+            if isinstance(awaitable, Multistreamable):
+                awaitable.record_stream(stream)
+        for tensor in (
+            self._inverse_indices[1],
+            self._inverse_indices_permute_indices,
+        ):
+            if tensor is not None and tensor.device.type in ("cuda", "mtia"):
+                tensor.record_stream(stream)
+
+    def wait(self) -> KeyedTensor:
+        """Register callbacks before waiting; later lazy access uses the cached result."""
+        result = super().wait()
+        self._result = result
+        return result
 
     def _wait_impl(self) -> KeyedTensor:
         embeddings = []
@@ -498,7 +520,7 @@ class VariableBatchEmbeddingBagCollectionAwaitable(
 
 
 class EmbeddingBagCollectionAwaitable(
-    LazyGetItemMixin[str, Tensor], LazyAwaitable[KeyedTensor]
+    LazyGetItemMixin[str, Tensor], LazyAwaitable[KeyedTensor], Multistreamable
 ):
     def __init__(
         self,
@@ -516,6 +538,22 @@ class EmbeddingBagCollectionAwaitable(
         self._module_fqn = module_fqn
         self._sharding_types = sharding_types
         self._resize_awaitables = resize_awaitables
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        if self._result is not None:
+            values = self._result.values()
+            if values.device.type in ("cuda", "mtia"):
+                values.record_stream(stream)
+            return
+        for awaitable in self._awaitables:
+            if isinstance(awaitable, Multistreamable):
+                awaitable.record_stream(stream)
+
+    def wait(self) -> KeyedTensor:
+        """Register callbacks before waiting; later lazy access uses the cached result."""
+        result = super().wait()
+        self._result = result
+        return result
 
     def _wait_impl(self) -> KeyedTensor:
         embeddings = []

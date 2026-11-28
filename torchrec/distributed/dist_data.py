@@ -49,6 +49,7 @@ from torchrec.distributed.types import (
 from torchrec.fx.utils import fx_marker
 from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from torchrec.streamable import Multistreamable
 
 # _safe_tolist and _cuda_to_cpu_safe were added in D101235037 / D101269943.
 # Older torch package exports freeze jagged_tensor.py from before those diffs,
@@ -1556,7 +1557,7 @@ class KJTOneToAll(nn.Module):
         return ret
 
 
-class PooledEmbeddingsAwaitable(Awaitable[torch.Tensor]):
+class PooledEmbeddingsAwaitable(Awaitable[torch.Tensor], Multistreamable):
     """
     Awaitable for pooled embeddings after collective operation.
 
@@ -1571,6 +1572,10 @@ class PooledEmbeddingsAwaitable(Awaitable[torch.Tensor]):
     ) -> None:
         super().__init__()
         self._tensor_awaitable = tensor_awaitable
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        if isinstance(self._tensor_awaitable, Multistreamable):
+            self._tensor_awaitable.record_stream(stream)
 
     def _wait_impl(self) -> torch.Tensor:
         """
