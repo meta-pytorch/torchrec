@@ -12,6 +12,13 @@ from unittest.mock import MagicMock, patch
 
 import torch
 import torchrec.distributed.quant_embedding_kernel as qek
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed._shard.sharded_tensor.metadata import ShardedTensorMetadata
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.distributed.fused_params import (
     FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER,
     fused_param_enable_fs_2d_async_allgather,
@@ -19,8 +26,18 @@ from torchrec.distributed.fused_params import (
     is_fused_param_device_ro,
     tbe_fused_params,
 )
-from torchrec.modules.embedding_configs import DataType
+from torchrec.modules.embedding_configs import DataType, PoolingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+try:
+    from fbgemm_gpu.tbe.cache.kv_zch_gpu_bucket_wise_embedding import (
+        KVZCHGPUBucketWiseEmbeddingInference,
+    )
+
+    HAS_KV_ZCH_GPU_BUCKET_WISE = True
+except ImportError:
+    # Released fbgemm_gpu builds may predate this TBE.
+    HAS_KV_ZCH_GPU_BUCKET_WISE = False
 
 
 class QuantizeWeightTest(unittest.TestCase):
@@ -42,6 +59,8 @@ class QuantBatchedEmbeddingBagDeviceRoTest(unittest.TestCase):
         bag._runtime_device = torch.device("cuda")
         bag.lengths_to_tbe = lengths_to_tbe
         bag._is_device_ro = is_device_ro
+        bag._is_virtual_table = False
+        bag._is_kv_zch_gpu_bucket_wise = False
         return bag
 
     def test_forward_uses_ro_unwrap_for_cuda_devicero(self) -> None:
@@ -148,3 +167,111 @@ class QuantBatchedEmbeddingBagDeviceRoTest(unittest.TestCase):
         self.assertIsNotNone(filtered_params)
         self.assertNotIn(FUSED_PARAM_ENABLE_FS_2D_ASYNC_ALLGATHER, filtered_params)
         self.assertIn("output_dtype", filtered_params)
+
+
+class KVZCHVirtualTableUnwrapTest(unittest.TestCase):
+    """KV-ZCH virtual table ids span int64 and must reach the KV TBE unchanged."""
+
+    def _kjt(self) -> KeyedJaggedTensor:
+        return KeyedJaggedTensor(
+            keys=["cu"],
+            values=torch.tensor([5, 2**33 + 7, 562949951477760 + 3], dtype=torch.int64),
+            lengths=torch.tensor([1, 2], dtype=torch.int64),
+        )
+
+    def test_only_the_kv_unwrap_keeps_int64_ids(self) -> None:
+        kjt = self._kjt()
+        indices, offsets, _ = qek._unwrap_kv_kjt(kjt)
+        self.assertEqual(indices.dtype, torch.int64)
+        self.assertEqual(offsets.dtype, torch.int64)
+        self.assertTrue(torch.equal(indices, kjt.values()))
+        indices, offsets, _ = qek._unwrap_kjt(kjt)
+        self.assertEqual(indices.dtype, torch.int32)
+        self.assertEqual(offsets.dtype, torch.int32)
+
+    def test_cuda_sequence_forward_passes_virtual_table_ids_unchanged(self) -> None:
+        emb = qek.QuantBatchedEmbedding.__new__(qek.QuantBatchedEmbedding)
+        emb._runtime_device = torch.device("cuda")
+        emb._is_virtual_table = True
+        emb._is_kv_zch_gpu_bucket_wise = True
+        emb._emb_module_registered = True
+        tbe = MagicMock(return_value=torch.tensor([1.0]))
+        emb._emb_module = tbe
+        kjt = self._kjt()
+
+        emb.forward(kjt)
+
+        sent = tbe.call_args.kwargs["indices"]
+        self.assertEqual(sent.dtype, torch.int64)
+        self.assertTrue(torch.equal(sent, kjt.values()))
+
+    def test_undeclared_cuda_virtual_table_keeps_trunk_unwrap(self) -> None:
+        emb = qek.QuantBatchedEmbedding.__new__(qek.QuantBatchedEmbedding)
+        emb._runtime_device = torch.device("cuda")
+        emb._is_virtual_table = True
+        emb._is_kv_zch_gpu_bucket_wise = False
+        emb._emb_module_registered = True
+        tbe = MagicMock(return_value=torch.tensor([1.0]))
+        emb._emb_module = tbe
+        emb.forward(self._kjt())
+        self.assertEqual(tbe.call_args.kwargs["indices"].dtype, torch.int32)
+
+    def test_declared_cpu_virtual_table_uses_the_kv_unwrap(self) -> None:
+        emb = qek.QuantBatchedEmbedding.__new__(qek.QuantBatchedEmbedding)
+        emb._runtime_device = torch.device("cpu")
+        emb._is_virtual_table = True
+        emb._is_kv_zch_gpu_bucket_wise = True
+        emb._emb_module_registered = True
+        tbe = MagicMock(return_value=torch.tensor([1.0]))
+        emb._emb_module = tbe
+        kjt = self._kjt()
+        emb.forward(kjt)
+        self.assertTrue(torch.equal(tbe.call_args.kwargs["indices"], kjt.values()))
+
+    @unittest.skipIf(
+        not HAS_KV_ZCH_GPU_BUCKET_WISE,
+        "fbgemm_gpu has no KVZCHGPUBucketWiseEmbeddingInference",
+    )
+    def test_tbe_class_selection_uses_the_table_declaration(self) -> None:
+        def config(declared: bool, virtual: bool = True) -> GroupedEmbeddingConfig:
+            shard = ShardMetadata(
+                shard_offsets=[0, 0], shard_sizes=[16, 8], placement="rank:0/cpu"
+            )
+            table = ShardedEmbeddingTable(
+                num_embeddings=16,
+                embedding_dim=8,
+                name="cu",
+                feature_names=["cu"],
+                data_type=DataType.INT8,
+                pooling=PoolingType.NONE,
+                compute_kernel=EmbeddingComputeKernel.QUANT,
+                local_rows=16,
+                local_cols=8,
+                local_metadata=shard,
+                global_metadata=ShardedTensorMetadata([shard], torch.Size([16, 8])),
+                use_virtual_table=virtual,
+                kv_zch_gpu_bucket_wise=declared,
+            )
+            return GroupedEmbeddingConfig(
+                data_type=DataType.INT8,
+                pooling=PoolingType.NONE,
+                is_weighted=False,
+                has_feature_processor=False,
+                compute_kernel=EmbeddingComputeKernel.QUANT,
+                embedding_tables=[table],
+            )
+
+        ordinary = qek.QuantBatchedEmbedding(
+            config(False), device=torch.device("cpu"), shard_index=0
+        )
+        declared = qek.QuantBatchedEmbedding(
+            config(True), device=torch.device("cpu"), shard_index=0
+        )
+        self.assertIs(type(ordinary.emb_module), qek.KVEmbeddingInference)
+        self.assertIs(type(declared.emb_module), KVZCHGPUBucketWiseEmbeddingInference)
+        with self.assertRaisesRegex(
+            ValueError, "must be declared on every virtual table"
+        ):
+            qek.QuantBatchedEmbedding(
+                config(True, virtual=False), device=torch.device("cpu"), shard_index=0
+            )

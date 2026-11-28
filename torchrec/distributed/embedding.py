@@ -293,6 +293,7 @@ def create_sharding_infos_by_sharding_device_group(
                         ),
                         enable_embedding_update=config.enable_embedding_update,
                         grouped_int4_group_size=config.grouped_int4_group_size,
+                        kv_zch_gpu_bucket_wise=config.kv_zch_gpu_bucket_wise,
                     ),
                     param_sharding=parameter_sharding,
                     param=param,
@@ -786,6 +787,7 @@ class ShardedEmbeddingCollection(
                                 table_name, config
                             ),
                             grouped_int4_group_size=config.grouped_int4_group_size,
+                            kv_zch_gpu_bucket_wise=config.kv_zch_gpu_bucket_wise,
                         ),
                         param_sharding=parameter_sharding,
                         param=param,

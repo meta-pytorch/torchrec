@@ -428,6 +428,7 @@ class BaseEmbeddingConfig:
     stash_weights: bool = False
     # Keyword-only so that subclass fields keep their positional slots.
     grouped_int4_group_size: int = field(default=0, kw_only=True)
+    kv_zch_gpu_bucket_wise: bool = field(default=False, kw_only=True, repr=False)
 
     def get_weight_init_max(self) -> float:
         if self.weight_init_max is None:

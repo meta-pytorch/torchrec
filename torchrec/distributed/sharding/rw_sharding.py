@@ -266,6 +266,7 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                         enable_embedding_update=info.embedding_config.enable_embedding_update,
                         stash_weights=info.embedding_config.stash_weights,
                         grouped_int4_group_size=info.embedding_config.grouped_int4_group_size,
+                        kv_zch_gpu_bucket_wise=info.embedding_config.kv_zch_gpu_bucket_wise,
                     )
                 )
         return tables_per_rank
