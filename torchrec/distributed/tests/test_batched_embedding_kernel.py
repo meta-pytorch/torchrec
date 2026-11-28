@@ -9,7 +9,7 @@
 
 import types
 import unittest
-from typing import Any, cast, List, Tuple
+from typing import Any, cast, Dict, List, Tuple
 from unittest.mock import patch
 
 import torch
@@ -20,7 +20,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     EmbeddingLocation,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.tbe.ssd.ssd_config import KVZCHTBEConfig
+from fbgemm_gpu.tbe.ssd.ssd_config import BackendType, KVZCHTBEConfig
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata
 from torch.distributed._shard.sharded_tensor.metadata import TensorProperties
@@ -29,6 +29,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     _gen_named_parameters_by_table_dense,
     _gen_named_parameters_by_table_fused,
     _get_grid_shard_cw_count,
+    _populate_zero_collision_tbe_params,
     _resolve_eviction_check_interval_batch,
     BatchedTPUEmbeddingBag,
     EmbeddingFusedOptimizer,
@@ -44,7 +45,11 @@ from torchrec.experimental.torch_tpu.modules.embedding_modules import (
     PallasTableBatchedEmbeddingBags,
     PooledLookupKernel,
 )
-from torchrec.modules.embedding_configs import DataType, PoolingType
+from torchrec.modules.embedding_configs import (
+    DataType,
+    PoolingType,
+    TimestampBasedEvictionPolicy,
+)
 
 
 def _grid_shards(
@@ -486,3 +491,71 @@ class EvictionCoordinationKwargsTest(unittest.TestCase):
             _eviction_coordination_kwargs(old_config, ("eviction_trigger_mode",)),
             {"eviction_free_mem_check_interval_batch": 1000},
         )
+
+
+class ZeroCollisionTbeParamsTest(unittest.TestCase):
+    """KVZCHTBEConfig fields reach the KVZCHParams of a virtual table's TBE."""
+
+    @staticmethod
+    def _kv_zch_params(
+        kvzch_tbe_config: KVZCHTBEConfig, embedding_cache_mode: bool = True
+    ) -> Any:
+        compute_kernel = EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE
+        table = ShardedEmbeddingTable(
+            name="table_0",
+            data_type=DataType.FP16,
+            pooling=PoolingType.NONE,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=compute_kernel,
+            embedding_dim=16,
+            local_cols=16,
+            num_embeddings=100,
+            feature_names=["feature_0"],
+            use_virtual_table=True,
+            virtual_table_eviction_policy=TimestampBasedEvictionPolicy(
+                eviction_ttl_mins=60
+            ),
+        )
+        config = GroupedEmbeddingConfig(
+            data_type=DataType.FP16,
+            pooling=PoolingType.NONE,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=compute_kernel,
+            embedding_tables=[table],
+        )
+        tbe_params: Dict[str, Any] = {
+            "kvzch_tbe_config": kvzch_tbe_config,
+            "l2_cache_size": 1,
+        }
+        _populate_zero_collision_tbe_params(
+            tbe_params,
+            [(0, 100, 100)],
+            config,
+            BackendType.DRAM,
+            embedding_cache_mode=embedding_cache_mode,
+        )
+        return tbe_params["kv_zch_params"]
+
+    @unittest.skipIf(
+        "row_storage_policy" not in KVZCHTBEConfig._fields,
+        "fbgemm_gpu predates KVZCHTBEConfig.row_storage_policy",
+    )
+    def test_row_storage_policy_is_passed(self) -> None:
+        from fbgemm_gpu.tbe.ssd.ssd_config import RowStoragePolicy
+
+        policy = RowStoragePolicy(dim=16, serving_qdq_bit_rate=4)
+        params = self._kv_zch_params(KVZCHTBEConfig(row_storage_policy=policy))
+        self.assertIs(params.row_storage_policy, policy)
+        # The TBE of a table that is not in cache mode, which shares the config,
+        # takes none: fbgemm rejects a row storage policy there.
+        params = self._kv_zch_params(
+            KVZCHTBEConfig(row_storage_policy=policy), embedding_cache_mode=False
+        )
+        self.assertIsNone(params.row_storage_policy)
+        params.validate()
+
+    def test_without_a_row_storage_policy_passes_none(self) -> None:
+        params = self._kv_zch_params(KVZCHTBEConfig())
+        self.assertIsNone(getattr(params, "row_storage_policy", None))

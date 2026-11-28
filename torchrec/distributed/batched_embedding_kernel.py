@@ -1134,6 +1134,19 @@ def _populate_zero_collision_tbe_params(
         load_ckpt_without_opt = True
 
     enrichment_policy = kvzch_tbe_config.enrichment_policy if kvzch_tbe_config else None
+    # For the cache-mode TBEs only, the ones fbgemm takes it for, though every
+    # virtual table's TBE gets the config; and only when set, as older fbgemm_gpu
+    # configs predate the field.
+    row_storage_policy = (
+        getattr(kvzch_tbe_config, "row_storage_policy", None)
+        if embedding_cache_mode_
+        else None
+    )
+    row_storage_kwargs: Dict[str, Any] = (
+        {"row_storage_policy": row_storage_policy}
+        if row_storage_policy is not None
+        else {}
+    )
 
     tbe_params["kv_zch_params"] = KVZCHParams(
         bucket_offsets=bucket_offsets,
@@ -1142,7 +1155,6 @@ def _populate_zero_collision_tbe_params(
         backend_return_whole_row=(
             backend_type in (BackendType.DRAM, BackendType.DRAM_SSD)
         ),
-        # pyrefly: ignore[bad-argument-type]
         eviction_policy=eviction_policy,
         embedding_cache_mode=embedding_cache_mode_,
         load_ckpt_without_opt=load_ckpt_without_opt,
@@ -1150,6 +1162,7 @@ def _populate_zero_collision_tbe_params(
         optimizer_state_dtypes_for_st=optimizer_state_dtypes_for_st,
         enrichment_policy=enrichment_policy,
         feature_score_collection_enabled=fs_eviction_enabled,
+        **row_storage_kwargs,
     )
 
 
@@ -1373,7 +1386,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                     state[weight][f"{table_config.name}.{cur_state_key}"] = (
                         self.get_sharded_optim_state(
                             cur_state_idx + 1,
-                            # pyrefly: ignore [bad-argument-type]
                             cur_state_key,
                             shard_params,
                             table_config,
@@ -2016,7 +2028,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         table_config.local_rows == optimizer_state_value.size(0)
                         or optimizer_state_value.nelement() == 1  # single value state
                     )
-                # pyrefly: ignore
                 optimizer_states_keys_by_table[table_config.name] = list(
                     optimizer_states.keys()
                 )
@@ -2218,7 +2229,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         cur_state_key = optimizer_state_keys[cur_state_idx]
 
                     state[weight][f"{table_config.name}.{cur_state_key}"] = (
-                        # pyrefly: ignore [bad-argument-type]
                         get_sharded_optim_state(cur_state_idx + 1, cur_state_key)
                     )
 
@@ -2432,7 +2442,7 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ]:
-                # pyrefly: ignore [missing-attribute, no-matching-overload]
+                # pyrefly: ignore [missing-attribute]
                 tmp_param = torch.zeros(param.shape, device=param.device)
                 tmp_param.uniform_(weight_init_min, weight_init_max).to(
                     # pyrefly: ignore [missing-attribute]
@@ -2805,7 +2815,6 @@ class ZeroCollisionKeyValueEmbedding(
             feature_table_map=self._feature_table_map,
             ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
             pooling_mode=SSDPoolingMode.NONE,
-            # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
             device=device,
@@ -3481,7 +3490,6 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
         self.init_parameters()
 
     @property
-    # pyrefly: ignore [bad-override]
     def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
         return dict(
             _gen_named_parameters_by_table_fused(
@@ -3900,7 +3908,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ]:
-                # pyrefly: ignore [missing-attribute, no-matching-overload]
+                # pyrefly: ignore [missing-attribute]
                 tmp_param = torch.zeros(param.shape, device=param.device)
                 tmp_param.uniform_(weight_init_min, weight_init_max).to(
                     # pyrefly: ignore [missing-attribute]
@@ -4275,7 +4283,6 @@ class ZeroCollisionKeyValueEmbeddingBag(
             feature_table_map=self._feature_table_map,
             ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
             pooling_mode=SSDPoolingMode(self._pooling.value),
-            # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
             device=device,
@@ -4703,7 +4710,6 @@ class BatchedFusedEmbeddingBag(
         self.init_parameters()
 
     @property
-    # pyrefly: ignore [bad-override]
     def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
         return dict(
             _gen_named_parameters_by_table_fused(
@@ -4911,7 +4917,6 @@ class TritonBatchedFusedEmbeddingBag(
         self.init_parameters()
 
     @property
-    # pyrefly: ignore [bad-override]
     def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
         # For Triton TBE, combine multiple shards of the same table (e.g. CW)
         # into a single TableBatchedEmbeddingSlice to match fused TBE behavior.
