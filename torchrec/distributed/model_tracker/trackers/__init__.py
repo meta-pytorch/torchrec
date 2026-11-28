@@ -8,6 +8,6 @@
 
 """MPZCH Raw ID Tracker"""
 
-from torchrec.distributed.model_tracker.trackers.raw_id_tracker import (  # noqa
-    RawIdTracker,
+from torchrec.distributed.model_tracker.trackers.raw_id_tracker import (
+    RawIdTracker as RawIdTracker,
 )

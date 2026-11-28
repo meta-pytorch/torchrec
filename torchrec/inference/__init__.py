@@ -7,4 +7,4 @@
 
 # pyre-strict
 
-from . import model_packager, modules  # noqa  # noqa
+from . import model_packager as model_packager, modules as modules

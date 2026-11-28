@@ -32,4 +32,4 @@ of pooled embeddings of different dimensions. Please refer to KeyedTensor docstr
 example and further information.
 """
 
-from . import jagged_tensor  # noqa
+from . import jagged_tensor as jagged_tensor

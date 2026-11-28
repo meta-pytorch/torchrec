@@ -7,4 +7,4 @@
 
 # pyre-strict
 
-from . import experimental  # noqa
+from . import experimental as experimental

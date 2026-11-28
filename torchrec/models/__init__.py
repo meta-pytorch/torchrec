@@ -26,4 +26,4 @@ The following notation is used throughout the documentation for the models:
 * num_features: number of dense features
 """
 
-from torchrec.models import deepfm, dlrm  # noqa
+from torchrec.models import deepfm as deepfm, dlrm as dlrm

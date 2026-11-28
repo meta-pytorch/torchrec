@@ -33,27 +33,32 @@ These include:
 
 """
 
-from torchrec.distributed.comm import get_local_rank, get_local_size  # noqa
-from torchrec.distributed.model_parallel import DistributedModelParallel  # noqa
-from torchrec.distributed.train_pipeline import (  # noqa
-    DataLoadingThread,
-    EvalPipelineSparseDist,
-    PrefetchTrainPipelineSparseDist,
-    TrainPipeline,
-    TrainPipelineBase,
-    TrainPipelineSparseDist,
+from torchrec.distributed.comm import (
+    get_local_rank as get_local_rank,
+    get_local_size as get_local_size,
 )
-from torchrec.distributed.types import (  # noqa
-    Awaitable,
-    ModuleSharder,
-    NoWait,
-    ParameterSharding,
-    ShardedModule,
-    ShardedTensor,
-    ShardingEnv,
-    ShardingPlanner,
+from torchrec.distributed.model_parallel import (
+    DistributedModelParallel as DistributedModelParallel,
 )
-from torchrec.distributed.utils import (  # noqa
-    get_unsharded_module_names,
-    sharded_model_copy,
+from torchrec.distributed.train_pipeline import (
+    DataLoadingThread as DataLoadingThread,
+    EvalPipelineSparseDist as EvalPipelineSparseDist,
+    PrefetchTrainPipelineSparseDist as PrefetchTrainPipelineSparseDist,
+    TrainPipeline as TrainPipeline,
+    TrainPipelineBase as TrainPipelineBase,
+    TrainPipelineSparseDist as TrainPipelineSparseDist,
+)
+from torchrec.distributed.types import (
+    Awaitable as Awaitable,
+    ModuleSharder as ModuleSharder,
+    NoWait as NoWait,
+    ParameterSharding as ParameterSharding,
+    ShardedModule as ShardedModule,
+    ShardedTensor as ShardedTensor,
+    ShardingEnv as ShardingEnv,
+    ShardingPlanner as ShardingPlanner,
+)
+from torchrec.distributed.utils import (
+    get_unsharded_module_names as get_unsharded_module_names,
+    sharded_model_copy as sharded_model_copy,
 )

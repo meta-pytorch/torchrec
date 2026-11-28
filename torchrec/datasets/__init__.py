@@ -26,7 +26,9 @@ Example::
     batch = next(iter(datapipe))
 """
 
-import torchrec.datasets.criteo  # noqa
-import torchrec.datasets.movielens  # noqa
-import torchrec.datasets.random  # noqa
-import torchrec.datasets.utils  # noqa
+from torchrec.datasets import (
+    criteo as criteo,
+    movielens as movielens,
+    random as random,
+    utils as utils,
+)
