@@ -397,6 +397,9 @@ def create_sharding_infos_by_sharding_device_group(
                     grouped_int4_group_size=getattr(
                         config, "grouped_int4_group_size", 0
                     ),
+                    kv_zch_gpu_bucket_wise=getattr(
+                        config, "kv_zch_gpu_bucket_wise", False
+                    ),
                 ),
                 param_sharding=parameter_sharding,
                 param=param,
@@ -1062,6 +1065,9 @@ class ShardedEmbeddingBagCollection(
                     ),
                     grouped_int4_group_size=getattr(
                         config, "grouped_int4_group_size", 0
+                    ),
+                    kv_zch_gpu_bucket_wise=getattr(
+                        config, "kv_zch_gpu_bucket_wise", False
                     ),
                 ),
                 param_sharding=parameter_sharding,

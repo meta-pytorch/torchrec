@@ -309,6 +309,8 @@ class QuantBatchedEmbeddingBag(
             if table.use_virtual_table:
                 is_virtual_table = True
         self._config: GroupedEmbeddingConfig = config
+        self._is_virtual_table: bool = is_virtual_table
+        self._is_kv_zch_gpu_bucket_wise: bool = _is_kv_zch_gpu_bucket_wise(config)
         self._emb_module_registered: bool = is_fused_param_register_tbe(fused_params)
         self._is_weighted: Optional[bool] = config.is_weighted
         self._quant_state_dict_split_scale_bias: bool = (
@@ -353,8 +355,12 @@ class QuantBatchedEmbeddingBag(
                 f"virtual tables, got pooled tables {config.table_names()}"
             )
 
+        if self._is_kv_zch_gpu_bucket_wise and self.lengths_to_tbe:
+            raise ValueError("KV_ZCH_GPU_BUCKET_WISE requires offsets-based lookup")
         if self.lengths_to_tbe:
             tbe_clazz = IntNBitTableBatchedEmbeddingBagsCodegenWithLength
+        elif self._is_kv_zch_gpu_bucket_wise:
+            tbe_clazz = _kv_zch_gpu_bucket_wise_tbe_class()
         elif is_virtual_table:
             tbe_clazz = KVEmbeddingInference
         else:
@@ -372,7 +378,7 @@ class QuantBatchedEmbeddingBag(
 
         # Determine embedding cache mode for KV embedding tables
         embedding_cache_mode = False  # Default: False = randomized initialization
-        if tbe_clazz == KVEmbeddingInference:
+        if issubclass(tbe_clazz, KVEmbeddingInference):
             # For KV embedding tables, set cache mode based on embedding table configuration
             # Check if any table has NoEvictionPolicy - use zero init for those
             for table in config.embedding_tables:
@@ -401,7 +407,7 @@ class QuantBatchedEmbeddingBag(
         }
 
         # Add KV-specific parameters
-        if tbe_clazz == KVEmbeddingInference:
+        if issubclass(tbe_clazz, KVEmbeddingInference):
             module_kwargs["embedding_cache_mode"] = embedding_cache_mode
 
         # Add fused params
@@ -413,8 +419,8 @@ class QuantBatchedEmbeddingBag(
         if device is not None:
             self._emb_module.initialize_weights()
         if shard_offsets_for_kv_zch is not None:
-            assert (
-                tbe_clazz == KVEmbeddingInference
+            assert issubclass(
+                tbe_clazz, KVEmbeddingInference
             ), "shard_offsets_for_kv_zch should be computed only for kv zch kernel"
             # pyrefly: ignore[not-callable]
             self._emb_module.init_tbe_config(shard_offsets_for_kv_zch)
@@ -468,7 +474,9 @@ class QuantBatchedEmbeddingBag(
     ) -> torch.Tensor:
         # Important: _unwrap_kjt regex for FX tracing TAGing
         lengths, offsets = None, None
-        if self._runtime_device.type == "cpu":
+        if self._is_kv_zch_gpu_bucket_wise:
+            indices, offsets, per_sample_weights = _unwrap_kv_kjt(features)
+        elif self._runtime_device.type == "cpu":
             if self.lengths_to_tbe:
                 indices, lengths, per_sample_weights = _unwrap_kjt_lengths(features)
             else:
@@ -484,7 +492,10 @@ class QuantBatchedEmbeddingBag(
             if self.lengths_to_tbe:
                 indices, lengths, per_sample_weights = _unwrap_kjt_lengths(features)
             else:
-                unwrap_kjt = _unwrap_ro_kjt if self._is_device_ro else _unwrap_kjt
+                if self._is_device_ro:
+                    unwrap_kjt = _unwrap_ro_kjt
+                else:
+                    unwrap_kjt = _unwrap_kjt
                 indices, offsets, per_sample_weights = unwrap_kjt(features)
 
         return self._emb_module_forward(
@@ -592,6 +603,8 @@ class QuantBatchedEmbedding(
             if table.enable_embedding_update:
                 embedding_cache_mode = True
         self._config: GroupedEmbeddingConfig = config
+        self._is_virtual_table: bool = is_virtual_table
+        self._is_kv_zch_gpu_bucket_wise: bool = _is_kv_zch_gpu_bucket_wise(config)
         self._emb_module_registered: bool = is_fused_param_register_tbe(fused_params)
         self._quant_state_dict_split_scale_bias: bool = (
             is_fused_param_quant_state_dict_split_scale_bias(fused_params)
@@ -602,9 +615,13 @@ class QuantBatchedEmbedding(
         # 16 for CUDA, 1 for others like CPU and MTIA.
         self._tbe_row_alignment: int = 16 if self._runtime_device.type == "cuda" else 1
         embedding_clazz = (
-            KVEmbeddingInference
-            if is_virtual_table
-            else IntNBitTableBatchedEmbeddingBagsCodegen
+            _kv_zch_gpu_bucket_wise_tbe_class()
+            if self._is_kv_zch_gpu_bucket_wise
+            else (
+                KVEmbeddingInference
+                if is_virtual_table
+                else IntNBitTableBatchedEmbeddingBagsCodegen
+            )
         )
         if is_virtual_table:
             assert (
@@ -649,7 +666,7 @@ class QuantBatchedEmbedding(
 
         grouped_int4_group_size = _get_grouped_int4_group_size(config)
         # Add KV-specific parameters
-        if embedding_clazz == KVEmbeddingInference:
+        if issubclass(embedding_clazz, KVEmbeddingInference):
             module_kwargs["embedding_cache_mode"] = embedding_cache_mode
             # Per table, so never through fused_params, which reach every TBE class.
             if grouped_int4_group_size:
@@ -673,8 +690,8 @@ class QuantBatchedEmbedding(
         if device is not None:
             self._emb_module.initialize_weights()
         if shard_offsets_for_kv_zch is not None:
-            assert (
-                embedding_clazz == KVEmbeddingInference
+            assert issubclass(
+                embedding_clazz, KVEmbeddingInference
             ), "shard_offsets_for_kv_zch should be computed only for kv zch kernel"
             # pyrefly: ignore[not-callable]
             self._emb_module.init_tbe_config(shard_offsets_for_kv_zch)
@@ -703,7 +720,9 @@ class QuantBatchedEmbedding(
         ]
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
-        if self._runtime_device.type == "cpu":
+        if self._is_kv_zch_gpu_bucket_wise:
+            values, offsets, _ = _unwrap_kv_kjt(features)
+        elif self._runtime_device.type == "cpu":
             # To distinguish fx tracing on CPU embedding.
             values, offsets, _ = _unwrap_kjt_for_cpu(
                 features, weighted=self._config.is_weighted
@@ -772,3 +791,37 @@ class QuantBatchedEmbedding(
         ret.emb_module.assign_embedding_weights(quant_weight_list)
 
         return ret
+
+
+def _is_kv_zch_gpu_bucket_wise(config: GroupedEmbeddingConfig) -> bool:
+    declarations = [table.kv_zch_gpu_bucket_wise for table in config.embedding_tables]
+    if any(declarations) and (
+        not all(declarations)
+        or not all(table.use_virtual_table for table in config.embedding_tables)
+    ):
+        raise ValueError(
+            "KV_ZCH_GPU_BUCKET_WISE must be declared on every virtual table in a TBE"
+        )
+    return any(declarations)
+
+
+# KV-ZCH virtual table ids span int64, so unlike _unwrap_kjt this keeps the
+# dtype. A distinct FX target, so models without virtual tables trace as before.
+@torch.fx.wrap
+def _unwrap_kv_kjt(
+    features: KeyedJaggedTensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    indices = features.values()
+    return (
+        indices,
+        features.offsets().type(indices.dtype),
+        features.weights_or_none(),
+    )
+
+
+def _kv_zch_gpu_bucket_wise_tbe_class() -> type[KVEmbeddingInference]:
+    from fbgemm_gpu.tbe.cache.kv_zch_gpu_bucket_wise_embedding import (  # @manual=//deeplearning/fbgemm/fbgemm_gpu:kv_zch_gpu_bucket_wise_embedding  # noqa: B950
+        KVZCHGPUBucketWiseEmbeddingInference,
+    )
+
+    return KVZCHGPUBucketWiseEmbeddingInference
