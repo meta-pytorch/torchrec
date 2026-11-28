@@ -6,10 +6,22 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import inspect
 import logging
 from abc import ABC
 from collections import OrderedDict
-from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.distributed as dist
@@ -75,6 +87,11 @@ from torchrec.distributed.embedding_types import (
     InputDistOutputs,
 )
 from torchrec.distributed.fused_params import (
+    FUSED_PARAM_BOUNDS_CHECK_MODE,
+    FUSED_PARAM_IS_DEVICE_RO,
+    FUSED_PARAM_LENGTHS_TO_OFFSETS_LOOKUP,
+    FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS,
+    FUSED_PARAM_REGISTER_TBE_BOOL,
     get_tbes_to_register_from_iterable,
     TBEToRegisterMixIn,
 )
@@ -94,10 +111,220 @@ from torchrec.distributed.types import (
     ShardingStrategy,
     ShardingType,
 )
-from torchrec.modules.embedding_configs import FeatureScoreBasedEvictionPolicy
+from torchrec.modules.embedding_configs import DataType, FeatureScoreBasedEvictionPolicy
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Torchrec fused params QuantBatchedEmbeddingBag reads itself (it strips them before
+# building the TBE).
+_QUANT_UVM_TORCHREC_FUSED_PARAMS = frozenset(
+    {
+        FUSED_PARAM_REGISTER_TBE_BOOL,
+        FUSED_PARAM_BOUNDS_CHECK_MODE,
+        FUSED_PARAM_LENGTHS_TO_OFFSETS_LOOKUP,
+        FUSED_PARAM_IS_DEVICE_RO,
+    }
+)
+# IntNBit constructor arguments QuantBatchedEmbeddingBag sets itself.
+_QUANT_UVM_KERNEL_SET_PARAMS = frozenset(
+    {
+        "embedding_specs",
+        "device",
+        "pooling_mode",
+        "feature_table_map",
+        "row_alignment",
+        "uvm_host_mapped",
+        "bounds_check_mode",
+        "feature_names_per_table",
+    }
+)
+
+
+def _vbe_pool(
+    pool: Callable[[KeyedJaggedTensor], torch.Tensor],
+    features: KeyedJaggedTensor,
+    dims: List[int],
+    output_dtype: torch.dtype,
+    vbe_output: Optional[torch.Tensor] = None,
+    vbe_output_offsets: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Pools a variable-batch (VBE) KJT on an IntNBit TBE, which takes no per-feature
+    batch sizes and infers ONE batch from the offsets.
+
+    `pool(kjt) -> [B, sum(dims)]` pools a uniform batch; `dims` are the TBE's
+    per-feature output widths, in key order, and `output_dtype` its output dtype (a
+    batch with no bags is not pooled, and its empty result still carries that dtype, so
+    every rank emits one dtype into the pooled all-to-all). Key k carries sum_r stride[k][r] bags,
+    rank-major (`stride_per_key_per_rank`). Every key is padded to the largest of those
+    counts with EMPTY bags, which pool to exactly 0 and add no values, so values and
+    weights pass unchanged. That uniform batch is pooled once, and each (rank, key)
+    block of rows is cut back out.
+
+    The result has the lookup's VBE layout, one 1-D tensor, rank-major then key-major
+    (`GroupedPooledEmbeddingsLookup._vbe_splits`):
+    - when the lookup pre-allocates `vbe_output` (two or more TBEs,
+      `_forward_with_vbe_merging`), each block is written at its [rank][key] start in
+      `vbe_output_offsets`, and `vbe_output` is returned;
+    - otherwise the concatenated blocks are returned.
+    """
+    stride_per_key_per_rank = features.stride_per_key_per_rank()
+    if len(stride_per_key_per_rank) != len(dims):
+        raise ValueError(
+            f"VBE batch has {len(stride_per_key_per_rank)} keys, the TBE has "
+            f"{len(dims)} features."
+        )
+    num_ranks = len(stride_per_key_per_rank[0]) if stride_per_key_per_rank else 0
+    totals = [sum(strides) for strides in stride_per_key_per_rank]
+    batch = max(totals, default=0)
+    lengths = features.lengths()
+    if totals:
+        lengths = torch.cat(
+            [
+                torch.cat([key_lengths, key_lengths.new_zeros(batch - total)])
+                for key_lengths, total in zip(torch.split(lengths, totals), totals)
+            ]
+        )
+    uniform = KeyedJaggedTensor(
+        keys=features.keys(),
+        values=features.values(),
+        lengths=lengths,
+        weights=features.weights_or_none(),
+    )
+    pooled = (
+        pool(uniform)
+        if batch
+        else torch.empty(
+            (0, sum(dims)), dtype=output_dtype, device=features.values().device
+        )
+    )
+    columns = torch.split(pooled, dims, dim=1)
+    starts = [
+        [sum(strides[:rank]) for rank in range(num_ranks)]
+        for strides in stride_per_key_per_rank
+    ]
+    blocks = [
+        columns[key][
+            starts[key][rank] : starts[key][rank] + stride_per_key_per_rank[key][rank]
+        ].reshape(-1)
+        for rank in range(num_ranks)
+        for key in range(len(dims))
+    ]
+    if vbe_output is None:
+        return torch.cat(blocks) if blocks else pooled.new_zeros(0)
+    if vbe_output_offsets is None:
+        raise ValueError("vbe_output was passed without vbe_output_offsets.")
+    # ponytail: one host sync for the offset table per call; a device-side scatter if
+    # it ever shows in a profile.
+    offsets: List[List[int]] = vbe_output_offsets.tolist()
+    if len(offsets) != num_ranks or any(len(row) != len(dims) for row in offsets):
+        raise ValueError(
+            f"vbe_output_offsets has shape {[len(row) for row in offsets]}, expected "
+            f"{num_ranks} ranks x {len(dims)} features."
+        )
+    blocks_iter = iter(blocks)
+    for rank_offsets in offsets:
+        for start in rank_offsets:
+            block = next(blocks_iter)
+            # Casts to the lookup's output dtype.
+            vbe_output[start : start + block.numel()] = block
+    return vbe_output
+
+
+class TrainingQuantBatchedEmbeddingBag(QuantBatchedEmbeddingBag):
+    """
+    The inference TBE for a quant_uvm table in a training sharding plan
+    (`_training_quant_uvm_kernel`). Unlike `QuantBatchedEmbeddingBag`, it serves
+    variable-batch (VBE) input, which a training module's input dist can produce (the
+    fb-ads VariableLengthEmbeddingArch does on every batch): see `_vbe_pool`. When the
+    lookup pre-allocates `vbe_output` (two or more TBEs), it fills that buffer as a
+    training TBE does, so it can share a lookup with one.
+    """
+
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+        vbe_output: Optional[torch.Tensor] = None,
+        vbe_output_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if features.variable_stride_per_key():
+            return _vbe_pool(
+                super().forward,
+                features,
+                self.config.embedding_dims(),
+                SparseType.from_int(self.emb_module.output_dtype).as_dtype(),
+                vbe_output,
+                vbe_output_offsets,
+            )
+        if vbe_output is not None:
+            # The lookup pre-allocates an output only for a VBE batch.
+            raise ValueError(
+                "A pre-allocated vbe_output was passed with a non-VBE batch."
+            )
+        return super().forward(features)
+
+
+def _training_quant_uvm_kernel(
+    config: GroupedEmbeddingConfig,
+    pg: Optional[dist.ProcessGroup],
+    device: Optional[torch.device],
+) -> TrainingQuantBatchedEmbeddingBag:
+    """
+    The kernel for quant_uvm tables in a training sharding plan: the inference TBE,
+    IntNBit rows in host memory. Each table's `data_type` is its planned INT8/INT4
+    dtype (`ParameterSharding.quantized_weight_dtype`). The kernel has no state dict
+    entry, so its owner fills its rows after each checkpoint load (see
+    `QuantUvmServingGate` in embeddingbag.py).
+
+    A training sharder's fused params mostly configure the training TBE and its
+    optimizer, which the inference TBE does not take (its constructor has no
+    `**kwargs`), so only the keys it accepts are passed. The split scale-bias mode is
+    forced: with it each table's TBE spec takes its shard's `local_cols`, without it the
+    full `embedding_dim`, which is wrong for a column-wise shard.
+    """
+    for table in config.embedding_tables:
+        if table.compute_kernel != EmbeddingComputeKernel.QUANT_UVM:
+            raise ValueError(
+                f"Table {table.name} has compute kernel {table.compute_kernel.value} "
+                "in a training sharding plan; of the quantized kernels only quant_uvm "
+                "is served there."
+            )
+        if table.data_type not in (DataType.INT8, DataType.INT4):
+            raise ValueError(
+                f"Table {table.name} has compute kernel quant_uvm in a training "
+                f"sharding plan but data_type {table.data_type}; plan it with "
+                "ParameterConstraints.quantized_weight_dtype INT8 or INT4."
+            )
+    accepted = (
+        (
+            set(
+                inspect.signature(
+                    IntNBitTableBatchedEmbeddingBagsCodegen.__init__
+                ).parameters
+            )
+            | _QUANT_UVM_TORCHREC_FUSED_PARAMS
+        )
+        - _QUANT_UVM_KERNEL_SET_PARAMS
+        - {"self"}
+    )
+    fused_params: Dict[str, Any] = {
+        key: value
+        for key, value in (config.fused_params or {}).items()
+        if key in accepted
+    }
+    # The plan's bounds check mode reaches a training kernel as `bounds_check_mode`
+    # (the training TBE's argument); this kernel reads it under torchrec's own key.
+    bounds_check_mode = (config.fused_params or {}).get("bounds_check_mode")
+    if bounds_check_mode is not None:
+        fused_params.setdefault(FUSED_PARAM_BOUNDS_CHECK_MODE, bounds_check_mode)
+    fused_params[FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS] = True
+    # Same output dtype as the training kernel's tables, so every table in one
+    # pooled all-to-all emits one dtype on every rank.
+    fused_params.setdefault("output_dtype", SparseType.FP32)
+    return TrainingQuantBatchedEmbeddingBag(
+        config=config, pg=pg, device=device, fused_params=fused_params
+    )
 
 
 @torch.fx.wrap
@@ -115,7 +342,7 @@ def dummy_tensor(
 
 
 def _load_state_dict(
-    emb_modules: "nn.ModuleList",
+    emb_modules: Iterable[nn.Module],
     state_dict: "OrderedDict[str, Union[torch.Tensor, ShardedTensor, DTensor]]",
 ) -> Tuple[List[str], List[str]]:
     missing_keys = []
@@ -796,6 +1023,13 @@ class GroupedPooledEmbeddingsLookup(
                 sharding_type=sharding_type,
                 backend_type=BackendType.DRAM,
             )
+        elif config.compute_kernel in (
+            # group_tables files a quant_uvm table's group under QUANT
+            # (_get_compute_kernel_type); the kernel refuses any other table.
+            EmbeddingComputeKernel.QUANT,
+            EmbeddingComputeKernel.QUANT_UVM,
+        ):
+            return _training_quant_uvm_kernel(config=config, pg=pg, device=device)
         elif config.compute_kernel == EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE:
             # DRAM_SSD only supports the embedding cache (EmbeddingCollection),
             # not pooled EmbeddingBagCollection.
@@ -1215,11 +1449,21 @@ class GroupedPooledEmbeddingsLookup(
             # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
 
-        for emb_module in self._emb_modules:
+        for emb_module in self._emb_modules_with_torch_state():
             # pyrefly: ignore[no-matching-overload]
             emb_module.state_dict(destination, prefix, keep_vars)
 
         return destination
+
+    def _emb_modules_with_torch_state(self) -> List[nn.Module]:
+        # A quant_uvm table holds IntNBit rows with no training-dtype state, so it
+        # neither saves nor loads; its owner fills it from the checkpoint after each
+        # load.
+        return [
+            emb_module
+            for emb_module in self._emb_modules
+            if not isinstance(emb_module, TrainingQuantBatchedEmbeddingBag)
+        ]
 
     #  inconsistently.
     # pyrefly: ignore[bad-override]
@@ -1228,7 +1472,7 @@ class GroupedPooledEmbeddingsLookup(
         state_dict: "OrderedDict[str, Union[ShardedTensor, torch.Tensor]]",
         strict: bool = True,
     ) -> _IncompatibleKeys:
-        m, u = _load_state_dict(self._emb_modules, state_dict)
+        m, u = _load_state_dict(self._emb_modules_with_torch_state(), state_dict)
         return _IncompatibleKeys(missing_keys=m, unexpected_keys=u)
 
     def named_parameters(

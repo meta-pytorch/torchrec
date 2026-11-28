@@ -216,6 +216,7 @@ def to_sharding_plan(
                 else None
             ),
             num_twrw_groups=sharding_option.num_twrw_groups,
+            quantized_weight_dtype=sharding_option.quantized_weight_dtype,
         )
         plan[sharding_option.path] = module_plan
     # pyrefly: ignore[bad-argument-type]
@@ -494,6 +495,7 @@ def extract_plan(
                     output_dtype=so.output_dtype,
                     key_value_params=so.key_value_params,
                     num_twrw_groups=so.num_twrw_groups,
+                    quantized_weight_dtype=so.quantized_weight_dtype,
                 )
             )
 

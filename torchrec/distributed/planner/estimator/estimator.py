@@ -51,7 +51,7 @@ from torchrec.distributed.planner.types import (
     ShardingOption,
     Topology,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import ShardingType, StorageUsageType
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -1749,10 +1749,17 @@ class EmbeddingPerfEstimator(ShardEstimator):
                 if contexts[0].has_feature_processor:
                     num_feature_processors += 1
 
+            # A training sharder's QUANT_UVM table is an inference TBE, which has no
+            # backward: price it with the inference evaluator.
+            forward_only = (
+                sharding_option.compute_kernel == EmbeddingComputeKernel.QUANT_UVM.value
+                and sharder_data.storage_usage_type == StorageUsageType.BASE
+            )
             # Compute perf for each context and assign to corresponding shard
             for shard, ctx in zip(sharding_option.shards, contexts):
                 evaluator = get_embedding_perf_sharding_evaluator(
-                    sharding_type=ctx.sharding_type, is_inference=ctx.is_inference
+                    sharding_type=ctx.sharding_type,
+                    is_inference=ctx.is_inference or forward_only,
                 )
                 shard.perf = evaluator.compute_perf(
                     ctx=ctx,
